@@ -320,8 +320,15 @@ Run-Scenario "17. /reset" {
 Print-Phase "PHASE 6 - Post-reset"
 
 Run-Scenario "18. Turn 9 — fresh session does NOT recall ALBATROSS-7" {
-  $r = Invoke-Brigade -Message "Did I tell you a codename in this conversation? Reply only YES or NO."
-  if ($r.exit -ne 0) { return "exit $($r.exit)" }
+  # /reset cleared the persisted (provider, modelId) override too, so we
+  # must pass --model again here — without it, agent.ts will refuse to
+  # run because there's no model resolution path. This is correct
+  # Brigade behaviour; the smoke test just has to thread the model
+  # through explicitly post-reset.
+  $r = Invoke-Brigade `
+    -Message "Did I tell you a codename in this conversation? Reply only YES or NO." `
+    -ModelOverride $Model
+  if ($r.exit -ne 0) { return "exit $($r.exit). stderr: $($r.stderr.Substring(0, [Math]::Min(200, $r.stderr.Length)))" }
   Print-Info "reply: $($r.stdout.Trim())"
   if ($r.stdout.ToUpper().Contains("YES")) {
     return "model claims to remember ALBATROSS-7 — /reset did not clear the session"
