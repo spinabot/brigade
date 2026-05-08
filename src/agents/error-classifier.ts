@@ -362,3 +362,333 @@ export function summariseError(value: unknown): string {
     return String(value);
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DETAILED CLASSIFIER + RETRY POLICY (folded in from src/core/error-classifier.ts).
+//
+// `classifyError` above returns a string `RetryReason`. The lifted v0.1.3
+// agent loop wants a richer ClassifiedError OBJECT with retry-after timing
+// and a `retryableOnSameModel` boolean, plus a `decideRetry` policy
+// function with backoff ladders. Rather than duplicating two parallel files,
+// we keep BOTH APIs in this single module:
+//
+//   • classifyError(value, ctx?)        → RetryReason       (Brigade-native, primitive #1)
+//   • classifyErrorDetailed(err)        → ClassifiedError   (lifted v0.1.3, used by core/agent.ts)
+//   • decideRetry(c, opts)              → RetryDecision     (lifted retry-policy ladder)
+//
+// The two classifiers are taxonomy-compatible where it matters (rate_limit /
+// auth / auth_permanent / model_not_found / unknown all overlap); the
+// detailed one adds context_overflow / server_5xx / network / content_filter
+// distinctions the retry policy needs to pick the right backoff.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type ErrorClass =
+  | "rate_limit"
+  | "server_5xx"
+  | "network"
+  | "timeout"
+  | "context_overflow"
+  | "auth"
+  | "auth_permanent"
+  | "content_filter"
+  | "model_not_found"
+  | "unknown";
+
+export interface ClassifiedError {
+  /** The class. Drives which recovery the loop attempts. */
+  class: ErrorClass;
+  /** Retry-After delay in ms, parsed from the message if the provider included one. */
+  retryAfterMs?: number;
+  /** Original error message, for logging. */
+  message: string;
+  /** True if the same MODEL might succeed on retry; false → advance to fallback. */
+  retryableOnSameModel: boolean;
+}
+
+/* ─────────── pattern tables for classifyErrorDetailed ─────────── */
+// (Renamed from the originals to avoid collision with the RetryReason
+// classifier's own pattern tables above. Detailed-suffix is a tag, not a
+// behaviour difference.)
+
+const NETWORK_ERROR_CODES_DETAILED = new Set<string>([
+  "ETIMEDOUT",
+  "ESOCKETTIMEDOUT",
+  "ECONNRESET",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "EHOSTDOWN",
+  "ENETRESET",
+  "EPIPE",
+  "EAI_AGAIN",
+]);
+
+const SERVER_5XX_CODES_DETAILED = new Set([499, 500, 502, 503, 504, 521, 522, 523, 524, 529]);
+
+const CONTEXT_OVERFLOW_PATTERNS_DETAILED = [
+  /context\s+(?:length|size|window)/i,
+  /maximum\s+context/i,
+  /token\s+limit/i,
+  /too\s+many\s+tokens/i,
+  /reduce\s+the\s+length/i,
+  /exceeds?\s+the\s+limit/i,
+  /prompt\s+is\s+too\s+long/i,
+  /context_window_exceeded/i,
+];
+
+const RATE_LIMIT_PATTERNS_DETAILED = [
+  /rate\s*limit/i,
+  /too\s+many\s+requests/i,
+  /requests\s+per\s+(?:minute|hour|day|second)/i,
+  /quota/i,
+  /throttl(?:ed|ing)/i,
+  /\b429\b/,
+  /tokens?\s+per\s+day/i,
+  /overloaded/i,
+];
+
+const AUTH_PATTERNS_DETAILED = [
+  /invalid\s+api\s+key/i,
+  /(?:un)?authenticat/i,
+  /unauthor[is]z/i,
+  /forbidden/i,
+  /invalid\s+token/i,
+  /access\s+denied/i,
+  /token\s+expired/i,
+  /token\s+revoked/i,
+  /incorrect\s+api\s+key/i,
+];
+
+const AUTH_PERMANENT_PATTERNS_DETAILED = [
+  /billing/i,
+  /payment\s+required/i,
+  /insufficient\s+(?:funds|credit|quota)/i,
+  /account\s+(?:disabled|suspended|terminated)/i,
+];
+
+const CONTENT_FILTER_PATTERNS_DETAILED = [
+  /content\s+filter/i,
+  /content\s+policy/i,
+  /safety/i,
+  /\b(?:cannot|can(?:'|’)?t|unable\s+to|won(?:'|’)?t)\s+(?:to\s+)?(?:respond|comply|assist|help|provide|do\s+that|continue)/i,
+  /refus(?:al|ed)/i,
+];
+
+const MODEL_NOT_FOUND_PATTERNS_DETAILED = [
+  /model\s+(?:not|does\s+not)\s+(?:found|exist|available)/i,
+  /\bmodel\b[^.\n]{0,80}(?:does\s+not\s+exist|not\s+(?:found|available)|is\s+(?:invalid|deprecated))/i,
+  /no\s+such\s+model/i,
+  /unknown\s+model/i,
+  /\b404\b.*model/i,
+];
+
+/**
+ * Detailed classifier (object return). Mirrors openclaw's primary classifier
+ * shape for the retry-policy ladder. Returns `{class, retryAfterMs?, message,
+ * retryableOnSameModel}` — `decideRetry` reads these fields to pick a
+ * backoff strategy.
+ *
+ * Use `classifyError` (above) when you only need the category string.
+ */
+export function classifyErrorDetailed(err: unknown): ClassifiedError {
+  const message = extractMessageDetailed(err);
+  const code = extractCodeDetailed(err);
+  const status = extractStatusDetailed(err);
+
+  if (code && NETWORK_ERROR_CODES_DETAILED.has(code)) {
+    return {
+      class: code === "ETIMEDOUT" || code === "ESOCKETTIMEDOUT" || code === "ECONNABORTED"
+        ? "timeout"
+        : "network",
+      message,
+      retryableOnSameModel: true,
+    };
+  }
+
+  if (typeof status === "number") {
+    if (status === 429) {
+      return {
+        class: "rate_limit",
+        message,
+        retryAfterMs: parseRetryAfter(err),
+        retryableOnSameModel: true,
+      };
+    }
+    if (SERVER_5XX_CODES_DETAILED.has(status)) {
+      return { class: "server_5xx", message, retryableOnSameModel: true };
+    }
+    if (status === 401 || status === 403) {
+      const isPermanent = AUTH_PERMANENT_PATTERNS_DETAILED.some((p) => p.test(message));
+      return {
+        class: isPermanent ? "auth_permanent" : "auth",
+        message,
+        retryableOnSameModel: false,
+      };
+    }
+    if (status === 402) {
+      return { class: "auth_permanent", message, retryableOnSameModel: false };
+    }
+    if (status === 404) {
+      return { class: "model_not_found", message, retryableOnSameModel: false };
+    }
+  }
+
+  if (CONTEXT_OVERFLOW_PATTERNS_DETAILED.some((p) => p.test(message))) {
+    return { class: "context_overflow", message, retryableOnSameModel: true };
+  }
+  if (RATE_LIMIT_PATTERNS_DETAILED.some((p) => p.test(message))) {
+    return {
+      class: "rate_limit",
+      message,
+      retryAfterMs: parseRetryAfter(err),
+      retryableOnSameModel: true,
+    };
+  }
+  if (AUTH_PERMANENT_PATTERNS_DETAILED.some((p) => p.test(message))) {
+    return { class: "auth_permanent", message, retryableOnSameModel: false };
+  }
+  if (AUTH_PATTERNS_DETAILED.some((p) => p.test(message))) {
+    return { class: "auth", message, retryableOnSameModel: false };
+  }
+  if (CONTENT_FILTER_PATTERNS_DETAILED.some((p) => p.test(message))) {
+    return { class: "content_filter", message, retryableOnSameModel: false };
+  }
+  if (MODEL_NOT_FOUND_PATTERNS_DETAILED.some((p) => p.test(message))) {
+    return { class: "model_not_found", message, retryableOnSameModel: false };
+  }
+
+  return { class: "unknown", message, retryableOnSameModel: false };
+}
+
+/* ─────────────────────────── retry policy ─────────────────────────── */
+
+export interface RetryDecision {
+  /** True → caller should retry on the same model after the given delay. */
+  retry: boolean;
+  /** Delay before retry in ms. Always >= 0. Ignored when retry=false. */
+  delayMs: number;
+  /** Reason string for logging / UI. */
+  reason: string;
+}
+
+export interface RetryPolicyOptions {
+  /** Which attempt number is this (1-indexed). Starts at 1 for the FIRST retry. */
+  attempt: number;
+  /** Hard cap on total retries before giving up on the same model. */
+  maxAttempts?: number;
+  /** Cap on total wait per single retry. */
+  maxDelayMs?: number;
+}
+
+/**
+ * Decide what to do with a classified error. Returns the next backoff and
+ * whether to retry on the same model. Cooldown ladder: 30s → 60s → 5min.
+ *
+ * `context_overflow` is special: caller should run smart compaction BEFORE
+ * retrying — delay is 0 because we're not waiting on the network, we're
+ * waiting on local work.
+ */
+export function decideRetry(c: ClassifiedError, opts: RetryPolicyOptions): RetryDecision {
+  const max = opts.maxAttempts ?? 3;
+  const maxDelay = opts.maxDelayMs ?? 60_000;
+
+  if (!c.retryableOnSameModel) {
+    return { retry: false, delayMs: 0, reason: `${c.class} — advance to fallback` };
+  }
+  if (opts.attempt > max) {
+    return { retry: false, delayMs: 0, reason: `${c.class} — exhausted retries on this model` };
+  }
+
+  switch (c.class) {
+    case "rate_limit": {
+      const ladder = [30_000, 60_000, 5 * 60_000];
+      const fromLadder = ladder[Math.min(opts.attempt - 1, ladder.length - 1)]!;
+      const delay = c.retryAfterMs
+        ? Math.min(c.retryAfterMs, maxDelay)
+        : Math.min(fromLadder, maxDelay);
+      return { retry: true, delayMs: delay, reason: `rate-limited — waiting ${delay}ms (attempt ${opts.attempt}/${max})` };
+    }
+    case "server_5xx": {
+      const base = 1000 * 2 ** (opts.attempt - 1);
+      const jitter = Math.floor(Math.random() * 500);
+      const delay = Math.min(base + jitter, maxDelay);
+      return { retry: true, delayMs: delay, reason: `server error — retrying in ${delay}ms (attempt ${opts.attempt}/${max})` };
+    }
+    case "network":
+    case "timeout": {
+      const ladder = [200, 1_000, 3_000];
+      const delay = ladder[Math.min(opts.attempt - 1, ladder.length - 1)]!;
+      return { retry: true, delayMs: delay, reason: `${c.class} — quick retry in ${delay}ms` };
+    }
+    case "context_overflow": {
+      return { retry: true, delayMs: 0, reason: `context overflow — compact then retry` };
+    }
+    default:
+      return { retry: false, delayMs: 0, reason: `${c.class} — not retryable on same model` };
+  }
+}
+
+/* ─────────────────────────── helpers (Detailed) ─────────────────────────── */
+
+function extractMessageDetailed(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object" && "message" in err) return String((err as any).message);
+  return String(err);
+}
+
+function extractCodeDetailed(err: unknown): string | undefined {
+  if (err && typeof err === "object" && "code" in err) {
+    const c = (err as any).code;
+    if (typeof c === "string") return c;
+  }
+  return undefined;
+}
+
+function extractStatusDetailed(err: unknown): number | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const e = err as any;
+  if (typeof e.status === "number") return e.status;
+  if (typeof e.statusCode === "number") return e.statusCode;
+  if (e.response && typeof e.response.status === "number") return e.response.status;
+
+  const msg = extractMessageDetailed(err);
+  const httpMatch = msg.match(/\b(?:HTTP|status)\s*(?::|\s)\s*(\d{3})\b/i);
+  if (httpMatch) {
+    const n = Number(httpMatch[1]);
+    if (n >= 100 && n < 600) return n;
+  }
+  const bareMatch = msg.match(/\b([45]\d{2})\b/);
+  if (bareMatch) {
+    const n = Number(bareMatch[1]);
+    if ([401, 403, 404, 429, 500, 502, 503, 504].includes(n)) return n;
+  }
+  return undefined;
+}
+
+/**
+ * Parse Retry-After. Providers express this as either a delta-seconds integer
+ * or an HTTP-date string per RFC 7231; we accept both. Exported so callers
+ * (tests, the model-fallback orchestrator) can read the same hint.
+ */
+export function parseRetryAfter(err: unknown): number | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const e = err as any;
+
+  const fromHeader =
+    e.headers?.["retry-after"] ??
+    e.response?.headers?.["retry-after"] ??
+    e.response?.headers?.get?.("retry-after");
+  if (fromHeader) {
+    const seconds = Number(fromHeader);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.floor(seconds * 1000);
+    const date = Date.parse(String(fromHeader));
+    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  }
+
+  const msg = extractMessageDetailed(err);
+  const m = msg.match(/(?:retry|try again)\s+(?:after|in)\s+(\d+)\s*s(?:ec)?/i);
+  if (m) return Number(m[1]) * 1000;
+  return undefined;
+}

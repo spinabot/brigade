@@ -1,314 +1,226 @@
-import fs from "node:fs";
-import path from "node:path";
-import { Command } from "commander";
+/**
+ * `brigade onboard` — provider/model setup wizard, standalone.
+ *
+ * Boot the Pi-TUI wizard, write the chosen provider+model to brigade.json
+ * and the API key to Brigade-native auth-profiles.json, tear down the TUI,
+ * print a one-liner with what to do next, and exit.
+ *
+ * Mirrors the published v0.1.3 `src/cli/onboard-cmd.ts` UI shape exactly:
+ * Pi-TUI arrow-key navigation, animated branding frames, the same step
+ * sequence (provider → key → model → name), and the same success / cancel /
+ * error messaging. The internals diverge in two small places, marked clearly
+ * below — see "Brigade-native bridge".
+ *
+ * Re-onboarding: this command always runs the wizard. If a default model
+ * is already saved, the wizard's existing flow lets the user pick a new one
+ * (or Esc out without changes). We don't pre-emptively delete anything from
+ * config — the wizard owns its own write semantics.
+ */
 
-import {
-  DEFAULT_AGENT_ID,
-  ensureDir,
-  resolveAllPaths,
-  resolveConfigPath,
-  resolveLogsDir,
-  resolveTasksDir,
-} from "../../config/paths.js";
-import { writeConfigSafe, readConfigOrInit } from "../../config/io.js";
-import { initAuthProfiles } from "../../auth/profiles.js";
-import { bootstrapWorkspace } from "../../workspace/bootstrap.js";
-import { ensureDeviceIdentity } from "../../identity/device.js";
-import {
-  applyConfigMeta,
-  applyWizardMetadata,
-  type BrigadeOnboardMode,
-} from "../wizard/helpers.js";
-import {
-  type BrigadeNonInteractiveSetupResult,
-  runNonInteractiveSetup,
-} from "../wizard/non-interactive.js";
-import {
-  BrigadeWizardCancelledError,
-  runInteractiveSetup,
-} from "../wizard/setup.js";
+import * as fsAsync from "node:fs/promises";
+import * as path from "node:path";
+import process from "node:process";
 
-interface OnboardOptions {
-  agentId: string;
-  workspace?: string;
-  installDaemon?: boolean;
-  // Wizard inputs — when any of these are set we run the non-interactive
-  // path and skip prompts entirely. The interactive path fills the same
-  // fields and feeds them through the same writer, so the brigade.json
-  // shape is identical regardless of input mode.
-  provider?: string;
-  apiKey?: string;
-  model?: string;
-  fallbackModel?: string;
-  gatewayPort?: string;
-  gatewayToken?: string;
-  secretInputMode?: "plaintext" | "ref";
-  nonInteractive?: boolean;
-  mode?: BrigadeOnboardMode;
-  skipWizard?: boolean;
+import { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
+import { ProcessTerminal, TUI } from "@mariozechner/pi-tui";
+import chalk from "chalk";
+import type { Command } from "commander";
+
+import { initAuthProfiles, upsertApiKeyProfile } from "../../auth/profiles.js";
+import { DEFAULT_AGENT_ID, resolveAuthProfilesPath } from "../../config/paths.js";
+import { BRIGADE_DIR, loadConfig, saveConfig } from "../../core/config.js";
+import { EXIT_CONFIG_ERROR } from "../../protocol.js";
+import { runOnboarding } from "../../ui/onboarding.js";
+import { restoreTerminal } from "../../ui/terminal-cleanup.js";
+
+export interface OnboardCommandOptions {
+	/**
+	 * When true, the wizard ignores any API keys exported in the user's shell
+	 * environment. Forces the typed-key prompt for every provider. Threaded
+	 * through from the `--no-env-detect` CLI flag.
+	 */
+	noEnvDetect?: boolean;
 }
 
+/**
+ * Run the onboarding wizard and exit. Resolves once the wizard completes
+ * (success or cancellation) — no long-running event loop to keep alive.
+ */
+export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promise<number> {
+	if (!process.stdin.isTTY || !process.stdout.isTTY) {
+		console.error(chalk.red("brigade onboard needs an interactive terminal."));
+		console.error(
+			chalk.dim(
+				"To configure non-interactively, set provider env vars (e.g. OPENROUTER_API_KEY) and write\n" +
+					"  ~/.brigade/brigade.json directly with `agents.defaults.model.primary` set.",
+			),
+		);
+		return EXIT_CONFIG_ERROR;
+	}
+
+	const tui = new TUI(new ProcessTerminal());
+	tui.start();
+
+	// SIGINT during the wizard — clean exit, no half-written config (the
+	// wizard's saveConfig only fires on a completed flow).
+	const onSigint = (): void => {
+		tui.stop();
+		restoreTerminal();
+		process.exit(130);
+	};
+	process.once("SIGINT", onSigint);
+
+	// Ensure the auth-profiles.json scaffold exists before the wizard runs —
+	// the bridge step at the end uses upsertApiKeyProfile which expects the
+	// file to already be present at mode 0600. Cheap idempotent call.
+	initAuthProfiles(DEFAULT_AGENT_ID);
+
+	const authStorage = AuthStorage.create(`${BRIGADE_DIR}/auth.json`);
+	const modelRegistry = ModelRegistry.create(authStorage, `${BRIGADE_DIR}/models.json`);
+
+	try {
+		const result = await runOnboarding(tui, authStorage, modelRegistry, {
+			noEnvDetect: opts.noEnvDetect,
+		});
+		tui.stop();
+		restoreTerminal();
+
+		// ─────────────────── Brigade-native bridge ───────────────────
+		// The lifted runOnboarding writes:
+		//   1. The API key into Pi's auth.json (via authStorage.set)
+		//   2. brigade.json with the legacy flat keys defaultProvider /
+		//      defaultModelId (line 144 in src/ui/onboarding.ts)
+		//
+		// Brigade's runtime (Primitive #1's agent-loop, the lifted chat/
+		// gateway, doctor, status) all read:
+		//   1. The API key from `~/.brigade/agents/main/agent/auth-profiles.json`
+		//      (resolveAuthProfilesPath + readBrigadeCredentials)
+		//   2. brigade.json's `agents.defaults.{provider, model.primary}` shape
+		//
+		// We bridge here so the chosen provider/model land in the canonical
+		// places without requiring a patch to the byte-identical lifted UI.
+		await bridgeOnboardingResultToBrigadeNative({
+			provider: result.provider,
+			modelId: result.modelId,
+			authStorage,
+		});
+
+		console.error(
+			chalk.dim(
+				`\n✓ onboarded — provider: ${chalk.bold(result.provider)} · model: ${chalk.bold(result.modelId)}\n` +
+					`Next: run ${chalk.bold("brigade gateway")} (then ${chalk.bold("brigade connect")} in a second terminal),\n` +
+					`      or ${chalk.bold("brigade")} for the in-process TUI.\n`,
+			),
+		);
+		return 0;
+	} catch (err) {
+		tui.stop();
+		restoreTerminal();
+		const msg = err instanceof Error ? err.message : String(err);
+		// `runOnboarding` throws "onboarding-cancelled" when the user hits Esc
+		// on the provider picker — surface that as a friendly message, not a
+		// crash. Any other error propagates as a real failure.
+		if (msg === "onboarding-cancelled") {
+			console.error(chalk.dim("Onboarding cancelled — run `brigade onboard` again any time."));
+			return 0;
+		}
+		console.error(chalk.red(`Onboarding failed: ${msg}`));
+		return 1;
+	}
+}
+
+/**
+ * Bridge the post-wizard state into Brigade-native storage.
+ *
+ *   - Pi auth.json → Brigade auth-profiles.json (so the runtime sees the key
+ *     via auth-bridge / readAuthProfilesAsCredentialMap).
+ *   - brigade.json `defaultProvider`/`defaultModelId` → `agents.defaults.
+ *     {provider, model.primary}` (so chat/gateway/status read the right
+ *     shape).
+ *
+ * Both writes are idempotent and tolerate a wizard re-run that flips
+ * provider/model — first-wins semantics on the auth side keep things sane.
+ */
+async function bridgeOnboardingResultToBrigadeNative(args: {
+	provider: string;
+	modelId: string;
+	authStorage: AuthStorage;
+}): Promise<void> {
+	// Pull the key Pi just stored. The wizard always sets a key for non-noAuth
+	// providers; for local providers (Ollama) `getApiKey` returns undefined
+	// and we skip the auth-profile bridge entirely.
+	const key = await args.authStorage.getApiKey(args.provider);
+	if (typeof key === "string" && key.length > 0) {
+		// Skip if a profile already exists with this exact key — avoids
+		// rewriting auth-profiles.json on every re-onboard.
+		try {
+			const profilesPath = resolveAuthProfilesPath(DEFAULT_AGENT_ID);
+			let alreadyHasMatch = false;
+			try {
+				const raw = await fsAsync.readFile(profilesPath, "utf8");
+				const parsed = JSON.parse(raw) as {
+					profiles?: Record<string, { provider?: string; key?: string }>;
+				};
+				alreadyHasMatch = Object.values(parsed.profiles ?? {}).some(
+					(p) => p?.provider === args.provider && p.key === key,
+				);
+			} catch {
+				// No file yet, or unreadable — fall through to the upsert.
+			}
+			if (!alreadyHasMatch) {
+				upsertApiKeyProfile(DEFAULT_AGENT_ID, { provider: args.provider, key });
+			}
+		} catch (err) {
+			// Don't block onboarding success on the bridge failing — surface a
+			// breadcrumb instead. The user can re-run `brigade onboard` to
+			// retry, or hand-edit auth-profiles.json themselves.
+			process.stderr.write(
+				chalk.yellow(
+					`\nbrigade: warning — couldn't mirror key to ${path.basename(
+						resolveAuthProfilesPath(DEFAULT_AGENT_ID),
+					)}: ${(err as Error).message}\n`,
+				),
+			);
+		}
+	}
+
+	// Migrate brigade.json's flat shape (written by ui/onboarding.ts:144) into
+	// the agents.defaults shape that the rest of Brigade reads. We don't
+	// delete the legacy keys — leaving them around as a no-op is safer than
+	// touching fields the user may have hand-edited.
+	try {
+		const cfg = loadConfig() as Record<string, unknown>;
+		const agents = (cfg.agents as Record<string, unknown> | undefined) ?? {};
+		const defaults = (agents.defaults as Record<string, unknown> | undefined) ?? {};
+		const model = (defaults.model as Record<string, unknown> | undefined) ?? {};
+		defaults.provider = args.provider;
+		model.primary = args.modelId;
+		defaults.model = model;
+		agents.defaults = defaults;
+		cfg.agents = agents;
+		saveConfig(cfg as never);
+	} catch (err) {
+		process.stderr.write(
+			chalk.yellow(
+				`\nbrigade: warning — couldn't update brigade.json: ${(err as Error).message}\n`,
+			),
+		);
+	}
+}
+
+/**
+ * Commander registrar — declared at the program level so `brigade --help`
+ * lists the subcommand. The action handler is dynamic-imported in
+ * build-program.ts to keep the command's import graph (Pi TUI + onboarding
+ * wizard) out of the cold-start path for unrelated commands.
+ */
 export function registerOnboardCommand(program: Command): void {
-  program
-    .command("onboard")
-    .description("Set up ~/.brigade/ — workspace, auth scaffolding, default config")
-    .option("--agent-id <id>", "agent id to provision", DEFAULT_AGENT_ID)
-    .option("--workspace <dir>", "override workspace directory")
-    .option("--install-daemon", "also install the gateway daemon")
-    .option(
-      "--provider <id>",
-      "provider id (openrouter|anthropic|openai|ollama). Triggers non-interactive setup when set.",
-    )
-    .option("--api-key <key>", "API key for the picked provider (literal or empty for ref mode)")
-    .option("--model <id>", "primary model id (must belong to --provider)")
-    .option("--fallback-model <id>", "secondary model id within the same provider")
-    .option("--gateway-port <port>", "gateway port (default: 18789)")
-    .option("--gateway-token <token>", "gateway auth token (default: random 48-hex)")
-    .option(
-      "--secret-input-mode <mode>",
-      "plaintext (literal in auth-profiles.json) | ref (read from env var at runtime)",
-      "plaintext",
-    )
-    .option("--non-interactive", "skip all prompts; require flags for any choice")
-    .option("--mode <mode>", "local|remote (default: local)", "local")
-    .option(
-      "--skip-wizard",
-      "scaffold dirs/workspace only — do not run the provider/model wizard",
-    )
-    .action(async (raw: OnboardOptions) => {
-      await runOnboard(raw);
-    });
-}
-
-export async function runOnboard(opts: OnboardOptions): Promise<void> {
-  const agentId = opts.agentId ?? DEFAULT_AGENT_ID;
-  const paths = resolveAllPaths(agentId, opts.workspace);
-  const mode: BrigadeOnboardMode = opts.mode === "remote" ? "remote" : "local";
-
-  // Eagerly create only the dirs the runtime actively uses. Other dirs
-  // (cache/, oauth/, credentials/, completions/) are created lazily by
-  // their own subsystems on first write — that matches the reference's
-  // pattern and avoids leaving empty-looking dirs behind that suggest
-  // brigade is provisioning more than it actually is.
-  ensureDir(paths.stateDir);
-  ensureDir(paths.agentDir);
-  ensureDir(paths.authDir);
-  ensureDir(paths.sessionsDir);
-  ensureDir(resolveTasksDir());
-  ensureDir(resolveLogsDir());
-
-  // Snapshot whether brigade.json existed BEFORE this onboard. The wizard
-  // uses this to gate first-onboard-only seeds (controlUi.allowInsecureAuth
-  // + nodes.denyCommands) so re-running onboard against a customised
-  // config doesn't clobber prior choices. Mirrors the reference's
-  // `quickstartGateway.hasExisting` flag.
-  const hasExistingConfig = fs.existsSync(resolveConfigPath());
-
-  // brigade.json — load or initialise, but do not write yet. The wizard
-  // step below builds the full object before the single write at the end.
-  let config = readConfigOrInit();
-  if (!config.agents) config.agents = {};
-  // Forward-compat slot for per-agent overrides — only materialised when
-  // the user passes an explicit --workspace or --default-route. Until then
-  // the agent inherits agents.defaults entirely, which matches the
-  // reference: a single-agent install has no per-id keys, just defaults.
-  if (opts.workspace) {
-    const existing = config.agents[agentId];
-    const isDefaults = isAgentDefaultsBlock(existing);
-    if (!existing || isDefaults) {
-      config.agents[agentId] = {
-        workspace: opts.workspace,
-        defaultRoute: null,
-      };
-    }
-  }
-
-  // auth-profiles.json — empty scaffold at mode 0600, never overwrite.
-  initAuthProfiles(agentId);
-
-  // Empty session-key index so the runtime has something to read on first turn.
-  if (!fs.existsSync(paths.sessionStorePath)) {
-    fs.writeFileSync(
-      paths.sessionStorePath,
-      JSON.stringify({ version: 1, sessions: {} }, null, 2),
-      "utf8",
-    );
-  }
-
-  // 7 workspace files (AGENTS, BOOTSTRAP, IDENTITY, SOUL, TOOLS, HEARTBEAT, USER).
-  // Content is loaded from templates/workspace/ on disk via the loader.
-  // bootstrapWorkspace is also responsible for git-init on truly fresh
-  // workspaces and for honouring the brand-new-workspace probe so
-  // re-onboard against a customised workspace doesn't resurrect BOOTSTRAP.md.
-  const ws = await bootstrapWorkspace(paths.workspaceDir);
-
-  // Ed25519 device identity. Written once on first onboard; subsequent
-  // calls are a no-op. Required for any future device-pairing primitive.
-  const identity = await ensureDeviceIdentity();
-
-  // Wizard step — provider pick + key entry + model pick. Skipped only
-  // when --skip-wizard is passed (test-mode scaffold) or when a non-TTY
-  // is detected without provider flags (CI calling onboard purely to
-  // create dirs).
-  let wizardResult: BrigadeNonInteractiveSetupResult | undefined;
-  let wizardSkipped = false;
-  if (opts.skipWizard) {
-    wizardSkipped = true;
-  } else if (shouldRunNonInteractive(opts)) {
-    if (!opts.provider) {
-      // No flags + non-interactive flag → caller wanted to scaffold only.
-      wizardSkipped = true;
-    } else {
-      wizardResult = runNonInteractiveSetup({
-        config,
-        workspace: paths.workspaceDir,
-        agentId,
-        provider: opts.provider,
-        apiKey: opts.apiKey,
-        secretInputMode: opts.secretInputMode ?? "plaintext",
-        ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.fallbackModel ? { fallbackModel: opts.fallbackModel } : {}),
-        ...(opts.gatewayPort ? { gatewayPort: parseGatewayPort(opts.gatewayPort) } : {}),
-        ...(opts.gatewayToken ? { gatewayToken: opts.gatewayToken } : {}),
-        mode,
-        hasExistingConfig,
-      });
-    }
-  } else {
-    // Interactive — prompt the user. Cancellation aborts cleanly without
-    // writing the wizard sections (dirs + workspace + identity stay).
-    try {
-      wizardResult = await runInteractiveSetup({
-        config,
-        workspace: paths.workspaceDir,
-        agentId,
-        hasExistingConfig,
-      });
-    } catch (err) {
-      if (err instanceof BrigadeWizardCancelledError) {
-        wizardSkipped = true;
-        console.log("");
-        console.log("[note] wizard cancelled — workspace + auth scaffolding kept.");
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  // Single write at the end — wizard output (if any) + meta/version stamps.
-  if (wizardResult) {
-    config = wizardResult.config;
-  }
-  config = applyWizardMetadata(config, { command: "onboard", mode });
-  config = applyConfigMeta(config);
-  writeConfigSafe(config);
-
-  printOnboardSummary({
-    agentId,
-    paths,
-    createdWorkspaceFiles: ws.created.length,
-    missingTemplates: ws.missingTemplates,
-    workspaceGitInitialised: ws.gitInitialised,
-    deviceIdCreated: identity.created,
-    deviceId: identity.identity.deviceId,
-    wizardResult,
-    wizardSkipped,
-  });
-
-  if (opts.installDaemon) {
-    console.log("");
-    console.log("[note] --install-daemon is not yet implemented in this scaffold.");
-    console.log("       Once the gateway module lands, this flag will install");
-    console.log("       the per-OS service: launchd / systemd / Task Scheduler.");
-  }
-}
-
-function shouldRunNonInteractive(opts: OnboardOptions): boolean {
-  if (opts.nonInteractive) return true;
-  if (opts.provider) return true;
-  // No TTY + no flags = scaffold only (skipWizard implied).
-  if (!process.stdin.isTTY) return true;
-  return false;
-}
-
-function parseGatewayPort(value: string): number {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 65535) {
-    throw new Error(
-      `--gateway-port must be a positive integer between 1 and 65535 (got: "${value}").`,
-    );
-  }
-  return parsed;
-}
-
-// The agents map can hold either AgentConfig (per-id overrides) or the
-// special `defaults` block. This guard tells them apart so re-runs of
-// onboard don't overwrite the defaults block with a per-id stub.
-function isAgentDefaultsBlock(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  const obj = value as Record<string, unknown>;
-  return "model" in obj || "models" in obj;
-}
-
-function printOnboardSummary(args: {
-  agentId: string;
-  paths: ReturnType<typeof resolveAllPaths>;
-  createdWorkspaceFiles: number;
-  missingTemplates: readonly string[];
-  workspaceGitInitialised: boolean;
-  deviceIdCreated: boolean;
-  deviceId: string;
-  wizardResult: BrigadeNonInteractiveSetupResult | undefined;
-  wizardSkipped: boolean;
-}): void {
-  const { agentId, paths, createdWorkspaceFiles, missingTemplates } = args;
-  console.log("Brigade onboarded.");
-  console.log("");
-  console.log(`  Agent id          ${agentId}`);
-  console.log(`  State dir         ${paths.stateDir}`);
-  console.log(`  Config            ${paths.configPath}`);
-  console.log(`  Auth dir          ${paths.authDir}`);
-  console.log(`  Auth profiles     ${path.basename(paths.authProfilesPath)} (mode 0600)`);
-  console.log(`  Sessions          ${paths.sessionsDir}`);
-  console.log(`  Workspace         ${paths.workspaceDir}`);
-  console.log(`  Workspace files   ${createdWorkspaceFiles} created`);
-  console.log(
-    `  Workspace git     ${args.workspaceGitInitialised ? "initialised" : "skipped (existing or git unavailable)"}`,
-  );
-  console.log(
-    `  Device identity   ${args.deviceIdCreated ? "generated" : "existing"} (${args.deviceId.slice(0, 8)}…)`,
-  );
-  console.log(`  Tasks db          ${paths.tasksDbPath} (lazy)`);
-
-  if (args.wizardResult) {
-    const cfg = args.wizardResult.config;
-    const provider = args.wizardResult.profileId.split(":")[0];
-    const model = (cfg.agents?.defaults as { model?: { primary?: string } } | undefined)?.model
-      ?.primary;
-    const port = cfg.gateway?.port;
-    console.log("");
-    console.log(`  Provider          ${provider}`);
-    if (model) console.log(`  Default model     ${model}`);
-    if (typeof port === "number") console.log(`  Gateway port      ${port}`);
-    console.log(`  Gateway token     ${cfg.gateway?.auth?.token ? "(stored, mode 0600 in brigade.json — rotate via /reset)" : "(not set)"}`);
-    if (args.wizardResult.wroteSecret) {
-      console.log(`  Auth profile      ${args.wizardResult.profileId} (key in auth-profiles.json)`);
-    }
-  } else if (args.wizardSkipped) {
-    console.log("");
-    console.log("  Wizard            skipped — re-run \`brigade onboard\` to pick a provider/model.");
-  }
-
-  if (missingTemplates.length > 0) {
-    console.log("");
-    console.log(
-      `  [warn] templates missing for: ${missingTemplates.join(", ")}.`,
-    );
-    console.log(
-      "         Drop the corresponding markdown into templates/workspace/ and re-run onboard.",
-    );
-  }
-  console.log("");
-  console.log("Next: `brigade agent --message \"hello\"` to drive a turn,");
-  console.log("      or `brigade tui` for the interactive shell.");
+	program
+		.command("onboard")
+		.description("Pick a provider and model — interactive Pi-TUI wizard")
+		.option("--no-env-detect", "ignore API keys from the shell environment", false)
+		.action(async (opts: { envDetect?: boolean }) => {
+			const code = await runOnboardCommand({ noEnvDetect: opts.envDetect === false });
+			process.exit(code);
+		});
 }

@@ -1,13 +1,19 @@
 {
   "name": "brigade",
   "version": "0.1.0",
-  "description": "Brigade — AI crew framework",
+  "description": "Brigade — your personal AI crew",
   "type": "module",
   "bin": {
     "brigade": "./brigade.mjs"
   },
+  "main": "dist/entry.js",
+  "exports": {
+    ".": "./brigade.mjs",
+    "./package.json": "./package.json"
+  },
   "files": [
     "brigade.mjs",
+    "scripts/run-brigade.mjs",
     "dist/**/*",
     "templates/**/*",
     "README.md",
@@ -16,26 +22,69 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "build:watch": "tsc -p tsconfig.build.json --watch",
-    "brigade": "node brigade.mjs",
-    "dev": "tsx src/entry.ts",
     "clean": "node -e \"import('node:fs').then(fs => fs.rmSync('dist', { recursive: true, force: true }))\"",
+    "prepack": "npm run build",
+    "test": "tsx --test src/**/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test src/**/*.test.ts"
+
+    "brigade": "node brigade.mjs",
+    "start": "node brigade.mjs",
+    "dev": "node scripts/run-brigade.mjs",
+    "dev:tsx": "tsx src/entry.ts",
+    "watch": "tsx --watch src/entry.ts",
+
+    "onboard": "node brigade.mjs onboard",
+    "onboard:dev": "node scripts/run-brigade.mjs onboard",
+    "onboard:watch": "tsx --watch src/entry.ts onboard",
+
+    "agent": "node brigade.mjs agent",
+    "agent:dev": "node scripts/run-brigade.mjs agent",
+    "agent:watch": "tsx --watch src/entry.ts agent",
+
+    "tui": "node brigade.mjs tui",
+    "tui:dev": "node scripts/run-brigade.mjs tui",
+    "tui:watch": "tsx --watch src/entry.ts tui",
+
+    "gateway": "node brigade.mjs gateway",
+    "gateway:dev": "node scripts/run-brigade.mjs gateway",
+    "gateway:watch": "tsx --watch src/entry.ts gateway",
+    "gateway:status": "node brigade.mjs gateway status",
+    "gateway:stop": "node brigade.mjs gateway stop",
+
+    "connect": "node brigade.mjs connect",
+    "connect:dev": "node scripts/run-brigade.mjs connect",
+    "connect:watch": "tsx --watch src/entry.ts connect",
+
+    "status": "node brigade.mjs status",
+    "status:dev": "node scripts/run-brigade.mjs status",
+    "status:json": "node brigade.mjs status --json",
+
+    "doctor": "node brigade.mjs doctor",
+    "doctor:dev": "node scripts/run-brigade.mjs doctor",
+    "doctor:json": "node brigade.mjs doctor --json",
+    "doctor:strict": "node brigade.mjs doctor --strict",
+
+    "config:list": "node brigade.mjs config list",
+    "config:file": "node brigade.mjs config file"
   },
   "engines": {
     "node": ">=22.12"
   },
   "dependencies": {
     "@mariozechner/pi-coding-agent": "^0.70.6",
+    "@mariozechner/pi-tui": "^0.70.6",
+    "cfonts": "^3.3.1",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
     "json5": "^2.2.3",
     "prompts": "^2.4.2",
+    "ws": "^8.20.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/prompts": "^2.4.9",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.20.0",
     "typescript": "^5.6.3"
   },
