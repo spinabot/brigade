@@ -1,3 +1,5 @@
+import { friendlyError, translateAuthError } from "../core/auth-error.js";
+import { cleanProviderError } from "../core/model-caps.js";
 import { buildProgram } from "./program/build-program.js";
 
 // Single entry point shared by `brigade.mjs` (built) and `npm run dev` (tsx).
@@ -27,7 +29,18 @@ function mapErrorToExitCode(err: unknown): number {
     }
     if (typeof e.exitCode === "number") return e.exitCode;
     if (e.message) {
-      console.error(`brigade: ${e.message}`);
+      // Translate Pi's auth errors (which leak `/login` references and raw
+      // `node_modules/@mariozechner/pi-coding-agent/docs/...` paths) into
+      // Brigade-native messages. `translateAuthError` returns its own
+      // `⚠`-prefixed message that doesn't need the `brigade:` prefix; for
+      // anything else, fall through to `friendlyError` (peels JSON wrappers
+      // off provider errors) and prefix as before.
+      const translated = translateAuthError(e.message);
+      if (translated) {
+        console.error(translated);
+      } else {
+        console.error(`brigade: ${friendlyError(e.message, cleanProviderError)}`);
+      }
       return 1;
     }
   }
