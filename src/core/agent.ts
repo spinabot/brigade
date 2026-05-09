@@ -52,6 +52,9 @@ import {
 } from "../agents/payload-mutators.js";
 import { smartCompactToolResults } from "../agents/smart-compaction.js";
 import { refreshSessionSystemPrompt, seedDefaultPrompts } from "./system-prompt.js";
+import { emitAgentEvent } from "../agents/agent-event-bus.js";
+import { DEFAULT_AGENT_ID } from "../config/paths.js";
+import { randomUUID } from "node:crypto";
 
 /**
  * Inspect a tool call BEFORE it executes. Return `{ block: true, reason }` to
@@ -148,6 +151,50 @@ export async function buildAgent(opts: BuildAgentOptions): Promise<AgentSession>
 		thinkingLevel,
 		// tools: omitted → Pi enables read/bash/edit/write by default; grep is available too
 	});
+
+	// Bridge Pi's per-session event stream into Brigade's process-wide
+	// agent-event bus. Same forwarder pattern as `runSingleTurnLocked`
+	// (Runtime B): every Pi `AgentSessionEvent` is wrapped as a `pi`
+	// bus event and broadcast to all `onAgentEvent` listeners.
+	//
+	// Why here: chat.ts (TUI) and server.ts (gateway) both call buildAgent
+	// for the long-lived session. Without this bridge they have to call
+	// `session.subscribe(...)` directly, which couples them to Pi's API
+	// shape and prevents bus subscribers from observing Runtime-A turns.
+	//
+	// `runId` is generated per buildAgent invocation rather than per turn
+	// because Runtime A holds a single Pi session for the full chat
+	// lifecycle — every event in that lifetime correlates to the same run
+	// from the bus's perspective. (Runtime B generates per-turn runIds.)
+	// Phase 4b/4c will replace this with a per-turn runId once chat.ts /
+	// server.ts migrate to the long-lived openChatSession variant.
+	const buildAgentRunId = randomUUID();
+	const subscribableSession = session as unknown as {
+		subscribe?: (cb: (piEvent: unknown) => void) => () => void;
+		__brigadeBusBridgeAttached?: boolean;
+	};
+	// Guard against double-attach. `buildAgent` is called once per
+	// gateway / TUI process under normal operation, but tests construct
+	// multiple sessions in one process and supervisor restarts can re-
+	// invoke it. Without this flag, every re-call wires another Pi → bus
+	// forwarder onto the same session object, so each Pi event fires N
+	// duplicate emissions (polluting the bus and any subscribers'
+	// counters). The flag lives on the session so it's GC'd with it.
+	if (
+		typeof subscribableSession.subscribe === "function" &&
+		!subscribableSession.__brigadeBusBridgeAttached
+	) {
+		subscribableSession.__brigadeBusBridgeAttached = true;
+		subscribableSession.subscribe((piEvent) => {
+			emitAgentEvent({
+				type: "pi",
+				runId: buildAgentRunId,
+				agentId: DEFAULT_AGENT_ID,
+				sessionId: (session as { id?: string }).id ?? "",
+				piEvent,
+			});
+		});
+	}
 
 	// Inject Brigade's system prompt — assembled from the layered .md files
 	// at ~/.brigade/workspace/ (with per-cwd override). The assembler embeds

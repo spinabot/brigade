@@ -16,6 +16,8 @@
 import * as path from "node:path";
 
 import type { AgentSession, AgentSessionEvent, AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
+
+import type { ChatClient } from "../agents/chat-client.js";
 import {
 	CancellableLoader,
 	CombinedAutocompleteProvider,
@@ -62,6 +64,15 @@ const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh
 type ThinkingLevelName = (typeof VALID_THINKING_LEVELS)[number];
 
 export interface ChatTUIOptions {
+	/** Brigade-side chat surface. The TUI reads/writes session state
+	 *  through this interface. Phase 4d will fully replace `session`
+	 *  with `client`; today both are required because the wrapper
+	 *  composition (runWithFallback / runWithThinkingFallback / etc.)
+	 *  still calls Pi-specific methods on the raw session. */
+	client: ChatClient;
+	/** Raw Pi `AgentSession`. Only used by the wrapper composition;
+	 *  the TUI itself talks to `client`. Will be removed in Phase 5
+	 *  once the wrappers move into `EmbeddedChatClient`. */
 	session: AgentSession;
 	tui: TUI;
 	provider: string;
@@ -83,7 +94,7 @@ export interface ChatHandle {
 }
 
 export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
-	const { session, tui, authStorage, modelRegistry } = opts;
+	const { client, session, tui, authStorage, modelRegistry } = opts;
 	let provider = opts.provider;
 	let modelId = opts.modelId;
 
@@ -170,8 +181,8 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 
 	const updateHeader = (extra?: string): void => {
 		const providerName = findProvider(provider)?.name ?? provider;
-		const caps = session.model
-			? describeModelCapabilities(session.model, session.thinkingLevel)
+		const caps = client.model
+			? describeModelCapabilities(client.model, client.thinkingLevel)
 			: "";
 		const capsStr = caps ? ` · ${caps}` : "";
 		const tokens = totalIn + totalOut > 0 ? ` · ${(totalIn + totalOut).toLocaleString()} tok` : "";
@@ -181,7 +192,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 		// the percentage stays accurate as the conversation grows. We only
 		// show it once it crosses 50% — below that the user doesn't need to
 		// worry. Highlights in amber at 75%+ to warn before auto-compact fires.
-		const usage = session.getContextUsage();
+		const usage = client.getContextUsage();
 		let usageStr = "";
 		if (usage?.percent != null && usage.percent >= 50) {
 			const pct = Math.round(usage.percent);
@@ -477,7 +488,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 			return false;
 		}
 		try {
-			await session.setModel(model);
+			await client.setModel(model);
 		} catch (err) {
 			const raw = err instanceof Error ? err.message : String(err);
 			const friendly = friendlyError(raw, cleanProviderError);
@@ -495,7 +506,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 	};
 
 	// ── replay: print prior conversation if resumed ────────────────────
-	for (const m of session.messages) {
+	for (const m of client.messages) {
 		if (m.role === "user" && Array.isArray(m.content)) {
 			const text = m.content
 				.filter((b: any) => b.type === "text")
@@ -515,8 +526,15 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 		}
 	}
 
-	// ── subscribe to Pi events ─────────────────────────────────────────
-	session.subscribe((event: AgentSessionEvent) => {
+	// ── subscribe to Pi events (via ChatClient) ────────────────────────
+	// Capture the disposer so the listener is released cleanly on
+	// process exit. Important for tests that boot multiple runChat
+	// instances in the same process — without the explicit dispose,
+	// each instance leaves a live forwarder behind. Production exit
+	// (SIGINT) GCs everything, but the tidy path is cheaper than the
+	// debugging cost when something does start running multiple
+	// instances in one process.
+	const disposeChatSubscription = client.subscribe((event: AgentSessionEvent) => {
 		switch (event.type) {
 			case "agent_start": {
 				isAgentRunning = true;
@@ -620,7 +638,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 				// Pi auto-compacts when context fills. Surface it so the user
 				// understands the brief pause + the assistant message that
 				// follows comes from a fresh summary.
-				const usage = session.getContextUsage();
+				const usage = client.getContextUsage();
 				const pct = usage?.percent != null ? `${Math.round(usage.percent)}%` : "high";
 				insertBeforeEditor(
 					new Text(
@@ -641,7 +659,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 					// Pi's getContextUsage returns null right after compaction by
 					// design — token estimates need a fresh LLM response to
 					// recalculate. Show that explicitly instead of a confusing "?".
-					const after = session.getContextUsage();
+					const after = client.getContextUsage();
 					const afterStr =
 						after?.percent != null
 							? `usage now ${Math.round(after.percent)}%`
@@ -742,6 +760,18 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 		}
 	});
 
+	// Release the chat-event listener on graceful process exit. SIGINT
+	// already exits via the handler in `cli/commands/chat.ts`; this
+	// covers the test-mode + supervisor-restart paths where the same
+	// process runs `runChat` more than once.
+	process.once("exit", () => {
+		try {
+			disposeChatSubscription();
+		} catch {
+			/* harmless — session may already be torn down */
+		}
+	});
+
 	// ── input handling ─────────────────────────────────────────────────
 	editor.onSubmit = async (value: string) => {
 		const trimmed = value.trim();
@@ -781,7 +811,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 					return;
 				}
 				// Find the most recent user message to replay on the new model.
-				const lastUser = [...session.messages].reverse().find((m: any) => m.role === "user");
+				const lastUser = [...client.messages].reverse().find((m: any) => m.role === "user");
 				const replayMsg = lastUser ? extractUserText(lastUser) : "";
 				if (!replayMsg) {
 					insertBeforeEditor(
@@ -824,10 +854,20 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 			}
 
 			editor.setText("");
-			session.agent.steer({
-				role: "user",
-				content: [{ type: "text", text: trimmed }],
-			} as any);
+			// Mid-turn injection. Pi's `AgentSession.steer(text, images?)`
+			// wraps the text into a `{role: "user", content: [...]}` message
+			// internally, so the structured equivalent of the previous
+			// `agent.steer({role, content: [...]})` call is just passing
+			// the text up via the ChatClient interface. Errors (invalid
+			// encoding, transcript write failure) get caught and shown
+			// inline so the user knows the steer didn't land — silent
+			// drops are worse than a one-line refusal.
+			void client.steer({ text: trimmed }).catch((err: unknown) => {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(`Mid-turn injection failed: ${msg}`)}`, 0, 0),
+				);
+			});
 			insertBeforeEditor(
 				new Markdown(`${brand.user("you")}  ${trimmed}`, 1, 0, markdownTheme),
 			);
@@ -882,7 +922,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 		if (trimmed === "/abort") {
 			editor.setText("");
 			if (isAgentRunning) {
-				session.abort().catch(() => {});
+				client.abort().catch(() => {});
 				insertBeforeEditor(new Text(`  ${brand.dim("aborting current turn…")}`, 0, 0));
 			} else {
 				insertBeforeEditor(new Text(`  ${brand.dim("nothing to abort — no turn in flight.")}`, 0, 0));
@@ -945,7 +985,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 		// on demand (or summarize early before a long task).
 		if (trimmed === "/compact") {
 			editor.setText("");
-			const usage = session.getContextUsage();
+			const usage = client.getContextUsage();
 			if (usage?.percent != null) {
 				insertBeforeEditor(
 					new Text(
@@ -958,15 +998,26 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 				insertBeforeEditor(new Text(`  ${brand.dim("Compacting…")}`, 0, 0));
 			}
 			try {
-				const result = await session.compact();
+				// Snapshot usage BEFORE compaction so we can compute the
+				// delta for the success message — Pi's session.compact()
+				// used to return a CompactionResult with `tokensBefore`,
+				// but the ChatClient interface dropped that to `void`
+				// for symmetry with the gateway path. Tracking it here
+				// from the public usage getter is cheaper than threading
+				// the CompactionResult through.
+				const beforeUsage = client.getContextUsage();
+				const tokensBefore =
+					beforeUsage?.tokens != null ? beforeUsage.tokens : undefined;
+
+				await client.compact();
 				// getContextUsage returns null right after compaction (Pi: token
 				// estimate needs a fresh LLM response). Show that explicitly.
-				const after = session.getContextUsage();
+				const after = client.getContextUsage();
 				const afterStr =
 					after?.percent != null
 						? `usage now ${Math.round(after.percent)}%`
 						: "usage refreshes after your next message";
-				const before = result?.tokensBefore ? `${(result.tokensBefore / 1000).toFixed(1)}k` : "?";
+				const before = tokensBefore != null ? `${(tokensBefore / 1000).toFixed(1)}k` : "?";
 				insertBeforeEditor(
 					new Text(
 						`  ${brand.amber("✓")} ${brand.dim(`Compacted ${before} of older context · ${afterStr}`)}`,
@@ -1289,7 +1340,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 		// actually applicable. Without args, reports current state + valid options.
 		if (trimmed === "/thinking" || trimmed.startsWith("/thinking ")) {
 			editor.setText("");
-			if (!session.supportsThinking()) {
+			if (!client.supportsThinking()) {
 				insertBeforeEditor(
 					new Text(
 						`  ${brand.dim(`This model (${modelId}) does not support thinking — nothing to set.`)}`,
@@ -1300,11 +1351,11 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 				return;
 			}
 			const arg = trimmed === "/thinking" ? "" : trimmed.slice("/thinking ".length).trim().toLowerCase();
-			const available = session.getAvailableThinkingLevels();
+			const available = client.getAvailableThinkingLevels();
 			if (!arg) {
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.dim("thinking is")} ${brand.amber(session.thinkingLevel)} ${brand.dim("· available:")} ${brand.dim(available.join(" "))}`,
+						`  ${brand.dim("thinking is")} ${brand.amber(client.thinkingLevel)} ${brand.dim("· available:")} ${brand.dim(available.join(" "))}`,
 						0,
 						0,
 					),
@@ -1331,7 +1382,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 				);
 				return;
 			}
-			session.setThinkingLevel(arg as ThinkingLevelName);
+			client.setThinkingLevel(arg as ThinkingLevelName);
 			updateHeader();
 			insertBeforeEditor(
 				new Text(
@@ -1523,7 +1574,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 	return {
 		abort: () => {
 			if (!isAgentRunning) return false;
-			session.abort().catch(() => {});
+			client.abort().catch(() => {});
 			isAgentRunning = false;
 			editor.disableSubmit = false;
 			if (activeLoader) {

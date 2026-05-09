@@ -20,6 +20,7 @@ import { ProcessTerminal, TUI } from "@mariozechner/pi-tui";
 import chalk from "chalk";
 
 import { buildAgent } from "../../core/agent.js";
+import { makeEmbeddedChatClient } from "../../agents/embedded-chat-client.js";
 import { loadBrigadeAuthStorage } from "../../core/auth-bridge.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig } from "../../core/config.js";
 import { attachEventLogger, getTodayLogPath } from "../../core/event-logger.js";
@@ -199,7 +200,15 @@ export async function runChatCommand(opts: ChatCommandOptions = {}): Promise<Cha
 	// Hand off to the chat TUI. runChat returns a ChatHandle synchronously once
 	// the UI is wired — the editor's onSubmit drives subsequent turns until
 	// /exit, Ctrl+D, or SIGINT (already wired above) tears it down.
+	// Wrap the long-lived Pi session in an EmbeddedChatClient so the TUI
+	// talks to a Brigade-native interface instead of Pi directly. Both
+	// `session` (raw, for the wrapper composition) and `client` (the
+	// public surface) are passed; Phase 5 collapses these by moving the
+	// wrappers into the client and dropping `session` from ChatTUIOptions.
+	const client = makeEmbeddedChatClient({ session });
+
 	chatHandle = await runChat({
+		client,
 		session,
 		tui,
 		provider: providerStr,

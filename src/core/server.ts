@@ -56,6 +56,7 @@ import {
 	runWithThinkingFallback,
 	switchModelMidTurn,
 } from "./agent.js";
+import { makeEmbeddedChatClient } from "../agents/embedded-chat-client.js";
 import { loadBrigadeAuthStorage } from "./auth-bridge.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig, saveConfig, type Config } from "./config.js";
 import { acquireGatewayLock, type GatewayLockHandle } from "./gateway-lock.js";
@@ -276,6 +277,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		cwd: getBrigadeWorkspaceDir(),
 	});
 
+	// Wrap the long-lived Pi session in a Brigade-native ChatClient. The
+	// gateway uses `client.X` for all read/write operations; the raw
+	// `session` is kept around only for the wrapper composition further
+	// below (Phase 5 will move that into the client and drop `session`).
+	const client = makeEmbeddedChatClient({ session });
+
 	// Stream every Pi event to the JSONL log file. Logger silently degrades
 	// on I/O errors so log loss never crashes the server.
 	const detachLogger = attachEventLogger(session);
@@ -298,7 +305,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 * complicate the buildSnapshot signature for sub-millisecond savings.
 	 */
 	const computeFirstRunBootstrap = (): boolean => {
-		if (session.messages.length > 0) return false;
+		if (client.messages.length > 0) return false;
 		const wsDir = getBrigadeWorkspaceDir();
 		try {
 			if (!existsSync(joinPath(wsDir, "BOOTSTRAP.md"))) return false;
@@ -329,20 +336,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	};
 
 	const buildSnapshot = (): SessionStateSnapshot => {
-		const usage = session.getContextUsage();
+		const usage = client.getContextUsage();
 		return {
 			provider,
 			modelId,
-			modelName: session.model?.name,
-			thinkingLevel: session.thinkingLevel,
-			supportsThinking: session.supportsThinking(),
-			availableThinkingLevels: session.getAvailableThinkingLevels(),
+			modelName: client.model?.name,
+			thinkingLevel: client.thinkingLevel,
+			supportsThinking: client.supportsThinking(),
+			availableThinkingLevels: [...client.getAvailableThinkingLevels()],
 			contextUsagePercent: usage?.percent ?? null,
 			totalTokensIn: totalIn,
 			totalTokensOut: totalOut,
 			totalCostUsd: totalCost,
 			isAgentRunning,
-			messageCount: session.messages.length,
+			messageCount: client.messages.length,
 			firstRunBootstrap: computeFirstRunBootstrap(),
 			agentName: computeAgentName(),
 		};
@@ -382,7 +389,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 	/* ──────────────── pi event forwarding ──────────────── */
 
-	const detachPi = session.subscribe((piEvent: AgentSessionEvent) => {
+	const detachPi = client.subscribe((piEvent: AgentSessionEvent) => {
 		if (piEvent.type === "agent_start") isAgentRunning = true;
 		if (piEvent.type === "agent_end") isAgentRunning = false;
 		if (piEvent.type === "turn_end") {
@@ -548,16 +555,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				return undefined as ResponseFor[M];
 			}
 			case "abort": {
-				await session.abort().catch(() => {});
+				await client.abort().catch(() => {});
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
 			}
 			case "steer": {
 				const p = params as RequestParams["steer"];
-				session.agent.steer({
-					role: "user",
-					content: [{ type: "text", text: p.text }],
-				} as any);
+				// `client.steer({text})` wraps the text into Pi's
+				// `{role:"user", content:[{type:"text",text}]}` shape internally
+				// — same as the previous `session.agent.steer({...})` call.
+				// Awaited so async errors (invalid encoding, transcript I/O)
+				// surface as RPC failures to the caller instead of dropping
+				// silently and leaving the user waiting for a steer that
+				// never landed.
+				await client.steer({ text: p.text });
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
 			}
@@ -565,7 +576,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const p = params as RequestParams["set-model"];
 				const target = modelRegistry.find(p.provider, p.modelId);
 				if (!target) throw new Error(`model ${p.provider}/${p.modelId} not found`);
-				await session.setModel(target);
+				await client.setModel(target);
 				model = target;
 				await saveConfig(persistDefaultModel(await loadConfig(), p.provider, p.modelId));
 				broadcast("state", buildSnapshot());
@@ -583,12 +594,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			case "set-thinking": {
 				const p = params as RequestParams["set-thinking"];
-				session.setThinkingLevel(p.level as any);
+				client.setThinkingLevel(p.level as never);
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
 			}
 			case "compact": {
-				await session.compact();
+				await client.compact();
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
 			}
