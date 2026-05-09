@@ -1,9 +1,12 @@
 import { strict as assert } from "node:assert";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 
 import {
 	isPathInsideWorkspace,
+	isPathInsideWorkspaceWithAlias,
 	makeWorkspaceJailGuard,
 	resolveAgainstWorkspace,
 } from "./workspace-jail.js";
@@ -139,5 +142,97 @@ describe("makeWorkspaceJailGuard", () => {
 			toolCall: { name: "  bash  ", arguments: { command: "ls" } },
 		} as never);
 		assert.equal(r?.block, true);
+	});
+
+	it("blocks Windows UNC paths (\\\\server\\share)", async () => {
+		const guard = makeWorkspaceJailGuard(WS);
+		const r = await guard({
+			toolCall: { name: "write", arguments: { path: "\\\\attacker\\share\\loot.md", content: "x" } },
+		} as never);
+		assert.equal(r?.block, true);
+		assert.match(r?.reason ?? "", /UNC.*paths/i);
+	});
+
+	it("blocks POSIX-style network paths (//host/share)", async () => {
+		const guard = makeWorkspaceJailGuard(WS);
+		const r = await guard({
+			toolCall: { name: "write", arguments: { path: "//host/share/file.md", content: "x" } },
+		} as never);
+		assert.equal(r?.block, true);
+	});
+
+	it("normalizes Unicode whitespace inside path arguments", async () => {
+		const guard = makeWorkspaceJailGuard(WS);
+		// path with NBSP between segments — should still resolve against workspace
+		const sneaky = "USER .md";
+		const r = await guard({
+			toolCall: { name: "write", arguments: { path: sneaky, content: "x" } },
+		} as never);
+		// not blocked — normalization makes it land at <ws>/USER .md (inside)
+		assert.equal(r, undefined);
+	});
+});
+
+describe("isPathInsideWorkspace edge cases", () => {
+	it("rejects UNC paths outright", () => {
+		assert.equal(isPathInsideWorkspace("\\\\server\\share\\file", WS), false);
+		assert.equal(isPathInsideWorkspace("//host/path", WS), false);
+	});
+});
+
+describe("isPathInsideWorkspaceWithAlias — symlink escape detection", () => {
+	let tmpRoot: string;
+	let tmpWs: string;
+	let outsideTarget: string;
+	let symlinkSupported = true;
+
+	before(async () => {
+		tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "brigade-jail-"));
+		tmpWs = path.join(tmpRoot, "workspace");
+		await fs.mkdir(tmpWs);
+		outsideTarget = path.join(tmpRoot, "secret.txt");
+		await fs.writeFile(outsideTarget, "secret");
+		// Probe whether we can create symlinks (Windows requires admin or Dev Mode).
+		try {
+			const probe = path.join(tmpRoot, "_probe");
+			await fs.symlink(outsideTarget, probe);
+			await fs.unlink(probe);
+		} catch {
+			symlinkSupported = false;
+		}
+	});
+
+	after(async () => {
+		await fs.rm(tmpRoot, { recursive: true, force: true });
+	});
+
+	it("accepts a normal path inside the workspace", async () => {
+		const ok = await isPathInsideWorkspaceWithAlias("USER.md", tmpWs);
+		assert.equal(ok, true);
+	});
+
+	it("rejects an absolute path outside the workspace (no symlink involved)", async () => {
+		const ok = await isPathInsideWorkspaceWithAlias(outsideTarget, tmpWs);
+		assert.equal(ok, false);
+	});
+
+	it("rejects a path that lexically matches but realpath-resolves outside (symlink alias escape)", async (t) => {
+		if (!symlinkSupported) {
+			t.skip("symlink creation not permitted on this host (Windows Dev Mode required)");
+			return;
+		}
+		const sneaky = path.join(tmpWs, "USER.md");
+		await fs.symlink(outsideTarget, sneaky);
+		try {
+			const ok = await isPathInsideWorkspaceWithAlias("USER.md", tmpWs);
+			assert.equal(ok, false, "alias escape MUST be rejected");
+		} finally {
+			await fs.unlink(sneaky).catch(() => {});
+		}
+	});
+
+	it("accepts a path that doesn't exist yet (broken-symlink-style — ancestor walk works)", async () => {
+		const ok = await isPathInsideWorkspaceWithAlias("brand-new-file.md", tmpWs);
+		assert.equal(ok, true);
 	});
 });
