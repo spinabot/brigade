@@ -86,19 +86,28 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   );
   lines.push("");
 
-  // First-turn nudge. Smaller models (gpt-4o-mini, llama-3.1-8b, etc.)
-  // don't reliably follow the implicit "First Run" pointer in AGENTS.md
-  // without a system-level anchor — they default to a stock greeting and
-  // skip BOOTSTRAP.md entirely. One-line nudge here is enough to redirect
-  // attention; the actual greeting wording stays under the user's control
-  // via BOOTSTRAP.md content.
-  if (args.bootstrapPhase === "first-turn") {
-    lines.push(
-      "**First turn:** read the `## BOOTSTRAP` section below and follow its " +
-        "first-run script verbatim. Do not produce a generic greeting.",
-    );
-    lines.push("");
-  }
+  // First-turn nudge: REMOVED. We tried injecting "**First turn:** read
+  // the ## BOOTSTRAP section below and follow its first-run script
+  // verbatim" when bootstrapPhase === "first-turn". Empirically (smoke
+  // 2026-05-09 vs c1894db baseline), the word "verbatim" caused two
+  // regressions:
+  //
+  //   1. gpt-5.4 — over-literal: dumped BOOTSTRAP's numbered list back
+  //      at the user as bullets, instead of the chill paraphrase
+  //      c1894db produced ("Hey. I just came online. Who am I? Who are
+  //      you?").
+  //   2. Claude — over-eager: read BOOTSTRAP line 35 ("Update these
+  //      files with what you learned") as a directive and proactively
+  //      called `write({path: "USER.md"})` after capturing the user's
+  //      name on turn 3. Felt presumptuous to the user.
+  //
+  // Both models read BOOTSTRAP.md (which is in the system prompt below
+  // the cache boundary) and follow it without a system-level nudge.
+  // The c1894db baseline confirms this: same persona stack, no nudge,
+  // OpenClaw-shape replies. Keep `bootstrapPhase` threaded through
+  // (callers already pass it) so a future per-model-family hint can
+  // re-enable a softer nudge for smaller models without re-plumbing.
+  void args.bootstrapPhase;
 
   // Inline guidance — three short, durable blocks. Restored from the
   // c1894db shape because the larger 6-block + per-family-guidance

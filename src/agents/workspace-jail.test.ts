@@ -102,16 +102,35 @@ describe("makeWorkspaceJailGuard", () => {
 		assert.equal(r?.block, true);
 	});
 
-	it("allows write with a relative path that resolves inside the workspace", async () => {
-		const guard = makeWorkspaceJailGuard(WS);
+	it("allows write with a relative path WHEN the agent cwd is inside the workspace", async () => {
+		// Pi resolves relative paths against `processCwd`, so when the agent
+		// is running with cwd = workspace, "USER.md" lands inside.
+		const guard = makeWorkspaceJailGuard(WS, WS);
 		const r = await guard({
 			toolCall: { name: "write", arguments: { path: "USER.md", content: "..." } },
 		} as never);
 		assert.equal(r, undefined);
 	});
 
-	it("allows write with an absolute path inside the workspace", async () => {
-		const guard = makeWorkspaceJailGuard(WS);
+	it("BLOCKS write with a relative path when agent cwd is OUTSIDE the workspace (the Claude bug)", async () => {
+		// Real-world: agent runs from F:\Brigade (the source tree), workspace is
+		// ~/.brigade/workspace. Claude emits write({path: "USER.md"}). Pi
+		// resolves "USER.md" against F:\Brigade — outside the workspace. The
+		// jail must catch this. The earlier (broken) jail let it through
+		// because it resolved the path against the workspace, not against cwd.
+		const projectCwd = path.resolve("/tmp/some-project");
+		const guard = makeWorkspaceJailGuard(WS, projectCwd);
+		const r = await guard({
+			toolCall: { name: "write", arguments: { path: "USER.md", content: "..." } },
+		} as never);
+		assert.equal(r?.block, true);
+		assert.match(r?.reason ?? "", /outside the workspace/);
+		assert.match(r?.reason ?? "", /Retry with the absolute path/);
+	});
+
+	it("allows write with an absolute path inside the workspace (cwd irrelevant)", async () => {
+		const projectCwd = path.resolve("/tmp/anywhere");
+		const guard = makeWorkspaceJailGuard(WS, projectCwd);
 		const r = await guard({
 			toolCall: { name: "write", arguments: { path: path.join(WS, "IDENTITY.md"), content: "..." } },
 		} as never);
@@ -162,13 +181,14 @@ describe("makeWorkspaceJailGuard", () => {
 	});
 
 	it("normalizes Unicode whitespace inside path arguments", async () => {
-		const guard = makeWorkspaceJailGuard(WS);
-		// path with NBSP between segments — should still resolve against workspace
-		const sneaky = "USER .md";
+		// Pass cwd = workspace so the relative path resolves inside the
+		// boundary; this test is about whitespace normalization, not the
+		// cwd-vs-workspace check (covered in its own test above).
+		const guard = makeWorkspaceJailGuard(WS, WS);
+		const sneaky = "USER .md"; // NBSP between USER and .md
 		const r = await guard({
 			toolCall: { name: "write", arguments: { path: sneaky, content: "x" } },
 		} as never);
-		// not blocked — normalization makes it land at <ws>/USER .md (inside)
 		assert.equal(r, undefined);
 	});
 });

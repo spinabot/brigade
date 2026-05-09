@@ -176,17 +176,50 @@ export async function isPathInsideWorkspaceWithAlias(
 }
 
 /**
+ * Resolve a path THE SAME WAY Pi will. Pi's `read` / `write` / `edit`
+ * resolve non-absolute inputs against the cwd the session was created
+ * with — NOT the workspace dir. The jail must mimic this resolution
+ * exactly, otherwise a relative path looks safe (resolves against
+ * workspace) but actually lands somewhere else.
+ *
+ * Concrete bug this prevents: model emits `write({path: "USER.md"})`,
+ * agent runs from `F:\Brigade`, Pi writes `F:\Brigade\USER.md` —
+ * outside the workspace. Without this function the lexical jail check
+ * mistakenly allows it because `<workspace>/USER.md` is inside the
+ * boundary, but Pi never resolved it that way.
+ */
+function actualPiResolvedPath(rawPath: string, processCwd: string): string {
+	if (!rawPath) return path.resolve(processCwd);
+	const cleaned = normalizeWhitespace(rawPath);
+	const expanded = cleaned.startsWith("~")
+		? cleaned.replace(/^~(?=$|[/\\])/, () => process.env.HOME ?? process.env.USERPROFILE ?? "~")
+		: cleaned;
+	if (path.isAbsolute(expanded)) return path.resolve(expanded);
+	return path.resolve(processCwd, expanded);
+}
+
+/**
  * Build a `beforeToolCall` hook that enforces the three policies above.
+ *
+ * @param workspaceRoot — agent persona dir; mutating tools stay inside.
+ * @param processCwd — cwd Pi was given when the session was created.
+ *   Pi resolves relative tool paths against THIS, not workspaceRoot.
+ *   Defaults to `process.cwd()` if omitted.
+ *
  * Compose with `makeUnknownToolGuard` at the call site:
  *
  *   const nameGuard = makeUnknownToolGuard(enabledToolNames);
- *   const jailGuard = makeWorkspaceJailGuard(workspaceRoot);
+ *   const jailGuard = makeWorkspaceJailGuard(workspaceRoot, processCwd);
  *   session.agent.beforeToolCall = async (ctx, signal) => {
  *     return (await nameGuard(ctx, signal)) ?? (await jailGuard(ctx, signal));
  *   };
  */
-export function makeWorkspaceJailGuard(workspaceRoot: string): BrigadeBeforeToolCallHook {
+export function makeWorkspaceJailGuard(
+	workspaceRoot: string,
+	processCwd: string = process.cwd(),
+): BrigadeBeforeToolCallHook {
 	const root = path.resolve(workspaceRoot);
+	const cwd = path.resolve(processCwd);
 	return async (ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> => {
 		const rawName = (ctx as { toolCall?: { name?: unknown }; name?: unknown })?.toolCall?.name
 			?? (ctx as { name?: unknown })?.name
@@ -228,26 +261,33 @@ export function makeWorkspaceJailGuard(workspaceRoot: string): BrigadeBeforeTool
 			};
 		}
 
-		const lexicalOk = isPathInsideWorkspace(candidate, root);
-		if (!lexicalOk) {
-			const resolved = resolveAgainstWorkspace(candidate, root);
+		// Compute the path Pi will ACTUALLY use. Pi resolves non-absolute
+		// inputs against the session cwd (`processCwd`), not the workspace.
+		// Without this step the jail used to mis-validate relative paths:
+		// a model emitting `write({path: "USER.md"})` looked safe because
+		// `<workspace>/USER.md` is inside the boundary, but Pi wrote to
+		// `<processCwd>/USER.md` instead — outside. Validate the path
+		// Pi will USE, not the path the workspace would use.
+		const piResolved = actualPiResolvedPath(candidate, cwd);
+		const piResolvedOk = isPathInsideWorkspace(piResolved, root);
+		if (!piResolvedOk) {
+			const suggestedAbsolute = path.join(root, path.basename(candidate));
 			return {
 				block: true,
 				reason:
-					`Tool "${name}" was blocked: path "${candidate}" resolves to "${resolved}" ` +
+					`Tool "${name}" was blocked: path "${candidate}" resolves to "${piResolved}" ` +
 					`which is outside the workspace "${root}". Persona files (USER.md, ` +
 					`IDENTITY.md, SOUL.md, AGENTS.md, TOOLS.md, BOOTSTRAP.md, HEARTBEAT.md, ` +
-					`MEMORY.md) belong inside the workspace — use a relative path like ` +
-					`"USER.md" and the tool will resolve it against the workspace root.`,
+					`MEMORY.md) belong inside the workspace. Retry with the absolute path ` +
+					`"${suggestedAbsolute}" so it lands inside the workspace regardless of ` +
+					`the agent's current working directory.`,
 			};
 		}
 
 		// Final realpath check — catches the symlink-alias-escape case
-		// where the lexical path is inside the workspace but the
-		// canonical (realpath-resolved) path is outside. The check is
-		// async because realpath is async; the caller's hook signature
-		// is already Promise-returning so this is free.
-		const aliasOk = await isPathInsideWorkspaceWithAlias(candidate, root);
+		// where the path is lexically inside the workspace but the
+		// canonical (realpath-resolved) path is outside.
+		const aliasOk = await isPathInsideWorkspaceWithAlias(piResolved, root);
 		if (!aliasOk) {
 			return {
 				block: true,

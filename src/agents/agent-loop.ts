@@ -358,7 +358,9 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   };
   if (sessionWithBeforeHook.agent) {
     const nameGuard = makeUnknownToolGuard(enabledToolNames);
-    const jailGuard = makeWorkspaceJailGuard(workspaceDir);
+    // Pass cwd so the jail validates the path Pi will ACTUALLY resolve
+    // to (Pi resolves relative paths against this cwd, not the workspace).
+    const jailGuard = makeWorkspaceJailGuard(workspaceDir, cwd);
     sessionWithBeforeHook.agent.beforeToolCall = async (ctx, signal) => {
       const named = await nameGuard(ctx, signal);
       if (named?.block) return named;
