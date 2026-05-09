@@ -69,6 +69,8 @@ import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-gua
 import { makeWorkspaceJailGuard } from "./workspace-jail.js";
 import { runWithContentQualityRetry, type ContentQualityIssue } from "./content-quality-retry.js";
 import { runWithThinkingFallback } from "./thinking-fallback.js";
+import { emitAgentEvent } from "./agent-event-bus.js";
+import { randomUUID } from "node:crypto";
 import { evaluateCompactionDecision } from "./smart-compaction.js";
 import { resolveToolSummary } from "./tool-summaries.js";
 import {
@@ -496,6 +498,44 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // string before Pi sees it; otherwise a paste-through of that literal
   // would coerce Claude into refusing the next turn.
   const scrubbedMessage = scrubAnthropicRefusalSentinel(args.message);
+  // Process-level event bus wiring. A short-lived run id correlates
+  // every event from this turn so multi-consumer subscribers (TUI,
+  // gateway WebSocket broadcast, debug logs) can group them. The
+  // forwarder pipes Pi's per-event stream into the global bus and
+  // is detached at the end of the function so listeners don't pile
+  // up across the gateway's long-running process. Mirrors OpenClaw's
+  // `src/infra/agent-events.ts` global registry pattern.
+  const runId = randomUUID();
+  const subscribableSession = session as unknown as {
+    subscribe?: (cb: (piEvent: unknown) => void) => () => void;
+  };
+  const rawDetach =
+    typeof subscribableSession.subscribe === "function"
+      ? subscribableSession.subscribe((piEvent) =>
+          emitAgentEvent({
+            type: "pi",
+            runId,
+            agentId,
+            sessionId: resolved.sessionId,
+            piEvent,
+          }),
+        )
+      : () => {};
+  // Idempotent detach. Called in two places: the success path emits
+  // turn-settled then detaches; the error path's finally block detaches
+  // unconditionally. Both routes converge here without double-detaching.
+  let piForwarderDetached = false;
+  const detachPiForwarder = (): void => {
+    if (piForwarderDetached) return;
+    piForwarderDetached = true;
+    try {
+      rawDetach();
+    } catch {
+      // session may already be torn down; nothing useful to do
+    }
+  };
+
+  try {
   log.info("turn starting", {
     agentId,
     sessionId: resolved.sessionId,
@@ -503,6 +543,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     provider: args.provider,
     model: args.modelId,
     bootstrapPhase: effectivePhase,
+  });
+  emitAgentEvent({
+    type: "turn-start",
+    runId,
+    agentId,
+    sessionId: resolved.sessionId,
+    isNewSession: resolved.isNew,
+    provider: args.provider,
+    modelId: args.modelId,
+    bootstrapPhase: String(effectivePhase),
   });
 
   // Pre-emptive compaction. When estimated context usage crosses the
@@ -661,6 +711,19 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     provider: args.provider,
     model: args.modelId,
   });
+  emitAgentEvent({
+    type: "turn-settled",
+    runId,
+    agentId,
+    sessionId: resolved.sessionId,
+    provider: args.provider,
+    modelId: args.modelId,
+  });
+  // Release the Pi listener now rather than waiting for GC. On error
+  // paths the function exits without reaching here, but the session
+  // goes out of scope so the listener is collected eventually — no
+  // long-lived leak in the gateway's process.
+  detachPiForwarder();
 
   const reply = extractLastAssistantText(session as AgentSession);
 
@@ -692,6 +755,14 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     reply,
     messages: (session as AgentSession).messages.slice(),
   };
+  } finally {
+    // Safety net: if anything between subscribe-time and the success-
+    // path detach throws (runWithRetry rejects, AbortError mid-stream,
+    // an exception in the cooldown bookkeeping), the listener still
+    // gets cleaned up here. Idempotent — the success path's explicit
+    // detach above is a no-op once this fires.
+    detachPiForwarder();
+  }
 }
 
 // Build the per-turn system prompt. Three steps:
