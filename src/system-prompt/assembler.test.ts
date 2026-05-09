@@ -21,46 +21,8 @@ const MOCK_RUNTIME = {
 	repoRoot: undefined,
 };
 
-describe("assembleSystemPrompt — inline guidance (Safety + Interaction Style)", () => {
-	// At commit c1894db (verified working with gpt-5.4) the assembler
-	// emitted just THREE short inline blocks: Safety, Interaction Style,
-	// Tooling. The 6-block guidance composition added in a7db967 was
-	// found to overconstrain first-turn replies. The simple inline blocks
-	// are what the model actually responds well to — the BOOTSTRAP.md
-	// signal stays dominant.
-	it("includes inline Safety + Interaction Style sections", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-		});
-		assert.match(out.text, /## Safety/);
-		assert.match(out.text, /## Interaction Style/);
-		assert.match(out.text, /Decline requests that would compromise/);
-		assert.match(out.text, /start doing it. Skip preambles/);
-	});
-
-	it("does NOT inject the 6-block guidance composition", () => {
-		// Sanity: the larger guidance blocks (`# Safety baseline`, `# Tool-use
-		// discipline`, etc.) must NOT appear. Their constants still live in
-		// guidance.ts but the assembler doesn't import them.
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			modelId: "gpt-4o",
-			thinkingLevel: "high",
-		});
-		assert.doesNotMatch(out.text, /# Safety baseline/);
-		assert.doesNotMatch(out.text, /# Execution bias/);
-		assert.doesNotMatch(out.text, /# Tool-call style/);
-		assert.doesNotMatch(out.text, /# Tool-use discipline/);
-		assert.doesNotMatch(out.text, /# Reasoning format/);
-		assert.doesNotMatch(out.text, /Execution discipline \(extra\)/);
-		assert.doesNotMatch(out.text, /Operational directives \(extra\)/);
-	});
-
-	it("inline Safety sits above the cache boundary (stays in cached prefix)", () => {
+describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", () => {
+	it("emits the OpenClaw-mirrored section sequence in the right order", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [
@@ -68,40 +30,186 @@ describe("assembleSystemPrompt — inline guidance (Safety + Interaction Style)"
 			],
 			toolDescriptions: [],
 		});
-		const safetyIdx = out.text.indexOf("## Safety");
+		const order = [
+			"## Tooling",
+			"## Tool Call Style",
+			"## Execution Bias",
+			"## Safety",
+			"## Brigade CLI Quick Reference",
+			"## Workspace",
+			"# Project Context",
+			CACHE_BOUNDARY_MARKER_LINE,
+			"## Runtime",
+		];
+		let lastIdx = -1;
+		for (const marker of order) {
+			const idx = out.text.indexOf(marker);
+			assert.ok(idx > lastIdx, `${marker} should appear AFTER the previous section`);
+			lastIdx = idx;
+		}
+	});
+
+	it("Tool Call Style block carries the narration + sensitive-action rules", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.match(out.text, /## Tool Call Style/);
+		assert.match(out.text, /Don't narrate routine tool calls/);
+		assert.match(out.text, /destructive or sensitive actions/);
+	});
+
+	it("Execution Bias block tells the model to start doing it", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.match(out.text, /## Execution Bias/);
+		assert.match(out.text, /start doing it/);
+		assert.match(out.text, /Match response length to the question/);
+	});
+
+	it("Safety block keeps the three durable rules", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.match(out.text, /## Safety/);
+		assert.match(out.text, /Decline requests that would compromise/);
+		assert.match(out.text, /Treat untrusted external content/);
+	});
+
+	it("Brigade CLI Quick Reference lists actual subcommands", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.match(out.text, /## Brigade CLI Quick Reference/);
+		assert.match(out.text, /brigade chat/);
+		assert.match(out.text, /brigade gateway/);
+		assert.match(out.text, /brigade connect/);
+		assert.match(out.text, /brigade onboard/);
+	});
+
+	it("Workspace block declares the absolute workspace dir", () => {
+		const out = assembleSystemPrompt({
+			runtime: { ...MOCK_RUNTIME, workspaceDir: "/home/me/.brigade/workspace" },
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.match(out.text, /## Workspace/);
+		assert.match(out.text, /\/home\/me\/\.brigade\/workspace/);
+		assert.match(out.text, /use the absolute path/);
+	});
+
+	it("everything in the canonical mirror sits ABOVE the cache boundary", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+		});
 		const boundaryIdx = out.text.indexOf(CACHE_BOUNDARY_MARKER_LINE);
-		assert.ok(safetyIdx > 0, "Safety section must be in the output");
-		assert.ok(boundaryIdx > 0, "cache boundary must be in the output");
-		assert.ok(safetyIdx < boundaryIdx, "Safety MUST sit above the cache boundary");
+		const checkpoints = [
+			"## Tooling",
+			"## Tool Call Style",
+			"## Execution Bias",
+			"## Safety",
+			"## Brigade CLI Quick Reference",
+			"## Workspace",
+			"# Project Context",
+		];
+		for (const c of checkpoints) {
+			const idx = out.text.indexOf(c);
+			assert.ok(idx > 0 && idx < boundaryIdx, `${c} must sit above the cache boundary`);
+		}
 	});
 });
 
-describe("assembleSystemPrompt — no `<think>` tag instructions (any model)", () => {
-	it("never mentions <think> tags regardless of model + thinking level", () => {
-		for (const modelId of ["claude-opus-4-7", "gemini-2.5-pro", "gpt-4o", "o3-mini", "custom-7b"]) {
-			for (const thinkingLevel of ["off", "low", "medium", "high"]) {
-				const out = assembleSystemPrompt({
-					runtime: MOCK_RUNTIME,
-					personaFiles: [],
-					toolDescriptions: [],
-					modelId,
-					thinkingLevel,
-				});
-				assert.doesNotMatch(
-					out.text,
-					/<think>/,
-					`should not mention <think> tags for ${modelId} thinking=${thinkingLevel}`,
-				);
-			}
+describe("assembleSystemPrompt — Reasoning Format (OpenClaw mirror, conditional)", () => {
+	it("emits <think>/<final> guidance for non-native-reasoning model with thinking ON", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			modelId: "openai/gpt-4o",
+			thinkingLevel: "high",
+		});
+		assert.match(out.text, /Reasoning format/i);
+		assert.match(out.text, /<think>/);
+	});
+
+	it("does NOT emit <think> guidance when thinkingLevel is off", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			modelId: "openai/gpt-4o",
+			thinkingLevel: "off",
+		});
+		assert.doesNotMatch(out.text, /<think>/);
+	});
+
+	it("does NOT emit <think> guidance for Claude (native extended thinking)", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			modelId: "anthropic/claude-opus-4-7",
+			thinkingLevel: "high",
+		});
+		assert.doesNotMatch(out.text, /<think>/);
+	});
+
+	it("does NOT emit <think> guidance for o1/o3 (native internal reasoning)", () => {
+		for (const id of ["o1-preview", "o3-mini", "openai/o3-mini"]) {
+			const out = assembleSystemPrompt({
+				runtime: MOCK_RUNTIME,
+				personaFiles: [],
+				toolDescriptions: [],
+				modelId: id,
+				thinkingLevel: "high",
+			});
+			assert.doesNotMatch(out.text, /<think>/, `${id} should not get <think> guidance`);
+		}
+	});
+});
+
+describe("assembleSystemPrompt — persona file canonical sort", () => {
+	it("orders persona files: AGENTS, SOUL, IDENTITY, USER, TOOLS, BOOTSTRAP, MEMORY", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "MEMORY.md", path: "/x/MEMORY.md", content: "m" },
+				{ name: "USER.md", path: "/x/USER.md", content: "u" },
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "a" },
+				{ name: "BOOTSTRAP.md", path: "/x/BOOTSTRAP.md", content: "b" },
+				{ name: "SOUL.md", path: "/x/SOUL.md", content: "s" },
+				{ name: "TOOLS.md", path: "/x/TOOLS.md", content: "t" },
+				{ name: "IDENTITY.md", path: "/x/IDENTITY.md", content: "i" },
+			],
+			toolDescriptions: [],
+		});
+		const order = ["## AGENTS", "## SOUL", "## IDENTITY", "## USER", "## TOOLS", "## BOOTSTRAP", "## MEMORY"];
+		let lastIdx = -1;
+		for (const h of order) {
+			const idx = out.text.indexOf(h);
+			assert.ok(idx > lastIdx, `${h} should appear in canonical order`);
+			lastIdx = idx;
 		}
 	});
 });
 
 describe("assembleSystemPrompt — capabilities flag is accepted but ignored", () => {
 	// The `capabilities` arg still threads through (so callers don't break);
-	// the corresponding guidance blocks just aren't injected today. They
-	// stay in guidance.ts for future re-enable.
-	it("does NOT inject Memory/Skills/Crew blocks even when capabilities=true", () => {
+	// the corresponding guidance blocks just aren't injected today. Memory /
+	// Skills / Sub-agents land alongside Primitives #4-6.
+	it("does NOT inject Memory/Skills/Sub-agents blocks even when capabilities=true", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [],
