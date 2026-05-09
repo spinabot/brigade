@@ -173,10 +173,11 @@ export async function runChatCommand(opts: ChatCommandOptions = {}): Promise<Cha
 	// runChat() call below which expects `string` for provider + modelId.
 	const providerStr: string = provider;
 	const modelIdStr: string = modelId;
-	const onboardingRan = false; // kickoff gating below — never true now that
-	// onboarding is a separate command. Kept as a const so the `shouldKickoff`
-	// expression below stays readable; if someone reintroduces inline onboarding
-	// here, they only need to flip this to `true`.
+	// No first-run kickoff. Brigade used to auto-fire "Wake up, my friend!" on
+	// fresh-workspace boots so the agent's BOOTSTRAP.md flow would trigger
+	// without the user having to type. Removed to mirror OpenClaw — its TUI
+	// never auto-sends a synthetic first turn; the user types the first
+	// message themselves.
 
 	// Build the Pi agent session. Note: do NOT overwrite session.agent.streamFn —
 	// createAgentSession installs an auth-aware wrapper that resolves the API key
@@ -195,23 +196,6 @@ export async function runChatCommand(opts: ChatCommandOptions = {}): Promise<Cha
 	attachEventLogger(session);
 	process.stderr.write(`\x1b[2mlogs: ${getTodayLogPath()}\x1b[0m\n`);
 
-	// First-run kickoff. ONLY fire when BOTH:
-	//   1. Onboarding actually ran on this boot (the user picked a provider +
-	//      model + key just now — we don't kick off an existing user when
-	//      `~/.brigade/config.json` already had a default).
-	//   2. BOOTSTRAP.md didn't exist before this boot — i.e. the workspace
-	//      is truly fresh, never been here. If the user previously completed
-	//      bootstrap and deleted BOOTSTRAP.md (the file's own instructions
-	//      tell the agent to do so when done), we honour that "I'm an
-	//      established user" signal and skip the kickoff even on re-onboard.
-	//
-	// The kickoff is a synthesised first user turn — same wording every time
-	// so the agent's BOOTSTRAP.md (loaded into the system prompt) reliably
-	// triggers the "Hey. I just came online. Who am I? Who are you?"
-	// name-discovery conversation it was designed to open.
-	const shouldKickoff = onboardingRan && !bootstrapExistedBeforeBoot;
-	const kickoffMessage = shouldKickoff ? "Wake up, my friend!" : undefined;
-
 	// Hand off to the chat TUI. runChat returns a ChatHandle synchronously once
 	// the UI is wired — the editor's onSubmit drives subsequent turns until
 	// /exit, Ctrl+D, or SIGINT (already wired above) tears it down.
@@ -222,11 +206,10 @@ export async function runChatCommand(opts: ChatCommandOptions = {}): Promise<Cha
 		modelId: modelIdStr,
 		authStorage,
 		modelRegistry,
-		kickoffMessage,
-		// Same gate as the kickoff message — only render the slash-command
-		// discoverability tip on a fresh-workspace boot. Returning users with
-		// an established BOOTSTRAP.md never see it.
-		firstRun: shouldKickoff,
+		// First-run discoverability tip ONLY when the workspace is truly
+		// fresh (BOOTSTRAP.md didn't exist before this boot). Returning
+		// users never see the slash-command hint on every boot.
+		firstRun: !bootstrapExistedBeforeBoot,
 	});
 	return chatHandle;
 }

@@ -7,9 +7,7 @@ import {
 	EXECUTION_BIAS_GUIDANCE,
 	MEMORY_GUIDANCE,
 	pickModelFamilyGuidance,
-	REASONING_FORMAT_GUIDANCE,
 	SAFETY_GUARDRAILS_GUIDANCE,
-	shouldUseReasoningFormat,
 	SKILLS_GUIDANCE,
 	SUB_AGENTS_GUIDANCE,
 	TOOL_CALL_STYLE_GUIDANCE,
@@ -121,13 +119,14 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push(TOOL_USE_ENFORCEMENT_GUIDANCE);
   lines.push("");
 
-  // Reasoning format — only for non-native-reasoning models with thinking on.
-  // Claude w/ extended thinking + OpenAI o1/o3 manage <think>-equivalent
-  // state internally, so injecting tags would conflict.
-  if (shouldUseReasoningFormat(args.modelId, args.thinkingLevel)) {
-    lines.push(REASONING_FORMAT_GUIDANCE);
-    lines.push("");
-  }
+  // No `<think>...</think>` tag instructions — mirrors OpenClaw, which has
+  // no equivalent guidance. Reasoning lives in Pi's structured `block.type
+  // === "thinking"` content, never as inline tags in text. Telling
+  // non-native-reasoning models to wrap thinking in `<think>` tags caused
+  // the tags to leak through into the rendered chat output (the user
+  // explicitly objected to seeing raw `<think>` markup). The chat
+  // renderer also strips any stray `<think>...</think>` blocks
+  // defensively in case a model still emits them from its own training.
 
   // Per-model family extras. OpenAI gets a verbose execution-discipline
   // block; Google gets path-absolutism + parallel-tool guidance. Claude

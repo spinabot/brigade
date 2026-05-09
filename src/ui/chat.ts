@@ -18,13 +18,16 @@ import * as path from "node:path";
 import type { AgentSession, AgentSessionEvent, AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
 import {
 	CancellableLoader,
-	Editor,
+	CombinedAutocompleteProvider,
 	Input,
 	type SelectItem,
 	SelectList,
+	type SlashCommand,
 	Text,
 	TUI,
 } from "@mariozechner/pi-tui";
+
+import { BrigadeEditor } from "./editor.js";
 import chalk from "chalk";
 
 // Brigade's `Markdown` is a thin Pi-TUI subclass that normalizes `_text_`
@@ -66,19 +69,9 @@ export interface ChatTUIOptions {
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
 	/**
-	 * Optional first user message to fire automatically once the chat is fully
-	 * wired. Used by onboarding to kick off the BOOTSTRAP.md name-discovery
-	 * conversation on a truly fresh workspace — without this, the agent sits
-	 * silently waiting for the user to type, and the seeded BOOTSTRAP.md
-	 * (which expects the model to open the conversation) never gets exercised.
-	 *
-	 * Whitespace-only / empty values are silently ignored.
-	 */
-	kickoffMessage?: string;
-	/**
-	 * Render a one-line slash-command discoverability tip after the kickoff turn
-	 * is queued. Gated by the caller on the same fresh-workspace signal that
-	 * gates `kickoffMessage`, so we never spam returning users.
+	 * Render a one-line slash-command discoverability tip after the chat is
+	 * wired. Gated by the caller on a fresh-workspace signal so returning
+	 * users never see it on every boot.
 	 */
 	firstRun?: boolean;
 }
@@ -123,6 +116,42 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 	// Also includes per-model capabilities (thinking level, vision, ctx, $/Mtok)
 	// derived from the live `session.model` + `session.thinkingLevel` so it stays
 	// accurate across thinking-level changes and (future) model swaps.
+
+	// ── streaming state ─────────────────────────────────────────────────
+	// Declared up here (above updateHeader / elapsedTimer / whimsicalTimer)
+	// because those functions read these vars and `updateHeader()` is
+	// invoked synchronously below — TDZ would fire otherwise.
+	let isAgentRunning = false;
+	let activeAssistant: Markdown | null = null;
+	let activeLoader: CancellableLoader | null = null;
+	let pendingTools = new Map<string, Text>();
+	// Elapsed-time tracker for the running agent. Started on `agent_start`,
+	// cleared on `agent_end`. Read by the 1s ticker below to refresh the
+	// header so the user sees "thinking… 12s" instead of a static "thinking…".
+	let agentStartedAt: number | null = null;
+	// Thinking-block visibility toggle. Default `false` — mirrors OpenClaw
+	// (`tui.ts:230`). User opts in via `/reasoning on`. When on, the
+	// assistant text extractor surfaces `block.type === "thinking"` content
+	// (and any inline `<think>` tags) before the actual reply, dimmed.
+	let showThinking = false;
+	// Whimsical phrase rotator for the loader. Mirrors openclaw's verb rotation
+	// in tui-waiting.ts — small delight, replaces the boring static "thinking"
+	// label with `flibbertigibbeting`, `kerfuffling`, etc. Rotates every 4s.
+	const WHIMSICAL_PHRASES = [
+		"thinking",
+		"flibbertigibbeting",
+		"kerfuffling",
+		"dillydallying",
+		"twiddling thumbs",
+		"noodling",
+		"bamboozling",
+		"moseying",
+		"hobnobbing",
+		"pondering",
+		"conjuring",
+	];
+	let whimsicalIdx = 0;
+
 	/**
 	 * Format an elapsed-millisecond duration into a compact label for the
 	 * status line: `12s` / `1m 4s` / `2h 3m`. Mirrors connect.ts's formatter
@@ -204,70 +233,128 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 	if (typeof whimsicalTimer.unref === "function") whimsicalTimer.unref();
 
 	// ── editor ──────────────────────────────────────────────────────────
-	const editor = new Editor(tui, editorTheme);
+	const editor = new BrigadeEditor(tui, editorTheme);
 	tui.addChild(editor);
 	tui.setFocus(editor);
 
+	// Slash-command autocomplete. Pi-TUI's Editor has built-in support via
+	// `setAutocompleteProvider` — when the user types `/` at the start of a
+	// message, a select list pops up with matching commands and descriptions.
+	// Tab cycles, Enter accepts, Esc dismisses.
+	//
+	// Argument completions: a few commands have meaningful arg sets
+	// (e.g. /thinking off|low|medium|high|xhigh, /reasoning on|off). Pi
+	// surfaces those via `getArgumentCompletions(prefix)` — return an
+	// AutocompleteItem[] filtered by prefix.
+	// Pi-TUI's slash-command spec: `name` is the command WITHOUT the leading
+	// `/`. Pi adds the `/` itself in both the popup label AND the inserted
+	// text on accept. Including a leading `/` here produces `//reasoning`.
+	const SLASH_COMMANDS: SlashCommand[] = [
+		{ name: "help", description: "show all slash commands" },
+		{ name: "exit", description: "quit Brigade" },
+		{ name: "quit", description: "quit Brigade" },
+		{ name: "clear", description: "clear the input editor" },
+		{ name: "abort", description: "abort the in-flight turn (same as Ctrl+C)" },
+		{ name: "usage", description: "show token totals + estimated cost so far" },
+		{ name: "compact", description: "summarize older turns to free context" },
+		{
+			name: "model",
+			description: "switch to another configured model (no arg = picker)",
+			argumentHint: "[<model-id>]",
+		},
+		{ name: "provider", description: "add a new provider mid-session" },
+		{
+			name: "thinking",
+			description: "set the model's reasoning effort",
+			argumentHint: "<off|low|medium|high|xhigh>",
+			getArgumentCompletions: (prefix) => {
+				const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
+				return levels
+					.filter((l) => l.startsWith(prefix.toLowerCase()))
+					.map((l) => ({ value: l, label: l }));
+			},
+		},
+		{
+			name: "reasoning",
+			description: "show/hide the model's thinking blocks before replies",
+			argumentHint: "<on|off>",
+			getArgumentCompletions: (prefix) => {
+				const opts = ["on", "off"];
+				return opts
+					.filter((o) => o.startsWith(prefix.toLowerCase()))
+					.map((o) => ({ value: o, label: o }));
+			},
+		},
+	];
+	editor.setAutocompleteProvider(new CombinedAutocompleteProvider(SLASH_COMMANDS, process.cwd()));
+
 	// Hint line below the editor
 	tui.addChild(
-		new Text(brand.dim("  Enter to send · Ctrl+C abort · Ctrl+D quit · /model /provider /thinking /compact /usage /show-thinking /help"), 0, 0),
+		new Text(brand.dim("  Enter to send · Ctrl+C abort · Ctrl+D quit · /model /provider /thinking /reasoning /compact /usage /help"), 0, 0),
 	);
 
-	// ── streaming state ─────────────────────────────────────────────────
-	let isAgentRunning = false;
-	let activeAssistant: Markdown | null = null;
-	let activeLoader: CancellableLoader | null = null;
-	let pendingTools = new Map<string, Text>();
-	// Elapsed-time tracker for the running agent. Started on `agent_start`,
-	// cleared on `agent_end`. Read by the 1s ticker below to refresh the
-	// header so the user sees "thinking… 12s" instead of a static "thinking…".
-	let agentStartedAt: number | null = null;
-	// Thinking-block visibility toggle. Default `false` matches today's UX
-	// (thinking blocks excluded by `extractAssistantText` filter). When flipped
-	// to `true` via `/show-thinking`, the extractor includes thinking-block
-	// text dimmed inline so the user can see the model's reasoning trail.
-	let showThinking = false;
-	// Whimsical phrase rotator for the loader. Mirrors openclaw's verb rotation
-	// in tui-waiting.ts — small delight, replaces the boring static "thinking"
-	// label with `flibbertigibbeting`, `kerfuffling`, etc. Rotates every 4s.
-	const WHIMSICAL_PHRASES = [
-		"thinking",
-		"flibbertigibbeting",
-		"kerfuffling",
-		"dillydallying",
-		"twiddling thumbs",
-		"noodling",
-		"bamboozling",
-		"moseying",
-		"hobnobbing",
-		"pondering",
-		"conjuring",
-	];
-	let whimsicalIdx = 0;
-
 	/**
-	 * Extract concatenated text from an assistant message's content blocks.
-	 * The cumulative content is what Pi maintains — we read from it instead of
-	 * trying to stitch deltas ourselves, because not every provider emits
-	 * `text_delta` events (some only emit `text_start` + `text_end`, and
-	 * reasoning models intersperse `thinking_*` events). Reading from
-	 * `event.message.content` is what Pi's own interactive mode does and is
-	 * the only robust approach across providers.
+	 * Extract the renderable text for an assistant message, mirroring OpenClaw's
+	 * `composeThinkingAndContent` (`tui-formatters.ts:177-194`).
+	 *
+	 * Flow:
+	 *   1. Pull thinking text from Pi's structured `block.type === "thinking"`
+	 *      blocks (this is the canonical source — OpenClaw uses the same).
+	 *   2. Pull content text from `block.type === "text"` blocks. Strip any
+	 *      stray `<think>...</think>` tags that some models inline despite
+	 *      Brigade not asking for them (defensive — OpenClaw also relies
+	 *      purely on structured blocks but has no defensive strip; we add
+	 *      one because `<think>` from training data was leaking through).
+	 *   3. Compose: when `showThinking` is on AND thinking is non-empty,
+	 *      prepend `[thinking]\n<dim thinking text>\n\n` before the content.
+	 *      Otherwise return content alone.
+	 *
+	 * Reads from cumulative `message.content` rather than stitching deltas —
+	 * works across providers regardless of whether they emit text_delta /
+	 * text_end / thinking_* event shapes (Pi normalises into structured
+	 * blocks; we only read the final cumulative form).
 	 */
 	const extractAssistantText = (message: any): string => {
 		if (!message || !Array.isArray(message.content)) return "";
-		return message.content
-			.filter(
-				(b: any) =>
-					b &&
-					((b.type === "text" && typeof b.text === "string") ||
-						(showThinking && b.type === "thinking" && typeof b.thinking === "string")),
-			)
-			.map((b: any) => {
-				if (b.type === "thinking") return brand.dim(`[thinking] ${b.thinking}`);
-				return b.text;
-			})
-			.join("");
+
+		const thinkingParts: string[] = [];
+		const contentParts: string[] = [];
+		for (const b of message.content) {
+			if (!b || typeof b !== "object") continue;
+			if (b.type === "thinking" && typeof b.thinking === "string") {
+				const t = b.thinking.trim();
+				if (t) thinkingParts.push(t);
+				continue;
+			}
+			if (b.type === "text" && typeof b.text === "string") {
+				const inlineThinking: string[] = [];
+				const stripped = b.text.replace(
+					/<think>([\s\S]*?)<\/think>\s*/g,
+					(_m: string, inner: string) => {
+						const t = inner.trim();
+						if (t) inlineThinking.push(t);
+						return "";
+					},
+				);
+				// `<think>` tags inside a text block count as thinking too —
+				// route them through the thinking pipeline so showThinking
+				// gates them consistently with structured thinking blocks.
+				thinkingParts.push(...inlineThinking);
+				if (stripped.trim()) contentParts.push(stripped);
+			}
+		}
+
+		const thinkingText = thinkingParts.join("\n").trim();
+		const contentText = contentParts.join("").trim();
+
+		// Compose. Same shape as OpenClaw's composeThinkingAndContent —
+		// `[thinking]` header + dim body, blank line, then the content.
+		const parts: string[] = [];
+		if (showThinking && thinkingText) {
+			parts.push(`${brand.dim("[thinking]")}\n${brand.dim(thinkingText)}`);
+		}
+		if (contentText) parts.push(contentText);
+		return parts.join("\n\n");
 	};
 
 	/** Pull text from a user message — used by mid-turn /model switch to replay the last user message on the new model. */
@@ -778,7 +865,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
 						`- ${chalk.bold("/abort")} — abort the in-flight turn (same as Ctrl+C)\n` +
 						`- ${chalk.bold("/usage")} — show token totals + estimated cost so far\n` +
-						`- ${chalk.bold("/show-thinking")} — toggle reasoning-block visibility (default: hidden)\n` +
+						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's thinking blocks before replies (default: off)\n` +
 						`- ${chalk.bold("Ctrl+C")} — abort the current turn\n` +
 						`- ${chalk.bold("Ctrl+D")} — quit`,
 					1,
@@ -819,15 +906,23 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 			return;
 		}
 
-		// /show-thinking — flip the reasoning-block filter so the user can peek
-		// at the model's chain-of-thought (when the provider streams it). Off
-		// by default to keep the chat clean. Echoes the new state inline.
-		if (trimmed === "/show-thinking") {
+		// /reasoning [on|off] — toggle whether the model's thinking blocks are
+		// rendered before each assistant turn. Off by default to keep the
+		// chat clean. With no arg → toggle. Mirrors OpenClaw's
+		// `/reasoning <on|off>` (`tui-command-handlers.ts:394-411`).
+		if (trimmed === "/reasoning" || trimmed.startsWith("/reasoning ")) {
 			editor.setText("");
-			showThinking = !showThinking;
+			const arg = trimmed === "/reasoning" ? "" : trimmed.slice("/reasoning ".length).trim().toLowerCase();
+			if (arg === "on") showThinking = true;
+			else if (arg === "off") showThinking = false;
+			else if (arg === "" || arg === "toggle") showThinking = !showThinking;
+			else {
+				insertBeforeEditor(new Text(`  ${brand.dim("usage: /reasoning <on|off>")}`, 0, 0));
+				return;
+			}
 			insertBeforeEditor(
 				new Text(
-					`  ${brand.dim(showThinking ? "showing reasoning blocks (dimmed)." : "hiding reasoning blocks.")}`,
+					`  ${brand.dim(showThinking ? "reasoning: on  (model thinking will render before each reply)" : "reasoning: off")}`,
 					0,
 					0,
 				),
@@ -1410,39 +1505,15 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 	// delegates here via the returned ChatHandle — preventing handler stacking.
 	tui.requestRender();
 
-	// Optional first-run kickoff. Caller (post-onboard chat boot) passes
-	// `kickoffMessage` only when the workspace is truly fresh (BOOTSTRAP.md
-	// just seeded), so the agent reads BOOTSTRAP.md from its system prompt
-	// and opens the "who am I, who are you?" name-discovery conversation
-	// instead of sitting silently waiting for the user to type first.
-	//
-	// We dispatch through `editor.onSubmit` (the same surface a real Enter
-	// keypress hits) instead of calling `session.prompt` directly, so the
-	// turn flows through every wrapper (timeout, heartbeat, fallback chain,
-	// content-quality retry, …) just like a user-typed turn would. The
-	// kickoff message also renders as a normal "you" bubble in the
-	// conversation log, keeping the UI honest about what was sent.
-	//
-	// Fire-and-forget on a microtask so we return the ChatHandle promptly —
-	// the caller can wire SIGINT against the handle while the kickoff turn
-	// is still streaming.
-	const kickoff = opts.kickoffMessage?.trim();
-	if (kickoff && editor.onSubmit) {
-		const dispatchKickoff = editor.onSubmit;
-		queueMicrotask(() => {
-			void dispatchKickoff(kickoff);
-		});
-	}
-
 	// First-run discoverability tip. Only shown on a truly fresh workspace
-	// (same signal that gates the kickoff) so returning users don't see it
-	// every boot. The slash command list mirrors the editor footer hint,
-	// minus /help itself (we tell them how to find /help so they can read
-	// the full list).
+	// (BOOTSTRAP.md didn't exist before this boot) so returning users never
+	// see it on every boot. The slash command list mirrors the editor
+	// footer hint, minus /help itself (we tell them how to find /help so
+	// they can read the full list).
 	if (opts.firstRun) {
 		insertBeforeEditor(
 			new Text(
-				`  ${brand.dim("tip: type /help for slash commands (/model · /provider · /thinking · /compact · /usage · /show-thinking)")}`,
+				`  ${brand.dim("tip: type /help for slash commands (/model · /provider · /thinking · /reasoning · /compact · /usage)")}`,
 				0,
 				0,
 			),

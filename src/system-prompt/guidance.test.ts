@@ -3,12 +3,10 @@ import { describe, it } from "node:test";
 
 import {
 	pickModelFamilyGuidance,
-	shouldUseReasoningFormat,
 	SAFETY_GUARDRAILS_GUIDANCE,
 	EXECUTION_BIAS_GUIDANCE,
 	TOOL_CALL_STYLE_GUIDANCE,
 	TOOL_USE_ENFORCEMENT_GUIDANCE,
-	REASONING_FORMAT_GUIDANCE,
 	MEMORY_GUIDANCE,
 	SKILLS_GUIDANCE,
 	SUB_AGENTS_GUIDANCE,
@@ -30,10 +28,6 @@ describe("guidance constants — non-empty + load-bearing language", () => {
 		assert.match(TOOL_USE_ENFORCEMENT_GUIDANCE, /MUST call the tool in the same response/i);
 		assert.match(TOOL_USE_ENFORCEMENT_GUIDANCE, /promise of future action/i);
 	});
-	it("Reasoning format mentions <think> tags", () => {
-		assert.match(REASONING_FORMAT_GUIDANCE, /<think>/);
-		assert.match(REASONING_FORMAT_GUIDANCE, /<\/think>/);
-	});
 	it("Memory guidance teaches declarative-not-imperative", () => {
 		assert.match(MEMORY_GUIDANCE, /DECLARATIVE FACTS/);
 		assert.match(MEMORY_GUIDANCE, /not instructions/i);
@@ -45,41 +39,6 @@ describe("guidance constants — non-empty + load-bearing language", () => {
 	it("Sub-agents guidance describes delegation boundaries", () => {
 		assert.match(SUB_AGENTS_GUIDANCE, /independent/i);
 		assert.match(SUB_AGENTS_GUIDANCE, /Don't delegate trivial work/i);
-	});
-});
-
-describe("shouldUseReasoningFormat", () => {
-	it("returns false when thinkingLevel is off / undefined", () => {
-		assert.equal(shouldUseReasoningFormat("gpt-4o", "off"), false);
-		assert.equal(shouldUseReasoningFormat("gpt-4o", undefined), false);
-		assert.equal(shouldUseReasoningFormat("gpt-4o", ""), false);
-	});
-	it("returns false for Claude (native extended thinking)", () => {
-		assert.equal(shouldUseReasoningFormat("claude-opus-4-7", "high"), false);
-		assert.equal(shouldUseReasoningFormat("claude-sonnet-4-6", "medium"), false);
-		assert.equal(shouldUseReasoningFormat("anthropic/claude-3-5-sonnet", "high"), false);
-		assert.equal(shouldUseReasoningFormat("openrouter/anthropic/claude-3", "high"), false);
-	});
-	it("returns false for OpenAI o1 / o3 (native internal reasoning)", () => {
-		assert.equal(shouldUseReasoningFormat("o1", "high"), false);
-		assert.equal(shouldUseReasoningFormat("o3-mini", "high"), false);
-		assert.equal(shouldUseReasoningFormat("openai/o3", "high"), false);
-		assert.equal(shouldUseReasoningFormat("openrouter/openai/o3-mini", "high"), false);
-	});
-	it("returns true for Gemini with thinking on", () => {
-		assert.equal(shouldUseReasoningFormat("gemini-2.5-pro", "high"), true);
-		assert.equal(shouldUseReasoningFormat("google/gemini-2.5-flash", "medium"), true);
-	});
-	it("returns true for unknown / niche models with thinking on", () => {
-		assert.equal(shouldUseReasoningFormat("custom-reasoner-7b", "high"), true);
-	});
-	it("trims whitespace before matching (handles aggregator artifacts)", () => {
-		assert.equal(shouldUseReasoningFormat(" claude-opus-4-7 ", "high"), false);
-		assert.equal(shouldUseReasoningFormat(" gemini ", "high"), true);
-	});
-	it("returns false for empty model id", () => {
-		assert.equal(shouldUseReasoningFormat("", "high"), false);
-		assert.equal(shouldUseReasoningFormat("   ", "high"), false);
 	});
 });
 

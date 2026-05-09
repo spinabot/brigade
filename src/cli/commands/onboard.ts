@@ -82,7 +82,36 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 	// file to already be present at mode 0600. Cheap idempotent call.
 	initAuthProfiles(DEFAULT_AGENT_ID);
 
-	const authStorage = AuthStorage.create(`${BRIGADE_DIR}/auth.json`);
+	// One-shot prune of any leftover `~/.brigade/auth.json` from a prior
+	// Brigade version that used Pi's `AuthStorage.create(<path>)` (which
+	// writes `{}` on construction and mirrors set() to disk). The wizard now
+	// uses `AuthStorage.inMemory()` so a fresh onboard never recreates this
+	// file — but stale ones from older builds keep showing up in `ls
+	// ~/.brigade/`, which surprised the user. Mirror OpenClaw: there's no
+	// `auth.json`, only `auth-profiles.json`. Best-effort delete; missing
+	// or unreadable file is fine.
+	try {
+		const fsSync = require("node:fs") as typeof import("node:fs");
+		const stalePath = `${BRIGADE_DIR}/auth.json`;
+		if (fsSync.existsSync(stalePath)) fsSync.unlinkSync(stalePath);
+	} catch {
+		/* best-effort */
+	}
+
+	// IN-MEMORY authStorage — never writes to disk. The wizard owns ALL
+	// persistence by writing directly to `~/.brigade/agents/<id>/agent/auth-profiles.json`
+	// (via `upsertApiKeyProfile` / `upsertApiKeyRefProfile`). Pi's
+	// `AuthStorage.create(path)` would write `{}` to `~/.brigade/auth.json`
+	// on construction AND mirror every `set()` to disk — that produced an
+	// orphaned `auth.json` file on every onboard run AND leaked the literal
+	// API key to a second on-disk location in ref mode. OpenClaw doesn't
+	// have an `auth.json` at all; mirror that.
+	//
+	// `set()` in memory is still useful: it lets the wizard process see the
+	// key for the rest of the run (online validation already takes the key
+	// as a string, so it doesn't read authStorage; but `ModelRegistry` does
+	// when discovering provider models for the picker).
+	const authStorage = AuthStorage.inMemory();
 	const modelRegistry = ModelRegistry.create(authStorage, `${BRIGADE_DIR}/models.json`);
 
 	try {

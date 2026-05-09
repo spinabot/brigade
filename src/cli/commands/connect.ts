@@ -24,7 +24,16 @@
 
 import process from "node:process";
 
-import { ProcessTerminal, TUI, Text, CancellableLoader, Editor } from "@mariozechner/pi-tui";
+import {
+	CancellableLoader,
+	CombinedAutocompleteProvider,
+	ProcessTerminal,
+	type SlashCommand,
+	Text,
+	TUI,
+} from "@mariozechner/pi-tui";
+
+import { BrigadeEditor } from "../../ui/editor.js";
 import chalk from "chalk";
 
 // Brigade's `Markdown` is a thin Pi-TUI subclass that normalizes `_text_`
@@ -279,9 +288,52 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	if (typeof whimsicalTimer.unref === "function") whimsicalTimer.unref();
 	updateHeader();
 
-	const editor = new Editor(tui, editorTheme);
+	const editor = new BrigadeEditor(tui, editorTheme);
 	tui.addChild(editor);
 	tui.setFocus(editor);
+
+	// Slash-command autocomplete (Pi-TUI built-in). Connect-mode list omits
+	// `/provider` (it can't run the wizard against the remote gateway's
+	// filesystem) and `/clear` (chat-only). See chat.ts for the full set.
+	// Pi-TUI's slash-command spec: `name` is the command WITHOUT the leading
+	// `/`. Pi adds the `/` itself on accept; including it here produces
+	// `//reasoning` instead of `/reasoning`.
+	const SLASH_COMMANDS: SlashCommand[] = [
+		{ name: "help", description: "show all slash commands" },
+		{ name: "exit", description: "quit Brigade connect" },
+		{ name: "quit", description: "quit Brigade connect" },
+		{ name: "abort", description: "abort the in-flight turn (same as Ctrl+C)" },
+		{ name: "usage", description: "show token totals + estimated cost so far" },
+		{ name: "compact", description: "summarize older turns to free context" },
+		{
+			name: "model",
+			description: "switch to another configured model (no arg = picker)",
+			argumentHint: "[<model-id>]",
+		},
+		{
+			name: "thinking",
+			description: "set the model's reasoning effort",
+			argumentHint: "<off|low|medium|high|xhigh>",
+			getArgumentCompletions: (prefix) => {
+				const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
+				return levels
+					.filter((l) => l.startsWith(prefix.toLowerCase()))
+					.map((l) => ({ value: l, label: l }));
+			},
+		},
+		{
+			name: "reasoning",
+			description: "show/hide the model's thinking blocks before replies",
+			argumentHint: "<on|off>",
+			getArgumentCompletions: (prefix) => {
+				const opts = ["on", "off"];
+				return opts
+					.filter((o) => o.startsWith(prefix.toLowerCase()))
+					.map((o) => ({ value: o, label: o }));
+			},
+		},
+	];
+	editor.setAutocompleteProvider(new CombinedAutocompleteProvider(SLASH_COMMANDS, process.cwd()));
 
 	// Connect mode cannot run the provider-onboarding wizard (it writes to the
 	// gateway machine's filesystem, which we don't have). We surface that gap
@@ -296,13 +348,13 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	);
 	tui.addChild(
 		new Text(
-			brand.dim("  Enter to send · Ctrl+C abort · /usage /abort /show-thinking · /help for full list"),
+			brand.dim("  Enter to send · Ctrl+C abort · /usage /abort /reasoning · /help for full list"),
 			0,
 			0,
 		),
 	);
 
-	type AnyChild = Text | Markdown | CancellableLoader | Editor;
+	type AnyChild = Text | Markdown | CancellableLoader | BrigadeEditor;
 	const insertBeforeEditor = (component: AnyChild): void => {
 		const children = tui.children;
 		const editorIdx = children.indexOf(editor);
@@ -321,22 +373,53 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		}
 	};
 
+	/**
+	 * Extract the renderable text for an assistant message — mirrors
+	 * chat.ts's `extractAssistantText` and OpenClaw's `composeThinkingAndContent`
+	 * shape. See chat.ts for the full rationale.
+	 */
 	const extractAssistantText = (message: any): string => {
 		if (!message || !Array.isArray(message.content)) return "";
-		const parts: string[] = [];
+
+		const thinkingParts: string[] = [];
+		const contentParts: string[] = [];
 		for (const b of message.content) {
-			if (!b) continue;
-			if (b.type === "text" && typeof b.text === "string") {
-				parts.push(b.text);
+			if (!b || typeof b !== "object") continue;
+			if (b.type === "thinking" && typeof b.thinking === "string") {
+				const t = b.thinking.trim();
+				if (t) thinkingParts.push(t);
 				continue;
 			}
-			// Thinking blocks: hidden by default; surfaced (dimmed) when the
-			// user flips `/show-thinking on`. The dim wrap keeps them
-			// visually distinct from the agent's actual reply.
-			if (showThinking && b.type === "thinking" && typeof b.text === "string") {
-				parts.push(brand.dim(`> ${b.text.split("\n").join("\n> ")}`));
+			// Some forwarded shapes use `text` instead of `thinking` on the
+			// thinking block (gateway re-emit quirk). Honour both.
+			if (b.type === "thinking" && typeof b.text === "string") {
+				const t = b.text.trim();
+				if (t) thinkingParts.push(t);
+				continue;
+			}
+			if (b.type === "text" && typeof b.text === "string") {
+				const inlineThinking: string[] = [];
+				const stripped = b.text.replace(
+					/<think>([\s\S]*?)<\/think>\s*/g,
+					(_m: string, inner: string) => {
+						const t = inner.trim();
+						if (t) inlineThinking.push(t);
+						return "";
+					},
+				);
+				thinkingParts.push(...inlineThinking);
+				if (stripped.trim()) contentParts.push(stripped);
 			}
 		}
+
+		const thinkingText = thinkingParts.join("\n").trim();
+		const contentText = contentParts.join("").trim();
+
+		const parts: string[] = [];
+		if (showThinking && thinkingText) {
+			parts.push(`${brand.dim("[thinking]")}\n${brand.dim(thinkingText)}`);
+		}
+		if (contentText) parts.push(contentText);
 		return parts.join("\n\n");
 	};
 
@@ -357,59 +440,16 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		return mm === 0 ? `${h}h` : `${h}h ${mm}m`;
 	};
 
-	// Auto-kickoff state. Mirrors openclaw's TUI behaviour: when we attach to
-	// a fresh-bootstrap workspace (BOOTSTRAP.md on disk + IDENTITY.md has no
-	// Name + no turn yet), auto-fire "Wake up, my friend!" as the first user
-	// message. The gateway exposes `firstRunBootstrap` in the state snapshot
-	// for exactly this — the TUI doesn't need to stat the workspace itself.
-	//
-	// Why client-side: matches openclaw's `setup.finalize.ts` → `tui.ts:898`
-	// pattern (TUI auto-sends), and keeps the gateway agnostic to whether
-	// any client is attached. A gateway booted with no client still doesn't
-	// fire a kickoff into the void.
-	//
-	// Latch: once we fire (or once we see `messageCount > 0`), never fire
-	// again. Survives reconnects gracefully — the latch is per-process, not
-	// per-connection, so a Ctrl+C during the kickoff turn + restart of
-	// `brigade connect` will see `messageCount > 0` and skip.
-	let kickoffFired = false;
-	const KICKOFF_MESSAGE = "Wake up, my friend!";
+	// No auto-kickoff. Brigade used to auto-send "Wake up, my friend!" as a
+	// synthetic first user turn on fresh-bootstrap workspaces; removed to
+	// mirror OpenClaw, whose TUI client never auto-sends. The user types
+	// the first message themselves.
 
 	// State snapshots from the gateway — every mutation pushes one.
 	client.on("state", (snap) => {
 		lastSnapshot = snap;
 		isAgentRunning = snap.isAgentRunning;
 		updateHeader();
-
-		// Fire kickoff on the FIRST snapshot that meets all conditions:
-		// fresh-bootstrap mode, no turn yet, agent idle (so we don't race a
-		// reconnect mid-turn), and we haven't already fired this process.
-		if (
-			!kickoffFired &&
-			snap.firstRunBootstrap &&
-			snap.messageCount === 0 &&
-			!snap.isAgentRunning
-		) {
-			kickoffFired = true;
-			// Mirror the message into the transcript like a normal user turn so
-			// the user sees what was sent (and why). Identical visual treatment
-			// to the regular prompt path below.
-			insertBeforeEditor(
-				new Markdown(`${brand.user("you")}  ${KICKOFF_MESSAGE}`, 1, 0, markdownTheme),
-			);
-			// Fire-and-forget; the request resolves when the turn completes,
-			// which we don't need to await — Pi events stream the reply.
-			// Disable client-side timeout for the same reason as the manual
-			// prompt path (see editor.onSubmit below).
-			void client
-				.request("prompt", { text: KICKOFF_MESSAGE }, { timeoutMs: 0 })
-				.catch((err) => {
-					const msg = err instanceof Error ? err.message : String(err);
-					insertBeforeEditor(
-						new Text(`  ${brand.error("✗")} ${brand.error(`kickoff failed: ${msg}`)}`, 0, 0),
-					);
-				});
-		}
 	});
 
 	// Server-side warnings/info (e.g. "primary failed, trying fallback") — the
@@ -608,7 +648,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
 						`- ${chalk.bold("/abort")} — stop the in-flight turn\n` +
 						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
-						`- ${chalk.bold("/show-thinking [on|off]")} — toggle thinking-block visibility (default off)\n` +
+						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's thinking blocks before replies (default: off)\n` +
 						`- ${chalk.bold("Ctrl+C")} — abort the current turn (same as /abort)\n` +
 						`- ${chalk.bold("Ctrl+D")} — quit\n\n` +
 						brand.dim("To add a new provider, run `brigade onboard` on the gateway machine."),
@@ -639,30 +679,27 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			return;
 		}
 
-		// /show-thinking [on|off] — toggle whether the assistant's thinking
-		// blocks render in the transcript. Pi pushes them via `pi` events
+		// /reasoning [on|off] — toggle whether the assistant's thinking blocks
+		// render before each reply. Pi pushes thinking via `pi` events
 		// regardless; this is purely a local view filter applied in
-		// `extractAssistantText`. Mirrors openclaw's Ctrl+T toggle on its
-		// custom-editor (Brigade uses base Pi-TUI Editor with no key-handler
-		// surface, so we expose the same behaviour through a slash command).
-		if (trimmed === "/show-thinking" || trimmed.startsWith("/show-thinking ")) {
+		// `extractAssistantText`. Mirrors OpenClaw's `/reasoning <on|off>`
+		// (`tui-command-handlers.ts:394-411`).
+		if (trimmed === "/reasoning" || trimmed.startsWith("/reasoning ")) {
 			editor.setText("");
-			const arg = trimmed === "/show-thinking" ? "" : trimmed.slice("/show-thinking ".length).trim().toLowerCase();
+			const arg = trimmed === "/reasoning" ? "" : trimmed.slice("/reasoning ".length).trim().toLowerCase();
 			if (arg === "on" || arg === "true" || arg === "1") {
 				showThinking = true;
 			} else if (arg === "off" || arg === "false" || arg === "0") {
 				showThinking = false;
-			} else if (arg.length === 0) {
-				showThinking = !showThinking; // bare `/show-thinking` toggles
+			} else if (arg.length === 0 || arg === "toggle") {
+				showThinking = !showThinking;
 			} else {
-				insertBeforeEditor(
-					new Text(`  ${brand.error("✗")} ${brand.dim(`unknown value: "${arg}" — use on|off|toggle`)}`, 0, 0),
-				);
+				insertBeforeEditor(new Text(`  ${brand.dim("usage: /reasoning <on|off>")}`, 0, 0));
 				return;
 			}
 			insertBeforeEditor(
 				new Text(
-					`  ${brand.amber("✓")} ${brand.dim(`thinking blocks are ${showThinking ? "visible" : "hidden"}`)}`,
+					`  ${brand.dim(showThinking ? "reasoning: on  (model thinking will render before each reply)" : "reasoning: off")}`,
 					0,
 					0,
 				),

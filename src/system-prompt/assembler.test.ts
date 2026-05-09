@@ -53,38 +53,33 @@ describe("assembleSystemPrompt — always-on guidance always present", () => {
 	});
 });
 
-describe("assembleSystemPrompt — reasoning format gating", () => {
-	it("omits reasoning format for Claude with thinking=high (native extended thinking)", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			modelId: "claude-opus-4-7",
-			thinkingLevel: "high",
-		});
-		assert.doesNotMatch(out.text, /# Reasoning format/);
-	});
-
-	it("includes reasoning format for Gemini with thinking=high", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			modelId: "gemini-2.5-pro",
-			thinkingLevel: "high",
-		});
-		assert.match(out.text, /# Reasoning format/);
-	});
-
-	it("omits reasoning format when thinking=off regardless of model", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			modelId: "gemini-2.5-pro",
-			thinkingLevel: "off",
-		});
-		assert.doesNotMatch(out.text, /# Reasoning format/);
+describe("assembleSystemPrompt — no `<think>` tag instructions", () => {
+	// Mirrors OpenClaw: no `<think>...</think>` tag guidance is ever emitted,
+	// regardless of model or thinking level. Reasoning lives in Pi's
+	// structured `block.type === "thinking"` content; never as inline
+	// markup that could leak into the rendered chat output.
+	it("never includes `# Reasoning format` block (any model, any thinking level)", () => {
+		for (const modelId of ["claude-opus-4-7", "gemini-2.5-pro", "gpt-4o", "o3-mini", "custom-reasoner-7b"]) {
+			for (const thinkingLevel of ["off", "low", "medium", "high"]) {
+				const out = assembleSystemPrompt({
+					runtime: MOCK_RUNTIME,
+					personaFiles: [],
+					toolDescriptions: [],
+					modelId,
+					thinkingLevel,
+				});
+				assert.doesNotMatch(
+					out.text,
+					/# Reasoning format/,
+					`should not emit reasoning format for ${modelId} thinking=${thinkingLevel}`,
+				);
+				assert.doesNotMatch(
+					out.text,
+					/<think>/,
+					`should not mention <think> tags for ${modelId} thinking=${thinkingLevel}`,
+				);
+			}
+		}
 	});
 });
 
