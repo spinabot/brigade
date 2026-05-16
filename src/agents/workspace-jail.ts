@@ -1,11 +1,12 @@
 /**
- * Workspace path jail — refuses tool calls that try to write or shell
- * outside the agent's workspace directory.
+ * Workspace path jail — refuses tool calls that try to write outside
+ * the agent's workspace directory, and gates `bash` through the
+ * exec-approvals allowlist.
  *
  * Wired into Pi's `session.agent.beforeToolCall` hook AFTER the
  * unknown-tool guard. The two guards are composed in `agent-loop.ts`:
  * unknown-tool first (name validation), then workspace-jail (path
- * validation for path-taking tools).
+ * validation for path-taking tools + bash policy gate).
  *
  * Three policies, one per risk level:
  *
@@ -20,18 +21,24 @@
  *      (lexically-inside path that realpath-resolves outside) are
  *      blocked via a final realpath comparison.
  *
- *   2. SHELL (`bash`) — refused entirely in this layer. There is no
- *      command-pattern allowlist, no approval flow, no per-pattern
- *      caching in v1. The proper exec-policy layer (analyzer +
- *      allowlist + safe-bins + approval flow) ships in Primitive #3.
- *      Until then, shell is gated off so a turn cannot run arbitrary
- *      commands against the user's host.
+ *   2. SHELL (`bash`) — routed through `decideApproval` from
+ *      `../core/exec-approvals.js`:
+ *        - `"deny"` (hard-deny pattern: rm -rf /, dd to raw disk,
+ *          fork bomb, etc.) → blocked with a permanent-refusal reason.
+ *        - `"allow"` (operator-approved exact command or pattern) →
+ *          passes through to Pi's bash tool.
+ *        - `"prompt"` (unknown command, v1 has no in-tui approval UI) →
+ *          blocked with instructions on how to allowlist it via
+ *          `brigade exec allow <cmd>` / `brigade exec allow-pattern <re>`.
+ *      No mid-turn TUI prompt in v1 — single-user, file-backed
+ *      allowlist is the v1 trust model. Channels + async approval
+ *      flows ship in Phase 2.
  *
  *   3. READ-ONLY (`read`, `grep`, `find`, `ls`) — left open. These
  *      cannot mutate state, and the "AI lives inside your workspace"
  *      UX leans on the agent being able to inspect surrounding code.
- *      Primitive #3 may add finer-grained read-scope policies; v1
- *      keeps them broad to preserve the working flow.
+ *      Finer-grained read-scope policies may land later; v1 keeps
+ *      them broad to preserve the working flow.
  *
  * Architecture choice: hook-based gating (single `beforeToolCall`
  * function on the session) vs per-tool wrapping (each Pi tool
@@ -49,6 +56,7 @@ import * as path from "node:path";
 
 import type { BeforeToolCallContext, BeforeToolCallResult } from "@mariozechner/pi-agent-core";
 
+import { decideApproval } from "../core/exec-approvals.js";
 import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
 
 /**
@@ -58,11 +66,11 @@ import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
 const PATH_MUTATING_TOOLS = new Set(["write", "edit"]);
 
 /**
- * Tools that are refused outright in v1. Until Primitive #3 ships
- * proper exec-policy + approval flow, blanket-deny rather than open
- * an unbounded shell to the host.
+ * Tools whose invocation is gated through the exec-approvals allowlist.
+ * v1 has only `bash`; the gate is general enough to take on additional
+ * shell-shaped tools (`sh`, `pwsh`, `cmd`) when/if Brigade exposes them.
  */
-const REFUSED_IN_V1 = new Set(["bash"]);
+const EXEC_GATED_TOOLS = new Set(["bash"]);
 
 /**
  * Unicode whitespace codepoints that some providers occasionally emit
@@ -227,23 +235,54 @@ export function makeWorkspaceJailGuard(
 		const name = typeof rawName === "string" ? rawName.trim() : "";
 		if (!name) return undefined;
 
-		if (REFUSED_IN_V1.has(name)) {
-			return {
-				block: true,
-				reason:
-					`Tool "${name}" is disabled in this build. Shell access is gated until ` +
-					`the exec-policy layer ships. If you need to inspect the workspace, ` +
-					`use "read", "grep", "find", or "ls" instead.`,
-			};
-		}
-
-		if (!PATH_MUTATING_TOOLS.has(name)) return undefined;
-
 		const args = (ctx as { toolCall?: { arguments?: unknown }; args?: unknown; arguments?: unknown })
 			?.toolCall?.arguments
 			?? (ctx as { args?: unknown })?.args
 			?? (ctx as { arguments?: unknown })?.arguments
 			?? {};
+
+		if (EXEC_GATED_TOOLS.has(name)) {
+			// Pull the command out of the tool args. Pi's `bash` tool accepts
+			// `command` (the OpenClaw/Anthropic convention); some providers
+			// emit `cmd` or `script` instead — fall back through them.
+			const cmdRaw =
+				(args && typeof args === "object"
+					? ((args as { command?: unknown }).command
+						?? (args as { cmd?: unknown }).cmd
+						?? (args as { script?: unknown }).script)
+					: undefined);
+			const cmd = typeof cmdRaw === "string" ? cmdRaw : "";
+			const decision = decideApproval(cmd);
+			if (decision === "allow") {
+				return undefined;
+			}
+			if (decision === "deny") {
+				return {
+					block: true,
+					reason:
+						`Tool "${name}" was blocked: command "${cmd.slice(0, 120)}" ` +
+						`matches a hard-deny pattern (e.g. rm -rf /, dd to raw disk, ` +
+						`fork bomb). This pattern is permanently refused and cannot be ` +
+						`allowlisted — pick a safer command.`,
+				};
+			}
+			// "prompt" — operator hasn't allowlisted this command yet. v1
+			// has no mid-turn TUI prompt UI, so we refuse and tell the
+			// model exactly how the operator can approve it.
+			const preview = cmd.slice(0, 200) || "(empty command)";
+			return {
+				block: true,
+				reason:
+					`Tool "${name}" was blocked: command "${preview}" is not on the ` +
+					`exec-approvals allowlist. The operator must run\n` +
+					`  brigade exec allow ${JSON.stringify(cmd || "<command>")}\n` +
+					`(or \`brigade exec allow-pattern <regex>\` for a family of commands) ` +
+					`before this command can execute. Until then, prefer ` +
+					`"read", "grep", "find", or "ls" — those tools never need approval.`,
+			};
+		}
+
+		if (!PATH_MUTATING_TOOLS.has(name)) return undefined;
 
 		if (!args || typeof args !== "object") return undefined;
 		const candidate = (args as { path?: unknown }).path;

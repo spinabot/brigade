@@ -306,5 +306,83 @@ export function buildProgram(): Command {
       process.exit(await runConfigValidate({ json: opts.json }));
     });
 
+  /* ───────────────────────────── exec ───────────────────────────── */
+  // CRUD over the bash-tool approval allowlist at
+  // ~/.brigade/exec-approvals.json. Brigade gates every bash command
+  // through this list — agents cannot run shell commands until the
+  // operator explicitly approves them with `brigade exec allow`.
+  const exec = program
+    .command("exec")
+    .description("Manage the bash-tool approval allowlist (~/.brigade/exec-approvals.json)");
+
+  exec
+    .command("list")
+    .description("Print all approved commands + patterns")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runExecList } = await import("../commands/exec-cmd.js");
+      process.exit(await runExecList({ json: opts.json }));
+    });
+
+  exec
+    .command("allow <command...>")
+    .description(
+      "Approve an exact bash command.\n" +
+        "  Example: brigade exec allow ls -la\n" +
+        "  Tip: quote complex commands so the shell doesn't reinterpret them.",
+    )
+    .option("--json", "emit JSON status instead of human text", false)
+    .action(async (parts: string[], opts: { json?: boolean }) => {
+      const { runExecAllow } = await import("../commands/exec-cmd.js");
+      process.exit(await runExecAllow(parts.join(" "), { json: opts.json }));
+    });
+
+  exec
+    .command("allow-pattern <regex>")
+    .description(
+      'Approve a regex pattern of bash commands.\n' +
+        "  Examples:\n" +
+        "    brigade exec allow-pattern '^git (status|diff|log)( |$)'\n" +
+        "    brigade exec allow-pattern '^cat package\\.json$'",
+    )
+    .option("--json", "emit JSON status instead of human text", false)
+    .action(async (regex: string, opts: { json?: boolean }) => {
+      const { runExecAllowPattern } = await import("../commands/exec-cmd.js");
+      process.exit(await runExecAllowPattern(regex, { json: opts.json }));
+    });
+
+  exec
+    .command("remove <value...>")
+    .description(
+      "Remove an exact command OR a pattern from the allowlist.\n" +
+        "  Brigade looks in both commands AND patterns; if the value is in either, it's dropped.",
+    )
+    .option("--json", "emit JSON status instead of human text", false)
+    .action(async (parts: string[], opts: { json?: boolean }) => {
+      const { runExecRemove } = await import("../commands/exec-cmd.js");
+      process.exit(await runExecRemove(parts.join(" "), { json: opts.json }));
+    });
+
+  exec
+    .command("deny-test <command...>")
+    .description(
+      "Show how the gate would classify a command (allow / prompt / deny).\n" +
+        "  Useful for sanity-checking before approving.",
+    )
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (parts: string[], opts: { json?: boolean }) => {
+      const { runExecDenyTest } = await import("../commands/exec-cmd.js");
+      process.exit(await runExecDenyTest(parts.join(" "), { json: opts.json }));
+    });
+
+  exec
+    .command("file")
+    .description("Print the absolute path to exec-approvals.json")
+    .option("--json", "emit JSON instead of bare-path output", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runExecFile } = await import("../commands/exec-cmd.js");
+      process.exit(await runExecFile({ json: opts.json }));
+    });
+
   return program;
 }

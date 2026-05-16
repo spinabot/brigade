@@ -1,17 +1,63 @@
 import { strict as assert } from "node:assert";
-import * as fs from "node:fs/promises";
+import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { after, before, describe, it } from "node:test";
+import { after, before, beforeEach, describe, it } from "node:test";
 
-import {
+// Point HOME at a per-test-file tempdir BEFORE the under-test modules
+// resolve `BRIGADE_DIR` (which they pin at import time). exec-approvals
+// reads/writes `<HOME>/.brigade/exec-approvals.json`; without this the
+// workspace-jail bash-decision tests would clobber the operator's real
+// allowlist.
+const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-jail-home-"));
+const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
+const originalBrigadeHome = process.env.BRIGADE_HOME;
+process.env.HOME = tmpHome;
+process.env.USERPROFILE = tmpHome;
+delete process.env.BRIGADE_HOME;
+
+const { decideApproval: _ensureLoaded, recordApproval, getApprovalsFilePath, _resetApprovalsCacheForTests } =
+	await import("../core/exec-approvals.js");
+// Marker reference so eslint doesn't complain about unused import.
+void _ensureLoaded;
+
+const {
 	isPathInsideWorkspace,
 	isPathInsideWorkspaceWithAlias,
 	makeWorkspaceJailGuard,
 	resolveAgainstWorkspace,
-} from "./workspace-jail.js";
+} = await import("./workspace-jail.js");
 
 const WS = path.resolve("/tmp/.brigade/workspace");
+
+before(() => {
+	process.on("exit", () => {
+		if (originalHome !== undefined) process.env.HOME = originalHome;
+		else delete process.env.HOME;
+		if (originalUserProfile !== undefined) process.env.USERPROFILE = originalUserProfile;
+		else delete process.env.USERPROFILE;
+		if (originalBrigadeHome !== undefined) process.env.BRIGADE_HOME = originalBrigadeHome;
+		else delete process.env.BRIGADE_HOME;
+		try {
+			fs.rmSync(tmpHome, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
+	});
+});
+
+beforeEach(() => {
+	// Each bash-decision test starts from an empty allowlist so behaviour
+	// is reproducible regardless of file order.
+	_resetApprovalsCacheForTests();
+	try {
+		fs.rmSync(getApprovalsFilePath(), { force: true });
+	} catch {
+		/* ignore */
+	}
+});
 
 describe("isPathInsideWorkspace", () => {
 	it("treats workspace root itself as inside", () => {
@@ -69,12 +115,58 @@ describe("makeWorkspaceJailGuard", () => {
 		assert.equal(r, undefined);
 	});
 
-	it("blocks bash outright (no exec-policy in v1)", async () => {
+	it("BLOCKS bash with a 'prompt' decision (command not on allowlist)", async () => {
 		const guard = makeWorkspaceJailGuard(WS);
 		const r = await guard({ toolCall: { name: "bash", arguments: { command: "ls" } } } as never);
 		assert.equal(r?.block, true);
-		assert.match(r?.reason ?? "", /disabled in this build/);
-		assert.match(r?.reason ?? "", /exec-policy/);
+		assert.match(r?.reason ?? "", /not on the exec-approvals allowlist/);
+		assert.match(r?.reason ?? "", /brigade exec allow/);
+	});
+
+	it("BLOCKS bash with a 'deny' decision (hard-deny pattern, even if previously approved)", async () => {
+		// Even if an operator somehow allowlisted a destructive command, the
+		// hard-deny pattern table wins. This is the safety floor.
+		recordApproval("rm -rf /", "exact");
+		const guard = makeWorkspaceJailGuard(WS);
+		const r = await guard({
+			toolCall: { name: "bash", arguments: { command: "rm -rf /" } },
+		} as never);
+		assert.equal(r?.block, true);
+		assert.match(r?.reason ?? "", /hard-deny pattern/);
+	});
+
+	it("ALLOWS bash when the command is on the exec-approvals allowlist", async () => {
+		recordApproval("ls -la", "exact");
+		const guard = makeWorkspaceJailGuard(WS);
+		const r = await guard({
+			toolCall: { name: "bash", arguments: { command: "ls -la" } },
+		} as never);
+		assert.equal(r, undefined);
+	});
+
+	it("ALLOWS bash via pattern allowlist", async () => {
+		recordApproval("^git (status|diff)( |$)", "pattern");
+		const guard = makeWorkspaceJailGuard(WS);
+		const r = await guard({
+			toolCall: { name: "bash", arguments: { command: "git status" } },
+		} as never);
+		assert.equal(r, undefined);
+	});
+
+	it("BLOCKS bash with empty command (treated as prompt)", async () => {
+		const guard = makeWorkspaceJailGuard(WS);
+		const r = await guard({ toolCall: { name: "bash", arguments: { command: "" } } } as never);
+		assert.equal(r?.block, true);
+		assert.match(r?.reason ?? "", /not on the exec-approvals allowlist/);
+	});
+
+	it("accepts bash command under 'cmd' or 'script' fallback arg key (provider variation)", async () => {
+		recordApproval("echo hi", "exact");
+		const guard = makeWorkspaceJailGuard(WS);
+		const a = await guard({ toolCall: { name: "bash", arguments: { cmd: "echo hi" } } } as never);
+		assert.equal(a, undefined);
+		const b = await guard({ toolCall: { name: "bash", arguments: { script: "echo hi" } } } as never);
+		assert.equal(b, undefined);
 	});
 
 	it("blocks write to a path outside the workspace", async () => {
@@ -155,12 +247,16 @@ describe("makeWorkspaceJailGuard", () => {
 		}
 	});
 
-	it("trims whitespace from tool name (defence in depth)", async () => {
+	it("trims whitespace from tool name (defence in depth — '  bash  ' still routes through exec-approvals)", async () => {
 		const guard = makeWorkspaceJailGuard(WS);
 		const r = await guard({
 			toolCall: { name: "  bash  ", arguments: { command: "ls" } },
 		} as never);
+		// "ls" isn't on the allowlist, so the exec-approvals gate refuses
+		// — the test's point is that the trim+match worked, not that bash
+		// is always blocked.
 		assert.equal(r?.block, true);
+		assert.match(r?.reason ?? "", /not on the exec-approvals allowlist/);
 	});
 
 	it("blocks Windows UNC paths (\\\\server\\share)", async () => {
@@ -207,23 +303,23 @@ describe("isPathInsideWorkspaceWithAlias — symlink escape detection", () => {
 	let symlinkSupported = true;
 
 	before(async () => {
-		tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "brigade-jail-"));
+		tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "brigade-jail-"));
 		tmpWs = path.join(tmpRoot, "workspace");
-		await fs.mkdir(tmpWs);
+		await fsp.mkdir(tmpWs);
 		outsideTarget = path.join(tmpRoot, "secret.txt");
-		await fs.writeFile(outsideTarget, "secret");
+		await fsp.writeFile(outsideTarget, "secret");
 		// Probe whether we can create symlinks (Windows requires admin or Dev Mode).
 		try {
 			const probe = path.join(tmpRoot, "_probe");
-			await fs.symlink(outsideTarget, probe);
-			await fs.unlink(probe);
+			await fsp.symlink(outsideTarget, probe);
+			await fsp.unlink(probe);
 		} catch {
 			symlinkSupported = false;
 		}
 	});
 
 	after(async () => {
-		await fs.rm(tmpRoot, { recursive: true, force: true });
+		await fsp.rm(tmpRoot, { recursive: true, force: true });
 	});
 
 	it("accepts a normal path inside the workspace", async () => {
@@ -242,12 +338,12 @@ describe("isPathInsideWorkspaceWithAlias — symlink escape detection", () => {
 			return;
 		}
 		const sneaky = path.join(tmpWs, "USER.md");
-		await fs.symlink(outsideTarget, sneaky);
+		await fsp.symlink(outsideTarget, sneaky);
 		try {
 			const ok = await isPathInsideWorkspaceWithAlias("USER.md", tmpWs);
 			assert.equal(ok, false, "alias escape MUST be rejected");
 		} finally {
-			await fs.unlink(sneaky).catch(() => {});
+			await fsp.unlink(sneaky).catch(() => {});
 		}
 	});
 

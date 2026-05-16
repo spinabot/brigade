@@ -69,6 +69,7 @@ import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-gua
 import { makeWorkspaceJailGuard } from "./workspace-jail.js";
 import { runWithContentQualityRetry, type ContentQualityIssue } from "./content-quality-retry.js";
 import { runWithThinkingFallback } from "./thinking-fallback.js";
+import { createBrigadeTools } from "./tools/registry.js";
 import { emitAgentEvent } from "./agent-event-bus.js";
 import { randomUUID } from "node:crypto";
 import { evaluateCompactionDecision } from "./smart-compaction.js";
@@ -317,6 +318,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // the user's actual workspace.
   const enabledToolNames: string[] = ["read", "write", "edit", "bash", "grep", "find", "ls"];
 
+  // Brigade-native custom tools (Primitive #3 framework). Empty in v1 —
+  // Pi's 5 built-ins above are the v1 surface. Tools land here in
+  // Primitives #4-6 (memory, skills, sub-agents) as one-liner additions
+  // inside `createBrigadeTools` without touching this callsite.
+  const brigadeCustomTools = createBrigadeTools({
+    workspaceDir,
+    agentId,
+    cwd,
+  });
+
   const { session } = await createAgentSession({
     cwd,
     agentDir,
@@ -325,7 +336,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     model: model as never,
     thinkingLevel: args.thinkingLevel ?? "off",
     tools: enabledToolNames,
-    customTools: [],
+    customTools: brigadeCustomTools,
     sessionManager,
     resourceLoader: new DefaultResourceLoader({ cwd, agentDir }),
     transformContext,
