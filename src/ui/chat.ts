@@ -612,7 +612,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 					// "✓ bash". Empty results (Pi's edit/write success cases)
 					// collapse to just the mark + name to keep the chat compact.
 					//
-					// ERROR results (jail / exec-approvals refusals, tool
+					// ERROR results (exec-gate / exec-approvals refusals, tool
 					// exceptions) preserve newlines + use a larger budget so the
 					// "brigade exec allow ..." instruction line survives intact.
 					// Without this, the operator only sees "✗ bash · Tool 'bash'

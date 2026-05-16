@@ -14,7 +14,7 @@
  *     gist.
  *   - ERROR (`{ isError: true }` from Pi, or `opts.preserveNewlines`) —
  *     keep newlines + raise the cap to ~800 chars. Refusals from the
- *     workspace jail / exec-approvals gate carry multi-line instructions
+ *     exec-gate / exec-approvals refusals carry multi-line instructions
  *     ("blocked: command 'ls' is not on the allowlist. Operator must
  *     run\n  brigade exec allow ...\n…"). A 120-char single-line preview
  *     would chop the magic `brigade exec allow` incantation in half and

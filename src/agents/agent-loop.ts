@@ -66,7 +66,8 @@ import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
 import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-guard.js";
-import { makeWorkspaceJailGuard } from "./workspace-jail.js";
+import { makeExecGate } from "./exec-gate.js";
+import { makeToolLoopDetector } from "./tool-loop-detector.js";
 import { runWithContentQualityRetry, type ContentQualityIssue } from "./content-quality-retry.js";
 import { runWithThinkingFallback } from "./thinking-fallback.js";
 import { createBrigadeTools } from "./tools/registry.js";
@@ -114,13 +115,17 @@ export interface RunSingleTurnArgs {
   modelId: string;
   message: string;
   sessionKey?: string;
-  // Override the agent's workspace dir (where persona/SOUL/USER files live).
-  // Defaults to <agentDir>/workspace via paths.ts.
+  // Override the agent's workspace dir — where persona/SOUL/USER files live
+  // AND the cwd Pi resolves relative tool paths against. Defaults to
+  // <agentDir>/workspace via paths.ts.
   workspaceDir?: string;
-  // The cwd Pi tools (read/bash/write/etc.) operate in. Defaults to the
-  // current process cwd so `brigade agent -m "…"` from any directory does
-  // what the user expects. Distinct from workspaceDir, which scopes
-  // *persona files* — those live with the agent, not with the project.
+  // Explicit override for Pi's session cwd. Defaults to `workspaceDir` so
+  // the agent has a stable home regardless of where the operator invoked
+  // brigade from. The agent is NOT a project-rooted coding agent — it
+  // operates in its own workspace and reaches project files via ABSOLUTE
+  // paths (taught by the system prompt). Mirrors OpenClaw's behaviour at
+  // src/agents/pi-embedded-runner/run/attempt.ts:1031-1032 where
+  // `cwd: resolvedWorkspace` is the AGENT'S workspace, not process.cwd().
   cwd?: string;
   // Pi accepts "off" | "low" | "medium" | "high". Some providers (e.g. Gemini
   // 2.5 Pro) reject "off" — derive from model.reasoning when wiring tools.
@@ -153,7 +158,13 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   const sessionKey = args.sessionKey ?? defaultSessionKey(agentId);
   const agentDir = resolveAgentDir(agentId);
   const workspaceDir = resolveAgentWorkspaceDir(agentId, args.workspaceDir);
-  const cwd = args.cwd ?? process.cwd();
+  // Default Pi's cwd to the agent's workspace dir (mirror of OpenClaw's
+  // `resolvedWorkspace` semantics). Relative tool paths now resolve into
+  // the persona directory naturally — `write({path: "USER.md"})` lands
+  // at `<workspace>/USER.md` without any path-jail guard. Absolute paths
+  // are passed through unchanged so the agent can still reach project
+  // files when the operator gives it one.
+  const cwd = args.cwd ?? workspaceDir;
   const modelsFile = resolveModelsPath(agentId);
   const authProfilesPath = resolveAuthProfilesPath(agentId);
 
@@ -346,44 +357,65 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     throw new Error("Pi createAgentSession returned no session.");
   }
 
-  // Install the composed beforeToolCall guard. Two layers run in order:
+  // Install the composed beforeToolCall guard. Three layers run in order:
   //
   //   1. UNKNOWN-TOOL GUARD (`makeUnknownToolGuard`) — name validation:
-  //      tool not in `enabledToolNames`, whitespace-wrapped names, empty
-  //      args for a tool that needs them. If this blocks, we stop here.
+  //      tool not in `enabledToolNames`, malformed args. Allowlist
+  //      uses normalised names so `Read`/`READ`/`  read  ` all match.
+  //      If this blocks, we stop here.
   //
-  //   2. WORKSPACE-JAIL GUARD (`makeWorkspaceJailGuard`) — argument
-  //      validation for path-mutating tools (`write`, `edit`) plus a
-  //      blanket refusal for `bash` until Primitive #3 ships exec policy.
-  //      Resolves relative paths against the agent's WORKSPACE root (not
-  //      process cwd), so `write({path: "USER.md"})` lands at
-  //      `<workspace>/USER.md` — what BOOTSTRAP.md tells the model to do.
-  //      Without this, gpt-5.4 wrote USER.md to the cwd (the Brigade
-  //      source tree), creating an orphan file that never feeds back into
-  //      the persona loop.
+  //   2. TOOL-LOOP DETECTOR (`makeToolLoopDetector`) — catches a model
+  //      that's stuck repeating the same call. Warns at 10 identical
+  //      consecutive calls (bus event), blocks at 20 with a synthetic
+  //      refusal that teaches the model to try something different.
+  //      Per-session ring buffer keyed by sessionKey via the shared
+  //      gateCtxRef so loops persist across turn boundaries within a
+  //      single session.
   //
-  // Pi turns either guard's `block: true` return into a synthetic
+  //   3. EXEC GATE (`makeExecGate`) — bash/exec/shell/sh routing
+  //      through `decideApproval` (Primitive #3): allow / deny / prompt.
+  //      Also refuses workdir/cwd/env overrides on shell tools and
+  //      surfaces a typed message when the on-disk allowlist file
+  //      has an unsupported schema version.
+  //
+  // Pi turns any guard's `block: true` return into a synthetic
   // tool_result the model sees inline, so the next turn can self-correct.
+  //
+  // Path-mutating tools (`write`, `edit`) are intentionally NOT gated
+  // here — Pi resolves their relative paths against the session cwd
+  // (the agent's workspace dir), and absolute paths pass through.
+  // Mirrors OpenClaw's `tools.fs.workspaceOnly = false` default at
+  // `src/agents/tool-fs-policy.ts:11`.
   const sessionWithBeforeHook = session as AgentSession & {
     agent?: {
       beforeToolCall?: BrigadeBeforeToolCallHook;
     };
   };
-  // Mutable closure-bag for the workspace jail: the agent-loop sets
-  // `jailCtxRef.value = {runId, agentId}` once it has those (just before
-  // the prompt() call) and clears it in the finally block. The jail
-  // reads .value live each call, so bus events carry accurate ids
-  // without re-wiring the guard between turns.
-  const jailCtxRef: { value: { runId?: string; agentId?: string } } = { value: {} };
+  // Mutable closure-bag shared by the exec-gate and the loop detector.
+  // The agent-loop sets `gateCtxRef.value = {runId, agentId, sessionKey}`
+  // once it has those (just before the prompt() call) and clears it in
+  // the finally block. Both guards read .value live each call, so
+  // `tool-blocked` bus events carry accurate correlation ids without
+  // re-wiring the guards between turns.
+  const gateCtxRef: {
+    value: { runId?: string; agentId?: string; sessionKey?: string };
+  } = { value: {} };
   if (sessionWithBeforeHook.agent) {
     const nameGuard = makeUnknownToolGuard(enabledToolNames);
-    // Pass cwd so the jail validates the path Pi will ACTUALLY resolve
-    // to (Pi resolves relative paths against this cwd, not the workspace).
-    const jailGuard = makeWorkspaceJailGuard(workspaceDir, cwd, jailCtxRef);
+    // Loop detector goes BEFORE the exec-gate so a stuck model doesn't
+    // even consult the approval allowlist — saves the operator from
+    // seeing 20 identical refusal messages when one will do. Detects
+    // both repeated allowlisted calls (e.g. read({path:"X"}) ad
+    // infinitum) and repeated refused calls (e.g. bash on the same
+    // unapproved command).
+    const loopDetector = makeToolLoopDetector({ ctxRef: gateCtxRef });
+    const execGate = makeExecGate({ ctxRef: gateCtxRef, displayCwd: cwd });
     sessionWithBeforeHook.agent.beforeToolCall = async (ctx, signal) => {
       const named = await nameGuard(ctx, signal);
       if (named?.block) return named;
-      return jailGuard(ctx, signal);
+      const loop = await loopDetector(ctx, signal);
+      if (loop?.block) return loop;
+      return execGate(ctx, signal);
     };
   }
 
@@ -523,11 +555,14 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // up across the gateway's long-running process. Mirrors OpenClaw's
   // `src/infra/agent-events.ts` global registry pattern.
   const runId = randomUUID();
-  // Publish runId+agentId to the workspace-jail closure-bag so any
+  // Publish runId+agentId+sessionKey to the closure-bag so any
   // `tool-blocked` events emitted during this turn carry accurate
-  // correlation ids. Cleared in finally so a subsequent turn (which
-  // reuses the same session) doesn't leak stale ids.
-  jailCtxRef.value = { runId, agentId };
+  // correlation ids AND the loop detector keys its ring buffer to
+  // this session's transcript (so loops persist across turn
+  // boundaries but stay scoped per-session). Cleared in finally
+  // so a subsequent turn (which reuses the same session) doesn't
+  // leak stale ids.
+  gateCtxRef.value = { runId, agentId, sessionKey: resolved.sessionKey };
   // Duck-typed Pi session subscription. We assert the SHAPE we want
   // rather than coupling to a specific Pi version's exported type. If
   // a future Pi changes `subscribe` to return `Promise<() => void>` or
@@ -791,11 +826,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // gets cleaned up here. Idempotent — the success path's explicit
     // detach above is a no-op once this fires.
     detachPiForwarder();
-    // Clear the jail context bag so the NEXT turn (which reuses the
+    // Clear the gate context bag so the NEXT turn (which reuses the
     // session) doesn't see this turn's runId on a refusal that fired
     // outside a prompt() call (e.g. a steer-triggered tool retry that
     // races the turn boundary).
-    jailCtxRef.value = {};
+    gateCtxRef.value = {};
   }
 }
 

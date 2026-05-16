@@ -81,7 +81,7 @@ describe("makeUnknownToolGuard", () => {
 		const result = await guard(ctx({ name: "  open_file  ", arguments: { path: "foo.ts" } }));
 		assert.ok(result?.block);
 		assert.match(result!.reason!, /had extra whitespace/i);
-		assert.match(result!.reason!, /use exactly "open_file"/);
+		assert.match(result!.reason!, /"open_file"/);
 	});
 
 	it("blocks a known tool with empty args (likely malformed)", async () => {

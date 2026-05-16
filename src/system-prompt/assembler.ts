@@ -232,11 +232,11 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
 
   // 7. ## Workspace.
   // OpenClaw `system-prompt.ts:742-746`. Declares the absolute workspace
-  // dir so the model emits absolute paths for persona writes (USER.md /
-  // IDENTITY.md / etc.) — not cwd-relative paths that the workspace-jail
-  // would reject. Without this, the model writes `USER.md` and Pi
-  // resolves it against `process.cwd()`, landing the file outside the
-  // workspace.
+  // dir so the model knows where its persona files live (USER.md /
+  // IDENTITY.md / etc.). Pi's session cwd defaults to this directory, so
+  // a relative `write({path: "USER.md"})` resolves into it naturally; the
+  // explicit absolute-path guidance below is belt-and-braces for tools
+  // that might be invoked with a different effective cwd in the future.
   lines.push("## Workspace");
   lines.push(`Your workspace directory is: \`${args.runtime.workspaceDir}\``);
   lines.push(

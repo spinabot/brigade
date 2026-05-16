@@ -75,7 +75,12 @@ export type TurnOutcome =
 export interface ChatSession {
 	readonly agentId: string;
 	readonly sessionKey: string;
-	readonly cwd: string;
+	/**
+	 * Explicit cwd override carried from `openChatSession({cwd})`. When
+	 * undefined, runSingleTurn applies its workspace-dir default — see
+	 * `agent-loop.ts:166` and the comment in `openChatSession`.
+	 */
+	readonly cwd: string | undefined;
 	readonly provider: string;
 	readonly modelId: string;
 	readonly thinkingLevel: ChatThinkingLevel;
@@ -103,7 +108,14 @@ export function openChatSession(args: OpenChatSessionArgs): ChatSession {
 	let modelId = args.modelId;
 	let thinkingLevel: ChatThinkingLevel = args.thinkingLevel ?? "off";
 	let currentAbort: AbortController | null = null;
-	const cwd = args.cwd ?? process.cwd();
+	// Intentionally NOT `?? process.cwd()`. The agent-loop defaults cwd to
+	// the agent's workspace dir (mirror of OpenClaw's behaviour at
+	// `attempt.ts:1031-1032`) — falling back to `process.cwd()` here would
+	// bypass that default and bind the agent's filesystem view to wherever
+	// the operator happened to invoke brigade from. Only forward `cwd`
+	// when the caller passes one explicitly; otherwise leave it undefined
+	// and let runSingleTurn apply the workspace default.
+	const cwd = args.cwd;
 	const sessionKey = args.sessionKey ?? `agent:${args.agentId}:main`;
 
 	async function runTurn(
@@ -155,9 +167,12 @@ export function openChatSession(args: OpenChatSessionArgs): ChatSession {
 				thinkingLevel,
 				message: messageForModel,
 				sessionKey,
-				cwd,
 				workspaceDir: args.workspaceDir,
 				signal: turnAbort.signal,
+				// Only forward cwd when the caller passed one explicitly.
+				// Omitting the key lets runSingleTurn apply the workspace
+				// default (see comment at the top of this function).
+				...(cwd !== undefined ? { cwd } : {}),
 			};
 			const result = await runSingleTurn(turnArgs);
 			return {

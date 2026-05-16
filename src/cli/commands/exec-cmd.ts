@@ -2,7 +2,7 @@
  * `brigade exec <list|allow|allow-pattern|remove|deny-test|file>` — CRUD over
  * the exec-approvals allowlist that gates `bash` tool calls. The allowlist
  * file lives at `~/.brigade/exec-approvals.json` and is consulted at every
- * tool-call boundary by `src/agents/workspace-jail.ts`.
+ * tool-call boundary by `src/agents/exec-gate.ts`.
  *
  * v1 shape (single-user, file-backed):
  *   - exact-command approvals: the literal command string must match (after

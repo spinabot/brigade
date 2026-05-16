@@ -26,9 +26,10 @@ import type { AnyBrigadeTool } from "./types.js";
  * Per-field rationale:
  *   - `workspaceDir` — the absolute path to `~/.brigade/workspace/`.
  *     Persona-mutating tools (write_memory, recall_memory) resolve
- *     their target files under this root. Already enforced by the
- *     workspace-jail `beforeToolCall` hook for Pi's built-ins; passed
- *     here so Brigade-native tools can use the same root explicitly.
+ *     their target files under this root. The agent's session cwd
+ *     defaults to this dir so Pi's built-in write/edit/read resolve
+ *     relative paths into it naturally; Brigade-native tools take it
+ *     as an explicit parameter so they're not coupled to that default.
  *   - `agentId` — the active agent id (default `"main"`). Sub-agent
  *     tools (`spawn_agent`) use this to scope nested sessions.
  *   - `cwd` — process cwd. Tools that need to resolve relative paths

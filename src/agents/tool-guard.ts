@@ -57,6 +57,22 @@ export function trimToolCallName(name: unknown): string {
 }
 
 /**
+ * Canonical tool-name normaliser shared by every `beforeToolCall` hook
+ * in the chain (unknown-tool guard, loop detector, exec gate). Lowercase
+ * + trim, so a provider that emits `Read`, `READ`, or `  read  ` is
+ * handled identically across all three layers. Without a shared
+ * helper, the layers diverge — earlier audits caught the bash gate
+ * doing lowercase matching while the path guards used raw casing.
+ *
+ * Mirrors OpenClaw's `normalizeToolName` at
+ * `src/agents/tool-policy.ts` (Brigade-native rename).
+ */
+export function normalizeToolName(name: unknown): string {
+	if (typeof name !== "string") return "";
+	return name.trim().toLowerCase();
+}
+
+/**
  * Heuristic detector for malformed tool arguments. Returns true when
  * the call looks suspiciously empty (likely a streaming JSON parse
  * failure) for a tool that typically requires arguments.
@@ -97,7 +113,10 @@ export function isLikelyMalformedArgs(args: unknown, toolName: string): boolean 
  *   };
  */
 export function makeUnknownToolGuard(allowedToolNames: string[]): BrigadeBeforeToolCallHook {
-	const allowed = new Set(allowedToolNames);
+	// Normalise the allowlist so a model that emits `Read`, `READ`, or
+	// `  read  ` matches a `read` entry. The shared `normalizeToolName`
+	// helper applies the same rules at every other hook layer.
+	const allowed = new Set(allowedToolNames.map((n) => normalizeToolName(n)));
 	return async (ctx) => {
 		// Pi's BeforeToolCallContext exposes the tool call. Field shape
 		// varies slightly across Pi versions — the most stable accessors
@@ -105,7 +124,7 @@ export function makeUnknownToolGuard(allowedToolNames: string[]): BrigadeBeforeT
 		const rawName = (ctx as { toolCall?: { name?: unknown }; name?: unknown })?.toolCall?.name
 			?? (ctx as { name?: unknown })?.name
 			?? "";
-		const name = trimToolCallName(rawName);
+		const name = normalizeToolName(rawName);
 		const args = (ctx as { toolCall?: { arguments?: unknown }; args?: unknown; arguments?: unknown })
 			?.toolCall?.arguments
 			?? (ctx as { args?: unknown })?.args
@@ -125,10 +144,17 @@ export function makeUnknownToolGuard(allowedToolNames: string[]): BrigadeBeforeT
 
 		if (!name || !allowed.has(name)) {
 			const list = [...allowed].sort().join(", ") || "(no tools enabled)";
+			const trimmedRaw = trimToolCallName(rawName);
+			const hadCasing = typeof rawName === "string" && trimmedRaw !== name;
+			const hadWhitespace = typeof rawName === "string" && rawName !== trimmedRaw;
 			const hint =
-				typeof rawName === "string" && rawName !== name
-					? ` (note: your tool name had extra whitespace — use exactly "${name}" without spaces)`
-					: "";
+				hadCasing && hadWhitespace
+					? ` (note: name normalises to "${name}" — re-emit lowercased and without surrounding whitespace)`
+					: hadCasing
+						? ` (note: name normalises to "${name}" — re-emit lowercased)`
+						: hadWhitespace
+							? ` (note: name had extra whitespace — re-emit as "${name}" without spaces)`
+							: "";
 			return {
 				block: true,
 				reason: `Tool "${String(rawName)}" is not available${hint}. Available tools: ${list}. Please use one of those instead.`,
