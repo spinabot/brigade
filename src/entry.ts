@@ -42,8 +42,8 @@ const argv = process.argv;
 
 // Fast-path 1 — `brigade --version`.
 if (isRootVersionInvocation(argv)) {
-  const { VERSION } = await import("./version.js");
-  console.log(`Brigade ${VERSION}`);
+  const { formatVersion } = await import("./version.js");
+  console.log(`Brigade ${formatVersion()}`);
   process.exit(0);
 }
 

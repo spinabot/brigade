@@ -1,6 +1,6 @@
 import { Command } from "commander";
 
-import { VERSION } from "../../version.js";
+import { formatVersion } from "../../version.js";
 
 // Mirrors OpenClaw's lazy command-registration pattern. Each subcommand's
 // real body (action handler) lives in a separate module under
@@ -26,7 +26,7 @@ export function buildProgram(): Command {
   program
     .name("brigade")
     .description("Brigade — your personal AI crew")
-    .version(VERSION, "-v, --version", "show brigade version");
+    .version(formatVersion(), "-v, --version", "show brigade version");
 
   // exitOverride lets runMain decide how to surface help/no-args, instead of
   // Commander killing the process directly with exit(1).

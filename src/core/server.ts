@@ -98,6 +98,7 @@ function persistDefaultModel(cfg: Config, provider: string, modelId: string): Co
 import { type ConsoleStream } from "./console-stream.js";
 import { attachEventLogger, getTodayLogPath } from "./event-logger.js";
 import { pickInitialThinkingLevel } from "./model-caps.js";
+import { getBuildInfo } from "../version.js";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { extractIdentityName, isIdentityNameUnset } from "./system-prompt.js";
 import { existsSync, readFileSync } from "node:fs";
@@ -927,6 +928,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const startupDurationMs = Date.now() - startupStartedAt;
 	const startupDurationLabel = `${(startupDurationMs / 1000).toFixed(1)}s`;
 	bootLog(`ready (${startupDurationLabel})`);
+
+	// Build identity — reports the exact commit + build time this daemon is
+	// running, from the postbuild stamp (dist/buildstamp.json). Only emitted
+	// when a stamp is present (skipped in a dev source tree).
+	const build = getBuildInfo();
+	if (build.head) {
+		const builtAt = build.builtAt ? ` · ${new Date(build.builtAt).toISOString()}` : "";
+		bootLog(`build: ${build.head.slice(0, 7)}${builtAt}`);
+	}
 
 	// Phase 10 — log-file pointer. Mirrors openclaw's
 	// `log file: <path>` line (`src/gateway/server-startup-log.ts:33`).
