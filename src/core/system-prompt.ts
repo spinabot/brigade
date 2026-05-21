@@ -102,11 +102,17 @@ export async function refreshSessionSystemPrompt(
   const personaFiles = await loadWorkspaceContextFiles(workspaceDir);
   const heartbeatFile = await loadHeartbeatFile(workspaceDir);
   const sessionAny = session as unknown as {
-    model?: { provider?: string; modelId?: string };
+    model?: { provider?: string; id?: string; modelId?: string };
     thinkingLevel?: string;
   };
   const provider = sessionAny.model?.provider ?? "unknown";
-  const modelId = sessionAny.model?.modelId ?? "unknown";
+  // Pi's `Model` exposes the model id as `.id`, NOT `.modelId`. Reading only
+  // `.modelId` (the prior bug) yielded "unknown", which broke BOTH the
+  // per-family identity override (pickModelFamilyGuidance("unknown") → null,
+  // so `gemma4:e2b` kept replying "I am Gemma 4") AND the reasoning-format
+  // gate (shouldUseReasoningFormat saw "unknown"). Prefer `.id`, fall back to
+  // `.modelId` for any Pi version that surfaced it differently.
+  const modelId = sessionAny.model?.id ?? sessionAny.model?.modelId ?? "unknown";
   const thinkingLevel = sessionAny.thinkingLevel ?? "off";
   const runtime = resolveRuntimeParams({
     agentId: DEFAULT_AGENT_ID,

@@ -48,7 +48,12 @@ import { Markdown } from "./markdown.js";
 // `runBrigadeTurnLoop`; the TUI never reaches into them directly anymore.
 import { classifySensitiveStopReason } from "../agents/stop-reason.js";
 import { BRIGADE_DIR, loadConfig, saveConfig } from "../core/config.js";
-import { cleanProviderError, describeModelCapabilities, pickStreamIdleMs } from "../core/model-caps.js";
+import {
+	cleanProviderError,
+	describeModelCapabilities,
+	pickInitialThinkingLevel,
+	pickStreamIdleMs,
+} from "../core/model-caps.js";
 import { buildLoginGuidanceMessage, friendlyError, translateAuthError } from "../core/auth-error.js";
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
 import { findProvider, PROVIDERS } from "../providers/catalog.js";
@@ -485,6 +490,15 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 		}
 		try {
 			await client.setModel(model);
+			// Re-pick a SAFE thinking level for the NEW model. Pi's setModel
+			// derives available levels from the model's `reasoning` flag; for a
+			// reasoning-only model whose aggregator metadata omits that flag
+			// (openrouter gemini-2.5-pro), the prior level may be invalid and a
+			// "off" budget=0 would 400 on the next turn. `pickInitialThinkingLevel`
+			// applies the same reasoning-aware default the initial build uses
+			// (incl. the isLikelyReasoningModelId fallback). Best-effort: Pi may
+			// still clamp if it believes the model is non-reasoning.
+			client.setThinkingLevel(pickInitialThinkingLevel(model) as never);
 		} catch (err) {
 			const raw = err instanceof Error ? err.message : String(err);
 			const friendly = friendlyError(raw, cleanProviderError);

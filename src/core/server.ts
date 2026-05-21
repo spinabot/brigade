@@ -477,6 +477,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					at: Date.now(),
 				});
 				break;
+			case "tool-blocked":
+				// Surface guard/exec-gate refusals to connect-mode clients as a
+				// warn log. The model ALSO sees Pi's synthetic error tool_result
+				// (broadcast via "pi"), but this gives the operator an explicit
+				// "✗ <tool> blocked" status line with the reason.
+				broadcast("log", {
+					level: "warn",
+					message: `${event.toolName} blocked: ${event.reason.split("\n")[0]}`,
+					at: Date.now(),
+				});
+				break;
 			default:
 				// `pi`, `turn-start`, `turn-settled`, etc. — handled elsewhere
 				// or not surfaced as status logs.

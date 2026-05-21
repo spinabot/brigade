@@ -47,7 +47,16 @@ export interface ChatCommandOptions {
  * the caller wants to introspect or wire additional signal handlers.
  */
 export async function runChatCommand(opts: ChatCommandOptions = {}): Promise<ChatHandle> {
-	const cwd = opts.cwd ?? process.cwd();
+	// Default the agent's session cwd to the WORKSPACE dir, not process.cwd().
+	// This mirrors OpenClaw (its session cwd is always the agent workspace) and
+	// matches the gateway (server.ts) + single-turn path (agent-loop.ts), so
+	// all three surfaces resolve relative tool paths into the same place.
+	// Critical for memory: the model writes `memory/<today>.md` with the
+	// `write` tool (relative → resolved against this cwd) and recall_memory
+	// reads from the workspace — if cwd were process.cwd(), writes would land
+	// in the operator's project dir and recall would never find them.
+	// Project files are reached via absolute paths (the OpenClaw model).
+	const cwd = opts.cwd ?? getBrigadeWorkspaceDir();
 
 	// Refuse to boot in a non-TTY environment (CI, piped stdin, redirected
 	// stdout) — the onboarding wizard would block forever waiting for keystrokes
