@@ -138,6 +138,17 @@ export interface RunSingleTurnArgs {
   // the *next* retry boundary; callers wanting hard mid-stream cancellation
   // should call session.abort() directly in the signal listener.
   signal?: AbortSignal;
+  /**
+   * Called once with the fully-wired Pi session AS SOON as it's constructed
+   * and its guards/stream-wrappers/persona are installed — BEFORE the turn
+   * runs. This is the per-turn mirror's seam: the gateway / TUI driver holds
+   * the returned session for the DURATION of this turn so it can `steer()`,
+   * `abort()`, or `switchModelMidTurn()` mid-stream, then drops the reference
+   * when the turn settles. Mirrors OpenClaw, where each `runEmbeddedAttempt`
+   * builds a fresh session and the surface interacts with it only for that
+   * turn's lifetime (there is no long-lived session between turns).
+   */
+  onSessionReady?: (session: AgentSession) => void;
 }
 
 export interface RunSingleTurnResult {
@@ -508,6 +519,22 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     applyPersonaOverrideToSession(session as AgentSession, personaPrompt);
   }
 
+  // Hand the fully-wired session to the per-turn driver (gateway / TUI) so it
+  // can steer / abort / switch-model mid-stream for the duration of THIS turn.
+  // The driver drops the reference when the turn settles — no session lives
+  // between turns (the per-turn mirror). Guarded so a throwing callback can't
+  // abort the turn.
+  if (args.onSessionReady) {
+    try {
+      args.onSessionReady(session as AgentSession);
+    } catch (err) {
+      log.warn("onSessionReady callback threw", {
+        sessionId: resolved.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   // prompt() runs a full user turn — Pi enqueues the message, drives the
   // agent loop, and resolves once the turn is complete (assistant reply
   // committed to messages, isStreaming/isCompacting cleared).
@@ -628,6 +655,17 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       };
       if (info.willRetry) log.warn("turn attempt failed, retrying", fields);
       else log.error("turn attempt failed, surfacing", fields);
+      // Narrate the retry on the bus so connect-mode clients see "retrying…"
+      // (the gateway translates this into a `log` frame). Only on actual
+      // retries — a terminal failure surfaces as the turn's error, not a retry.
+      if (info.willRetry) {
+        emitAgentEvent({
+          type: "turn-retry-attempt",
+          runId,
+          errorClass: String((info as { class?: string }).class ?? "unknown"),
+          reason: String(info.reason ?? info.errorSummary ?? "transient error"),
+        });
+      }
       // Update the on-disk cooldown state so this profile rotates out on
       // the next run if its failure category warrants a cooldown. Skipped
       // when no profile id was tracked (single-profile fallback path).
@@ -680,6 +718,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
                   provider: args.provider,
                   model: args.modelId,
                 });
+                // Connect-mode narration: "<reason> — re-prompting for a
+                // usable answer". The gateway maps this to a `log` frame.
+                emitAgentEvent({
+                  type: "turn-content-retry",
+                  runId,
+                  reason: reason as "empty" | "reasoning-only" | "planning-only",
+                });
               },
             },
           );
@@ -693,6 +738,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
               errorMessage,
               provider: args.provider,
               model: args.modelId,
+            });
+            // Connect-mode narration: "model doesn't support thinking —
+            // switching from <level> to off and retrying".
+            emitAgentEvent({
+              type: "turn-thinking-downgrade",
+              runId,
+              from: String(originalLevel),
             });
           },
         },

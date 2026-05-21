@@ -416,34 +416,16 @@ export async function runGatewayCommand(opts: GatewayCommandOptions = {}): Promi
 		// interactive supervisors get the message + exit 78 as before, so
 		// systemd doesn't sit waiting for stdin that will never come.
 		if (/no saved config|model .+ not in registry/i.test(msg)) {
+			// Point straight at onboarding. We used to offer to launch
+			// `brigade chat` here "to onboard", but chat is now a thin client
+			// to THIS gateway — it doesn't run the wizard, it just refuses
+			// without config the same way. `brigade onboard` is the one true
+			// setup path, so send the user there directly instead of through a
+			// hand-off that dead-ends.
 			process.stderr.write(
 				chalk.yellow(`brigade-gateway: this gateway hasn't been set up yet.\n`) +
 					chalk.dim(`  Run ${chalk.bold("brigade onboard")} to pick a provider + model, then re-launch.\n`),
 			);
-
-			if (process.stdin.isTTY && process.stdout.isTTY) {
-				const readline = await import("node:readline");
-				const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-				const answer = await new Promise<string>((resolve) => {
-					rl.question(`\nLaunch ${chalk.bold("brigade chat")} now to onboard? [Y/n] `, (a) => {
-						rl.close();
-						resolve(a.trim().toLowerCase());
-					});
-				});
-				if (answer === "" || answer === "y" || answer === "yes") {
-					// Hand off to chat. It boots the TUI, runs onboarding, then
-					// stays in chat — the user can `/exit` and re-run gateway
-					// when they're ready. Don't auto-restart the gateway: chat
-					// may have done other work (model switch, /provider add)
-					// the operator wants to control.
-					const { runChatCommand } = await import("./chat.js");
-					await runChatCommand({});
-					// Chat owns its own exit. The gateway never started, so
-					// there's no teardown to run — return a no-op so the
-					// caller's contract holds.
-					return async () => {};
-				}
-			}
 			process.exit(EXIT_CONFIG_ERROR);
 		}
 		// Lock-held — another `brigade gateway` is already running and the

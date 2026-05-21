@@ -29,7 +29,12 @@ import { createServer as createTcpServer } from "node:net";
 import { pathToFileURL } from "node:url";
 
 import type { Model } from "@mariozechner/pi-ai";
-import { type AgentSessionEvent, type AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	type AuthStorage,
+	ModelRegistry,
+} from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, type WebSocket } from "ws";
 
 import {
@@ -46,18 +51,19 @@ import {
 	type SessionStateSnapshot,
 	TICK_INTERVAL_MS,
 } from "../protocol.js";
-import {
-	buildAgent,
-	// `runWith*` and `switchModelMidTurn` are no longer imported here
-	// as of Phase 5c. Gateway turns route through `client.prompt(...)`
-	// + `client.switchModelMidTurn(...)` — both delegate to the
-	// Brigade-native helpers internally, so the gateway no longer
-	// needs raw Pi access. The lifecycle bus subscriber above
-	// translates the resulting events into `broadcast("log", ...)`
-	// frames for connect-mode TUI clients.
-} from "./agent.js";
-import { makeEmbeddedChatClient } from "../agents/embedded-chat-client.js";
+// Per-turn execution path (the single canonical runtime). The gateway no
+// longer holds a long-lived Pi session: every inbound `prompt` builds a
+// fresh session via `runResilientTurn`, resumes the JSONL transcript by
+// sessionKey, runs the full Brigade safety stack, and drops the session
+// when the turn settles. This mirrors OpenClaw, where each turn is its own
+// `runEmbeddedAttempt` and no session lives between turns. The in-flight
+// session is surfaced for the turn's lifetime via `onSessionReady` so the
+// gateway can steer / abort / switch-model mid-stream.
+import { runResilientTurn } from "../agents/agent-loop.js";
+import { switchModelMidTurn as piSwitchModelMidTurn } from "../agents/mid-turn-switch.js";
 import { onAgentEvent } from "../agents/agent-event-bus.js";
+import { DEFAULT_AGENT_ID } from "../config/paths.js";
+import { defaultSessionKey } from "../sessions/session-store.js";
 import { loadBrigadeAuthStorage } from "./auth-bridge.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig, saveConfig, type Config } from "./config.js";
 import { acquireGatewayLock, type GatewayLockHandle } from "./gateway-lock.js";
@@ -67,6 +73,16 @@ import { clearPidFile, writePidFile } from "./gateway-probe.js";
 // code expected the older flat `defaultProvider`/`defaultModelId` fields).
 // Writes through the same `agents.defaults.{provider, model.primary}` path
 // the onboard wizard uses, so set-model and onboard stay consistent.
+// Seed the snapshot's "available thinking levels" from a model when no live
+// Pi session exists to ask. Pi's `getAvailableThinkingLevels()` is the source
+// of truth during a turn (it refreshes the cache); this is the between-turns
+// fallback. Reasoning models expose the full ladder; non-reasoning models
+// only "off". Kept deliberately simple — the live session corrects it the
+// moment a turn starts.
+function deriveThinkingLevels(model: Model<string>): string[] {
+	return model?.reasoning ? ["off", "low", "medium", "high"] : ["off"];
+}
+
 function persistDefaultModel(cfg: Config, provider: string, modelId: string): Config {
   const next: Config = { ...cfg };
   const agents = { ...((next.agents as Record<string, unknown> | undefined) ?? {}) } as Record<string, unknown>;
@@ -80,7 +96,8 @@ function persistDefaultModel(cfg: Config, provider: string, modelId: string): Co
 }
 import { type ConsoleStream } from "./console-stream.js";
 import { attachEventLogger, getTodayLogPath } from "./event-logger.js";
-import { pickStreamIdleMs } from "./model-caps.js";
+import { pickInitialThinkingLevel } from "./model-caps.js";
+import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { extractIdentityName, isIdentityNameUnset } from "./system-prompt.js";
 import { existsSync, readFileSync } from "node:fs";
 import { join as joinPath } from "node:path";
@@ -243,51 +260,34 @@ interface BootContinueArgs {
 }
 
 async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
-	const { opts, port, host, startupStartedAt, lockHandle, authStorage, modelRegistry, bootLog, provider, modelId } = args;
+	const { opts, port, host, startupStartedAt, lockHandle, modelRegistry, bootLog } = args;
+
+	// Gateway-held turn parameters. There is NO long-lived Pi session: each
+	// inbound `prompt` builds a fresh session per turn (see the `prompt`
+	// handler). These vars carry the "current selection" between turns and
+	// are mutated by set-model / set-thinking / switch-model-mid-turn. The
+	// next turn reads them when it constructs its session.
+	let provider = args.provider;
+	let modelId = args.modelId;
 	let model = args.model;
+	let thinkingLevel: ThinkingLevel = pickInitialThinkingLevel(model);
 
-	// Build the Pi session. This is the ONLY agent in the server process.
-	//
-	// cwd = workspace dir (NOT the gateway's launch dir).
-	//
-	// Why: openclaw runs its agent with cwd = `~/.openclaw/workspace` and
-	// gets correct bootstrap behaviour where Brigade kept failing. Tracing
-	// openclaw's session log (May 2026, GPT-5.4) confirmed:
-	//   - openclaw's session cwd is the WORKSPACE dir, not the gateway
-	//     launch dir. The system prompt's "Workspace" section reports
-	//     `~/.openclaw/workspace` — a neutral folder, no project bias.
-	//   - The model's reply correctly opens with "I'm your OpenClaw assistant,
-	//     just waking up in this workspace. I don't have a real name yet…"
-	//
-	// Brigade was passing `process.cwd()` here, which (when the gateway
-	// is launched from the Brigade source repo, the natural dogfooding
-	// position) put `C:\...\Brigade` into the prompt's Workspace section.
-	// The model read that as "I'm the assistant for the Brigade project"
-	// and ignored IDENTITY.md every time — across Sonnet 4.6, Haiku 4.5,
-	// GPT-5, all models, even after we put "You are felix" at position 0.
-	//
-	// The trade-off: tools (read/edit/write/bash) now resolve relative
-	// paths against the workspace dir instead of the user's project. For
-	// project-aware coding work, users should use `brigade chat` (which
-	// keeps process.cwd()) or pass absolute paths. The gateway is the
-	// "personal assistant" surface; chat is the "coding agent" surface.
-	const session = await buildAgent({
-		authStorage,
-		modelRegistry,
-		model,
-		cwd: getBrigadeWorkspaceDir(),
-	});
+	// The agent identity + session key the gateway drives. A single
+	// long-lived sessionKey gives conversation continuity across turns:
+	// every turn resumes the same JSONL transcript (the per-turn mirror —
+	// state lives on disk, not in a held session object).
+	const agentId = DEFAULT_AGENT_ID;
+	const sessionKey = defaultSessionKey(agentId);
 
-	// Wrap the long-lived Pi session in a Brigade-native ChatClient.
-	// Post-Phase-5c the gateway uses `client.X` for every read/write
-	// operation; the raw `session` is held only for the event-logger
-	// attachment below (which needs Pi's session.subscribe directly to
-	// stream events to disk). Everything else flows through `client`.
-	const client = makeEmbeddedChatClient({ session });
-
-	// Stream every Pi event to the JSONL log file. Logger silently degrades
-	// on I/O errors so log loss never crashes the server.
-	const detachLogger = attachEventLogger(session);
+	// The in-flight Pi session, surfaced via `runResilientTurn`'s
+	// `onSessionReady` for the DURATION of a turn only. Null between turns.
+	// abort / steer / switch-model-mid-turn / compact operate on it; when
+	// no turn is active they no-op (there is nothing to steer).
+	let inFlightSession: AgentSession | null = null;
+	// Per-turn cleanup: detaches the gateway's Pi-event subscription + the
+	// JSONL event logger for the active turn. Set when a turn starts, called
+	// (idempotently) when it settles.
+	let currentTurnCleanup: (() => void) | null = null;
 
 	// Cumulative usage totals for the state snapshot. Pi reports per-turn
 	// usage on turn_end; we accumulate across turns.
@@ -295,6 +295,43 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	let totalOut = 0;
 	let totalCost = 0;
 	let isAgentRunning = false;
+
+	// Snapshot fields that can only be read from a LIVE Pi session
+	// (context usage %, message count, thinking capabilities). With no
+	// session between turns we cache the last-known values: seeded from the
+	// model at boot, refreshed from the in-flight session during each turn.
+	let lastContextUsagePercent: number | null = null;
+	let lastMessageCount = 0;
+	let cachedSupportsThinking = !!model.reasoning;
+	let cachedThinkingLevels: string[] = deriveThinkingLevels(model);
+
+	// Refresh the session-derived caches from a live Pi session. Called on
+	// every forwarded event during a turn so the snapshot tracks the live
+	// state, and once more as the turn settles so the between-turns snapshot
+	// reflects the final message count / context usage.
+	const refreshCachesFromSession = (s: AgentSession): void => {
+		try {
+			lastMessageCount = s.messages.length;
+		} catch {
+			/* session torn down — keep last value */
+		}
+		try {
+			const usage = s.getContextUsage();
+			if (usage?.percent != null) lastContextUsagePercent = usage.percent;
+		} catch {
+			/* ignore */
+		}
+		try {
+			cachedSupportsThinking = s.supportsThinking();
+		} catch {
+			/* ignore */
+		}
+		try {
+			cachedThinkingLevels = [...s.getAvailableThinkingLevels()];
+		} catch {
+			/* ignore */
+		}
+	};
 
 	/**
 	 * Detect "fresh-bootstrap mode + no turn yet" — the signal that drives
@@ -307,7 +344,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 * complicate the buildSnapshot signature for sub-millisecond savings.
 	 */
 	const computeFirstRunBootstrap = (): boolean => {
-		if (client.messages.length > 0) return false;
+		if (lastMessageCount > 0) return false;
 		const wsDir = getBrigadeWorkspaceDir();
 		try {
 			if (!existsSync(joinPath(wsDir, "BOOTSTRAP.md"))) return false;
@@ -338,20 +375,19 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	};
 
 	const buildSnapshot = (): SessionStateSnapshot => {
-		const usage = client.getContextUsage();
 		return {
 			provider,
 			modelId,
-			modelName: client.model?.name,
-			thinkingLevel: client.thinkingLevel,
-			supportsThinking: client.supportsThinking(),
-			availableThinkingLevels: [...client.getAvailableThinkingLevels()],
-			contextUsagePercent: usage?.percent ?? null,
+			modelName: model?.name,
+			thinkingLevel,
+			supportsThinking: cachedSupportsThinking,
+			availableThinkingLevels: cachedThinkingLevels,
+			contextUsagePercent: lastContextUsagePercent,
 			totalTokensIn: totalIn,
 			totalTokensOut: totalOut,
 			totalCostUsd: totalCost,
 			isAgentRunning,
-			messageCount: client.messages.length,
+			messageCount: lastMessageCount,
 			firstRunBootstrap: computeFirstRunBootstrap(),
 			agentName: computeAgentName(),
 		};
@@ -389,25 +425,65 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		}
 	};
 
-	/* ──────────────── pi event forwarding ──────────────── */
+	/* ──────────────── per-turn pi event forwarding ──────────────── */
 
-	const detachPi = client.subscribe((piEvent: AgentSessionEvent) => {
-		if (piEvent.type === "agent_start") isAgentRunning = true;
-		if (piEvent.type === "agent_end") isAgentRunning = false;
-		if (piEvent.type === "turn_end") {
-			const usage = (piEvent as any).message?.usage;
-			if (usage) {
-				totalIn += usage.input ?? 0;
-				totalOut += usage.output ?? 0;
-				totalCost += usage.cost ?? 0;
+	// Wire a fresh per-turn Pi session into the gateway's broadcast +
+	// logging plumbing. Called from the `prompt` handler's `onSessionReady`
+	// the moment `runResilientTurn` finishes constructing the session (after
+	// persona injection + guard install, before the model call). Returns a
+	// cleanup that detaches both the Pi subscription and the JSONL logger;
+	// the prompt handler calls it when the turn settles so nothing leaks
+	// across turns (the per-turn mirror — no subscription outlives its turn).
+	const attachTurnSession = (session: AgentSession): (() => void) => {
+		inFlightSession = session;
+		// Stream this turn's Pi events to the JSONL log file. Logger silently
+		// degrades on I/O errors so log loss never crashes the server.
+		const detachLogger = attachEventLogger(session);
+		const detachPi = session.subscribe((piEvent: AgentSessionEvent) => {
+			// NOTE: `isAgentRunning` is owned by the `prompt` handler's
+			// try/finally — NOT by Pi's per-run agent_start/agent_end. A single
+			// logical turn fires multiple `session.prompt()` runs (content-quality
+			// retry, thinking-fallback, max_tokens continuations), each emitting
+			// its own agent_start/agent_end. Toggling the flag here would flap it
+			// false mid-turn, flicker the connect header, and re-open the
+			// single-turn concurrency guard. We only forward the events.
+			if (piEvent.type === "turn_end") {
+				const usage = (piEvent as any).message?.usage;
+				if (usage) {
+					totalIn += usage.input ?? 0;
+					totalOut += usage.output ?? 0;
+					totalCost += usage.cost ?? 0;
+				}
 			}
-		}
-		// Live console stream (verbose mode). Mirrors the JSONL file but
-		// human-readable. Same event sequence in both places.
-		opts.consoleStream?.pi(piEvent);
-		broadcast("pi", { event: piEvent });
-		broadcast("state", buildSnapshot());
-	});
+			// Keep the between-turns snapshot caches (message count, context
+			// usage %, thinking caps) tracking the live session.
+			refreshCachesFromSession(session);
+			// Live console stream (verbose mode). Mirrors the JSONL file but
+			// human-readable. Same event sequence in both places.
+			opts.consoleStream?.pi(piEvent);
+			broadcast("pi", { event: piEvent });
+			broadcast("state", buildSnapshot());
+		});
+		let cleaned = false;
+		return () => {
+			if (cleaned) return;
+			cleaned = true;
+			try {
+				detachPi();
+			} catch {
+				/* session may already be torn down */
+			}
+			try {
+				detachLogger();
+			} catch {
+				/* ignore */
+			}
+			// Final cache refresh so the idle snapshot reflects the settled
+			// turn, then drop the session reference (no session between turns).
+			refreshCachesFromSession(session);
+			if (inFlightSession === session) inFlightSession = null;
+		};
+	};
 
 	// Lifecycle bus subscriber (Phase 5b): translate `runBrigadeTurnLoop`
 	// events into broadcast("log", ...) frames so connect-mode TUI clients
@@ -516,47 +592,79 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		switch (method) {
 			case "prompt": {
 				const p = params as RequestParams["prompt"];
-				// Resolve fallback model fresh per turn — the user may have
-				// edited config (or rotated keys) between turns. F:\Brigade's
-				// new shape: `agents.defaults.model.fallbacks[]` (string array).
-				const cfgNow = await loadConfig();
-				const wizardNow = (cfgNow.agents as { defaults?: { provider?: string; model?: { fallbacks?: string[] } } } | undefined)?.defaults;
-				const fallbackProvider = wizardNow?.provider;
-				const fallbackModelId = wizardNow?.model?.fallbacks?.[0];
-				const fallbackModel =
-					fallbackProvider && fallbackModelId
-						? modelRegistry.find(fallbackProvider, fallbackModelId)
-						: undefined;
-
-				// Drive the turn through `client.prompt`, which routes to
-				// `runBrigadeTurnLoop` (the canonical Brigade safety stack:
-				// fallback → heartbeat → stream-timeout → length-continue →
-				// content-quality retry → thinking-fallback → session.prompt).
-				// Lifecycle status events fire on the agent-event bus; the
-				// subscriber below translates them into `broadcast("log", ...)`
-				// frames so connect-mode TUI clients see the same status
-				// messages they used to receive from the inline composition.
-				await client.prompt(p.text, {
-					fallbacks: fallbackModel ? [{ model: fallbackModel }] : [],
-				});
+				// One turn at a time. The per-turn model resumes a single
+				// shared transcript by sessionKey, so two overlapping prompts
+				// would interleave appends to the same JSONL. Reject the second.
+				//
+				// Claim the turn SYNCHRONOUSLY — set `isAgentRunning` immediately
+				// after the guard check, before the first `await`. Otherwise two
+				// prompts arriving in the same tick both pass the check (the
+				// `await loadConfig()` below yields the event loop between them)
+				// and both start. The flag is owned here, top to bottom (NOT by
+				// Pi's per-run agent_end — see the per-turn subscription note).
+				if (isAgentRunning) throw new Error("a turn is already in progress");
+				isAgentRunning = true;
 				broadcast("state", buildSnapshot());
+				try {
+					// Resolve fallback model fresh per turn — the user may have
+					// edited config (or rotated keys) between turns. F:\Brigade's
+					// new shape: `agents.defaults.model.fallbacks[]` (string array).
+					const cfgNow = await loadConfig();
+					const wizardNow = (cfgNow.agents as { defaults?: { provider?: string; model?: { fallbacks?: string[] } } } | undefined)?.defaults;
+					const fallbackProvider = wizardNow?.provider;
+					const fallbackModelId = wizardNow?.model?.fallbacks?.[0];
+					const fallbacks =
+						fallbackProvider && fallbackModelId && modelRegistry.find(fallbackProvider, fallbackModelId)
+							? [{ provider: fallbackProvider, modelId: fallbackModelId }]
+							: [];
+
+					// Build a FRESH session for this turn via the single canonical
+					// per-turn path. `runResilientTurn` resolves auth + model,
+					// resumes the JSONL transcript by sessionKey, runs the full
+					// Brigade safety stack (retry → thinking-fallback → content
+					// quality → stream wrappers → multi-model fallback), and drops
+					// the session when it settles. `onSessionReady` hands us the
+					// session for its lifetime so abort/steer/switch-model-mid-turn
+					// have something to act on; we tear the wiring down in finally.
+					await runResilientTurn({
+						agentId,
+						provider,
+						modelId,
+						message: p.text,
+						sessionKey,
+						thinkingLevel: thinkingLevel as "off" | "low" | "medium" | "high",
+						fallbacks,
+						onSessionReady: (session) => {
+							// A fallback candidate builds a fresh session; tear
+							// down the previous candidate's wiring before attaching.
+							if (currentTurnCleanup) currentTurnCleanup();
+							currentTurnCleanup = attachTurnSession(session);
+						},
+					});
+				} finally {
+					if (currentTurnCleanup) {
+						currentTurnCleanup();
+						currentTurnCleanup = null;
+					}
+					inFlightSession = null;
+					isAgentRunning = false;
+					broadcast("state", buildSnapshot());
+				}
 				return undefined as ResponseFor[M];
 			}
 			case "abort": {
-				await client.abort().catch(() => {});
+				// Abort only means something mid-turn. With no held session,
+				// abort the in-flight one if present; otherwise harmless no-op.
+				if (inFlightSession) await inFlightSession.abort().catch(() => {});
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
 			}
 			case "steer": {
 				const p = params as RequestParams["steer"];
-				// `client.steer({text})` wraps the text into Pi's
-				// `{role:"user", content:[{type:"text",text}]}` shape internally
-				// — same as the previous `session.agent.steer({...})` call.
-				// Awaited so async errors (invalid encoding, transcript I/O)
-				// surface as RPC failures to the caller instead of dropping
-				// silently and leaving the user waiting for a steer that
-				// never landed.
-				await client.steer({ text: p.text });
+				// Steer injects a mid-turn user message. Only valid while a turn
+				// is active — there's no session to enqueue into otherwise.
+				if (!inFlightSession) throw new Error("nothing to steer — no turn in progress");
+				await inFlightSession.steer(p.text);
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
 			}
@@ -564,8 +672,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const p = params as RequestParams["set-model"];
 				const target = modelRegistry.find(p.provider, p.modelId);
 				if (!target) throw new Error(`model ${p.provider}/${p.modelId} not found`);
-				await client.setModel(target);
+				// No live session to mutate — update the gateway's current
+				// selection so the NEXT turn builds with this model. Re-pick a
+				// safe thinking level (reasoning models reject "off") + refresh
+				// the snapshot's thinking caps from the new model.
+				provider = p.provider;
+				modelId = p.modelId;
 				model = target;
+				thinkingLevel = pickInitialThinkingLevel(target);
+				cachedSupportsThinking = !!target.reasoning;
+				cachedThinkingLevels = deriveThinkingLevels(target);
 				await saveConfig(persistDefaultModel(await loadConfig(), p.provider, p.modelId));
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
@@ -574,20 +690,51 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const p = params as RequestParams["switch-model-mid-turn"];
 				const target = modelRegistry.find(p.provider, p.modelId);
 				if (!target) throw new Error(`model ${p.provider}/${p.modelId} not found`);
-				await client.switchModelMidTurn(target, p.replayMessage);
+				// A live mid-turn switch (abort → swap → replay) only applies
+				// when a turn is actually running. If one is, perform it on the
+				// in-flight session; either way, update the gateway selection so
+				// subsequent turns continue on the new model.
+				if (inFlightSession) {
+					await piSwitchModelMidTurn(inFlightSession, target, p.replayMessage);
+				}
+				provider = p.provider;
+				modelId = p.modelId;
 				model = target;
+				thinkingLevel = pickInitialThinkingLevel(target);
+				cachedSupportsThinking = !!target.reasoning;
+				cachedThinkingLevels = deriveThinkingLevels(target);
 				await saveConfig(persistDefaultModel(await loadConfig(), p.provider, p.modelId));
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
 			}
 			case "set-thinking": {
 				const p = params as RequestParams["set-thinking"];
-				client.setThinkingLevel(p.level as never);
+				// Update the gateway's current level; the next turn passes it
+				// into its session. If a turn is live, set it on the in-flight
+				// session too so it takes effect immediately. Pi clamps to the
+				// model's capabilities either way.
+				thinkingLevel = p.level as ThinkingLevel;
+				if (inFlightSession) {
+					try {
+						inFlightSession.setThinkingLevel(p.level as never);
+					} catch {
+						/* clamp / unsupported — snapshot still reflects intent */
+					}
+				}
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
 			}
 			case "compact": {
-				await client.compact();
+				// Compaction operates on a live session. Between turns there's
+				// nothing loaded — compaction auto-triggers at the start of the
+				// next turn when usage crosses the threshold (maybeTriggerCompaction
+				// in agent-loop.ts). If a turn IS live, compact it now.
+				if (!inFlightSession) {
+					throw new Error(
+						"nothing to compact yet — compaction runs during a turn and auto-triggers near the context limit",
+					);
+				}
+				await (inFlightSession as AgentSession & { compact?: () => Promise<unknown> }).compact?.();
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
 			}
@@ -769,9 +916,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		host,
 		async stop() {
 			clearInterval(tickTimer);
-			detachPi();
+			// Tear down any in-flight turn's Pi subscription + JSONL logger.
+			// Between turns there's nothing attached, so this is a no-op then.
+			if (currentTurnCleanup) {
+				currentTurnCleanup();
+				currentTurnCleanup = null;
+			}
+			// Best-effort abort of a turn that's still streaming at shutdown.
+			if (inFlightSession) await inFlightSession.abort().catch(() => {});
 			detachLifecycleBus();
-			detachLogger();
 			for (const ws of clients) {
 				try {
 					ws.close();

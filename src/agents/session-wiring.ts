@@ -1,22 +1,23 @@
 /**
- * Shared Brigade session-wiring — the single source of truth for the tool
- * surface + the `beforeToolCall` guard chain that EVERY Brigade agent
- * session gets, regardless of which surface created it.
+ * Brigade session-wiring — the single source of truth for the tool surface
+ * + the `beforeToolCall` guard chain that EVERY Brigade agent session gets.
  *
- * Why this exists: Brigade briefly had two divergent session builders —
- * `core/agent.ts:buildAgent` (the long-lived session used by the TUI and
- * the gateway) and `agents/agent-loop.ts:runSingleTurn` (the per-turn
- * session used by `brigade agent`). They drifted: the interactive path was
- * missing the memory tools (Primitive #4), the exec-gate + loop-detector
- * (Primitive #3), and the full tool list — so the surfaces the operator
- * actually uses ran a gutted agent loop with UNGATED bash and no memory.
+ * History: Brigade briefly had two divergent session builders — a long-lived
+ * `buildAgent` (TUI + gateway) and the per-turn `runSingleTurn` (`brigade
+ * agent`). They drifted: the interactive path was missing the memory tools
+ * (Primitive #4), the exec-gate + loop-detector (Primitive #3), and the full
+ * tool list — so the surfaces the operator actually used ran a gutted agent
+ * loop with UNGATED bash and no memory.
  *
- * OpenClaw has exactly ONE construction path (`runEmbeddedAttempt` → a
- * single `createAgentSession`) that every surface funnels through. These
- * helpers are Brigade's equivalent: both builders call them so the tool
- * set + guards are identical everywhere. Per-provider behaviour stays in
- * the stream-fn wrappers (see `stream-wrappers.ts`) — never per-model loop
- * branching, mirroring OpenClaw's "one loop + provider adapters" shape.
+ * That divergence is gone. There is now exactly ONE construction path —
+ * `agents/agent-loop.ts:runSingleTurn` → a single `createAgentSession` — and
+ * every surface funnels through it: `brigade agent` calls it directly, and
+ * the gateway (which `brigade chat` / `brigade connect` are thin WebSocket
+ * clients of) runs it once per turn. This mirrors OpenClaw's single
+ * `runEmbeddedAttempt`. These helpers are factored out of that one path so
+ * the tool set + guards stay legible and unit-testable; per-provider
+ * behaviour lives in the stream-fn wrappers (see `stream-wrappers.ts`),
+ * never per-model loop branching — OpenClaw's "one loop + provider adapters".
  */
 
 import { makeExecGate } from "./exec-gate.js";

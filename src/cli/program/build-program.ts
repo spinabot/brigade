@@ -78,12 +78,14 @@ export function buildProgram(): Command {
 
   program
     .command("tui", { isDefault: true })
-    .description("Launch the in-process Brigade chat TUI (default subcommand)")
+    .description("Launch the Brigade chat TUI (auto-starts the gateway if needed)")
     // Same Commander `--no-X` pattern as `onboard` above — no third arg.
     .option("--no-env-detect", "ignore API keys from the shell environment")
-    .action(async (opts: { envDetect?: boolean }) => {
+    .option("-h, --host <host>", "gateway host to connect to / spawn on (default: 127.0.0.1)")
+    .option("-p, --port <port>", "gateway port (default: 7777)", (v) => parseInt(v, 10))
+    .action(async (opts: { envDetect?: boolean; host?: string; port?: number }) => {
       const { runChatCommand } = await import("../commands/chat.js");
-      await runChatCommand({ noEnvDetect: opts.envDetect === false });
+      await runChatCommand({ noEnvDetect: opts.envDetect === false, host: opts.host, port: opts.port });
       // Hold the action handler open — `runChatCommand` resolves once the
       // editor is wired; without this pin, entry.ts's `process.exit(0)`
       // would kill the chat before the user could type. The chat itself

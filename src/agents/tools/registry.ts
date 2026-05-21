@@ -2,14 +2,15 @@
  * Brigade tool registry.
  *
  * Factory that builds the array of Brigade-native custom tools passed to
- * Pi's `createAgentSession({customTools})` slot. Today (Primitive #3 v1)
- * the registry is empty — Pi's 5 built-in tools (`read`, `bash`, `edit`,
- * `write`, `grep`) cover the v1 surface, and the 3 Brigade-native tools
- * (`write_memory`, `recall_memory`, `spawn_agent`) ship in Primitives
- * #4-6 alongside their respective primitives.
+ * Pi's `createAgentSession({customTools})` slot. Today it returns the two
+ * Primitive #4 memory read tools — `recall_memory` (lexical search across
+ * memory files) and `read_memory` (fetch a specific file) — alongside Pi's
+ * built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`).
+ * The remaining Brigade-native tools (`write_memory`, `spawn_agent`) ship
+ * with their primitives (#4 write path, #6 sub-agents).
  *
- * The factory is plumbed through to `agent-loop.ts` and `core/agent.ts`
- * now so that adding a tool later is a one-line change in
+ * The factory is plumbed through `session-wiring.ts` (the single
+ * tool-assembly seam) so adding a tool later is a one-line change in
  * `createBrigadeTools` rather than a multi-file rewire.
  *
  * Mirrors OpenClaw's pattern at `src/agents/openclaw-tools.ts:51-114`
