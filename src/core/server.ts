@@ -314,7 +314,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// model call, so the per-turn path stays at a single call. This is the
 	// scalable shape (OpenClaw-style off-hot-path + batching) over Boop's
 	// extraction algorithm — see agents/memory/extract.ts. Kill-switch:
-	// BRIGADE_DISABLE_MEMORY_EXTRACT=1.
+	// BRIGADE_DISABLE_MEMORY_EXTRACT=1 turns off the ENTIRE background memory
+	// sweep — extraction AND the decay GC AND consolidation that ride in the
+	// same quiet window (runDecayGc + runConsolidation live inside
+	// runExtractionNow below). This is intentional: disabling background memory
+	// processing freezes the fact store wholesale rather than letting decay keep
+	// silently ageing out facts the user can no longer see being replenished.
 	const memoryExtractEnabled = process.env.BRIGADE_DISABLE_MEMORY_EXTRACT !== "1";
 	const EXTRACT_DEBOUNCE_MS = 45_000;
 	let extractTimer: ReturnType<typeof setTimeout> | null = null;

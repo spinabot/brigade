@@ -177,6 +177,13 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
     // with `brigade:` and returns the right exit code for entry.ts to
     // surface. The try/finally exists only to clean up the signal
     // listeners regardless of outcome.
+    //
+    // NOTE: this headless CLI turn deliberately does NOT schedule background
+    // memory extraction/decay/consolidation — that debounced sweep is owned by
+    // the long-lived gateway (see core/server.ts runExtractionNow), since a
+    // one-shot CLI process exits before any 45s debounce could fire. Auto-recall
+    // still injects facts here (it's synchronous), and `brigade chat` routes
+    // through the gateway, so interactive use is fully covered.
     result = await runSingleTurn({
       agentId,
       provider,
