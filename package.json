@@ -9,6 +9,10 @@
   "main": "dist/entry.js",
   "exports": {
     ".": "./brigade.mjs",
+    "./extension-sdk": {
+      "types": "./dist/extension-sdk.d.ts",
+      "import": "./dist/extension-sdk.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

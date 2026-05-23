@@ -60,8 +60,10 @@ import {
 // session is surfaced for the turn's lifetime via `onSessionReady` so the
 // gateway can steer / abort / switch-model mid-stream.
 import { runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop.js";
-import { BUNDLED_MODULES, loadModules } from "../agents/extensions/index.js";
+import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
+import type { HttpRouteHandler, Service } from "../agents/extensions/index.js";
 import { type ChannelManager, startChannels } from "../agents/channels/manager.js";
+import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { switchModelMidTurn as piSwitchModelMidTurn } from "../agents/mid-turn-switch.js";
 import { onAgentEvent } from "../agents/agent-event-bus.js";
@@ -313,6 +315,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// Channel manager (WhatsApp/Slack/…): started after the WS listener is up
 	// (see below), torn down in handle.stop(). Null when no channel is configured.
 	let channelManager: ChannelManager | undefined;
+
+	// Extension registry + the product capabilities it yields (services, HTTP
+	// routes, gateway methods). Populated in Phase 11 after the listener is up.
+	// `customMethods` is consulted by the request dispatcher's default branch so
+	// module-registered RPCs resolve; `serviceAbort` stops background services.
+	let extensionRegistry: BrigadeExtensionRegistry | undefined;
+	let customMethods = new Map<string, (params: unknown) => Promise<unknown> | unknown>();
+	let httpRoutes: { method?: string; path: string; handler: HttpRouteHandler }[] = [];
+	const startedServices: { id: string; service: Service }[] = [];
+	let serviceAbort: AbortController | undefined;
 
 	// Set true once handle.stop() begins, so background work (memory extraction
 	// debounce) doesn't re-arm timers or run sweeps against a torn-down server.
@@ -938,8 +950,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				});
 				return undefined as ResponseFor[M];
 			}
-			default:
+			default: {
+				// Module-registered gateway methods (extensions). These don't appear
+				// in the static RequestMethod union, so they resolve here.
+				const custom = customMethods.get(method as string);
+				if (custom) return (await custom(rawParams)) as ResponseFor[M];
 				throw new Error(`unknown method: ${method}`);
+			}
 		}
 	};
 
@@ -1077,23 +1094,133 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// `log file: <path>` line (`src/gateway/server-startup-log.ts:33`).
 	bootLog(`log file: ${getTodayLogPath()}`);
 
-	// Phase 11 — channels. Load the extension registry for its product-level
-	// channel adapters and start any that are configured. Inbound messages run
-	// through the SAME serialized turn queue as TUI prompts (`runGatewayTurn`),
-	// so a channel turn never overlaps a TUI turn. A channel that isn't
-	// configured (or fails to start) is skipped — never fatal to the gateway.
-	try {
-		const cfgForChannels = await loadConfig();
+	// HTTP request handler for module-registered routes. Attached once; it reads
+	// the live `httpRoutes` list, so a reload swaps routes without re-binding.
+	// WS upgrades use the separate 'upgrade' event and are unaffected.
+	httpServer.on("request", (req, res) => {
+		void (async () => {
+			try {
+				const reqPath = (req.url ?? "").split("?")[0];
+				const route = httpRoutes.find((r) => r.path === reqPath && (!r.method || r.method === req.method));
+				if (!route) {
+					res.statusCode = 404;
+					res.end("Not found");
+					return;
+				}
+				await route.handler(req, res);
+			} catch (err) {
+				opts.consoleStream?.info?.(`http route error: ${err instanceof Error ? err.message : String(err)}`);
+				if (!res.headersSent) {
+					res.statusCode = 500;
+					res.end("Internal error");
+				}
+			}
+		})();
+	});
+
+	// A module's start()/stop() must never wedge boot, reload, or shutdown — cap
+	// each. On timeout we log + move on (the straggler is left running; the race
+	// keeps it handled — see extension-lifecycle.ts).
+	const SERVICE_START_TIMEOUT_MS = 15_000;
+	const SERVICE_STOP_TIMEOUT_MS = 10_000;
+
+	// Serialize ALL extension-lifecycle ops (initial start + every reload) onto
+	// one chain. Without this, a `system.reload` racing boot — or two concurrent
+	// reloads — would build two registries, double-start services, and leak a
+	// channel manager (start a second WhatsApp socket while the first is never
+	// stopped). The chain guarantees stop→start runs atomically, one at a time.
+	const queueExtensionsOp = makeOpQueue();
+
+	// Stop every started product capability (channels + services). Idempotent;
+	// used by both shutdown and reload.
+	const stopExtensions = async (): Promise<void> => {
+		if (channelManager) {
+			await channelManager.stop().catch(() => {});
+			channelManager = undefined;
+		}
+		if (serviceAbort) {
+			serviceAbort.abort();
+			serviceAbort = undefined;
+		}
+		for (const { id, service } of startedServices.splice(0)) {
+			try {
+				await withTimeout(Promise.resolve(service.stop()), SERVICE_STOP_TIMEOUT_MS, `service ${id} stop`);
+			} catch (err) {
+				opts.consoleStream?.info?.(`service ${id} stop error: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
+	};
+
+	// Load the extension registry and start/mount everything it yields: channels,
+	// background services, HTTP routes, gateway methods, plus a built-in
+	// `system.capabilities` / `system.reload` RPC. Best-effort — a module failure
+	// never stops the gateway. Reusable so `system.reload` can re-run it.
+	const startExtensions = async (): Promise<void> => {
+		if (serverStopped) return; // a reload queued after shutdown must not restart anything
+		const cfg = await loadConfig();
 		const workspaceDir = resolveAgentWorkspaceDir(agentId);
 		const registry = await loadModules({
 			modules: BUNDLED_MODULES,
-			meta: { agentId, workspaceDir, cwd: workspaceDir, config: cfgForChannels as never },
+			meta: { agentId, workspaceDir, cwd: workspaceDir, config: cfg as never },
 		});
+		extensionRegistry = registry;
+
+		// Gateway methods: module-registered RPCs + two built-ins. The `system.`
+		// prefix is reserved for built-ins — a module that uses it would be
+		// silently overwritten below, so warn instead of failing quietly.
+		for (const m of registry.gatewayMethods) {
+			if (m.name.startsWith("system.")) {
+				bootLog(`extension gateway method "${m.name}" ignored — the "system." prefix is reserved`);
+			}
+		}
+		const methods = new Map<string, (params: unknown) => Promise<unknown> | unknown>(
+			registry.gatewayMethods.filter((m) => !m.name.startsWith("system.")).map((m) => [m.name, m.handler]),
+		);
+		methods.set("system.capabilities", () => ({
+			channels: registry.channels.map((c) => c.id),
+			voice: {
+				tts: registry.speechProviders.map((p) => p.id),
+				stt: registry.transcriptionProviders.map((p) => p.id),
+			},
+			media: registry.mediaGenProviders.map((p) => p.id),
+			integrations: registry.integrations.map((i) => i.id),
+			services: registry.services.map((s) => s.id),
+			httpRoutes: registry.httpRoutes.map((r) => ({ method: r.method ?? "ANY", path: r.path })),
+			gatewayMethods: registry.gatewayMethods.map((m) => m.name),
+			modules: registry.loadedModules.map((m) => m.id),
+		}));
+		methods.set("system.reload", () =>
+			// Serialized onto the extension-lifecycle chain — can't race boot or
+			// another reload (no double-start / leaked channel manager).
+			queueExtensionsOp(async () => {
+				await stopExtensions();
+				clearDiscoveryCache(); // re-scan ~/.brigade/extensions on reload
+				await startExtensions();
+				for (const m of extensionRegistry?.loadedModules ?? []) {
+					try {
+						await m.reload?.();
+					} catch (err) {
+						opts.consoleStream?.info?.(
+							`module ${m.id} reload error: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
+				}
+				return { ok: true };
+			}),
+		);
+		customMethods = methods;
+
+		// HTTP routes — swap in the live list the request handler reads.
+		httpRoutes = registry.httpRoutes.map((r) => ({ method: r.method, path: r.path, handler: r.handler }));
+
+		// Channels — inbound runs through the SAME serialized turn queue as TUI
+		// prompts (`runGatewayTurn`), so a channel turn never overlaps a TUI turn.
 		if (registry.channels.length > 0) {
 			channelManager = await startChannels({
 				adapters: registry.channels,
-				config: cfgForChannels as never,
+				config: cfg as never,
 				agentId,
+				commands: registry.channelCommands,
 				runTurn: (turn) => runGatewayTurn(turn),
 				onPairing: (channelId, info) => {
 					const line =
@@ -1104,13 +1231,56 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					broadcast("log", { level: "info", message: line, at: Date.now() });
 				},
 			});
-			if (channelManager.started.length > 0) {
-				bootLog(`channels: ${channelManager.started.join(", ")}`);
-			}
+			if (channelManager.started.length > 0) bootLog(`channels: ${channelManager.started.join(", ")}`);
 		}
+
+		// Background services — start each; a failing one is skipped, not fatal.
+		if (registry.services.length > 0) {
+			serviceAbort = new AbortController();
+			for (const service of registry.services) {
+				// Track BEFORE awaiting start so a hung/slow start is still stopped on
+				// teardown (its abort signal fires, and stop() is attempted).
+				startedServices.push({ id: service.id, service });
+				try {
+					await withTimeout(
+						Promise.resolve(
+							service.start({
+								signal: serviceAbort.signal,
+								log: (msg, m) =>
+									opts.consoleStream?.info?.(`[${service.id}] ${msg}${m ? ` ${JSON.stringify(m)}` : ""}`),
+							}),
+						),
+						SERVICE_START_TIMEOUT_MS,
+						`service ${service.id} start`,
+					);
+				} catch (err) {
+					bootLog(`service ${service.id} failed to start: ${err instanceof Error ? err.message : String(err)}`);
+				}
+			}
+			if (startedServices.length > 0) bootLog(`services: ${startedServices.map((s) => s.id).join(", ")}`);
+		}
+
+		// Surface the rest so voice/media/integration/route/method registrations
+		// are visible (and the registries are genuinely consumed, not dead).
+		const caps: string[] = [];
+		if (registry.speechProviders.length) caps.push(`tts:${registry.speechProviders.map((p) => p.id).join("/")}`);
+		if (registry.transcriptionProviders.length)
+			caps.push(`stt:${registry.transcriptionProviders.map((p) => p.id).join("/")}`);
+		if (registry.mediaGenProviders.length) caps.push(`media:${registry.mediaGenProviders.map((p) => p.id).join("/")}`);
+		if (registry.integrations.length) caps.push(`integrations:${registry.integrations.map((i) => i.id).join("/")}`);
+		if (registry.httpRoutes.length) caps.push(`http:${registry.httpRoutes.length}`);
+		if (registry.gatewayMethods.length) caps.push(`rpc:${registry.gatewayMethods.length}`);
+		if (caps.length) bootLog(`capabilities: ${caps.join(" ")}`);
+	};
+
+	// Phase 11 — extensions. Load the registry + start product capabilities.
+	// Routed through the lifecycle queue so a `system.reload` arriving during
+	// boot serializes AFTER this initial start (never concurrently).
+	try {
+		await queueExtensionsOp(startExtensions);
 	} catch (err) {
-		// Channels are best-effort — a failure here must not stop the gateway.
-		bootLog(`channels failed to start: ${err instanceof Error ? err.message : String(err)}`);
+		// Best-effort — an extension failure must not stop the gateway.
+		bootLog(`extensions failed to start: ${err instanceof Error ? err.message : String(err)}`);
 	}
 
 	// Write the PID file AFTER the listen succeeded so a failed-to-bind boot
@@ -1131,11 +1301,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			clearInterval(tickTimer);
 			if (extractTimer) clearTimeout(extractTimer);
 			pendingExtracts.clear();
-			// Stop channels first so no new inbound turn is enqueued during teardown.
-			if (channelManager) {
-				await channelManager.stop().catch(() => {});
-				channelManager = undefined;
-			}
+			// Stop all product capabilities (channels + services) first so no new
+			// inbound turn is enqueued during teardown. Routed through the lifecycle
+			// queue so it can't race an in-flight `system.reload`.
+			await queueExtensionsOp(stopExtensions).catch(() => {});
 			// Best-effort abort of a turn that's still streaming, then WAIT for the
 			// turn queue to drain so an in-flight (or just-queued) turn's finally —
 			// cleanup, broadcast, scheduleExtraction — can't run against a

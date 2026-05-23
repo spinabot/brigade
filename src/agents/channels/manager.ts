@@ -16,7 +16,7 @@
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import type { BrigadeConfig } from "../../config/io.js";
-import type { ChannelAdapter, ChannelStartContext, InboundMessage } from "../extensions/types.js";
+import type { ChannelAdapter, ChannelCommand, ChannelStartContext, InboundMessage } from "../extensions/types.js";
 import { channelSessionKey } from "./session-key.js";
 
 const log = createSubsystemLogger("channels/manager");
@@ -39,6 +39,8 @@ export interface StartChannelsArgs {
 	 * reply text to send back to the conversation.
 	 */
 	runTurn: (args: { text: string; sessionKey: string }) => Promise<ChannelTurnResult>;
+	/** Channel commands (`/name`) handled before the LLM. */
+	commands?: ChannelCommand[];
 	/** Injected env for gating (tests); defaults to process.env. */
 	env?: NodeJS.ProcessEnv;
 	/** Surface a pairing code / QR to the operator (e.g. WhatsApp first-link). */
@@ -61,6 +63,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 	const env = args.env ?? process.env;
 	const abort = new AbortController();
 	const started: { id: string; adapter: ChannelAdapter }[] = [];
+	const commandMap = new Map((args.commands ?? []).map((c) => [c.name.toLowerCase(), c]));
 
 	for (const adapter of args.adapters) {
 		// Gate: required env present AND the adapter says it's configured.
@@ -92,6 +95,30 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 				try {
 					const text = msg.text?.trim();
 					if (!text) return; // nothing to answer (sticker / empty / system event)
+					// Channel command (`/name ...`) — handled before the LLM. Unknown
+					// commands fall through to a normal turn so plain "/" text isn't eaten.
+					if (text.startsWith("/") && commandMap.size > 0) {
+						const space = text.indexOf(" ");
+						const name = (space === -1 ? text.slice(1) : text.slice(1, space)).toLowerCase();
+						const command = commandMap.get(name);
+						if (command) {
+							const cmdCtx = {
+								channel: adapter.id,
+								conversationId: msg.conversationId,
+								from: msg.from,
+								fromName: msg.fromName,
+								args: space === -1 ? "" : text.slice(space + 1).trim(),
+								config: args.config,
+							};
+							if (command.authorize && !command.authorize(cmdCtx)) {
+								await adapter.sendText(msg.conversationId, "Not authorized to run that command.");
+								return;
+							}
+							const out = await command.handler(cmdCtx);
+							if (typeof out === "string" && out.trim()) await adapter.sendText(msg.conversationId, out.trim());
+							return; // command handled — no turn
+						}
+					}
 					const sessionKey = channelSessionKey(args.agentId, adapter.id, msg.conversationId);
 					const result = await args.runTurn({ text, sessionKey });
 					const reply = result.reply?.trim();

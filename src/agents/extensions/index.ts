@@ -12,13 +12,21 @@ export type {
 	BrigadeExtensionContext,
 	BrigadeModule,
 	ChannelAdapter,
+	ChannelCommand,
+	ChannelCommandContext,
 	ChannelStartContext,
+	GatewayMethodHandler,
+	HttpRoute,
+	HttpRouteHandler,
 	InboundMessage,
 	Integration,
 	MediaGenProvider,
+	Service,
+	ServiceStartContext,
 	SpeechProvider,
 	TranscriptionProvider,
 } from "./types.js";
 export { BrigadeExtensionRegistry, type RegistryContextMeta } from "./registry.js";
+export { clearDiscoveryCache, discoverUserModules, type DiscoveredModule } from "./discovery.js";
 export { loadModules, type LoadModulesArgs } from "./loader.js";
 export { BUNDLED_MODULES } from "./modules/index.js";

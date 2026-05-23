@@ -10,13 +10,21 @@
  * `ExtensionFactory`, and hands the product-level ones to the gateway.
  *
  * THE NO-REWRITE GUARANTEE: every capability contract below is fixed HERE, once.
- * Adding ElevenLabs TTS, Whisper STT, a Slack channel, or a new API later means
- * writing a module that implements the contract + calls `b.tts(...)` / `b.channel(...)`
- * — existing code never changes. Implementations land per phase; the seam doesn't move.
+ * Adding a Slack channel, a background service, an HTTP webhook, or an RPC method
+ * means writing a module that calls `b.channel(...)` / `b.service(...)` /
+ * `b.httpRoute(...)` / `b.gatewayMethod(...)` — the gateway already consumes those
+ * registries, so existing code never changes. Voice (`b.tts`/`b.stt`) and media
+ * (`b.mediaGen`) contracts are likewise fixed; the gateway surfaces them today via
+ * `system.capabilities`, and the turn-time synthesis/transcription wiring lands
+ * with the Voice/Media phase against these same shapes.
  *
  * Provides a full plugin-API register surface, but realized as Pi extensions +
  * light capability registries instead of a bespoke engine.
  */
+
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+import type { TSchema } from "typebox";
 
 import type { BrigadeConfig } from "../../config/io.js";
 import type { AnyBrigadeTool } from "../tools/types.js";
@@ -72,6 +80,39 @@ export interface ChannelAdapter {
 	sendText(conversationId: string, text: string): Promise<void>;
 }
 
+/** Context for a channel command handler (a `/cmd` typed in a channel chat). */
+export interface ChannelCommandContext {
+	/** Channel id the command came from. */
+	channel: string;
+	/** Conversation/chat id (where to reply). */
+	conversationId: string;
+	/** Sender id within the channel. */
+	from: string;
+	/** Sender display name, when known. */
+	fromName?: string;
+	/** Text after the command word, trimmed (e.g. `/echo hi there` → `hi there`). */
+	args: string;
+	/** Active config (for the handler to read its own settings / owner list). */
+	config: BrigadeConfig;
+}
+
+/**
+ * A channel command — a `/name ...` message handled BEFORE the LLM, returning a
+ * direct reply. Distinct from a Pi interactive slash-command (`b.command`),
+ * which is TUI-only. Auth is
+ * the command's own concern via `authorize` (Brigade has no channel ACL yet);
+ * default is allow-all, so gate sensitive commands explicitly.
+ */
+export interface ChannelCommand {
+	/** Command word without the leading slash, e.g. "status". */
+	name: string;
+	description?: string;
+	/** Optional gate; return false to refuse (the manager replies with a refusal). */
+	authorize?: (ctx: ChannelCommandContext) => boolean;
+	/** Handle the command; return reply text, or void/empty for no reply. */
+	handler: (ctx: ChannelCommandContext) => Promise<string | void> | string | void;
+}
+
 /** Text-to-speech provider (Voice phase). e.g. ElevenLabs, OpenAI, Edge TTS. */
 export interface SpeechProvider {
 	id: string;
@@ -110,6 +151,45 @@ export interface Integration {
 	isConfigured(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): boolean;
 }
 
+/** Context handed to a background service when the gateway starts it. */
+export interface ServiceStartContext {
+	/** Subsystem logger. */
+	log: (msg: string, meta?: Record<string, unknown>) => void;
+	/** Abort signal — the service must stop cleanly when this fires. */
+	signal: AbortSignal;
+}
+
+/**
+ * A long-lived background service started once at gateway boot and stopped on
+ * shutdown. Use for pollers, schedulers, webhook listeners, or anything that
+ * needs to run alongside the gateway.
+ */
+export interface Service {
+	id: string;
+	label?: string;
+	start(ctx: ServiceStartContext): Promise<void>;
+	stop(): Promise<void>;
+}
+
+/** A handler for a module-registered HTTP route on the gateway's server. */
+export type HttpRouteHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
+
+/** A module-registered HTTP route on the gateway's server. */
+export interface HttpRoute {
+	/** HTTP method; defaults to any when omitted. */
+	method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+	/** Exact path, e.g. `/webhooks/stripe`. */
+	path: string;
+	handler: HttpRouteHandler;
+}
+
+/** A module-registered gateway RPC method clients can invoke. */
+export interface GatewayMethodHandler {
+	/** Method name clients invoke; namespaced by convention, e.g. `whatsapp.status`. */
+	name: string;
+	handler: (params: unknown) => Promise<unknown> | unknown;
+}
+
 /* ─────────────────────────── the module context ─────────────────────────── */
 
 /** A recorded model-provider registration (replayed into Pi via `pi.registerProvider`). */
@@ -128,6 +208,13 @@ export interface CommandRegistration {
 export interface HookRegistration {
 	event: string;
 	handler: (...args: unknown[]) => unknown;
+	/**
+	 * Higher runs earlier. Pi itself has no priority ordering (handlers fire in
+	 * registration order), so Brigade sorts its recorded hooks by this value
+	 * before replaying them into a Pi session — the one ordering lever the seam
+	 * adds above Pi. Defaults to 0.
+	 */
+	priority?: number;
 }
 
 /** A recorded tool registration + its enablement gate. */
@@ -155,25 +242,40 @@ export interface BrigadeExtensionContext {
 	readonly cwd: string;
 	/** The active Brigade config (read-only to modules). */
 	readonly config: BrigadeConfig;
+	/**
+	 * This module's own validated config block (`extensions.entries[id].config`),
+	 * checked against the module's `configSchema` by the loader before `register`
+	 * runs. `undefined` when the module declared no config / set none.
+	 */
+	readonly moduleConfig: unknown;
 
 	/* agent-level → replayed into Pi's ExtensionAPI per session */
 	tool(tool: AnyBrigadeTool, opts?: { toolset?: string; eligible?: () => boolean }): void;
 	/**
-	 * Subscribe to a Pi lifecycle event (replayed via `pi.on`). NOTE: a
-	 * `before_agent_start` handler may NOT replace the system prompt — Brigade
-	 * pins the persona, so any `systemPrompt` returned from that event is
-	 * stripped before Pi sees it (the rest of the result is kept).
+	 * Subscribe to a Pi lifecycle event (replayed via `pi.on`). `priority` orders
+	 * Brigade's recorded hooks before replay (higher = earlier; Pi has no native
+	 * priority). NOTE: a `before_agent_start` handler may NOT replace the system
+	 * prompt — Brigade pins the persona, so any `systemPrompt` returned from that
+	 * event is stripped before Pi sees it (the rest of the result is kept).
 	 */
-	hook(event: string, handler: (...args: unknown[]) => unknown): void;
+	hook(event: string, handler: (...args: unknown[]) => unknown, opts?: { priority?: number }): void;
 	command(name: string, options: unknown): void;
 	modelProvider(name: string, config: unknown): void;
 
 	/* product-level → Brigade capability registries (gateway-level) */
 	channel(adapter: ChannelAdapter): void;
+	/** Register a channel command (`/name`) handled before the LLM. */
+	channelCommand(command: ChannelCommand): void;
 	tts(provider: SpeechProvider): void;
 	stt(provider: TranscriptionProvider): void;
 	mediaGen(provider: MediaGenProvider): void;
 	integration(integration: Integration): void;
+	/** Register a long-lived background service (started at boot, stopped on shutdown). */
+	service(service: Service): void;
+	/** Register an HTTP route on the gateway's server. */
+	httpRoute(route: HttpRoute): void;
+	/** Register a gateway RPC method clients can invoke. */
+	gatewayMethod(method: GatewayMethodHandler): void;
 }
 
 /**
@@ -186,10 +288,22 @@ export interface BrigadeModule {
 	id: string;
 	/** Env vars required for this module to load at all. */
 	requiresEnv?: string[];
+	/**
+	 * Optional TypeBox schema for this module's `extensions.entries[id].config`.
+	 * When present the loader validates the config before `register` runs and
+	 * skips the module (non-fatally) if it doesn't match.
+	 */
+	configSchema?: TSchema;
 	/** Optional gate evaluated at load (os/bins/config, skills-style). */
 	eligible?: (ctx: { config: BrigadeConfig; env: NodeJS.ProcessEnv }) => boolean;
 	/** Register this module's capabilities. */
 	register(b: BrigadeExtensionContext): void | Promise<void>;
+	/**
+	 * Optional reload hook. Called when the gateway reloads extensions so a module
+	 * can refresh in-memory state. Product capabilities (channels/services) are
+	 * stopped + restarted by the gateway around this regardless.
+	 */
+	reload?(): void | Promise<void>;
 }
 
 /** Identity helper for authoring a module (mirrors Pi's `defineTool`). */

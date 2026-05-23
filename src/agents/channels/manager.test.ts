@@ -148,6 +148,68 @@ describe("startChannels", () => {
 		await mgr.stop();
 	});
 
+	it("intercepts a /command before the LLM and replies with the handler output", async () => {
+		const f = makeFakeChannel();
+		let turnRan = false;
+		const seenArgs: string[] = [];
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "should not happen" };
+			},
+			commands: [
+				{
+					name: "echo",
+					handler: (ctx) => {
+						seenArgs.push(ctx.args);
+						return `you said: ${ctx.args}`;
+					},
+				},
+			],
+		});
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "/echo hi there" });
+		assert.equal(turnRan, false); // command short-circuits the turn
+		assert.deepEqual(seenArgs, ["hi there"]);
+		assert.deepEqual(f.sent, [{ conversationId: "c1", text: "you said: hi there" }]);
+		await mgr.stop();
+	});
+
+	it("refuses an unauthorized /command", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "x" }),
+			commands: [{ name: "secret", authorize: () => false, handler: () => "leaked" }],
+		});
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "/secret" });
+		assert.equal(f.sent[0]?.text, "Not authorized to run that command.");
+		await mgr.stop();
+	});
+
+	it("an unknown /command falls through to a normal turn", async () => {
+		const f = makeFakeChannel();
+		let turnRan = false;
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "answered" };
+			},
+			commands: [{ name: "known", handler: () => "k" }],
+		});
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "/unknown please" });
+		assert.equal(turnRan, true);
+		assert.deepEqual(f.sent, [{ conversationId: "c1", text: "answered" }]);
+		await mgr.stop();
+	});
+
 	it("stop() tears down every started channel and is idempotent", async () => {
 		const f = makeFakeChannel();
 		const mgr = await startChannels({ adapters: [f.adapter], config: CONFIG, agentId: "main", runTurn: async () => ({ reply: "" }) });

@@ -145,6 +145,13 @@ export function resolveChannelStateDir(channelId: string): string {
   return path.join(resolveStateDir(), "channels", channelId);
 }
 
+// User-extension root, `~/.brigade/extensions/`. Out-of-tree modules dropped
+// here (a `*.js`/`*.mjs` file, or a folder with an `index.js`) are discovered
+// + loaded alongside the bundled ones — the "drop a module, it works" path.
+export function resolveExtensionsDir(): string {
+  return path.join(resolveStateDir(), "extensions");
+}
+
 export function resolveConfigAuditLogPath(): string {
   return path.join(resolveLogsDir(), "config-audit.jsonl");
 }

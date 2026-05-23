@@ -6,8 +6,9 @@
  *   - agent-level registrations (tools/hooks/commands/model-providers) are replayed
  *     into EVERY Pi session via `toPiExtensionFactory()` (handed to
  *     `DefaultResourceLoader({ extensionFactories })`);
- *   - product-level registrations (channels/voice/media/integrations) are exposed
- *     to the gateway, which starts them ONCE at boot.
+ *   - product-level registrations (channels/voice/media/integrations/services/
+ *     http-routes/gateway-methods) are exposed to the gateway, which starts /
+ *     mounts them ONCE at boot.
  *
  * Product registrations dedupe by id (last wins) so re-running modules is safe.
  */
@@ -19,11 +20,15 @@ import type { AnyBrigadeTool } from "../tools/types.js";
 import type {
 	BrigadeExtensionContext,
 	ChannelAdapter,
+	ChannelCommand,
 	CommandRegistration,
+	GatewayMethodHandler,
 	HookRegistration,
+	HttpRoute,
 	Integration,
 	MediaGenProvider,
 	ModelProviderRegistration,
+	Service,
 	SpeechProvider,
 	ToolRegistration,
 	TranscriptionProvider,
@@ -35,6 +40,8 @@ export interface RegistryContextMeta {
 	workspaceDir: string;
 	cwd: string;
 	config: BrigadeConfig;
+	/** This module's validated config block (see `BrigadeExtensionContext.moduleConfig`). */
+	moduleConfig?: unknown;
 }
 
 export class BrigadeExtensionRegistry {
@@ -43,10 +50,17 @@ export class BrigadeExtensionRegistry {
 	private readonly commandRegs: CommandRegistration[] = [];
 	private readonly modelProviderRegs: ModelProviderRegistration[] = [];
 	private readonly channelMap = new Map<string, ChannelAdapter>();
+	private readonly channelCommandMap = new Map<string, ChannelCommand>();
 	private readonly speechMap = new Map<string, SpeechProvider>();
 	private readonly transcriptionMap = new Map<string, TranscriptionProvider>();
 	private readonly mediaGenMap = new Map<string, MediaGenProvider>();
 	private readonly integrationMap = new Map<string, Integration>();
+	private readonly serviceMap = new Map<string, Service>();
+	private readonly httpRouteMap = new Map<string, HttpRoute>();
+	private readonly gatewayMethodMap = new Map<string, GatewayMethodHandler>();
+
+	/** Modules that successfully registered — the loader fills this (used for reload). */
+	readonly loadedModules: import("./types.js").BrigadeModule[] = [];
 
 	/** Build the recording context a module's `register(b)` writes into. */
 	context(meta: RegistryContextMeta): BrigadeExtensionContext {
@@ -55,12 +69,13 @@ export class BrigadeExtensionRegistry {
 			workspaceDir: meta.workspaceDir,
 			cwd: meta.cwd,
 			config: meta.config,
+			moduleConfig: meta.moduleConfig,
 			// agent-level → recorded, replayed into each Pi session
 			tool: (tool, opts) => {
 				this.toolRegs.push({ tool, toolset: opts?.toolset, eligible: opts?.eligible });
 			},
-			hook: (event, handler) => {
-				this.hookRegs.push({ event, handler });
+			hook: (event, handler, opts) => {
+				this.hookRegs.push({ event, handler, priority: opts?.priority });
 			},
 			command: (name, options) => {
 				this.commandRegs.push({ name, options });
@@ -71,6 +86,11 @@ export class BrigadeExtensionRegistry {
 			// product-level → gateway-level registries (dedupe by id, last wins)
 			channel: (adapter) => {
 				this.channelMap.set(adapter.id, adapter);
+			},
+			channelCommand: (command) => {
+				// Lowercase the key so dedup here agrees with the manager's
+				// case-insensitive dispatch (both sides use lowercase).
+				this.channelCommandMap.set(command.name.toLowerCase(), command);
 			},
 			tts: (provider) => {
 				this.speechMap.set(provider.id, provider);
@@ -84,12 +104,26 @@ export class BrigadeExtensionRegistry {
 			integration: (integration) => {
 				this.integrationMap.set(integration.id, integration);
 			},
+			service: (service) => {
+				this.serviceMap.set(service.id, service);
+			},
+			httpRoute: (route) => {
+				// Dedupe by method+path (last wins) so two modules can't both bind
+				// the same route with one silently dead.
+				this.httpRouteMap.set(`${route.method ?? "ANY"} ${route.path}`, route);
+			},
+			gatewayMethod: (method) => {
+				this.gatewayMethodMap.set(method.name, method);
+			},
 		};
 	}
 
 	/* ── product-level getters (the gateway consumes these) ── */
 	get channels(): ChannelAdapter[] {
 		return [...this.channelMap.values()];
+	}
+	get channelCommands(): ChannelCommand[] {
+		return [...this.channelCommandMap.values()];
 	}
 	get speechProviders(): SpeechProvider[] {
 		return [...this.speechMap.values()];
@@ -102,6 +136,15 @@ export class BrigadeExtensionRegistry {
 	}
 	get integrations(): Integration[] {
 		return [...this.integrationMap.values()];
+	}
+	get services(): Service[] {
+		return [...this.serviceMap.values()];
+	}
+	get httpRoutes(): HttpRoute[] {
+		return [...this.httpRouteMap.values()];
+	}
+	get gatewayMethods(): GatewayMethodHandler[] {
+		return [...this.gatewayMethodMap.values()];
 	}
 
 	/* ── agent-level ── */
@@ -116,6 +159,15 @@ export class BrigadeExtensionRegistry {
 		return this.eligibleTools().map((t) => t.name);
 	}
 
+	/** Recorded hooks sorted by priority (higher first); ties keep registration order. */
+	private sortedHooks(): HookRegistration[] {
+		// Stable sort: decorate with index so equal priorities preserve insertion order.
+		return this.hookRegs
+			.map((h, i) => ({ h, i }))
+			.sort((a, b) => (b.h.priority ?? 0) - (a.h.priority ?? 0) || a.i - b.i)
+			.map((x) => x.h);
+	}
+
 	/**
 	 * Replay the recorded agent-level registrations into a Pi session. Hand the
 	 * result to `new DefaultResourceLoader({ extensionFactories: [factory] })`
@@ -126,13 +178,15 @@ export class BrigadeExtensionRegistry {
 		return (pi: ExtensionAPI) => {
 			for (const t of this.toolRegs) {
 				if (t.eligible && !t.eligible()) continue;
-				// AgentTool → Pi ToolDefinition: structurally compatible (Brigade's
-				// 4-arg execute is assignable to the 5-arg ToolDefinition.execute; the
-				// optional ToolDefinition fields are simply absent). Cast bridges the
-				// nominal gap without changing tool authoring.
+				// AgentTool → Pi ToolDefinition: Pi's tool wrapper invokes execute with
+				// `ctx` as a trailing positional arg, which Brigade's 4-arg execute
+				// simply ignores; the required fields (name/label/description/parameters)
+				// all match. Cast bridges the nominal gap without changing authoring.
 				pi.registerTool(t.tool as never);
 			}
-			for (const h of this.hookRegs) {
+			// Pi has no native hook priority — handlers fire in registration order — so
+			// we replay in Brigade's priority order (higher first).
+			for (const h of this.sortedHooks()) {
 				if (h.event === "before_agent_start") {
 					// Brigade PINS the persona (it overwrites Pi's _baseSystemPrompt).
 					// Pi lets a `before_agent_start` handler replace the system prompt
@@ -156,8 +210,8 @@ export class BrigadeExtensionRegistry {
 			for (const c of this.commandRegs) {
 				pi.registerCommand(c.name, c.options as never);
 			}
-			// Model-provider registration is forward-compat (no providers ship as
-			// modules yet); guard at runtime so a Pi API rename can't break the build.
+			// Model-provider registration: guard at runtime so a Pi API rename can't
+			// break the build (no providers ship as modules yet).
 			const registerProvider = (pi as unknown as { registerProvider?: (n: string, c: unknown) => void })
 				.registerProvider;
 			if (typeof registerProvider === "function") {

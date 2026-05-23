@@ -141,6 +141,8 @@ const EXTENSION_ENTRY_SCHEMA = Type.Object({
 
 const EXTENSIONS_SCHEMA = Type.Object({
 	enabled: Type.Optional(Type.Boolean()),
+	// When non-empty, ONLY listed module ids load (allowlist).
+	allow: Type.Optional(Type.Array(Type.String())),
 	disabled: Type.Optional(Type.Array(Type.String())),
 	entries: Type.Optional(Type.Record(Type.String(), EXTENSION_ENTRY_SCHEMA)),
 });
