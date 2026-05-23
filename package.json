@@ -65,7 +65,54 @@
     "config:list": "node scripts/run-brigade.mjs config list",
     "config:file": "node scripts/run-brigade.mjs config file",
     "config:schema": "node scripts/run-brigade.mjs config schema",
-    "config:validate": "node scripts/run-brigade.mjs config validate"
+    "config:validate": "node scripts/run-brigade.mjs config validate",
+
+    "channels": "node scripts/run-brigade.mjs channels",
+    "channels:list": "node scripts/run-brigade.mjs channels list",
+    "channels:status": "node scripts/run-brigade.mjs channels status --channel whatsapp",
+    "channels:link": "node scripts/run-brigade.mjs channels link --channel whatsapp",
+    "channels:unlink": "node scripts/run-brigade.mjs channels unlink --channel whatsapp",
+    "channels:enable": "node scripts/run-brigade.mjs channels enable --channel whatsapp",
+    "channels:disable": "node scripts/run-brigade.mjs channels disable --channel whatsapp",
+    "channels:allow": "node scripts/run-brigade.mjs channels allow list --channel whatsapp",
+    "channels:allow:add": "node scripts/run-brigade.mjs channels allow add --channel whatsapp",
+    "channels:allow:remove": "node scripts/run-brigade.mjs channels allow remove --channel whatsapp",
+    "channels:add": "node scripts/run-brigade.mjs channels add",
+
+    "wa": "node scripts/run-brigade.mjs channels status --channel whatsapp",
+    "wa:link": "node scripts/run-brigade.mjs channels link --channel whatsapp",
+    "wa:unlink": "node scripts/run-brigade.mjs channels unlink --channel whatsapp",
+    "wa:status": "node scripts/run-brigade.mjs channels status --channel whatsapp",
+    "wa:allow": "node scripts/run-brigade.mjs channels allow list --channel whatsapp",
+
+    "pairing": "node scripts/run-brigade.mjs pairing list --channel whatsapp",
+    "pairing:list": "node scripts/run-brigade.mjs pairing list --channel whatsapp",
+    "pairing:approve": "node scripts/run-brigade.mjs pairing approve --channel whatsapp",
+    "pairing:revoke": "node scripts/run-brigade.mjs pairing revoke --channel whatsapp",
+
+    "backup": "node scripts/run-brigade.mjs backup create",
+    "backup:create": "node scripts/run-brigade.mjs backup create",
+    "backup:verify": "node scripts/run-brigade.mjs backup verify",
+    "backup:restore": "node scripts/run-brigade.mjs backup restore",
+
+    "gateway:install": "node scripts/run-brigade.mjs gateway install",
+    "gateway:uninstall": "node scripts/run-brigade.mjs gateway uninstall",
+    "gateway:restart": "node scripts/run-brigade.mjs gateway restart",
+
+    "sessions": "node scripts/run-brigade.mjs sessions list",
+    "sessions:list": "node scripts/run-brigade.mjs sessions list",
+    "sessions:cleanup": "node scripts/run-brigade.mjs sessions cleanup",
+
+    "skills": "node scripts/run-brigade.mjs skills list",
+    "skills:list": "node scripts/run-brigade.mjs skills list",
+    "skills:info": "node scripts/run-brigade.mjs skills info",
+
+    "logs": "node scripts/run-brigade.mjs logs",
+    "logs:follow": "node scripts/run-brigade.mjs logs --follow",
+
+    "secrets:audit": "node scripts/run-brigade.mjs secrets audit",
+
+    "exec:list": "node scripts/run-brigade.mjs exec list"
   },
   "engines": {
     "node": ">=22.12"
@@ -79,7 +126,9 @@
     "commander": "^12.1.0",
     "json5": "^2.2.3",
     "prompts": "^2.4.2",
+    "proper-lockfile": "^4.1.2",
     "qrcode-terminal": "^0.12.0",
+    "tar": "^7.5.15",
     "ws": "^8.20.0",
     "yaml": "^2.9.0",
     "zod": "^3.23.8"
@@ -87,7 +136,9 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/prompts": "^2.4.9",
+    "@types/proper-lockfile": "^4.1.4",
     "@types/qrcode-terminal": "^0.12.2",
+    "@types/tar": "^6.1.13",
     "@types/ws": "^8.18.1",
     "tsx": "^4.20.0",
     "typescript": "^5.6.3"

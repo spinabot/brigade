@@ -138,9 +138,31 @@ export interface ServerHandle {
 
 /* ────────────────────────── boot ────────────────────────── */
 
+/** Bind addresses that are safe to listen on under the v1 "single-user" model. */
+const LOCALHOST_BINDS = new Set(["127.0.0.1", "::1", "localhost", "0.0.0.0/loopback-only"]);
+
+function isLocalhostBind(host: string): boolean {
+	return LOCALHOST_BINDS.has(host) || host === "::ffff:127.0.0.1";
+}
+
 export async function startServer(opts: ServerOptions = {}): Promise<ServerHandle> {
 	const port = opts.port ?? (Number(process.env.BRIGADE_PORT) || DEFAULT_PORT);
 	const host = opts.host ?? "127.0.0.1";
+
+	// Brigade v1 is single-user / localhost-only. The gateway exposes
+	// agent-controls + module RPCs over an UNAUTHENTICATED WebSocket; binding it
+	// to anything reachable from the LAN/internet would publish those controls
+	// to anyone who can reach the port. Multi-user/network exposure lands with
+	// the Phase-2 SaaS shape (HTTP-session auth, not a static token). Refusing
+	// non-localhost binds here means an operator can't accidentally ship a wide-
+	// open daemon by setting `--host 0.0.0.0`.
+	if (!isLocalhostBind(host)) {
+		throw new Error(
+			`brigade gateway only binds to localhost in v1 (got --host ${host}). ` +
+				"Multi-user / network-exposed deployment requires the Phase-2 SaaS shape. " +
+				"For LAN access today, front the gateway with a reverse-proxy that adds your own auth.",
+		);
+	}
 
 	// Capture the boot start time so the `ready (Xs)` line can report total
 	// startup duration. Mirrors openclaw's `serverStartedAt = Date.now()`
@@ -735,10 +757,19 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 * schedules the off-hot-path memory sweep, and tears the per-turn wiring down
 	 * when it settles. Always invoked inside `runQueued` so only one runs at once.
 	 */
-	const runGatewayTurn = (turn: { text: string; sessionKey: string }): Promise<RunSingleTurnResult> =>
+	const runGatewayTurn = (turn: {
+		text: string;
+		sessionKey: string;
+		signal?: AbortSignal;
+	}): Promise<RunSingleTurnResult> =>
 		runQueued(async () => {
 			isAgentRunning = true;
 			broadcast("state", buildSnapshot());
+			// Hoist the abort listener so the finally can detach it without a
+			// scope issue (a `const` inside `try` is invisible from `finally`).
+			const onAbort = () => {
+				inFlightSession?.abort().catch(() => {});
+			};
 			try {
 				// Resolve fallback model fresh per turn — the user may have edited
 				// config (or rotated keys) between turns. F:\Brigade's shape:
@@ -755,6 +786,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const fallbacks =
 					fallbackProvider && fallbackModelId ? [{ provider: fallbackProvider, modelId: fallbackModelId }] : [];
 
+				// If a channel inbound passed an AbortSignal, abort the in-flight Pi
+				// session when it fires (so `/stop` from the chat actually cancels).
+				turn.signal?.addEventListener("abort", onAbort, { once: true });
 				const result = await runResilientTurn({
 					agentId,
 					provider,
@@ -763,6 +797,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					sessionKey: turn.sessionKey,
 					thinkingLevel: thinkingLevel as "off" | "low" | "medium" | "high",
 					fallbacks,
+					signal: turn.signal,
 					onSessionReady: (session) => {
 						// A fallback candidate builds a fresh session; tear down the
 						// previous candidate's wiring before attaching the new one.
@@ -775,6 +810,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				scheduleExtraction({ sessionId: result.sessionId, messages: result.messages });
 				return result;
 			} finally {
+				turn.signal?.removeEventListener("abort", onAbort);
 				if (currentTurnCleanup) {
 					currentTurnCleanup();
 					currentTurnCleanup = null;
@@ -966,6 +1002,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 	/* ──────────────── connection lifecycle ──────────────── */
 
+	// Per-connection rate limit: a sliding window of RPC timestamps. Anyone who
+	// can reach the WS (localhost-only today) can fire requests as fast as the
+	// dispatcher accepts them — a misbehaving client (or stolen creds, once
+	// multi-user lands) could flood `system.reload` / `list-models` / `prompt`
+	// rejections and pin the gateway. Defaults are generous: 60 RPCs/10s per
+	// connection ⇒ ~6 QPS sustained, plenty for a human-driven TUI.
+	const RATE_LIMIT_WINDOW_MS = 10_000;
+	const RATE_LIMIT_MAX = 60;
+
 	wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 		clients.add(ws);
 		const clientLabel = `${req.socket.remoteAddress ?? "?"}:${req.socket.remotePort ?? "?"}`;
@@ -974,6 +1019,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// Send the initial snapshot so the client can render its header
 		// before any user action.
 		ws.send(JSON.stringify({ type: "event", event: "state", payload: buildSnapshot() } satisfies Frame));
+
+		// Per-connection ring of RPC timestamps powering the sliding-window check.
+		const rateRing: number[] = [];
 
 		ws.on("message", async (data) => {
 			let frame: Frame;
@@ -988,6 +1036,27 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			if (frame.type !== "req") return; // server only handles requests
 
 			const reqFrame = frame as RequestFrame;
+
+			// Sliding-window rate limit: drop oldest timestamps outside the window,
+			// reject if we're already at the cap. We respond with a typed error
+			// frame so well-behaved clients can back off; a flooding client just
+			// keeps getting `rate-limited` until they slow down.
+			const now = Date.now();
+			while (rateRing.length > 0 && now - (rateRing[0] as number) > RATE_LIMIT_WINDOW_MS) rateRing.shift();
+			if (rateRing.length >= RATE_LIMIT_MAX) {
+				const response: Frame = {
+					type: "res",
+					id: reqFrame.id,
+					ok: false,
+					error: {
+						code: "rate-limited",
+						message: `WS connection exceeded ${RATE_LIMIT_MAX} requests / ${RATE_LIMIT_WINDOW_MS}ms — slow down.`,
+					},
+				};
+				if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(response));
+				return;
+			}
+			rateRing.push(now);
 			opts.consoleStream?.wsRequest(reqFrame.method, reqFrame.id, clientLabel);
 			const startedAt = Date.now();
 			try {

@@ -156,6 +156,33 @@ export function buildProgram(): Command {
       process.exit(await runGatewayStopCommand(opts));
     });
 
+  // OS-service installer: macOS launchd / Linux systemd-user / Windows Task
+  // Scheduler. The supervisor IS the restart loop; the gateway survives reboots
+  // and crashes via the OS-native mechanism.
+  gw.command("install")
+    .description("Install Brigade as an OS service (launchd / systemd / Task Scheduler)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runGatewayInstall } = await import("../commands/gateway-install.js");
+      process.exit(await runGatewayInstall({ json: opts.json }));
+    });
+
+  gw.command("uninstall")
+    .description("Remove the OS-service registration (the unit file and the supervisor entry)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runGatewayUninstall } = await import("../commands/gateway-install.js");
+      process.exit(await runGatewayUninstall({ json: opts.json }));
+    });
+
+  gw.command("restart")
+    .description("Restart the installed Brigade service (stop + start)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runGatewayRestart } = await import("../commands/gateway-install.js");
+      process.exit(await runGatewayRestart({ json: opts.json }));
+    });
+
   /* ─────────────────────────────── connect ─────────────────────────────── */
 
   program
@@ -306,6 +333,298 @@ export function buildProgram(): Command {
     .action(async (opts: { json?: boolean }) => {
       const { runConfigValidate } = await import("../commands/config-cmd.js");
       process.exit(await runConfigValidate({ json: opts.json }));
+    });
+
+  /* ───────────────────────────── channels ───────────────────────────── */
+  // Manage messaging channels (WhatsApp today, more later). `link` runs the
+  // adapter directly to pair a device — the gateway must be stopped first so
+  // the two don't fight over the same socket. `enable`/`disable` only touch
+  // brigade.json (cheap; the gateway picks up the flag on next boot/reload).
+  const channels = program
+    .command("channels")
+    .description("Manage messaging channels (link, status, enable/disable)");
+
+  channels
+    .command("list")
+    .description("List every available channel with its enabled/linked status")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runChannelsList } = await import("../commands/channels.js");
+      process.exit(await runChannelsList({ json: opts.json }));
+    });
+
+  channels
+    .command("status")
+    .description("Show one channel's enabled / linked / configured / authDir / gateway state")
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { channel?: string; json?: boolean }) => {
+      const { runChannelsStatus } = await import("../commands/channels.js");
+      process.exit(await runChannelsStatus({ channel: opts.channel }, { json: opts.json }));
+    });
+
+  channels
+    .command("link")
+    .description(
+      "Pair a device with a channel (e.g. scan a WhatsApp QR).\n" +
+        "  Requires the gateway to be stopped so the channel socket isn't shared.\n" +
+        "  Example: brigade channels link --channel whatsapp",
+    )
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("--timeout <ms>", "max time to wait for pairing (default 180000)", (v) => parseInt(v, 10))
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { channel?: string; timeout?: number; json?: boolean }) => {
+      const { runChannelsLink } = await import("../commands/channels.js");
+      process.exit(
+        await runChannelsLink({ channel: opts.channel, timeoutMs: opts.timeout }, { json: opts.json }),
+      );
+    });
+
+  channels
+    .command("unlink")
+    .description(
+      "Disable a channel and erase its on-disk auth state.\n" +
+        "  Requires the gateway to be stopped.",
+    )
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("-y, --yes", "skip the confirmation prompt", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { channel?: string; yes?: boolean; json?: boolean }) => {
+      const { runChannelsUnlink } = await import("../commands/channels.js");
+      process.exit(await runChannelsUnlink({ channel: opts.channel, yes: opts.yes }, { json: opts.json }));
+    });
+
+  channels
+    .command("enable")
+    .description("Set channels.<id>.enabled=true in brigade.json (no link)")
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { channel?: string; json?: boolean }) => {
+      const { runChannelsEnable } = await import("../commands/channels.js");
+      process.exit(await runChannelsEnable({ channel: opts.channel }, { json: opts.json }));
+    });
+
+  channels
+    .command("disable")
+    .description("Set channels.<id>.enabled=false in brigade.json (creds untouched)")
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { channel?: string; json?: boolean }) => {
+      const { runChannelsDisable } = await import("../commands/channels.js");
+      process.exit(await runChannelsDisable({ channel: opts.channel }, { json: opts.json }));
+    });
+
+  // `channels allow <list|add|remove>` — manage the per-channel allow-from list.
+  // Pairs with `brigade pairing approve <CODE>` (which adds approved senders).
+  const channelsAllow = channels
+    .command("allow")
+    .description("Manage the per-channel allow-from list (senders permitted to DM the agent)");
+
+  channelsAllow
+    .command("list")
+    .description("Print the channel's allow-from list")
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { channel?: string; json?: boolean }) => {
+      const { runChannelsAllowList } = await import("../commands/channels.js");
+      process.exit(await runChannelsAllowList({ channel: opts.channel }, { json: opts.json }));
+    });
+
+  channelsAllow
+    .command("add <id>")
+    .description("Add a sender to the allow-from list (e.g. an E.164 phone number)")
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (id: string, opts: { channel?: string; json?: boolean }) => {
+      const { runChannelsAllowAdd } = await import("../commands/channels.js");
+      process.exit(await runChannelsAllowAdd({ id, channel: opts.channel }, { json: opts.json }));
+    });
+
+  channelsAllow
+    .command("remove <id>")
+    .description("Remove a sender from the allow-from list")
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (id: string, opts: { channel?: string; json?: boolean }) => {
+      const { runChannelsAllowRemove } = await import("../commands/channels.js");
+      process.exit(await runChannelsAllowRemove({ id, channel: opts.channel }, { json: opts.json }));
+    });
+
+  // `channels add` — non-interactive provisioning for token-based channels.
+  channels
+    .command("add")
+    .description("Provision a token-based channel non-interactively (Slack/Telegram/Discord shape)")
+    .requiredOption("--channel <id>", "channel id (e.g. slack)")
+    .option("--token <secret>", "auth token / api key")
+    .option("--account <id>", "account id (multi-account channels)")
+    .option("--set <kv...>", "extra key=value pairs (parsed JSON, falls back to string)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { channel: string; token?: string; account?: string; set?: string[]; json?: boolean }) => {
+      const { runChannelsAdd } = await import("../commands/channels.js");
+      process.exit(
+        await runChannelsAdd(
+          { channel: opts.channel, token: opts.token, account: opts.account, set: opts.set },
+          { json: opts.json },
+        ),
+      );
+    });
+
+  /* ───────────────────────────── sessions ───────────────────────────── */
+  // Inspect + GC the JSONL transcripts under ~/.brigade/agents/<id>/sessions/.
+  const sessions = program
+    .command("sessions")
+    .description("List + clean up agent session transcripts");
+
+  sessions
+    .command("list")
+    .description("Show every session for an agent (newest first)")
+    .option("--agent <id>", "agent id (default: main)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { agent?: string; json?: boolean }) => {
+      const { runSessionsList } = await import("../commands/sessions.js");
+      process.exit(await runSessionsList({ agent: opts.agent }, { json: opts.json }));
+    });
+
+  sessions
+    .command("cleanup")
+    .description("Delete session transcripts older than --older-than (e.g. 30d / 12h)")
+    .requiredOption("--older-than <duration>", "max age before a session is deleted (e.g. 30d)")
+    .option("--agent <id>", "agent id (default: main)")
+    .option("--dry-run", "show what would be deleted without removing anything", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { agent?: string; olderThan: string; dryRun?: boolean; json?: boolean }) => {
+      const { runSessionsCleanup } = await import("../commands/sessions.js");
+      process.exit(
+        await runSessionsCleanup(
+          { agent: opts.agent, olderThan: opts.olderThan, dryRun: opts.dryRun },
+          { json: opts.json },
+        ),
+      );
+    });
+
+  /* ───────────────────────────── skills ───────────────────────────── */
+  const skills = program.command("skills").description("Inspect installed Brigade skills");
+  skills
+    .command("list")
+    .description("Show every discovered skill (bundled + workspace)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runSkillsList } = await import("../commands/skills.js");
+      process.exit(await runSkillsList({ json: opts.json }));
+    });
+  skills
+    .command("info <name>")
+    .description("Print a skill's full body (SKILL.md)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (name: string, opts: { json?: boolean }) => {
+      const { runSkillsInfo } = await import("../commands/skills.js");
+      process.exit(await runSkillsInfo({ name }, { json: opts.json }));
+    });
+
+  /* ───────────────────────────── logs ───────────────────────────── */
+  program
+    .command("logs")
+    .description("Tail today's gateway log file (--follow streams new lines)")
+    .option("--follow", "follow appended lines (Ctrl+C to stop)", false)
+    .option("--limit <n>", "how many trailing lines to print first (default 50)", (v) => parseInt(v, 10))
+    .option("--json", "emit raw JSON lines instead of one-line formatted output", false)
+    .action(async (opts: { follow?: boolean; limit?: number; json?: boolean }) => {
+      const { runLogsCommand } = await import("../commands/logs.js");
+      process.exit(await runLogsCommand({ follow: opts.follow, limit: opts.limit }, { json: opts.json }));
+    });
+
+  /* ───────────────────────────── secrets ───────────────────────────── */
+  const secrets = program
+    .command("secrets")
+    .description("Find suspected leaked credentials inside ~/.brigade");
+  secrets
+    .command("audit")
+    .description("Scan ~/.brigade for plaintext-key shapes (sk-…, Bearer …, …)")
+    .option("--strict", "exit non-zero on findings (CI mode)", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { strict?: boolean; json?: boolean }) => {
+      const { runSecretsAudit } = await import("../commands/secrets-audit.js");
+      process.exit(await runSecretsAudit({ strict: opts.strict }, { json: opts.json }));
+    });
+
+  /* ───────────────────────────── pairing ───────────────────────────── */
+  // `brigade pairing <list|approve|revoke>` — operator-side review of the
+  // pending-code list. Strangers' DMs to a `pairing`-policy channel get an
+  // 8-char code; the operator approves it here to add them to the allow-from
+  // list, or revokes to drop without granting access.
+  const pairing = program
+    .command("pairing")
+    .description("Review and approve/revoke pending channel pairing codes");
+
+  pairing
+    .command("list")
+    .description("Show pending pairing codes for a channel")
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { channel?: string; json?: boolean }) => {
+      const { runPairingList } = await import("../commands/pairing.js");
+      process.exit(await runPairingList({ channel: opts.channel }, { json: opts.json }));
+    });
+
+  pairing
+    .command("approve <code>")
+    .description("Approve a pending code (moves the sender into the allow-from list)")
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (code: string, opts: { channel?: string; json?: boolean }) => {
+      const { runPairingApprove } = await import("../commands/pairing.js");
+      process.exit(await runPairingApprove({ code, channel: opts.channel }, { json: opts.json }));
+    });
+
+  pairing
+    .command("revoke <code>")
+    .description("Drop a pending code without approving it")
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (code: string, opts: { channel?: string; json?: boolean }) => {
+      const { runPairingRevoke } = await import("../commands/pairing.js");
+      process.exit(await runPairingRevoke({ code, channel: opts.channel }, { json: opts.json }));
+    });
+
+  /* ───────────────────────────── backup ───────────────────────────── */
+  // Snapshot / verify / restore the entire ~/.brigade directory so an operator
+  // can migrate hosts or disaster-recover. Refuses to run while the gateway is
+  // alive (locks would fight) unless --force is passed.
+  const backup = program
+    .command("backup")
+    .description("Snapshot, verify, and restore ~/.brigade as a single .tar.gz");
+
+  backup
+    .command("create")
+    .description("Write a sha256-manifest'd .tar.gz snapshot of ~/.brigade")
+    .option("--output <path>", "where to write the archive (default: ./brigade-backup-<ts>.tar.gz)")
+    .option("--force", "back up even if the gateway is running (risk: torn writes)", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { output?: string; force?: boolean; json?: boolean }) => {
+      const { runBackupCreate } = await import("../commands/backup.js");
+      process.exit(await runBackupCreate({ output: opts.output, force: opts.force }, { json: opts.json }));
+    });
+
+  backup
+    .command("verify <archive>")
+    .description("Re-hash every entry in an archive against its manifest; exit non-zero on mismatch")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (archive: string, opts: { json?: boolean }) => {
+      const { runBackupVerify } = await import("../commands/backup.js");
+      process.exit(await runBackupVerify({ archive }, { json: opts.json }));
+    });
+
+  backup
+    .command("restore <archive>")
+    .description("Extract an archive into ~/.brigade (or --target). Refuses if target exists without --force")
+    .option("--target <path>", "where to extract (default: ~/.brigade)")
+    .option("--force", "overwrite an existing target / restore while gateway is running", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (archive: string, opts: { target?: string; force?: boolean; json?: boolean }) => {
+      const { runBackupRestore } = await import("../commands/backup.js");
+      process.exit(
+        await runBackupRestore({ archive, target: opts.target, force: opts.force }, { json: opts.json }),
+      );
     });
 
   /* ───────────────────────────── exec ───────────────────────────── */

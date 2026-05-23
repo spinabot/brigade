@@ -128,7 +128,20 @@ const SKILLS_SCHEMA = Type.Object({
 	entries: Type.Optional(Type.Record(Type.String(), SKILL_ENTRY_SCHEMA)),
 });
 
-const CHANNELS_SCHEMA = Type.Record(Type.String(), Type.Record(Type.String(), Type.Unknown()));
+// Per-channel settings. `dmPolicy` gates inbound DMs:
+//   - `pairing` (default) — strangers get a one-shot code, operator approves
+//   - `allowlist` — only senders in the allow-from list (no auto-challenge)
+//   - `open` — anyone can DM (use with care)
+//   - `disabled` — silently drop every DM
+// The schema is intentionally OPEN so adapters can carry their own settings
+// (account ids, baseUrls, etc.) without per-channel schema changes here.
+const CHANNEL_ENTRY_SCHEMA = Type.Object({
+	enabled: Type.Optional(Type.Boolean()),
+	dmPolicy: Type.Optional(
+		Type.Union([Type.Literal("pairing"), Type.Literal("allowlist"), Type.Literal("open"), Type.Literal("disabled")]),
+	),
+});
+const CHANNELS_SCHEMA = Type.Record(Type.String(), Type.Intersect([CHANNEL_ENTRY_SCHEMA, Type.Record(Type.String(), Type.Unknown())]));
 
 // Extension subsystem (Pi-native tools/hooks/commands + Brigade product
 // channels/voice/media). Mirrors the plugins/skills gating shape: a global
@@ -147,13 +160,14 @@ const EXTENSIONS_SCHEMA = Type.Object({
 	entries: Type.Optional(Type.Record(Type.String(), EXTENSION_ENTRY_SCHEMA)),
 });
 
-const GATEWAY_AUTH_SCHEMA = Type.Object({
-	mode: Type.Optional(
-		Type.Union([Type.Literal("none"), Type.Literal("token"), Type.Literal("password")]),
-	),
-	token: Type.Optional(Type.String()),
-	password: Type.Optional(Type.String()),
-});
+// Brigade v1 is single-user / localhost-only — there is no WS auth layer to
+// configure here. The gateway hard-refuses non-localhost binds (see server.ts)
+// so this block is a no-op today; multi-user auth lands with the Phase-2 SaaS
+// shape (HTTP-session / Convex), NOT a static token in this file.
+//
+// We intentionally still accept arbitrary keys here so existing brigade.json
+// files don't fail validation, but no field is read by any runtime.
+const GATEWAY_AUTH_SCHEMA = Type.Record(Type.String(), Type.Unknown());
 
 const GATEWAY_HTTP_SCHEMA = Type.Object({
 	endpoints: Type.Optional(

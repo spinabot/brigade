@@ -1,12 +1,21 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import type { BrigadeConfig } from "../../config/io.js";
 import type { ChannelAdapter, ChannelStartContext, InboundMessage } from "../extensions/types.js";
+import { addAllowFrom, readPendingPairings } from "./access-control/index.js";
 import { startChannels } from "./manager.js";
 import { channelSessionKey } from "./session-key.js";
 
-const CONFIG = {} as BrigadeConfig;
+// Most non-ACL tests in this file don't care about the gate — they pre-date
+// access control and just verify the inbound→turn→reply flow. We default the
+// fake channel to `open` policy here so those tests keep working; ACL-specific
+// tests below pass their own config (`pairing` / `disabled` / `allowlist`).
+const CONFIG = { channels: { fake: { dmPolicy: "open" } } } as unknown as BrigadeConfig;
 
 /** A controllable fake channel that captures its start ctx + sent messages. */
 function makeFakeChannel(overrides: Partial<ChannelAdapter> = {}): {
@@ -108,7 +117,7 @@ describe("startChannels", () => {
 		await mgr.stop();
 	});
 
-	it("a turn that throws is swallowed — the listener survives", async () => {
+	it("a turn that throws is swallowed AND surfaces a friendly error reply", async () => {
 		const f = makeFakeChannel();
 		const mgr = await startChannels({
 			adapters: [f.adapter],
@@ -119,7 +128,8 @@ describe("startChannels", () => {
 			},
 		});
 		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "hi" }); // must not reject
-		assert.equal(f.sent.length, 0);
+		assert.equal(f.sent.length, 1, "should reply with an error message instead of going silent");
+		assert.match(f.sent[0]?.text ?? "", /error|try again/i);
 		await mgr.stop();
 	});
 
@@ -207,6 +217,207 @@ describe("startChannels", () => {
 		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "/unknown please" });
 		assert.equal(turnRan, true);
 		assert.deepEqual(f.sent, [{ conversationId: "c1", text: "answered" }]);
+		await mgr.stop();
+	});
+
+	it("default policy (`pairing`) challenges a stranger with a code instead of running a turn", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-acl-mgr-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			const f = makeFakeChannel();
+			let turnRan = false;
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				config: {} as BrigadeConfig, // no policy override → default = `pairing`
+				agentId: "main",
+				runTurn: async () => {
+					turnRan = true;
+					return { reply: "should not happen" };
+				},
+			});
+			await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "+1 555-000-0001", text: "hi" });
+			assert.equal(turnRan, false, "stranger must not reach the agent");
+			assert.equal(f.sent.length, 1, "a challenge reply was sent");
+			assert.match(f.sent[0]?.text ?? "", /one-time code|approve your access|brigade pairing approve/i);
+			assert.match(f.sent[0]?.text ?? "", /[A-Z2-9]{8}/);
+			const pending = readPendingPairings("fake");
+			assert.equal(pending.length, 1);
+			// senderId is normalized (whitespace stripped) by the store.
+			assert.equal(pending[0]?.senderId, "+1555-000-0001");
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("an allow-listed sender reaches the agent (turn runs, reply sent)", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-acl-mgr-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			addAllowFrom("fake", "alice");
+			const f = makeFakeChannel();
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				config: {} as BrigadeConfig, // default pairing policy
+				agentId: "main",
+				runTurn: async () => ({ reply: "pong" }),
+			});
+			await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "alice", text: "ping" });
+			assert.deepEqual(f.sent, [{ conversationId: "c1", text: "pong" }]);
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("`disabled` policy silently drops every inbound (no challenge, no reply, no turn)", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-acl-mgr-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			const f = makeFakeChannel();
+			let turnRan = false;
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				config: { channels: { fake: { dmPolicy: "disabled" } } } as unknown as BrigadeConfig,
+				agentId: "main",
+				runTurn: async () => {
+					turnRan = true;
+					return { reply: "x" };
+				},
+			});
+			await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "alice", text: "hi" });
+			assert.equal(turnRan, false);
+			assert.equal(f.sent.length, 0);
+			assert.equal(readPendingPairings("fake").length, 0);
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("`open` policy lets any sender through (legacy/test mode)", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-acl-mgr-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			const f = makeFakeChannel();
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				config: { channels: { fake: { dmPolicy: "open" } } } as unknown as BrigadeConfig,
+				agentId: "main",
+				runTurn: async () => ({ reply: "ok" }),
+			});
+			await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "stranger", text: "hi" });
+			assert.deepEqual(f.sent, [{ conversationId: "c1", text: "ok" }]);
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("self (adapter.selfId === sender) is always allowed, even with no allow-from entries", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-acl-mgr-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			const f = makeFakeChannel({ selfId: () => "owner" });
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				config: {} as BrigadeConfig, // default pairing policy
+				agentId: "main",
+				runTurn: async () => ({ reply: "hi self" }),
+			});
+			await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "owner", text: "note to self" });
+			assert.deepEqual(f.sent, [{ conversationId: "c1", text: "hi self" }]);
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("media-only inbound synthesizes a path note into the turn text", async () => {
+		const f = makeFakeChannel();
+		const calls: { text: string }[] = [];
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async (a) => {
+				calls.push({ text: a.text });
+				return { reply: "got it" };
+			},
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "c1",
+			from: "u",
+			text: "",
+			media: [{ kind: "image", path: "/tmp/abc.jpg", mimeType: "image/jpeg", caption: "look at this" }],
+		});
+		assert.equal(calls.length, 1, "media-only inbound should still produce a turn");
+		assert.match(calls[0]?.text ?? "", /\[attached image.*look at this.*\/tmp\/abc\.jpg\]/);
+		await mgr.stop();
+	});
+
+	it("`/stop` with no in-flight turn replies with a friendly 'nothing running' line", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "x" }),
+		});
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "/stop" });
+		assert.match(f.sent[0]?.text ?? "", /nothing was running|try again/i);
+		await mgr.stop();
+	});
+
+	it("a `/stop` mid-turn aborts the AbortSignal and replies 'Stopped.'", async () => {
+		const f = makeFakeChannel();
+		let observedSignal: AbortSignal | undefined;
+		let releaseTurn: () => void = () => {};
+		const turnDone = new Promise<void>((r) => {
+			releaseTurn = r;
+		});
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async (a) => {
+				observedSignal = a.signal;
+				await turnDone; // simulate a slow turn
+				return { reply: "should-be-suppressed" };
+			},
+		});
+		// Kick off the slow turn (don't await — it pends on `turnDone`).
+		const inboundP = f
+			.ctx()
+			.onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "do something long" });
+		// Give the manager a tick to register the controller.
+		await new Promise((r) => setTimeout(r, 10));
+		assert.ok(observedSignal, "runTurn must have been called with a signal");
+		assert.equal(observedSignal?.aborted, false);
+		// Now send /stop; should abort + reply "Stopped." synchronously.
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "stop" });
+		assert.equal(observedSignal?.aborted, true, "the in-flight turn's signal must have been aborted");
+		assert.ok(f.sent.some((s) => /Stopped\./.test(s.text)));
+		// Now finish the originally-slow turn; its (stale) reply must be dropped.
+		releaseTurn();
+		await inboundP;
+		assert.equal(f.sent.filter((s) => s.text === "should-be-suppressed").length, 0);
 		await mgr.stop();
 	});
 

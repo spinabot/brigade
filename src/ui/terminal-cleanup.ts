@@ -35,11 +35,28 @@
 import process from "node:process";
 
 /**
+ * Active only after a TUI command (chat/connect/onboard) explicitly enters
+ * raw/alt-screen/kitty/etc. mode. Non-TUI subcommands (`channels list`,
+ * `pairing approve`, …) never set this, so their exit doesn't emit cleanup
+ * escapes — which would otherwise render as visible garbage on terminals
+ * (notably older PowerShell hosts) that don't parse the full set.
+ */
+let tuiActive = false;
+export function markTuiActive(): void {
+  tuiActive = true;
+}
+
+/**
  * Emit every escape sequence needed to restore the terminal to a known-good
  * state. Called from every Brigade exit path (signal handlers, normal exit,
  * crash, `process.on("exit")`).
+ *
+ * No-op when no TUI command marked itself active — a one-shot CLI command
+ * exiting has nothing to clean up, and emitting "disable" escapes pollutes
+ * the operator's terminal scrollback.
  */
 export function restoreTerminal(): void {
+  if (!tuiActive) return;
   const out = process.stderr;
   try {
     out.write(

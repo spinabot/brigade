@@ -58,20 +58,36 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 				authDir,
 				verbose: false,
 				log: ctx.log,
+				// Plumb linkMode from the channel-start context so the CLI's
+				// `channels link` command gets clean one-shot behavior, while the
+				// gateway path keeps its aggressive auto-reconnect.
+				linkMode: ctx.linkMode === true,
 				onQr: (qr) => {
 					ctx.onPairing?.({ kind: "qr", value: qr });
 					void printQr(qr);
 				},
-				onConnected: () => ctx.log("WhatsApp ready"),
-				onLoggedOut: () =>
-					ctx.log(`WhatsApp was unlinked. Delete ${authDir} and restart to scan a new QR code.`),
+				onConnected: () => {
+					ctx.log("WhatsApp ready");
+					ctx.onConnected?.();
+				},
+				onLoggedOut: () => {
+					ctx.log(`WhatsApp was unlinked. Delete ${authDir} and restart to scan a new QR code.`);
+					ctx.onLoggedOut?.();
+				},
 				onMessage: (msg) => {
 					void ctx.onInbound({
 						channel: CHANNEL_ID,
 						conversationId: msg.conversationId,
+						messageId: msg.messageId,
+						participantId: msg.participantId,
 						from: msg.from,
 						fromName: msg.fromName,
 						text: msg.text,
+						chatType: msg.chatType,
+						isGroup: msg.chatType === "group",
+						mentions: msg.mentions,
+						replyTo: msg.replyTo,
+						media: msg.media,
 						raw: msg.raw,
 					});
 				},
@@ -86,6 +102,27 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 		async sendText(conversationId: string, text: string): Promise<void> {
 			if (!connection) throw new Error("WhatsApp channel is not started");
 			await connection.sendText(conversationId, text);
+		},
+		async sendMedia(conversationId, media): Promise<void> {
+			if (!connection) throw new Error("WhatsApp channel is not started");
+			await connection.sendMedia(conversationId, media);
+		},
+		async react(conversationId, messageId, emoji): Promise<void> {
+			if (!connection) throw new Error("WhatsApp channel is not started");
+			await connection.react(conversationId, messageId, emoji);
+		},
+		async markRead(conversationId, messageId, participant): Promise<void> {
+			// No-op when the socket isn't up — read receipts are cosmetic and the
+			// manager calls this best-effort post-gate.
+			if (!connection) return;
+			await connection.markRead(conversationId, messageId, participant);
+		},
+		async setComposing(conversationId, state): Promise<void> {
+			if (!connection) return;
+			await connection.setComposing(conversationId, state);
+		},
+		selfId(): string | undefined {
+			return connection?.selfId() ?? undefined;
 		},
 	};
 }

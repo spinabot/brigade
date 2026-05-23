@@ -33,18 +33,94 @@ import type { AnyBrigadeTool } from "../tools/types.js";
 /* These are the LOCKED interfaces. Implementations arrive per phase; the shapes
  * are stable so nothing downstream is rewritten when a capability lands. */
 
+/** Outbound media payload — what the agent wants to send out via `sendMedia`. */
+export interface OutboundMedia {
+	kind: "image" | "video" | "audio" | "voice" | "document" | "sticker";
+	/** Absolute path to the file on disk. */
+	path: string;
+	/** Override the file name surfaced to the recipient (documents). */
+	fileName?: string;
+	/** Caption to render alongside image/video/document. */
+	caption?: string;
+	/** Override MIME (defaults to a kind-specific value). */
+	mimeType?: string;
+}
+
+/** Inbound media attachment (image / voice note / document / sticker / video). */
+export interface InboundMediaAttachment {
+	/** What it is. */
+	kind: "image" | "video" | "audio" | "voice" | "document" | "sticker";
+	/** Absolute path on disk where the adapter saved the bytes (under ~/.brigade). */
+	path: string;
+	/** Detected MIME type, e.g. "image/jpeg". */
+	mimeType?: string;
+	/** Original file name (documents) or sender-provided caption-extracted name. */
+	fileName?: string;
+	/** Caption sent alongside the media; surfaces as `text` when no other text was sent. */
+	caption?: string;
+}
+
+/** Context of a previous message the inbound is replying to. */
+export interface InboundReplyContext {
+	/** Stable id of the quoted message, when the channel exposes one. */
+	messageId?: string;
+	/** A short excerpt of the quoted body so the LLM can see what was replied to. */
+	body?: string;
+	/** Sender id of the quoted message. */
+	from?: string;
+}
+
 /** A normalized inbound message from any channel (WhatsApp/Slack/Telegram/…). */
 export interface InboundMessage {
 	/** Channel id, e.g. "whatsapp". */
 	channel: string;
 	/** Stable conversation/chat id within the channel (the session-key seed). */
 	conversationId: string;
+	/**
+	 * Channel-native id of THIS inbound message (e.g. Baileys `msg.key.id`).
+	 * Used by the manager to call `adapter.markRead` after the access-control
+	 * gate allows the message. `undefined` for channels that don't expose a
+	 * stable id per inbound.
+	 */
+	messageId?: string;
+	/**
+	 * Channel-native id of the speaker on a group message (e.g. WhatsApp
+	 * `msg.key.participant`). Used alongside `messageId` for read receipts on
+	 * group rooms where the platform tracks read state per-participant.
+	 */
+	participantId?: string;
 	/** Sender id within the channel (phone/user id). */
 	from: string;
-	/** Plain text of the message. */
+	/** Plain text of the message (may be empty when media has no caption). */
 	text: string;
 	/** Optional display name of the sender. */
 	fromName?: string;
+	/**
+	 * `direct` (a DM) or `group` (a multi-party room). Channels that don't
+	 * carry the distinction (Slack channels behave like groups) should pick
+	 * `group`. The access-control gate routes on this.
+	 */
+	chatType?: "direct" | "group";
+	/** True iff `chatType === "group"`. Convenience flag for gates that don't care about other distinctions. */
+	isGroup?: boolean;
+	/**
+	 * Channel-native ids of accounts mentioned/@-tagged in the message
+	 * (e.g. WhatsApp jids in a group). Empty when no @-mentions were used.
+	 */
+	mentions?: string[];
+	/**
+	 * Quoted-reply context — what message this inbound is replying to.
+	 * `undefined` when the inbound is a fresh message, not a reply.
+	 */
+	replyTo?: InboundReplyContext;
+	/**
+	 * Thread id for channels that support threads (Slack/Discord/Telegram topics).
+	 * `undefined` for WhatsApp and other flat-DM channels. Used by access-control
+	 * and session-key for thread-scoped routing.
+	 */
+	threadId?: string;
+	/** Media attachments saved to disk, when the inbound carried any. */
+	media?: InboundMediaAttachment[];
 	/** Raw provider payload (for adapters that need more). */
 	raw?: unknown;
 }
@@ -59,6 +135,25 @@ export interface ChannelStartContext {
 	signal: AbortSignal;
 	/** A place to surface a QR / pairing code to the operator (e.g. WhatsApp). */
 	onPairing?: (info: { kind: "qr" | "code"; value: string }) => void;
+	/**
+	 * Called once the adapter completes its initial connection (e.g. WhatsApp
+	 * reaches the `open` state after the QR is scanned). The CLI link command
+	 * uses this as its "done" signal; the gateway can ignore it.
+	 */
+	onConnected?: () => void;
+	/**
+	 * Called when the channel ends the session and re-linking is required
+	 * (e.g. WhatsApp creds invalidated). The link/status commands surface this;
+	 * the gateway logs it.
+	 */
+	onLoggedOut?: () => void;
+	/**
+	 * One-shot link mode — the CLI's `channels link` command sets this so the
+	 * adapter knows to skip aggressive reconnect-loops (those are right for the
+	 * gateway, wrong for an interactive pair). Adapters that don't have a link
+	 * vs serve distinction can ignore it.
+	 */
+	linkMode?: boolean;
 }
 
 /**
@@ -78,6 +173,43 @@ export interface ChannelAdapter {
 	stop(): Promise<void>;
 	/** Send an outbound text reply to a conversation. */
 	sendText(conversationId: string, text: string): Promise<void>;
+	/**
+	 * Optional: send a media attachment (image / video / audio / voice / doc /
+	 * sticker) to a conversation. Channels that don't support media omit this
+	 * slot; the runtime falls back to a `sendText` describing the path.
+	 */
+	sendMedia?(conversationId: string, media: OutboundMedia): Promise<void>;
+	/**
+	 * Optional: react to a previously-received message with an emoji (or pass
+	 * `""` to clear a prior reaction). `messageId` is the inbound message id
+	 * the adapter normalized into `InboundMessage.raw` (Baileys: `msg.key.id`).
+	 */
+	react?(conversationId: string, messageId: string, emoji: string): Promise<void>;
+	/**
+	 * The linked self id (operator's own account on the channel) once connected.
+	 * Used by the access-control gate to always allow the operator's own DMs.
+	 * `undefined` before the first successful connection.
+	 */
+	selfId?(): string | undefined;
+	/**
+	 * Optional: mark a previously-received message as read (e.g. WhatsApp "blue
+	 * ticks"). Called by the manager AFTER access control allows the inbound so
+	 * a stranger waiting on a pairing challenge never sees a read receipt before
+	 * the bot has decided to engage. `messageId`/`participant` are the channel-
+	 * native ids; channels without read receipts omit this slot.
+	 */
+	markRead?(
+		conversationId: string,
+		messageId: string,
+		participant?: string,
+	): Promise<void>;
+	/**
+	 * Optional: signal "typing…" on the conversation while the agent thinks
+	 * (`state: "composing"`) and clear it when done (`state: "paused"`). Called
+	 * by the manager around the turn so a blocked stranger never sees a typing
+	 * indicator. Best-effort — channels without presence omit this slot.
+	 */
+	setComposing?(conversationId: string, state: "composing" | "paused"): Promise<void>;
 }
 
 /** Context for a channel command handler (a `/cmd` typed in a channel chat). */

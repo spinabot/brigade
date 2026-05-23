@@ -152,6 +152,21 @@ export function resolveExtensionsDir(): string {
   return path.join(resolveStateDir(), "extensions");
 }
 
+// Per-channel access-control files: the list of allowed senders + any pending
+// pairing codes. Co-located with the channel's other state so the existing
+// `rm -rf ~/.brigade/channels/<id>` reset wipes them along with the creds.
+export function resolveChannelAllowFromPath(channelId: string): string {
+  return path.join(resolveChannelStateDir(channelId), "allow-from.json");
+}
+// Group allow-from is a separate file so revoking a group's access doesn't
+// kick the operator out of their own DMs and vice-versa.
+export function resolveChannelGroupAllowFromPath(channelId: string): string {
+  return path.join(resolveChannelStateDir(channelId), "group-allow-from.json");
+}
+export function resolveChannelPairingPath(channelId: string): string {
+  return path.join(resolveChannelStateDir(channelId), "pairing.json");
+}
+
 export function resolveConfigAuditLogPath(): string {
   return path.join(resolveLogsDir(), "config-audit.jsonl");
 }

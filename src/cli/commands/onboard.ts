@@ -30,7 +30,7 @@ import { DEFAULT_AGENT_ID, resolveAuthProfilesPath } from "../../config/paths.js
 import { BRIGADE_DIR, loadConfig, saveConfig } from "../../core/config.js";
 import { EXIT_CONFIG_ERROR } from "../../protocol.js";
 import { runOnboarding } from "../../ui/onboarding.js";
-import { restoreTerminal } from "../../ui/terminal-cleanup.js";
+import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 
 export interface OnboardCommandOptions {
 	/**
@@ -54,6 +54,10 @@ export interface OnboardCommandOptions {
  * (success or cancellation) — no long-running event loop to keep alive.
  */
 export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promise<number> {
+	// Onboard uses prompts (raw mode + cursor manipulation) — opt into the
+	// on-exit terminal cleanup so a Ctrl+C mid-wizard doesn't leave the
+	// terminal in raw mode.
+	markTuiActive();
 	if (!process.stdin.isTTY || !process.stdout.isTTY) {
 		console.error(chalk.red("brigade onboard needs an interactive terminal."));
 		console.error(

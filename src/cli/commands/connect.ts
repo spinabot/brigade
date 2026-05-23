@@ -41,7 +41,7 @@ import chalk from "chalk";
 // of leaking literal underscores. Same shape as Pi-TUI's `Markdown` — drop-in.
 import { Markdown } from "../../ui/markdown.js";
 import { renderBrandHeader } from "../../ui/brand.js";
-import { restoreTerminal } from "../../ui/terminal-cleanup.js";
+import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { brand, editorTheme, markdownTheme } from "../../ui/theme.js";
 import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
@@ -87,6 +87,9 @@ export interface ConnectHandle {
  * user gets a clear "couldn't reach gateway" error instead of a blank chat.
  */
 export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promise<ConnectHandle> {
+	// Connect runs a TUI client (raw mode, alt-screen, kitty keys) — opt into
+	// the on-exit terminal cleanup. Non-TUI commands skip this and exit silently.
+	markTuiActive();
 	const host = opts.host ?? "127.0.0.1";
 	const port = opts.port ?? 7777;
 	const url = `ws://${host}:${port}`;
