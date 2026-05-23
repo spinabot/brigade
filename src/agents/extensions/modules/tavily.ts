@@ -199,6 +199,11 @@ const WebExtractSchema = Type.Object({
 			description: "`advanced` enables JS rendering for SPA pages. Costs more.",
 		}),
 	),
+	includeImages: Type.Optional(
+		Type.Boolean({
+			description: "When true, surface image URLs found on each page in the result.",
+		}),
+	),
 });
 
 export interface WebExtractDetails {
@@ -210,6 +215,7 @@ export interface WebExtractDetails {
 		url: string;
 		content: string;
 		rawContent?: string;
+		images?: string[];
 	}>;
 	failedResults?: Array<{ url: string; error: string }>;
 }
@@ -258,6 +264,7 @@ function makeWebExtractTool(): AnyBrigadeTool {
 			if (args.query) body.query = args.query;
 			if (args.chunksPerSource) body.chunks_per_source = args.chunksPerSource;
 			if (args.extractDepth) body.extract_depth = args.extractDepth;
+			if (args.includeImages) body.include_images = true;
 
 			onUpdate?.({
 				content: [{ type: "text", text: `Extracting ${urls.length} URL${urls.length === 1 ? "" : "s"}…` }],
@@ -286,7 +293,18 @@ function makeWebExtractTool(): AnyBrigadeTool {
 					const rawContent = typeof r.raw_content === "string"
 						? wrapWebContent(r.raw_content, "web_fetch", { includeWarning: false })
 						: undefined;
-					return { url, content, rawContent };
+					// Surface image URLs when the operator opted in via
+					// `includeImages: true`. URLs themselves stay raw (treated
+					// as data references; the body is still untrusted).
+					const images = Array.isArray(r.images)
+						? (r.images as unknown[]).filter((u): u is string => typeof u === "string")
+						: undefined;
+					return {
+						url,
+						content,
+						rawContent,
+						images: images && images.length > 0 ? images : undefined,
+					};
 				})
 				.filter((r): r is NonNullable<typeof r> => r !== null);
 			const failedResults = Array.isArray(json.failed_results)
@@ -339,9 +357,14 @@ async function postTavily(opts: PostTavilyOptions): Promise<Record<string, unkno
 	try {
 		// Tavily takes the key in the request body (`api_key`) — NOT a
 		// Bearer header. They allow both but the body form is documented.
+		// `X-Client-Source` tells Tavily that the request is from Brigade
+		// — used for analytics + rate-limit tiering.
 		const response = await fetch(opts.url, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: {
+				"content-type": "application/json",
+				"x-client-source": "brigade",
+			},
 			body: JSON.stringify({ ...opts.body, api_key: opts.apiKey }),
 			signal: combined,
 		});

@@ -30,7 +30,7 @@ import {
 
 const EXA_ENDPOINT = "https://api.exa.ai/search";
 
-type ExaSearchType = "auto" | "neural" | "fast" | "keyword";
+type ExaSearchType = "auto" | "neural" | "fast" | "keyword" | "deep" | "deep-reasoning" | "instant";
 
 interface ExaConfig {
 	apiKey?: string;
@@ -38,6 +38,37 @@ interface ExaConfig {
 	includeText?: boolean;
 	includeSummary?: boolean;
 	summaryQuery?: string;
+	includeHighlights?: boolean;
+	highlightsQuery?: string;
+	highlightsPerUrl?: number;
+	numSentences?: number;
+	/** Freshness preset: day / week / month / year. Computed into startPublishedDate. */
+	freshness?: "day" | "week" | "month" | "year";
+	/** Explicit YYYY-MM-DD lower bound on publishedDate. Overrides freshness. */
+	dateAfter?: string;
+	/** Explicit YYYY-MM-DD upper bound on publishedDate. */
+	dateBefore?: string;
+}
+
+/**
+ * Compute the start-published-date for Exa's API from a freshness preset.
+ * Returns YYYY-MM-DD or undefined when no/invalid preset.
+ */
+function resolveFreshnessStart(preset: ExaConfig["freshness"]): string | undefined {
+	if (!preset) return undefined;
+	const now = new Date();
+	switch (preset) {
+		case "day": now.setUTCDate(now.getUTCDate() - 1); break;
+		case "week": now.setUTCDate(now.getUTCDate() - 7); break;
+		case "month": now.setUTCMonth(now.getUTCMonth() - 1); break;
+		case "year": now.setUTCFullYear(now.getUTCFullYear() - 1); break;
+	}
+	return now.toISOString().slice(0, 10);
+}
+
+function isValidIsoDate(raw: string | undefined): boolean {
+	if (!raw) return false;
+	return /^\d{4}-\d{2}-\d{2}$/.test(raw) && Number.isFinite(Date.parse(`${raw}T00:00:00Z`));
 }
 
 interface ExaHit {
@@ -112,12 +143,29 @@ function createExaSearchProvider(): WebSearchProvider {
 					if (cfgSlot.includeSummary) {
 						contents.summary = cfgSlot.summaryQuery ? { query: cfgSlot.summaryQuery } : true;
 					}
+					if (cfgSlot.includeHighlights) {
+						const hl: Record<string, unknown> = {};
+						if (cfgSlot.highlightsQuery) hl.query = cfgSlot.highlightsQuery;
+						if (typeof cfgSlot.highlightsPerUrl === "number") hl.highlightsPerUrl = cfgSlot.highlightsPerUrl;
+						if (typeof cfgSlot.numSentences === "number") hl.numSentences = cfgSlot.numSentences;
+						contents.highlights = Object.keys(hl).length > 0 ? hl : true;
+					}
 					const body: Record<string, unknown> = {
 						query,
 						numResults,
 						type: cfgSlot.type ?? "auto",
 					};
 					if (Object.keys(contents).length > 0) body.contents = contents;
+					// Date filtering — explicit YYYY-MM-DD beats freshness preset.
+					if (isValidIsoDate(cfgSlot.dateAfter)) {
+						body.startPublishedDate = cfgSlot.dateAfter;
+					} else {
+						const fromPreset = resolveFreshnessStart(cfgSlot.freshness);
+						if (fromPreset) body.startPublishedDate = fromPreset;
+					}
+					if (isValidIsoDate(cfgSlot.dateBefore)) {
+						body.endPublishedDate = cfgSlot.dateBefore;
+					}
 
 					const controller = new AbortController();
 					const timer = setTimeout(() => controller.abort(new Error("timeout")), timeoutMs);
@@ -129,6 +177,7 @@ function createExaSearchProvider(): WebSearchProvider {
 							headers: {
 								"content-type": "application/json",
 								"x-api-key": apiKey,
+								"x-exa-integration": "brigade",
 							},
 							body: JSON.stringify(body),
 							signal: combined,

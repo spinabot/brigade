@@ -69,6 +69,27 @@ const FORBIDDEN_HOSTNAMES = new Set([
 const FORBIDDEN_HOSTNAME_SUFFIXES = [".local", ".internal", ".localhost"];
 
 /**
+ * Detect non-canonical IPv4 literals — `0177.0.0.1` (octal), `0x7f.0.0.1`
+ * (hex), `2130706433` (decimal-int), `127.1` (short). All of these resolve
+ * to `127.0.0.1` in `inet_aton` parsers but slip past a plain dotted-quad
+ * regex. We refuse them outright — a fetch URL has no business carrying a
+ * legacy form, and accepting them is a known SSRF bypass.
+ */
+function isLegacyIpv4Literal(host: string): boolean {
+	// Single decimal integer that fits a 32-bit IPv4 address.
+	if (/^\d+$/.test(host) && Number(host) <= 0xFFFFFFFF && Number(host) >= 256) return true;
+	const parts = host.split(".");
+	// Short forms (1-, 2-, 3-part dotted) — not canonical, refuse.
+	if (parts.length > 0 && parts.length < 4 && parts.every((p) => /^\d+$/.test(p))) return true;
+	// Octal prefix (`0` + digits, length > 1) or hex prefix (`0x`).
+	for (const p of parts) {
+		if (/^0\d+$/.test(p)) return true;
+		if (/^0[xX][0-9a-fA-F]+$/.test(p)) return true;
+	}
+	return false;
+}
+
+/**
  * Classify an IPv4 address. Returns a reason string when the IP is in a
  * forbidden range, or `null` when it's safe to fetch.
  */
@@ -107,7 +128,10 @@ function classifyIPv4(ip: string): string | null {
  * we refuse.
  */
 function classifyIPv6(ip: string): string | null {
-	const lower = ip.toLowerCase();
+	// Strip zone identifier (`fe80::1%eth0`) before classifying — the
+	// address itself is what we judge; zone routes locally only.
+	const noZone = ip.split("%", 1)[0] ?? ip;
+	const lower = noZone.toLowerCase();
 	// ::1 — loopback
 	if (lower === "::1" || lower === "::ffff:127.0.0.1") return "IPv6 loopback";
 	// :: — unspecified
@@ -117,6 +141,11 @@ function classifyIPv6(ip: string): string | null {
 	// fe80::/10 — link-local
 	if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) {
 		return "IPv6 link-local (fe80::/10)";
+	}
+	// fec0::/10 — deprecated site-local. Some networks still use it
+	// internally; treat as private and refuse.
+	if (lower.startsWith("fec") || lower.startsWith("fed") || lower.startsWith("fee") || lower.startsWith("fef")) {
+		return "IPv6 site-local (fec0::/10, deprecated)";
 	}
 	// ::ffff:0:0/96 — IPv4-mapped — re-classify the embedded v4
 	const mapped = lower.match(/^::ffff:([0-9.]+)$/);
@@ -141,8 +170,14 @@ export function classifyHostnameSync(hostname: string): string | null {
 	}
 	// Strip brackets from IPv6 literals before classifying.
 	const stripped = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+	// Refuse non-canonical IPv4 (octal/hex/decimal-int/short forms) outright —
+	// these resolve to the same IP via legacy inet_aton parsers but bypass a
+	// dotted-quad sanity check.
+	if (isLegacyIpv4Literal(stripped)) return "legacy IPv4 literal (non-canonical form)";
 	if (isIPv4(stripped)) return classifyIPv4(stripped);
-	if (isIPv6(stripped)) return classifyIPv6(stripped);
+	// Drop zone identifier before IPv6 classification.
+	const noZone = stripped.split("%", 1)[0] ?? stripped;
+	if (isIPv6(noZone)) return classifyIPv6(noZone);
 	if (isIP(stripped) === 0 && /^[\d.]+$/.test(stripped)) return "invalid IPv4 literal";
 	return null;
 }

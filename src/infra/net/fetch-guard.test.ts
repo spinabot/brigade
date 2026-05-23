@@ -61,6 +61,27 @@ describe("classifyHostnameSync — refusals", () => {
 		assert.ok(classifyHostnameSync("0.255.255.255"));
 	});
 
+	it("refuses legacy IPv4 literals (octal/hex/decimal-int/short)", () => {
+		// Decimal-int form of 127.0.0.1
+		assert.ok(classifyHostnameSync("2130706433"));
+		// Hex form
+		assert.ok(classifyHostnameSync("0x7f.0.0.1"));
+		// Octal form
+		assert.ok(classifyHostnameSync("0177.0.0.1"));
+		// 3-part short form (127.0.1 → 127.0.0.1 in inet_aton)
+		assert.ok(classifyHostnameSync("127.0.1"));
+	});
+
+	it("refuses IPv6 site-local fec0::/10 (deprecated)", () => {
+		assert.ok(classifyHostnameSync("fec0::1"));
+		assert.ok(classifyHostnameSync("feff::1"));
+	});
+
+	it("strips IPv6 zone identifier before classifying", () => {
+		// fe80::1%eth0 is link-local. Zone-suffix must not let it pass.
+		assert.ok(classifyHostnameSync("fe80::1%eth0"));
+	});
+
 	it("refuses IPv6 loopback + ULA + link-local", () => {
 		assert.ok(classifyHostnameSync("::1"));
 		assert.ok(classifyHostnameSync("fc00::1"));

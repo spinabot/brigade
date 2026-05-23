@@ -29,7 +29,6 @@ import { DEFAULT_TIMEOUT_SECONDS, readResponseText } from "../../tools/web-share
 import {
 	makeProviderCacheKey,
 	normalizeFreshnessPreset,
-	parseIsoDate,
 	readProviderConfigSlot,
 	resolveProviderApiKey,
 	resolveSiteName,
@@ -46,6 +45,52 @@ interface BraveSearchConfig {
 	freshness?: string;
 	dateAfter?: string;
 	dateBefore?: string;
+}
+
+/**
+ * Brave's documented country codes. Anything else is silently dropped so
+ * we don't pass an invalid code that would 400 the request.
+ */
+const BRAVE_COUNTRY_CODES = new Set([
+	"AR","AU","AT","BE","BR","CA","CL","DK","FI","FR","DE","HK","IN","ID","IT","JP","KR","MY",
+	"MX","NL","NZ","NO","CN","PL","PT","PH","RU","SA","ZA","ES","SE","CH","TW","TR","GB","US",
+	"ALL",
+]);
+
+const BRAVE_SEARCH_LANG_CODES = new Set([
+	"ar","bg","cs","da","de","el","en","en-gb","es","et","fi","fr","he","hi","hr","hu","id",
+	"it","ja","ko","lt","lv","nb","nl","pl","pt-br","pt-pt","ro","ru","sk","sl","sr","sv","th",
+	"tr","uk","vi","zh-hans","zh-hant",
+]);
+
+const UI_LANG_REGEX = /^[a-z]{2}-[a-z]{2}$/i;
+
+function normalizeBraveCountry(raw: string | undefined): string | undefined {
+	if (!raw) return undefined;
+	const upper = raw.trim().toUpperCase();
+	return BRAVE_COUNTRY_CODES.has(upper) ? upper : undefined;
+}
+
+function normalizeBraveSearchLang(raw: string | undefined): string | undefined {
+	if (!raw) return undefined;
+	const lower = raw.trim().toLowerCase();
+	if (BRAVE_SEARCH_LANG_CODES.has(lower)) return lower;
+	// Common aliases.
+	if (lower === "ja" || lower === "jp") return "ja";
+	if (lower === "zh") return "zh-hans";
+	return undefined;
+}
+
+function normalizeBraveUiLang(raw: string | undefined): string | undefined {
+	if (!raw) return undefined;
+	const v = raw.trim();
+	return UI_LANG_REGEX.test(v) ? v : undefined;
+}
+
+function isValidIsoDate(raw: string | undefined): boolean {
+	if (!raw) return false;
+	if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return false;
+	return Number.isFinite(Date.parse(`${raw}T00:00:00Z`));
 }
 
 interface BraveSearchHit {
@@ -120,15 +165,22 @@ function createBraveSearchProvider(): WebSearchProvider {
 					const url = new URL(BRAVE_SEARCH_ENDPOINT);
 					url.searchParams.set("q", query);
 					url.searchParams.set("count", String(count));
-					if (cfgSlot.country) url.searchParams.set("country", cfgSlot.country);
-					if (cfgSlot.search_lang) url.searchParams.set("search_lang", cfgSlot.search_lang);
-					if (cfgSlot.ui_lang) url.searchParams.set("ui_lang", cfgSlot.ui_lang);
+					// Validate locale/country codes against Brave's documented
+					// set before forwarding. Invalid values are dropped silently
+					// so the request still goes through with safe defaults.
+					const country = normalizeBraveCountry(cfgSlot.country);
+					const searchLang = normalizeBraveSearchLang(cfgSlot.search_lang);
+					const uiLang = normalizeBraveUiLang(cfgSlot.ui_lang);
+					if (country) url.searchParams.set("country", country);
+					if (searchLang) url.searchParams.set("search_lang", searchLang);
+					if (uiLang) url.searchParams.set("ui_lang", uiLang);
 					const freshness = normalizeFreshnessPreset(cfgSlot.freshness);
 					if (freshness) {
 						url.searchParams.set("freshness", freshness);
 					} else {
-						const after = parseIsoDate(cfgSlot.dateAfter);
-						const before = parseIsoDate(cfgSlot.dateBefore);
+						// Validate dates against YYYY-MM-DD format + parseable.
+						const after = isValidIsoDate(cfgSlot.dateAfter) ? cfgSlot.dateAfter : undefined;
+						const before = isValidIsoDate(cfgSlot.dateBefore) ? cfgSlot.dateBefore : undefined;
 						if (after && before) {
 							url.searchParams.set("freshness", `${after}to${before}`);
 						} else if (after) {
@@ -184,7 +236,17 @@ function createBraveSearchProvider(): WebSearchProvider {
 						return {
 							provider: "brave",
 							results,
-							_cacheKey: makeProviderCacheKey(["brave", query, count, cfgSlot.country, freshness]),
+							_cacheKey: makeProviderCacheKey([
+								"brave",
+								query,
+								count,
+								country,
+								searchLang,
+								uiLang,
+								freshness,
+								cfgSlot.dateAfter,
+								cfgSlot.dateBefore,
+							]),
 						};
 					} finally {
 						clearTimeout(timer);

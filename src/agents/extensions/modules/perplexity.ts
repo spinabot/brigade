@@ -35,6 +35,21 @@ interface PerplexityConfig {
 	country?: string;
 	searchRecencyFilter?: "day" | "week" | "month" | "year";
 	searchDomainFilter?: string[];
+	/** ISO 639-1 language codes (e.g. ["en", "de"]). */
+	searchLanguageFilter?: string[];
+	/** YYYY-MM-DD lower-bound on publication date. */
+	searchAfterDate?: string;
+	/** YYYY-MM-DD upper-bound. */
+	searchBeforeDate?: string;
+	/** Total content budget across results (per-call). */
+	maxTokens?: number;
+	/** Per-page content budget. */
+	maxTokensPerPage?: number;
+}
+
+function isValidIsoDate(raw: string | undefined): boolean {
+	if (!raw) return false;
+	return /^\d{4}-\d{2}-\d{2}$/.test(raw) && Number.isFinite(Date.parse(`${raw}T00:00:00Z`));
 }
 
 interface PerplexityHit {
@@ -106,7 +121,24 @@ function createPerplexitySearchProvider(): WebSearchProvider {
 					if (cfgSlot.country) body.country = cfgSlot.country;
 					if (cfgSlot.searchRecencyFilter) body.search_recency_filter = cfgSlot.searchRecencyFilter;
 					if (cfgSlot.searchDomainFilter?.length) {
-						body.search_domain_filter = cfgSlot.searchDomainFilter;
+						body.search_domain_filter = cfgSlot.searchDomainFilter.slice(0, 20);
+					}
+					if (cfgSlot.searchLanguageFilter?.length) {
+						body.search_language_filter = cfgSlot.searchLanguageFilter
+							.filter((l) => /^[a-z]{2}$/i.test(l))
+							.map((l) => l.toLowerCase());
+					}
+					if (isValidIsoDate(cfgSlot.searchAfterDate)) {
+						body.search_after_date = cfgSlot.searchAfterDate;
+					}
+					if (isValidIsoDate(cfgSlot.searchBeforeDate)) {
+						body.search_before_date = cfgSlot.searchBeforeDate;
+					}
+					if (typeof cfgSlot.maxTokens === "number" && cfgSlot.maxTokens > 0) {
+						body.max_tokens = cfgSlot.maxTokens | 0;
+					}
+					if (typeof cfgSlot.maxTokensPerPage === "number" && cfgSlot.maxTokensPerPage > 0) {
+						body.max_tokens_per_page = cfgSlot.maxTokensPerPage | 0;
 					}
 
 					const controller = new AbortController();
@@ -119,6 +151,10 @@ function createPerplexitySearchProvider(): WebSearchProvider {
 							headers: {
 								"content-type": "application/json",
 								authorization: `Bearer ${apiKey}`,
+								// Telemetry hints — Perplexity uses these to bucket
+								// usage for OpenRouter-routed flows + ranking.
+								"http-referer": "https://github.com/Bhasvanth-Dev9380/brigade",
+								"x-title": "Brigade",
 							},
 							body: JSON.stringify(body),
 							signal: combined,

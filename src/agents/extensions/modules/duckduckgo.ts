@@ -76,9 +76,40 @@ function parseDdgResults(html: string, count: number): Array<{ title: string; ur
 	return hits;
 }
 
-/** Detect DDG's anti-bot challenge page so we can fail loud instead of silently empty. */
+/**
+ * Detect DDG's anti-bot challenge page so we can fail loud instead of
+ * silently empty. Whitelist check first: if the page contains a
+ * `result__a` link, treat as legitimate even if a marker word slipped in.
+ * Otherwise scan for known challenge markers.
+ */
 function looksLikeBotChallenge(html: string): boolean {
-	return /anomaly|unusual\s+traffic|please verify|captcha|are you a robot/i.test(html.slice(0, 2_000));
+	// Whitelist: if real result markup is present, accept the page.
+	if (/class="[^"]*\bresult__a\b/i.test(html.slice(0, 5_000))) return false;
+	const head = html.slice(0, 5_000);
+	return /g-recaptcha|id="challenge-form"|name="challenge"|anomaly|unusual\s+traffic|please\s+verify|captcha|are\s+you\s+a\s+(?:human|robot)/i.test(
+		head,
+	);
+}
+
+interface DuckDuckGoConfig {
+	/** SafeSearch level — DDG `kp` param: -2=off, -1=moderate, 1=strict. */
+	safeSearch?: "off" | "moderate" | "strict";
+	/** Region code — DDG `kl` param: e.g. "us-en", "uk-en", "de-de". */
+	region?: string;
+}
+
+function resolveDdgConfig(cfg: unknown): DuckDuckGoConfig {
+	const slot = (cfg as {
+		tools?: { web?: { search?: { providers?: { duckduckgo?: DuckDuckGoConfig } } } };
+	}).tools?.web?.search?.providers?.duckduckgo;
+	return slot ?? {};
+}
+
+function safeSearchToKp(value: DuckDuckGoConfig["safeSearch"]): string | undefined {
+	if (value === "off") return "-2";
+	if (value === "moderate") return "-1";
+	if (value === "strict") return "1";
+	return undefined;
 }
 
 /** Build the DuckDuckGo provider. Zero-config — no envVar, no API key. */
@@ -95,6 +126,9 @@ function createDuckDuckGoProvider(): WebSearchProvider {
 		isConfigured: () => true,
 		createTool(ctx: WebProviderContext): WebProviderToolDefinition {
 			const timeoutMs = (ctx.runtime?.timeoutMs ?? DEFAULT_TIMEOUT_SECONDS * 1_000) | 0;
+			const ddgCfg = resolveDdgConfig(ctx.config);
+			const kp = safeSearchToKp(ddgCfg.safeSearch);
+			const kl = ddgCfg.region?.trim();
 			return {
 				description: "DuckDuckGo web search (HTML lite endpoint).",
 				parameters: {
@@ -110,6 +144,8 @@ function createDuckDuckGoProvider(): WebSearchProvider {
 					if (!query) throw new Error("duckduckgo: missing query");
 					const count = Math.max(1, Math.min(25, Number((args as { count?: unknown }).count ?? 10)));
 					const form = new URLSearchParams({ q: query });
+					if (kp) form.set("kp", kp);
+					if (kl) form.set("kl", kl);
 					const { response, finalUrl } = await guardedFetch(DDG_ENDPOINT, {
 						method: "POST",
 						headers: {

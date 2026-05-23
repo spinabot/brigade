@@ -97,6 +97,12 @@ const HIDDEN_CLASS_HINTS = [
 	"screen-reader-only",
 	"screen-reader-text",
 	"hidden-text",
+	// Bootstrap / Tailwind / utility frameworks
+	"d-none",
+	"hide",
+	"is-hidden",
+	"invisible",
+	"offscreen",
 ];
 
 /**
@@ -173,6 +179,15 @@ function stripHiddenByInlineStyle(html: string): string {
 		/clip-path\s*:\s*inset\(\s*50%/i,
 		/transform\s*:\s*scale\(\s*0\b/i,
 		/(?:left|top)\s*:\s*-\d{4,}px/i,
+		// Off-screen via translate. Spam pages hide instructions like this.
+		/transform\s*:\s*translate(?:x|y)?\(\s*-?\d{4,}px/i,
+		// Color-transparency tricks — text is rendered but invisible.
+		/color\s*:\s*transparent\b/i,
+		/color\s*:\s*rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0(?:\.0+)?\s*\)/i,
+		/color\s*:\s*hsla?\(\s*[\d.]+\s*,\s*[\d.]+%?\s*,\s*[\d.]+%?\s*,\s*0(?:\.0+)?\s*\)/i,
+		// 0×0 + overflow:hidden combo (common screen-reader-hide pattern
+		// but also used by injection attacks to smuggle text).
+		/width\s*:\s*0\s*(?:px|em|%)?\s*;\s*height\s*:\s*0/i,
 	];
 	const re = /<([a-z][a-z0-9-]*)\b[^>]*style=["']([^"']*)["'][^>]*>[\s\S]*?<\/\1>/gi;
 	return html.replace(re, (match, _tag, style: string) => {
@@ -222,15 +237,90 @@ export function stripInvisibleUnicode(text: string): string {
 /**
  * Scrub literal envelope marker tokens from incoming content. If an
  * attacker page emits the exact open/close markers used by
- * `wrapWebContent` (e.g. `<<<EXTERNAL_UNTRUSTED_CONTENT id="…">>>`)
- * inside its own body, it can pose as a marker boundary and trick the
- * model into treating subsequent text as instructions. Replace any
- * occurrence with a placeholder before the envelope is applied.
+ * `wrapWebContent` inside its own body, it can pose as a marker boundary
+ * and trick the model into treating subsequent text as instructions.
+ *
+ * Defenses applied in order:
+ *   1. Strip invisible Unicode so zero-width chars can't break up the
+ *      marker token (e.g. `<<<EXTER​NAL_UNTRUSTED_CONTENT>>>` with a
+ *      ZWSP after the R wouldn't match a naive regex).
+ *   2. Normalize ASCII-homoglyphs (fullwidth, mathematical-style chars)
+ *      to their plain-ASCII equivalents before pattern matching.
+ *   3. Match-and-replace the canonical marker forms.
+ *
+ * Returns content with any marker (real or spoofed) redacted to a
+ * placeholder. NOTE: this normalization is per-call defensive — it does
+ * NOT mutate the document's actual text; only the spoof-suspicion paths
+ * see the normalized form.
  */
 export function stripEnvelopeMarkers(text: string): string {
-	return text
-		.replace(/<<<EXTERNAL_UNTRUSTED_CONTENT\b[^>]*>>>/gi, "[redacted-marker]")
-		.replace(/<<<END_EXTERNAL_UNTRUSTED_CONTENT\b[^>]*>>>/gi, "[redacted-marker]");
+	const probe = normalizeHomoglyphs(stripInvisibleUnicode(text));
+	if (!/EXTERNAL_UNTRUSTED_CONTENT/i.test(probe)) return text;
+	// Build a regex tolerant of mixed spacing + case + underscore/space
+	// variants. This catches `external_untrusted_content`, `EXTERNAL
+	// UNTRUSTED CONTENT`, plus homoglyph reconstructions.
+	const tokenOpen = /<<<\s*EXTERNAL[_\s]+UNTRUSTED[_\s]+CONTENT\b[^>]*>>>/gi;
+	const tokenClose = /<<<\s*END[_\s]+EXTERNAL[_\s]+UNTRUSTED[_\s]+CONTENT\b[^>]*>>>/gi;
+	const stripped = stripInvisibleUnicode(text);
+	const normalized = normalizeHomoglyphs(stripped);
+	return normalized
+		.replace(tokenClose, "[redacted-end-marker]")
+		.replace(tokenOpen, "[redacted-marker]");
+}
+
+/**
+ * Map common Unicode homoglyphs back to plain ASCII for marker detection.
+ * The output is NOT meant to be human-readable; it's an internal
+ * normalized form so spoofed markers (using fullwidth `Ｅ` instead of `E`,
+ * or `‹` instead of `<`) can be caught by ASCII regex.
+ */
+function normalizeHomoglyphs(text: string): string {
+	let out = "";
+	for (const ch of text) {
+		const code = ch.codePointAt(0) ?? 0;
+		// ASCII passes through.
+		if (code < 0x80) {
+			out += ch;
+			continue;
+		}
+		// Fullwidth Latin A-Z (U+FF21..U+FF3A) → ASCII A-Z.
+		if (code >= 0xFF21 && code <= 0xFF3A) {
+			out += String.fromCharCode(code - 0xFF21 + 0x41);
+			continue;
+		}
+		// Fullwidth Latin a-z (U+FF41..U+FF5A) → ASCII a-z.
+		if (code >= 0xFF41 && code <= 0xFF5A) {
+			out += String.fromCharCode(code - 0xFF41 + 0x61);
+			continue;
+		}
+		// Fullwidth digits + punctuation (U+FF00..U+FF20).
+		if (code >= 0xFF01 && code <= 0xFF20) {
+			out += String.fromCharCode(code - 0xFF00 + 0x20);
+			continue;
+		}
+		// Common bracket / angle homoglyphs.
+		switch (ch) {
+			case "‹": out += "<"; continue;
+			case "›": out += ">"; continue;
+			case "«": out += "<"; continue;
+			case "»": out += ">"; continue;
+			case "⟨": out += "<"; continue;
+			case "⟩": out += ">"; continue;
+			case "＜": out += "<"; continue;
+			case "＞": out += ">"; continue;
+			case "‒": out += "-"; continue;
+			case "–": out += "-"; continue;
+			case "—": out += "-"; continue;
+			case "_": out += "_"; continue;
+			case " ": out += " "; continue;
+			case "　": out += " "; continue;
+			default: break;
+		}
+		// Drop everything else from the probe so it can't ride along with
+		// adjacent ASCII to evade the regex.
+		out += ch;
+	}
+	return out;
 }
 
 /* ─────────────────────────── html → markdown ─────────────────────────── */
@@ -325,6 +415,34 @@ function normalizeWhitespace(input: string): string {
 }
 
 /**
+ * Cheap heuristic: scan the open/close tag stream and track depth. If at
+ * any point the depth exceeds `maxDepth`, return true. Not exact — self-
+ * closing tags, malformed HTML, and void elements are best-effort — but
+ * good enough to refuse a `<div>` × 10 000 nesting attack before linkedom
+ * blows the recursion stack.
+ */
+function exceedsEstimatedNestingDepth(html: string, maxDepth: number): boolean {
+	let depth = 0;
+	let max = 0;
+	const VOID_RE = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i;
+	const re = /<\/?([a-z][a-z0-9-]*)\b[^>]*?(\/?)>/gi;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(html)) !== null) {
+		const tag = m[1] ?? "";
+		const selfClosing = m[2] === "/" || VOID_RE.test(tag);
+		const isClose = m[0].startsWith("</");
+		if (isClose) {
+			if (depth > 0) depth -= 1;
+		} else if (!selfClosing) {
+			depth += 1;
+			if (depth > max) max = depth;
+			if (max > maxDepth) return true;
+		}
+	}
+	return false;
+}
+
+/**
  * Decode the most common HTML entities. Not exhaustive — covers what
  * actually appears in scraped pages 99% of the time.
  */
@@ -363,6 +481,10 @@ export async function extractReadableContent(
 	const sanitized = sanitizeHtml(html);
 	// Pre-flight: very-deep DOMs blow Readability's recursion stack.
 	if (sanitized.length > 1_048_576) return null;
+	// Nesting-depth guard — pathologically nested `<div><div>…` would
+	// also crash the parser. Bail fast if the open-tag streak suggests
+	// excessive depth.
+	if (exceedsEstimatedNestingDepth(sanitized, 3_000)) return null;
 	let parseHTML: LinkedomModule["parseHTML"];
 	let Readability: ReadabilityModule["Readability"];
 	try {
