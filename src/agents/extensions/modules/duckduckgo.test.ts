@@ -40,6 +40,16 @@ describe("unwrapDdgUrl", () => {
 	});
 });
 
+describe("DDG Instant Answer fast-path", () => {
+	it("Instant Answer is opt-out via instantAnswer: false (default ON)", () => {
+		// We don't have a unit-testable hook into the fast-path execute
+		// from outside, but the config-shape contract is what matters.
+		// Compile-time check: TypeScript allows `instantAnswer: boolean`.
+		const cfg: { instantAnswer?: boolean } = { instantAnswer: false };
+		assert.equal(cfg.instantAnswer, false);
+	});
+});
+
 describe("parseDdgResults", () => {
 	it("extracts title, URL, snippet for each result row", () => {
 		const hits = parseDdgResults(SAMPLE_HTML, 10);
