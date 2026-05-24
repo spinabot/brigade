@@ -366,3 +366,114 @@ describe("assembleSystemPrompt — tool listing", () => {
 		assert.match(out.text, /- bash: Run a shell command/);
 	});
 });
+
+describe("assembleSystemPrompt — subagent mode (Primitive #6)", () => {
+	it("swaps the identity opener for the SUB-AGENT banner", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			capabilities: { subagentMode: true },
+		});
+		assert.match(out.text, /You are a SUB-AGENT running inside Brigade/);
+		assert.doesNotMatch(out.text, /^You are a personal assistant/m);
+		// Top-level banner heading.
+		assert.match(out.text, /# Sub-agent Context/);
+	});
+
+	it("includes the OC-style behavioural rules block", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			capabilities: { subagentMode: true },
+		});
+		assert.match(out.text, /Stay focused/);
+		assert.match(out.text, /Complete the task/);
+		assert.match(out.text, /Don't initiate/);
+		assert.match(out.text, /Be ephemeral/);
+		assert.match(out.text, /No further sub-agents/);
+		assert.match(out.text, /Recover from truncated tool output/);
+		assert.match(out.text, /Don't poll/);
+	});
+
+	it("includes the Output Format guidance", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			capabilities: { subagentMode: true },
+		});
+		assert.match(out.text, /## Output Format/);
+		assert.match(out.text, /what you accomplished or found/);
+		assert.match(out.text, /specific details the parent needs/);
+	});
+
+	it("gates off operator-only sections in subagent mode", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			capabilities: { subagentMode: true, memory: true, skills: true },
+			heartbeatFile: { name: "HEARTBEAT.md", path: "/x/HEARTBEAT.md", content: "tick" },
+			modelId: "gemini-2.5-pro",
+			skillsPromptBlock: "<available_skills><skill name=\"audit\" /></available_skills>",
+		});
+		assert.doesNotMatch(out.text, /## Execution Bias/);
+		assert.doesNotMatch(out.text, /## Output Formatting/);
+		assert.doesNotMatch(out.text, /## Brigade CLI Quick Reference/);
+		assert.doesNotMatch(out.text, /## Memory/);
+		assert.doesNotMatch(out.text, /## Skills/);
+		assert.doesNotMatch(out.text, /<available_skills>/);
+		assert.doesNotMatch(out.text, /## HEARTBEAT/);
+		// Per-family identity override would normally fire for `gemini-*`.
+		assert.doesNotMatch(out.text, /You are NOT Gemini/i);
+	});
+
+	it("keeps universal sections (tooling, tool call style, safety, workspace) in subagent mode", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [{ name: "read", summary: "Read a file" }],
+			capabilities: { subagentMode: true },
+		});
+		assert.match(out.text, /## Tooling/);
+		assert.match(out.text, /## Tool Call Style/);
+		assert.match(out.text, /## Safety/);
+		assert.match(out.text, /## Workspace/);
+		assert.match(out.text, /# Project Context/);
+		assert.match(out.text, /## Runtime/);
+	});
+
+	it("does NOT modify the opener when subagentMode is unset / false", () => {
+		const baseline = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+		});
+		const explicitFalse = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			capabilities: { subagentMode: false },
+		});
+		assert.match(baseline.text, /You are a personal assistant running inside Brigade/);
+		assert.match(explicitFalse.text, /You are a personal assistant running inside Brigade/);
+		assert.doesNotMatch(baseline.text, /SUB-AGENT/);
+		assert.doesNotMatch(explicitFalse.text, /SUB-AGENT/);
+	});
+});

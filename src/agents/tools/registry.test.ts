@@ -70,6 +70,65 @@ describe("createBrigadeTools — Primitive #4 (memory)", () => {
 	});
 });
 
+describe("createBrigadeTools — Primitive #6 (sub-agents)", () => {
+	it("does NOT register spawn_agent when subagentContext is omitted", () => {
+		const tools = createBrigadeTools({
+			workspaceDir: tmpWorkspace,
+			agentId: "main",
+			cwd: tmpWorkspace,
+		});
+		const names = tools.map((t) => t.name);
+		assert.ok(!names.includes("spawn_agent"), "spawn_agent absent without context");
+	});
+
+	it("registers spawn_agent when subagentContext is provided at the top-level depth", () => {
+		const tools = createBrigadeTools({
+			workspaceDir: tmpWorkspace,
+			agentId: "main",
+			cwd: tmpWorkspace,
+			subagentContext: {
+				parentSessionKey: "agent:main:main",
+				callerDepth: 0,
+			},
+		});
+		const names = tools.map((t) => t.name);
+		assert.ok(names.includes("spawn_agent"), "spawn_agent present for top-level turn");
+	});
+
+	it("drops spawn_agent at leaf depth (callerDepth === maxDepth)", () => {
+		const tools = createBrigadeTools({
+			workspaceDir: tmpWorkspace,
+			agentId: "main",
+			cwd: tmpWorkspace,
+			subagentContext: {
+				parentSessionKey: "agent:main:main:subagent:abc",
+				callerDepth: 1,
+			},
+			subagentMaxDepth: 1,
+		});
+		const names = tools.map((t) => t.name);
+		assert.ok(!names.includes("spawn_agent"), "spawn_agent dropped at leaf");
+	});
+
+	it("registers spawn_agent at depth 1 when subagentMaxDepth allows depth 2", () => {
+		const tools = createBrigadeTools({
+			workspaceDir: tmpWorkspace,
+			agentId: "main",
+			cwd: tmpWorkspace,
+			subagentContext: {
+				parentSessionKey: "agent:main:main:subagent:abc",
+				callerDepth: 1,
+			},
+			subagentMaxDepth: 2,
+		});
+		const names = tools.map((t) => t.name);
+		assert.ok(
+			names.includes("spawn_agent"),
+			"spawn_agent present when child wouldn't be leaf",
+		);
+	});
+});
+
 describe("listBrigadeToolNames", () => {
 	it("returns the memory tool names", () => {
 		assert.deepEqual(listBrigadeToolNames().sort(), ["read_memory", "recall_memory", "write_memory"]);

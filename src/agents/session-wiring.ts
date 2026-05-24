@@ -41,7 +41,7 @@ export interface BrigadeToolset {
 	/** Brigade-native tool objects (passed to Pi's `customTools`). */
 	customTools: AnyBrigadeTool[];
 	/** Capability gates for the system-prompt assembler (## Memory, etc.). */
-	capabilities: { memory: boolean };
+	capabilities: { memory: boolean; subAgents: boolean };
 }
 
 /**
@@ -75,12 +75,30 @@ export function assembleBrigadeToolset(opts: {
 	 * omitted the tool registry builds the built-in file-based default.
 	 */
 	memoryCapability?: MemoryCapability;
+	/**
+	 * Sub-agent context — Primitive #6. When provided, the registry adds
+	 * `spawn_agent` to the surface UNLESS the would-be child would land at
+	 * leaf depth (`callerDepth + 1 >= maxDepth`), in which case it's dropped
+	 * automatically. The parent session key drives child-key derivation +
+	 * the concurrent-children map; the abort signal propagates cancellation.
+	 */
+	subagentContext?: {
+		parentSessionKey: string;
+		callerDepth: number;
+		parentRunId?: string;
+		parentSignal?: AbortSignal;
+		/** Parent's resolved provider + modelId — child inherits unless caller
+		 *  overrides via `spawn_agent`'s `model` param. */
+		parentProvider?: string;
+		parentModelId?: string;
+	};
 }): BrigadeToolset {
 	const rawCustomTools = createBrigadeTools({
 		workspaceDir: opts.workspaceDir,
 		agentId: opts.agentId,
 		cwd: opts.cwd,
 		...(opts.memoryCapability ? { memoryCapability: opts.memoryCapability } : {}),
+		...(opts.subagentContext ? { subagentContext: opts.subagentContext } : {}),
 	});
 	const senderIsOwner = opts.senderIsOwner ?? true;
 	// Wrap every tool — `wrapOwnerOnlyToolExecution` is a no-op for the owner
@@ -92,13 +110,24 @@ export function assembleBrigadeToolset(opts: {
 		brigadeToolNames,
 		enabledToolNames: [...BUILTIN_TOOL_NAMES, ...brigadeToolNames],
 		customTools,
-		capabilities: { memory: brigadeToolNames.includes("recall_memory") },
+		capabilities: {
+			memory: brigadeToolNames.includes("recall_memory"),
+			subAgents: brigadeToolNames.includes("spawn_agent"),
+		},
 	};
 }
 
 /** Live correlation-id bag the guards read for `tool-blocked` bus events. */
 export interface GuardContextRef {
-	value: { runId?: string; agentId?: string; sessionKey?: string };
+	value: {
+		runId?: string;
+		agentId?: string;
+		sessionKey?: string;
+		/** Sub-agent attribution surfaced to approval prompts (Primitive #6). */
+		subagentDepth?: number;
+		subagentLabel?: string;
+		parentRunId?: string;
+	};
 }
 
 export interface ComposeGuardsOptions {

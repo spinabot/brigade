@@ -89,6 +89,13 @@ const EXEC_GATED_TOOLS = new Set(["bash", "exec", "shell", "sh"]);
 export interface ExecGateContext {
 	runId?: string;
 	agentId?: string;
+	/** When this turn IS running inside a sub-agent, these surface so the
+	 *  operator's approval prompt can show "Sub-agent '<label>' wants to run
+	 *  …" instead of the default attribution. Top-level turns leave them
+	 *  unset (the prompt falls back to "Brigade wants to run …"). */
+	subagentLabel?: string;
+	subagentDepth?: number;
+	parentRunId?: string;
 }
 
 export interface MakeExecGateOptions {
@@ -275,12 +282,16 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 				"deny",
 			];
 			try {
+				const c = ctxRef.value;
 				const decision = await bridge.requestApproval({
 					command: cmd,
 					toolName: name,
 					cwd: displayCwd,
 					timeoutMs: 5 * 60 * 1000,
 					decisions,
+					...(c.subagentLabel !== undefined ? { subagentLabel: c.subagentLabel } : {}),
+					...(c.subagentDepth !== undefined ? { subagentDepth: c.subagentDepth } : {}),
+					...(c.parentRunId !== undefined ? { parentRunId: c.parentRunId } : {}),
 				});
 				if (decision.timedOut) {
 					const reason =

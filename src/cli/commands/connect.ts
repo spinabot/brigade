@@ -195,7 +195,15 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// up where we left off instead of zeroing the totals on the user's screen.
 	let lastSnapshot: SessionStateSnapshot | null = null;
 	let isAgentRunning = false;
-	let activeAssistant: Markdown | null = null;
+	// Streaming-assistant buffers keyed by sub-agent depth (Primitive #6).
+	// Depth 0 = top-level agent's stream; depth ≥ 1 = sub-agent at that nesting
+	// level. Each depth gets its own Markdown block that grows in place as
+	// `message_update` events arrive, so a sub-agent's multi-chunk reply
+	// renders as ONE growing block (not N fresh blocks). Cleared per-depth on
+	// `tool_execution_start` (so the next message_update at that depth
+	// creates a fresh block under the tool), and wholesale on `agent_end` /
+	// abort (turn boundary).
+	const activeAssistants = new Map<number, Markdown>();
 	let activeLoader: CancellableLoader | null = null;
 	const pendingTools = new Map<string, Text>();
 	// Elapsed-time tracker for the running agent. Started on `agent_start`,
@@ -518,7 +526,15 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		}
 		const prompt = new ApprovalPrompt({
 			tui,
-			request: { id: req.id, command: req.command, toolName: req.toolName, cwd: req.cwd },
+			request: {
+				id: req.id,
+				command: req.command,
+				toolName: req.toolName,
+				cwd: req.cwd,
+				...(req.subagentLabel !== undefined ? { subagentLabel: req.subagentLabel } : {}),
+				...(req.subagentDepth !== undefined ? { subagentDepth: req.subagentDepth } : {}),
+				...(req.parentRunId !== undefined ? { parentRunId: req.parentRunId } : {}),
+			},
 			onResolve: (resolution: ApprovalResolution) => {
 				// Clear the prompt and hand focus back to the editor BEFORE
 				// firing the resolve — so the next agent_start event (which
@@ -568,9 +584,14 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		insertBeforeEditor(new Text(`  ${tone}`, 0, 0));
 	});
 
-	// Pi events are forwarded as `{ event: <pi event> }`. Same render logic
-	// as src/ui/chat.ts but stripped of in-process state mutations.
-	client.on("pi", ({ event }: { event: any }) => {
+	// Pi events are forwarded as `{ event: <pi event>, subagentDepth? }`.
+	// Same render logic as src/ui/chat.ts but stripped of in-process state
+	// mutations. Primitive #6: when `subagentDepth > 0`, indent child events
+	// by `2 * depth` spaces so nested sub-agent activity is visually distinct
+	// from the parent's stream.
+	client.on("pi", ({ event, subagentDepth }: { event: any; subagentDepth?: number }) => {
+		const depth = typeof subagentDepth === "number" ? subagentDepth : 0;
+		const subIndent = depth > 0 ? "  ".repeat(depth) : "";
 		switch (event?.type) {
 			case "agent_start": {
 				isAgentRunning = true;
@@ -603,11 +624,20 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				// the agent yet — same convention as the brand colour, just
 				// dynamic per-workspace.
 				const label = lastSnapshot?.agentName ?? "brigade";
-				if (!activeAssistant) {
-					activeAssistant = new Markdown(`${brand.agent(label)}  ${text}`, 1, 0, markdownTheme);
-					insertBeforeEditor(activeAssistant);
+				const labelPrefix = depth > 0 ? "sub-agent" : label;
+				const renderedText = `${subIndent}${brand.agent(labelPrefix)}  ${text}`;
+				// Per-depth streaming buffers: top-level (depth 0) and each sub-
+				// agent (depth ≥ 1) get their OWN Markdown block that grows in
+				// place. A child's message_update chunks now land in the child's
+				// own buffer (not appended as N fresh blocks, and not overwriting
+				// the parent's buffer).
+				const existing = activeAssistants.get(depth);
+				if (!existing) {
+					const fresh = new Markdown(renderedText, 1, 0, markdownTheme);
+					activeAssistants.set(depth, fresh);
+					insertBeforeEditor(fresh);
 				} else {
-					activeAssistant.setText(`${brand.agent(label)}  ${text}`);
+					existing.setText(renderedText);
 					tui.requestRender();
 				}
 				break;
@@ -617,16 +647,20 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 					removeChild(activeLoader);
 					activeLoader = null;
 				}
-				// Close the current assistant text block when a tool starts —
-				// otherwise the assistant block's position is locked at first
-				// stream-chunk, and a long final answer flowing in AFTER the
-				// tools end ends up rendered ABOVE them (the upstream bug we
-				// saw with multi-search turns). Mirroring the reference TUI:
-				// strictly chronological order — clearing the pointer lets the
-				// NEXT `message_update` create a fresh block that lands below
-				// the most recent tool.
-				activeAssistant = null;
-				const indicator = new Text(`  ${brand.tool("⚡")} ${brand.tool(event.toolName)}`, 0, 0);
+				// Close the current depth's assistant text block when a tool starts.
+				// Otherwise the assistant block's position is locked at first stream-
+				// chunk, and a long final answer flowing in AFTER the tools end ends
+				// up rendered ABOVE them. Strictly chronological order — clearing
+				// the per-depth pointer lets the next message_update at THIS depth
+				// create a fresh block that lands below the most recent tool.
+				// We clear ONLY this depth's buffer so a sub-agent's tool start
+				// doesn't close the parent's open assistant block (separate streams).
+				activeAssistants.delete(depth);
+				const indicator = new Text(
+					`${subIndent}  ${brand.tool("⚡")} ${brand.tool(event.toolName)}`,
+					0,
+					0,
+				);
 				pendingTools.set(event.toolCallId, indicator);
 				insertBeforeEditor(indicator);
 				break;
@@ -643,15 +677,16 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 						preserveNewlines: event.isError,
 					});
 					if (event.isError && summary.multiline) {
-						indicator.setText(`  ${mark} ${brand.tool(event.toolName)}`);
+						indicator.setText(`${subIndent}  ${mark} ${brand.tool(event.toolName)}`);
+						const errIndent = `${subIndent}      `;
 						const indentedBody = summary.preview
 							.split("\n")
-							.map((line) => `      ${brand.dim(line)}`)
+							.map((line) => `${errIndent}${brand.dim(line)}`)
 							.join("\n");
 						insertBeforeEditor(new Text(indentedBody, 0, 0));
 					} else {
 						const preview = summary.hasContent ? ` ${brand.dim(`· ${summary.preview}`)}` : "";
-						indicator.setText(`  ${mark} ${brand.tool(event.toolName)}${preview}`);
+						indicator.setText(`${subIndent}  ${mark} ${brand.tool(event.toolName)}${preview}`);
 					}
 					tui.requestRender();
 					pendingTools.delete(event.toolCallId);
@@ -732,7 +767,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				isAgentRunning = false;
 				agentStartedAt = null;
 				editor.disableSubmit = false;
-				activeAssistant = null;
+				activeAssistants.clear();
 				if (activeLoader) {
 					removeChild(activeLoader);
 					activeLoader = null;
@@ -1039,7 +1074,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				removeChild(indicator);
 			}
 			pendingTools.clear();
-			activeAssistant = null;
+			activeAssistants.clear();
 			insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.dim("aborted")}`, 0, 0));
 			updateHeader();
 			return true;

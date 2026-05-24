@@ -169,7 +169,13 @@ export interface ResponseFor {
 
 /** Payload shape for each event. */
 export interface EventPayload {
-	pi: { event: any }; // Pi's AgentSessionEvent — kept opaque to avoid coupling
+	pi: {
+		event: any; // Pi's AgentSessionEvent — kept opaque to avoid coupling
+		/** Sub-agent depth (Primitive #6). > 0 means this event came from a
+		 *  child sub-agent; the TUI indents nested rendering by this value.
+		 *  Top-level turns leave it undefined. */
+		subagentDepth?: number;
+	};
 	state: SessionStateSnapshot;
 	error: { message: string };
 	log: { level: "info" | "warn" | "error"; message: string; at: number };
@@ -186,6 +192,12 @@ export interface EventPayload {
 		timeoutMs: number;
 		/** Subset of decisions the operator is allowed to pick. */
 		decisions: ReadonlyArray<"allow-once" | "allow-always" | "allow-pattern" | "deny">;
+		/** Sub-agent attribution (Primitive #6). Present when the gated tool
+		 *  call originated inside a sub-agent run. The TUI surfaces this so
+		 *  the operator knows it isn't the top-level agent asking. */
+		subagentLabel?: string;
+		subagentDepth?: number;
+		parentRunId?: string;
 	};
 }
 

@@ -604,6 +604,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			cwd: request.cwd,
 			timeoutMs: request.timeoutMs,
 			decisions: request.decisions,
+			// Primitive #6: forward sub-agent attribution so the TUI prompt
+			// surfaces "Sub-agent wants to run …" instead of the default
+			// attribution. Top-level turns leave these undefined.
+			...(request.subagentLabel !== undefined ? { subagentLabel: request.subagentLabel } : {}),
+			...(request.subagentDepth !== undefined ? { subagentDepth: request.subagentDepth } : {}),
+			...(request.parentRunId !== undefined ? { parentRunId: request.parentRunId } : {}),
 		});
 	});
 	setActiveApprovalBridge(approvalBridge);
@@ -667,6 +673,22 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			if (inFlightSession === session) inFlightSession = null;
 		};
 	};
+
+	// Sub-agent pi-event forwarder (Primitive #6). The gateway's
+	// `attachTurnSession` only subscribes to the TOP-LEVEL Pi session — when
+	// a sub-agent runs (via `subagent-runner` recursing into `runSingleTurn`),
+	// no `onSessionReady` is wired for the inner session so its events would
+	// never reach the WS otherwise. The agent-event-bus carries pi events
+	// from EVERY run, tagged with `subagentDepth`, so we listen here for the
+	// child events (`subagentDepth > 0`) and broadcast them with the depth
+	// attached. We deliberately skip top-level events (depth === undefined ||
+	// depth === 0) because `attachTurnSession` already broadcasts those —
+	// forwarding both paths would duplicate every event.
+	const detachSubagentPiBus = onAgentEvent((event) => {
+		if (event.type !== "pi") return;
+		if (!event.subagentDepth || event.subagentDepth <= 0) return;
+		broadcast("pi", { event: event.piEvent, subagentDepth: event.subagentDepth });
+	});
 
 	// Lifecycle bus subscriber (Phase 5b): translate `runBrigadeTurnLoop`
 	// events into broadcast("log", ...) frames so connect-mode TUI clients
@@ -1579,6 +1601,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				currentTurnCleanup = null;
 			}
 			detachLifecycleBus();
+			detachSubagentPiBus();
 			for (const ws of clients) {
 				try {
 					ws.close();

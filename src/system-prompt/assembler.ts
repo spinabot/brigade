@@ -72,13 +72,22 @@ export interface AssembleArgs {
   thinkingLevel?: string;
   // Capability gates for conditional guidance. `memory` is WIRED
   // (Primitive #4) — when true the assembler emits the `## Memory`
-  // section. `skills` (#5) and `subAgents` (#6) are accepted but still
-  // produce no section until their primitives ship. Gates stay false by
-  // default so the cached prefix stays small.
+  // section. `skills` (#5) is wired too. `subAgents` (#6) advertises that
+  // `spawn_agent` is on the surface; `subagentMode` flips the prompt into
+  // minimal-mode (we ARE the sub-agent, not the parent). Gates stay false
+  // by default so the cached prefix stays small.
   capabilities?: {
     memory?: boolean;
     skills?: boolean;
     subAgents?: boolean;
+    /**
+     * When true, this assembled prompt is going INTO a sub-agent run. The
+     * opener is swapped for the sub-agent banner; operator-only sections
+     * (CLI quick reference, execution bias, memory, output formatting,
+     * heartbeat, per-family identity override) are gated off; the persona
+     * set is already filtered upstream to the minimal allowlist.
+     */
+    subagentMode?: boolean;
     /** Web tools (`fetch_url` and/or `web_search`) wired into this session.
      *  Gates the ## Web behavioural guidance + untrusted-content posture. */
     web?: boolean;
@@ -124,6 +133,7 @@ function sortPersonaFiles(files: ContextFile[]): ContextFile[] {
 
 export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   const lines: string[] = [];
+  const isSubagentMode = args.capabilities?.subagentMode === true;
 
   // 1. Identity opener.
   // Eight words. One brand mention. No marketing nouns. An earlier
@@ -135,8 +145,70 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // (voice, values, identity, behavioural rules) lives in IDENTITY.md /
   // SOUL.md / AGENTS.md inside `# Project Context` below — those don't
   // need to be advertised here.
-  lines.push("You are a personal assistant running inside Brigade.");
-  lines.push("");
+  //
+  // Sub-agent mode (Primitive #6): swap the opener for a banner that
+  // re-frames the model as a delegated worker, not the operator-facing
+  // parent. The persona files in `# Project Context` carry voice/identity;
+  // the banner sets role + boundaries (return one bounded reply, do NOT try
+  // to be the parent, do NOT spawn further sub-agents) AND the behavioural
+  // rules that load-bear on sub-agent quality (don't initiate, be ephemeral,
+  // recover from truncated output, follow the output format).
+  if (isSubagentMode) {
+    lines.push("# Sub-agent Context");
+    lines.push("");
+    lines.push("You are a SUB-AGENT running inside Brigade.");
+    lines.push("");
+    lines.push(
+      "Your job: complete the bounded task you were spawned for, then return a single concise reply. " +
+      "Your reply becomes a tool result for the parent — keep it focused on the answer, no preamble " +
+      "or sign-off. The parent agent (not the user) is your caller; the user does NOT see your " +
+      "intermediate output, only your final reply via the parent.",
+    );
+    lines.push("");
+    lines.push("## Rules");
+    lines.push(
+      "1. **Stay focused** — do the assigned task and nothing else. No side quests, no proactive " +
+      "follow-ups, no questions back to the user.",
+    );
+    lines.push(
+      "2. **Complete the task** — your final assistant message IS the deliverable. The parent reads " +
+      "it as a tool result and decides what to do next.",
+    );
+    lines.push(
+      "3. **Don't initiate** — no greetings, no heartbeats, no \"would you like me to also …\" " +
+      "questions, no proactive memory writes. You are not in a conversation; you are filling a slot.",
+    );
+    lines.push(
+      "4. **Be ephemeral** — your session ends when you reply. Don't plan for follow-up turns; " +
+      "don't promise actions you can't finish in this turn.",
+    );
+    lines.push(
+      "5. **No further sub-agents** — even if `spawn_agent` is available, your depth has already " +
+      "reached the cap. Finish the work yourself.",
+    );
+    lines.push(
+      "6. **Recover from truncated tool output** — if you see a notice like `[... N more " +
+      "characters truncated]`, prior output was reduced. Re-read only what you need using smaller " +
+      "chunks (`read` with `offset` and `limit`, or targeted `grep`), not a full re-read of the file.",
+    );
+    lines.push(
+      "7. **Don't poll** — there is no async backplane. After a tool call, the next assistant " +
+      "message is the result; you don't need to wait, list, or status-check.",
+    );
+    lines.push("");
+    lines.push("## Output Format");
+    lines.push(
+      "Your final reply should answer in this order: (a) what you accomplished or found, " +
+      "(b) the specific details the parent needs (file:line, exact value, decision), (c) any " +
+      "caveats the parent should know about. Plain prose for short results; a fenced block when " +
+      "you're returning structured data (json, code). Skip the meta — no \"I'll now\", \"as " +
+      "requested\", \"hope this helps\".",
+    );
+    lines.push("");
+  } else {
+    lines.push("You are a personal assistant running inside Brigade.");
+    lines.push("");
+  }
 
   // No first-turn synthetic guidance — first-turn behaviour comes from
   // BOOTSTRAP.md content alone. The earlier `**First turn: ... verbatim**`
@@ -206,26 +278,32 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // model that needs them most. Promoting to a universal block because
   // every model benefits from "no walls of text" and the cost is just
   // four prompt lines.
-  lines.push("## Execution Bias");
-  lines.push(
-    "If the user asks you to do the work, start doing it in the same turn.",
-  );
-  lines.push(
-    "Use a real tool call or concrete action first when the task is actionable; do not stop at a plan or promise-to-act reply.",
-  );
-  lines.push(
-    "Commentary-only turns are incomplete when tools are available and the next action is clear.",
-  );
-  lines.push(
-    "If the work will take multiple steps or a while to finish, send one short progress update before or while acting.",
-  );
-  lines.push(
-    "Default to short natural replies unless the user asks for depth. Avoid walls of text, long preambles, and repetitive restatement. Friendly does not mean verbose.",
-  );
-  lines.push(
-    "If the latest user message is a short approval like \"ok do it\" or \"go ahead\", skip the recap and start acting.",
-  );
-  lines.push("");
+  //
+  // Skipped in sub-agent mode: the sub-agent has a single-shot task; it
+  // doesn't field operator approvals or send "progress updates", and the
+  // banner already sets the "return a focused reply" bias.
+  if (!isSubagentMode) {
+    lines.push("## Execution Bias");
+    lines.push(
+      "If the user asks you to do the work, start doing it in the same turn.",
+    );
+    lines.push(
+      "Use a real tool call or concrete action first when the task is actionable; do not stop at a plan or promise-to-act reply.",
+    );
+    lines.push(
+      "Commentary-only turns are incomplete when tools are available and the next action is clear.",
+    );
+    lines.push(
+      "If the work will take multiple steps or a while to finish, send one short progress update before or while acting.",
+    );
+    lines.push(
+      "Default to short natural replies unless the user asks for depth. Avoid walls of text, long preambles, and repetitive restatement. Friendly does not mean verbose.",
+    );
+    lines.push(
+      "If the latest user message is a short approval like \"ok do it\" or \"go ahead\", skip the recap and start acting.",
+    );
+    lines.push("");
+  }
 
   // 5. ## Output Formatting.
   // Markdown formatting rules — load-bearing for TUI rendering quality.
@@ -235,26 +313,33 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // own line, body on subsequent lines, closing fence). Compact single-
   // line emit like ` ```json {…} ``` ` is parsed as inline code and
   // renders flat — same content, ugly UX.
-  lines.push("## Output Formatting");
-  lines.push(
-    "For any code, JSON, shell command, configuration, or tool output longer than ~20 chars, use a fenced Markdown code block with a language tag.",
-  );
-  lines.push(
-    "The opening fence + language tag goes on its own line; the body goes on the next line(s); the closing fence goes on its own line. NEVER put the opening fence, language, body, and closing fence on the same line.",
-  );
-  lines.push(
-    "Use these language tags: `bash` (shell), `json`, `typescript` / `ts`, `javascript` / `js`, `python`, `sql`, `yaml`, `html`, `css`, `diff`, `text` (plain). Default to `text` when uncertain.",
-  );
-  lines.push(
-    "Pretty-print JSON across multiple lines with 2-space indent unless the user asks for compact output — single-line `{\"a\":1,\"b\":2}` is harder to read in a chat UI.",
-  );
-  lines.push(
-    "Inline backticks (` `x` `) are for short identifiers / file names / single-word references INSIDE a sentence — never for multi-token data like a full JSON object, a multi-flag command, or a path with a value.",
-  );
-  lines.push(
-    "Example, correct:\n```json\n{\n  \"name\": \"…\",\n  \"value\": 42\n}\n```\nExample, wrong: `json {\"name\":\"…\",\"value\":42}`.",
-  );
-  lines.push("");
+  //
+  // Skipped in sub-agent mode: the sub-agent's reply becomes a tool
+  // result the parent receives as plain text, so fence discipline isn't
+  // load-bearing there. The parent's prompt still carries the rules and
+  // the parent decides how to render the final answer.
+  if (!isSubagentMode) {
+    lines.push("## Output Formatting");
+    lines.push(
+      "For any code, JSON, shell command, configuration, or tool output longer than ~20 chars, use a fenced Markdown code block with a language tag.",
+    );
+    lines.push(
+      "The opening fence + language tag goes on its own line; the body goes on the next line(s); the closing fence goes on its own line. NEVER put the opening fence, language, body, and closing fence on the same line.",
+    );
+    lines.push(
+      "Use these language tags: `bash` (shell), `json`, `typescript` / `ts`, `javascript` / `js`, `python`, `sql`, `yaml`, `html`, `css`, `diff`, `text` (plain). Default to `text` when uncertain.",
+    );
+    lines.push(
+      "Pretty-print JSON across multiple lines with 2-space indent unless the user asks for compact output — single-line `{\"a\":1,\"b\":2}` is harder to read in a chat UI.",
+    );
+    lines.push(
+      "Inline backticks (` `x` `) are for short identifiers / file names / single-word references INSIDE a sentence — never for multi-token data like a full JSON object, a multi-flag command, or a path with a value.",
+    );
+    lines.push(
+      "Example, correct:\n```json\n{\n  \"name\": \"…\",\n  \"value\": 42\n}\n```\nExample, wrong: `json {\"name\":\"…\",\"value\":42}`.",
+    );
+    lines.push("");
+  }
 
   // 6. ## Safety.
   // Constitution-style anti-self-preservation rules. The previous
@@ -285,10 +370,17 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // the prefix stripping). Conditional: returns null for Claude (native
   // identity is "Claude", already aligned with Anthropic) and for
   // unknown / niche models.
-  const familyBlock = pickModelFamilyGuidance(args.modelId);
-  if (familyBlock) {
-    lines.push(familyBlock);
-    lines.push("");
+  //
+  // Skipped in sub-agent mode: the sub-agent's identity is already
+  // anchored by the persona files (SOUL/IDENTITY) + the SUB-AGENT banner.
+  // It will not be addressing the user directly, so the "you are not
+  // Gemini / ChatGPT" reframing isn't load-bearing.
+  if (!isSubagentMode) {
+    const familyBlock = pickModelFamilyGuidance(args.modelId);
+    if (familyBlock) {
+      lines.push(familyBlock);
+      lines.push("");
+    }
   }
 
   // 7. ## Brigade CLI Quick Reference.
@@ -298,16 +390,22 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // replies about unrelated topics. Operator-critical commands stay
   // (gateway, onboard, doctor); the rest is reachable via help-text
   // the model can ask the user to run.
-  lines.push("## Brigade CLI Quick Reference");
-  lines.push("Brigade is controlled via subcommands. Do not invent commands.");
-  lines.push("To manage the Gateway daemon (start/stop/restart):");
-  lines.push("- `brigade gateway` — start the gateway in the foreground");
-  lines.push("- `brigade gateway status` — probe a running gateway");
-  lines.push("- `brigade gateway stop` — stop the running gateway");
-  lines.push("- `brigade onboard` — interactive provider/model setup");
-  lines.push("- `brigade doctor` — health checks");
-  lines.push("If unsure, ask the user to run `brigade --help` (or `brigade gateway --help`) and paste the output.");
-  lines.push("");
+  //
+  // Skipped in sub-agent mode: managing the gateway daemon, onboarding,
+  // and health checks are operator concerns — the sub-agent is task-
+  // scoped and never needs to invoke these.
+  if (!isSubagentMode) {
+    lines.push("## Brigade CLI Quick Reference");
+    lines.push("Brigade is controlled via subcommands. Do not invent commands.");
+    lines.push("To manage the Gateway daemon (start/stop/restart):");
+    lines.push("- `brigade gateway` — start the gateway in the foreground");
+    lines.push("- `brigade gateway status` — probe a running gateway");
+    lines.push("- `brigade gateway stop` — stop the running gateway");
+    lines.push("- `brigade onboard` — interactive provider/model setup");
+    lines.push("- `brigade doctor` — health checks");
+    lines.push("If unsure, ask the user to run `brigade --help` (or `brigade gateway --help`) and paste the output.");
+    lines.push("");
+  }
 
   // 8. ## Workspace.
   // Deliberately terse: a long section here teaches the model to PARROT
@@ -333,7 +431,12 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // facts are stored. MEMORY.md itself is injected separately as a
   // persona file in `# Project Context` below — this section is the
   // behavioural wrapper.
-  if (args.capabilities?.memory) {
+  //
+  // Skipped in sub-agent mode: long-term memory is the operator/parent's
+  // concern. The sub-agent shouldn't write to it (its task is bounded)
+  // and shouldn't recall from it (the parent already injected whatever
+  // context the task needs as the first user message).
+  if (args.capabilities?.memory && !isSubagentMode) {
     lines.push(MEMORY_GUIDANCE);
     lines.push("");
   }
@@ -346,7 +449,12 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // names + descriptions + read-tool locations. Brigade owns this render
   // (rather than Pi's auto-injection) because the persona pin replaces Pi's
   // prompt-build hook, so the assembled prompt carries the skills section.
-  if (args.capabilities?.skills) {
+  //
+  // Skipped in sub-agent mode: skills are operator-workspace metadata and add
+  // significant token bloat. The parent already injected whatever context the
+  // sub-agent needs as the first user message; a scoped task gets the answer
+  // through its bounded tool surface, not the full skill index.
+  if (args.capabilities?.skills && !isSubagentMode) {
     lines.push(SKILLS_GUIDANCE);
     lines.push("");
     if (args.skillsPromptBlock && args.skillsPromptBlock.trim().length > 0) {
@@ -420,8 +528,10 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
 
     // 11. # Dynamic Project Context — HEARTBEAT.md (below boundary).
     // HEARTBEAT.md changes per cycle so it's deliberately below the
-    // cache marker.
-    if (args.heartbeatFile) {
+    // cache marker. Skipped in sub-agent mode: heartbeat is the parent's
+    // cycle state (last operator activity, mode, time-since), which
+    // doesn't belong in a task-scoped child's context.
+    if (args.heartbeatFile && !isSubagentMode) {
       lines.push("# Dynamic Project Context");
       lines.push("");
       lines.push("## HEARTBEAT");
@@ -461,7 +571,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // so prompt caching works on the (very small) stable prefix.
   lines.push(CACHE_BOUNDARY_MARKER_LINE);
   lines.push("");
-  if (args.heartbeatFile) {
+  if (args.heartbeatFile && !isSubagentMode) {
     lines.push("# Dynamic Project Context");
     lines.push("");
     lines.push("## HEARTBEAT");

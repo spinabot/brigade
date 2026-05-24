@@ -46,6 +46,13 @@ export interface ApprovalRenderRequest {
 	command: string;
 	toolName: string;
 	cwd?: string;
+	/** Sub-agent attribution (Primitive #6). When `subagentDepth > 0` the title
+	 *  switches to "Sub-agent wants to run" (with the optional label when set). */
+	subagentLabel?: string;
+	subagentDepth?: number;
+	/** Parent run id (Primitive #6). Carried for audit/correlation; not rendered
+	 *  in the title today, but available to logging or extension consumers. */
+	parentRunId?: string;
 }
 
 export interface ApprovalResolution {
@@ -61,7 +68,47 @@ export interface ApprovalPromptOptions {
 	onCancel?: () => void;
 }
 
-const TITLE = " Brigade wants to run ";
+const DEFAULT_TITLE = " Brigade wants to run ";
+
+/**
+ * Sanitise a sub-agent label for safe embedding in the title string. A label
+ * containing a literal `"` (e.g. `bad"label`) would otherwise unbalance the
+ * surrounding quotes and corrupt the rendered box border. We strip the danger:
+ * collapse runs of whitespace, drop control chars + raw quotes, truncate to
+ * a sensible width. The model isn't supposed to send unsafe labels, but the
+ * approval prompt is operator-facing and we don't trust input we render.
+ */
+function sanitizeSubagentLabel(raw: string): string {
+	const stripped = raw
+		.replace(/["\r\n\t]/g, " ")
+		.replace(/[\x00-\x1f\x7f]/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (stripped.length <= 48) return stripped;
+	return `${stripped.slice(0, 45)}…`;
+}
+
+/**
+ * Derive the prompt title from the request. Top-level (operator-driven) calls
+ * show the default "Brigade wants to run …". Sub-agent calls (Primitive #6)
+ * surface attribution so the operator knows whose action they are approving:
+ * `Sub-agent "audit auth flow" wants to run …` when a label is supplied,
+ * `Sub-agent (depth 1) wants to run …` when only depth is known.
+ *
+ * Defensive against non-number `subagentDepth` (e.g. a string serialised
+ * across the wire) — only `typeof === "number" && > 0` flips into sub-agent
+ * mode; everything else falls back to the default attribution.
+ */
+function deriveTitle(request: ApprovalRenderRequest): string {
+	const isSubagent = typeof request.subagentDepth === "number" && request.subagentDepth > 0;
+	if (!isSubagent) return DEFAULT_TITLE;
+	const rawLabel = request.subagentLabel?.trim();
+	if (rawLabel) {
+		const safe = sanitizeSubagentLabel(rawLabel);
+		if (safe.length > 0) return ` Sub-agent "${safe}" wants to run `;
+	}
+	return ` Sub-agent (depth ${request.subagentDepth}) wants to run `;
+}
 
 export class ApprovalPrompt implements Component {
 	private state: "menu" | "pattern" = "menu";
@@ -86,7 +133,7 @@ export class ApprovalPrompt implements Component {
 	private renderMenuState(): string[] {
 		const w = this.lastWidth;
 		const inner = w - 4; // 2 for "│ " + 2 for " │"
-		const titleLine = drawTitleLine(w, TITLE);
+		const titleLine = drawTitleLine(w, deriveTitle(this.opts.request));
 		const cmdLine = boxLine(inner, truncateForBox(this.opts.request.command, inner));
 		const spacer = boxLine(inner, "");
 		const row1 = boxLine(

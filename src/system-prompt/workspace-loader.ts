@@ -21,14 +21,48 @@ const STABLE_FILE_ORDER = [
   "MEMORY.md",
 ] as const;
 
+/**
+ * Persona files a SUB-AGENT (Primitive #6) gets to see. Drops two files from
+ * the full top-level set so a delegated child stays focused on its task:
+ *   - BOOTSTRAP.md (operator-onboarding ritual — "Who am I? Who are you?" —
+ *     irrelevant to a task-scoped child).
+ *   - MEMORY.md (parent-scoped persistent memory the child shouldn't read or
+ *     write back).
+ * HEARTBEAT.md is loaded separately and is also skipped for sub-agents.
+ *
+ * Identity persistence (SOUL.md, IDENTITY.md, AGENTS.md, TOOLS.md, USER.md)
+ * stays: the child is the SAME persona executing a delegated task, not a
+ * different agent.
+ */
+const SUBAGENT_BOOTSTRAP_ALLOWLIST = new Set<string>([
+  "AGENTS.md",
+  "SOUL.md",
+  "TOOLS.md",
+  "IDENTITY.md",
+  "USER.md",
+]);
+
 // Per-file safety cap. Anything larger gets truncated by the budget pass
 // (head + tail kept). 2 MB matches the upstream cap; legitimate persona
 // files run a few hundred lines, so this only fires on accidents.
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
-export async function loadWorkspaceContextFiles(workspaceDir: string): Promise<ContextFile[]> {
+export interface LoadWorkspaceContextOptions {
+  /**
+   * When true, restrict the loaded persona set to the sub-agent allowlist
+   * (drop BOOTSTRAP.md + MEMORY.md). Defaults to false — top-level turns see
+   * the full persona surface.
+   */
+  subagentMode?: boolean;
+}
+
+export async function loadWorkspaceContextFiles(
+  workspaceDir: string,
+  opts: LoadWorkspaceContextOptions = {},
+): Promise<ContextFile[]> {
   const out: ContextFile[] = [];
   for (const name of STABLE_FILE_ORDER) {
+    if (opts.subagentMode && !SUBAGENT_BOOTSTRAP_ALLOWLIST.has(name)) continue;
     const filePath = path.join(workspaceDir, name);
     const raw = await readRawContextFile(filePath);
     if (raw === undefined) continue;

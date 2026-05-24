@@ -35,6 +35,10 @@ export type AgentBusEvent =
 			sessionId: string;
 			/** Raw Pi `AgentSessionEvent`. Consumers narrow as they need. */
 			piEvent: unknown;
+			/** Sub-agent depth this event originated at (Primitive #6). 0 (or
+			 *  undefined) for the top-level turn; ≥ 1 for child sub-agent runs.
+			 *  Surfaced to the WS so connect-mode TUIs can indent nested rendering. */
+			subagentDepth?: number;
 	  }
 	| {
 			type: "turn-start";

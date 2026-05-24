@@ -79,6 +79,7 @@ import {
   composeBrigadeBeforeToolCall,
   type GuardContextRef,
 } from "./session-wiring.js";
+import { getSubagentDepthFromSessionKey } from "./subagent-policy.js";
 import { emitAgentEvent } from "./agent-event-bus.js";
 import { randomUUID } from "node:crypto";
 import { evaluateCompactionDecision } from "./smart-compaction.js";
@@ -214,6 +215,24 @@ export interface RunSingleTurnArgs {
    * that one denies tool calls; this one suppresses a prompt nudge.)
    */
   senderIsOwner?: boolean;
+  /**
+   * Sub-agent attribution (Primitive #6). When the parent's spawn-agent tool
+   * launches THIS turn as a child run, it threads the human label + parent
+   * runId here so exec-gate / approval-bridge / TUI can attribute approval
+   * prompts to the right sub-agent. Both fields are unset for top-level
+   * (operator-driven) turns; their absence is what the approval prompt's
+   * `deriveTitle()` checks to fall back to the default "Brigade wants to
+   * run" attribution.
+   */
+  subagentLabel?: string;
+  parentRunId?: string;
+  /**
+   * Sub-agent metadata to persist on the session-store entry (Primitive #6).
+   * Written once at session creation so post-crash forensics + `brigade
+   * sessions list` can identify children + walk the ancestry chain. Top-level
+   * turns leave this unset.
+   */
+  subagentMetadata?: import("../sessions/session-store.js").SubagentSessionMetadata;
 }
 
 export interface RunSingleTurnResult {
@@ -248,7 +267,15 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   const resolved = resolveOrCreateSession({
     agentId,
     sessionKey,
-    overrides: { provider: args.provider, modelId: args.modelId },
+    overrides: {
+      provider: args.provider,
+      modelId: args.modelId,
+      // Primitive #6 — persist sub-agent metadata on the entry so post-crash
+      // forensics can identify children + walk the ancestry chain. Only set
+      // when this turn IS a sub-agent run (top-level turns leave it unset
+      // and the open index signature on SessionEntry tolerates `undefined`).
+      ...(args.subagentMetadata !== undefined ? { subagent: args.subagentMetadata } : {}),
+    },
   });
 
   // Profile cooldown gate. The on-disk profile-state.json tracks per-profile
@@ -456,7 +483,28 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // Tool objects. The unknown-tool guard's allowlist must include the
   // custom names too (else `recall_memory` is refused as unknown), which
   // `enabledToolNames` already covers.
-  const toolset = assembleBrigadeToolset({ workspaceDir, agentId, cwd, memoryCapability });
+  // Primitive #6: derive sub-agent depth from the session key. Top-level turns
+  // (e.g. `agent:main:main`) yield depth 0 — spawn_agent registers. Sub-agent
+  // turns (e.g. `agent:main:subagent:<uuid>`) yield depth 1 — spawn_agent is
+  // automatically filtered out at the leaf so recursion is impossible.
+  const callerSubagentDepth = getSubagentDepthFromSessionKey(resolved.sessionKey);
+  const toolset = assembleBrigadeToolset({
+    workspaceDir,
+    agentId,
+    cwd,
+    memoryCapability,
+    subagentContext: {
+      parentSessionKey: resolved.sessionKey,
+      callerDepth: callerSubagentDepth,
+      ...(args.signal ? { parentSignal: args.signal } : {}),
+      // Inherit the parent's RESOLVED provider+modelId so the child uses
+      // whatever the operator is actually running (Anthropic, Ollama, ...)
+      // instead of the runner's hardcoded fallback. The `spawn_agent` tool's
+      // `model` param can still override per-call.
+      parentProvider: args.provider,
+      parentModelId: args.modelId,
+    },
+  });
   const brigadeCustomTools = toolset.customTools;
   const enabledToolNames = toolset.enabledToolNames;
 
@@ -471,6 +519,12 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // least one of `fetch_url` / `web_search` lands in `customTools`. The
     // ## Web section in the prompt is gated on this flag.
     web: false as boolean,
+    // Primitive #6 — flip the assembler into sub-agent mode when this turn's
+    // session key indicates we ARE a sub-agent (depth > 0). The assembler
+    // swaps the identity opener for the SUB-AGENT banner and gates off
+    // operator-only sections; the workspace loader drops BOOTSTRAP.md +
+    // MEMORY.md from the persona set; the heartbeat file is skipped.
+    subagentMode: callerSubagentDepth > 0,
   };
   // `agents.defaults.toolset` (when set in `brigade.json`) narrows the active
   // tool profile — e.g. `"minimal" | "coding" | "messaging"`. The registry
@@ -828,8 +882,14 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // also lands below the cache boundary. Both are per-turn dynamic so they
     // share the ephemeral slot; the assembler's sanitiser handles either as
     // plain text.
+    // Auto-recall is for the OPERATOR-facing turn: surface what the parent
+    // remembers about THIS user message so the model can use it without an
+    // explicit recall_memory call. Sub-agents (Primitive #6) get a focused,
+    // parent-injected task — auto-recalling parent-scoped memory facts there
+    // would pollute the bounded context with content the task didn't ask for.
+    // Gate on `!subagentMode` so the suffix stays clean for delegated runs.
     ephemeralSuffix: mergeEphemeralSuffix(
-      promptCapabilities?.memory
+      promptCapabilities?.memory && !promptCapabilities.subagentMode
         ? await buildAutoRecallBlock(memoryCapability, args.message)
         : undefined,
       contextEngineAddition,
@@ -888,7 +948,19 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // boundaries but stay scoped per-session). Cleared in finally
   // so a subsequent turn (which reuses the same session) doesn't
   // leak stale ids.
-  gateCtxRef.value = { runId, agentId, sessionKey: resolved.sessionKey };
+  gateCtxRef.value = {
+    runId,
+    agentId,
+    sessionKey: resolved.sessionKey,
+    // Primitive #6: when this turn IS a sub-agent run, propagate depth + label
+    // + parent runId to every guard event (exec-gate routes them into the
+    // approval prompt so the operator sees "Sub-agent 'audit auth flow' wants
+    // to run …" instead of the default "Brigade wants to run …" attribution).
+    // Top-level turns leave all three unset.
+    ...(callerSubagentDepth > 0 ? { subagentDepth: callerSubagentDepth } : {}),
+    ...(args.subagentLabel !== undefined ? { subagentLabel: args.subagentLabel } : {}),
+    ...(args.parentRunId !== undefined ? { parentRunId: args.parentRunId } : {}),
+  };
   // Duck-typed Pi session subscription. We assert the SHAPE we want
   // rather than coupling to a specific Pi version's exported type. If
   // a future Pi changes `subscribe` to return `Promise<() => void>` or
@@ -908,6 +980,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
             agentId,
             sessionId: resolved.sessionId,
             piEvent,
+            // Primitive #6: tag sub-agent depth so the gateway can indent
+            // child events in the connect-mode TUI without re-deriving from
+            // the session key on every event.
+            ...(callerSubagentDepth > 0 ? { subagentDepth: callerSubagentDepth } : {}),
           }),
         )
       : () => {};
@@ -1231,7 +1307,12 @@ async function buildPersonaPrompt(args: {
    * the matching primitives ship (Memory=#4, Skills=#5, Sub-agents=#6).
    * Pre-plumbed so flipping them on later is a one-line change here.
    */
-  capabilities?: { memory?: boolean; skills?: boolean; subAgents?: boolean };
+  capabilities?: {
+    memory?: boolean;
+    skills?: boolean;
+    subAgents?: boolean;
+    subagentMode?: boolean;
+  };
   /**
    * Pre-rendered `<available_skills>` block (Primitive #5). Emitted in the
    * cached prefix under `## Skills` when `capabilities.skills` is true.
@@ -1249,8 +1330,16 @@ async function buildPersonaPrompt(args: {
   const override = resolveSystemPromptOverride({ config, agentId: args.agentId });
   if (override) return override;
 
-  const personaFiles = await loadWorkspaceContextFiles(args.workspaceDir);
-  const heartbeatFile = await loadHeartbeatFile(args.workspaceDir);
+  // Primitive #6 — sub-agent mode flips three things in the assembled prompt:
+  //   1. The persona loader drops BOOTSTRAP.md + MEMORY.md (operator-only).
+  //   2. The heartbeat file is skipped entirely (parent's cycle state).
+  //   3. The assembler swaps the identity opener for the SUB-AGENT banner and
+  //      gates off operator-only sections (CLI quick ref, execution bias,
+  //      output formatting, per-family identity override, memory wrapper).
+  const subagentMode = args.capabilities?.subagentMode === true;
+
+  const personaFiles = await loadWorkspaceContextFiles(args.workspaceDir, { subagentMode });
+  const heartbeatFile = subagentMode ? undefined : await loadHeartbeatFile(args.workspaceDir);
   if (personaFiles.length === 0 && !heartbeatFile) return "";
 
   const runtime = resolveRuntimeParams({

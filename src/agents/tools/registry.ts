@@ -23,7 +23,12 @@ import {
 	createDefaultMemoryCapability,
 	isDefaultMemoryCapability,
 } from "../memory/plugin-runtime.js";
+import {
+	DEFAULT_SUBAGENT_MAX_DEPTH,
+	filterToolsForSubagentDepth,
+} from "../subagent-policy.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
+import { makeSpawnAgentTool } from "./spawn-agent-tool.js";
 import type { AnyBrigadeTool } from "./types.js";
 
 /**
@@ -55,6 +60,34 @@ export interface CreateBrigadeToolsOptions {
 	 * pre-SDK call sites + tests).
 	 */
 	memoryCapability?: MemoryCapability;
+	/**
+	 * Sub-agent spawn context — Primitive #6. When provided, `spawn_agent` is
+	 * registered so the model can delegate sub-tasks. When omitted, the tool is
+	 * dropped (tests, unit-test paths, and any caller that doesn't want a
+	 * `spawn_agent` surface get the legacy three-tool set).
+	 *
+	 * The depth at which the CHILD will run is `callerDepth + 1`. When that
+	 * already equals `subagentMaxDepth`, the tool is also dropped — a leaf
+	 * sub-agent cannot recursively spawn further sub-agents.
+	 */
+	subagentContext?: {
+		/** Parent session key — drives the child key + the concurrency map. */
+		parentSessionKey: string;
+		/** Caller's depth (0 = top-level operator-driven turn). */
+		callerDepth: number;
+		/** Parent's run id (event correlation). */
+		parentRunId?: string;
+		/** Parent's abort signal — propagates cancellation to the child. */
+		parentSignal?: AbortSignal;
+		/**
+		 * Parent's RESOLVED provider + modelId. The child inherits these unless
+		 * the `spawn_agent` call explicitly overrides via the `model` param.
+		 */
+		parentProvider?: string;
+		parentModelId?: string;
+	};
+	/** Max sub-agent depth — defaults to `DEFAULT_SUBAGENT_MAX_DEPTH` (1). */
+	subagentMaxDepth?: number;
 }
 
 /**
@@ -86,7 +119,7 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 	const fileStore = isDefaultMemoryCapability(capability)
 		? capability.fileStore
 		: new FileMemoryStore(opts.workspaceDir);
-	return [
+	const tools: AnyBrigadeTool[] = [
 		// recall routes through the capability (rich render for the default,
 		// minimal SDK render for plugins).
 		makeRecallMemoryTool(capability),
@@ -94,6 +127,35 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// write_memory persists distilled structured facts through the capability.
 		makeWriteMemoryTool(capability),
 	];
+	// Primitive #6 — register `spawn_agent` only when the caller supplied a
+	// parent context AND the child wouldn't be a leaf. `filterToolsForSubagentDepth`
+	// owns the leaf check so the rule lives in one place; the registry just
+	// passes the candidate tool array through it.
+	if (opts.subagentContext) {
+		const spawnAgentTool = makeSpawnAgentTool({
+			parentSessionKey: opts.subagentContext.parentSessionKey,
+			parentAgentId: opts.agentId,
+			...(opts.subagentContext.parentRunId !== undefined
+				? { parentRunId: opts.subagentContext.parentRunId }
+				: {}),
+			...(opts.subagentContext.parentSignal !== undefined
+				? { parentSignal: opts.subagentContext.parentSignal }
+				: {}),
+			...(opts.subagentContext.parentProvider !== undefined
+				? { parentProvider: opts.subagentContext.parentProvider }
+				: {}),
+			...(opts.subagentContext.parentModelId !== undefined
+				? { parentModelId: opts.subagentContext.parentModelId }
+				: {}),
+		});
+		const filtered = filterToolsForSubagentDepth({
+			tools: [spawnAgentTool],
+			callerDepth: opts.subagentContext.callerDepth,
+			maxDepth: opts.subagentMaxDepth ?? DEFAULT_SUBAGENT_MAX_DEPTH,
+		});
+		tools.push(...filtered);
+	}
+	return tools;
 }
 
 /**

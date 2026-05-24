@@ -46,6 +46,16 @@ export interface ApprovalRequest {
 	cwd?: string;
 	timeoutMs: number;
 	decisions: ReadonlyArray<ApprovalDecisionKind>;
+	/**
+	 * Sub-agent attribution (Primitive #6). When set, the TUI surfaces a
+	 * "Sub-agent '<label>' wants to run …" title instead of the default
+	 * "Brigade wants to run …", so the operator knows whose tool call they
+	 * are about to approve. Top-level (operator-driven) turns leave these
+	 * undefined.
+	 */
+	subagentLabel?: string;
+	subagentDepth?: number;
+	parentRunId?: string;
 }
 
 /** Broadcaster the bridge calls when a new request lands. */
@@ -98,6 +108,9 @@ export class InMemoryApprovalBridge implements ApprovalBridge {
 			cwd: req.cwd,
 			timeoutMs: req.timeoutMs,
 			decisions: req.decisions,
+			...(req.subagentLabel !== undefined ? { subagentLabel: req.subagentLabel } : {}),
+			...(req.subagentDepth !== undefined ? { subagentDepth: req.subagentDepth } : {}),
+			...(req.parentRunId !== undefined ? { parentRunId: req.parentRunId } : {}),
 		};
 		return new Promise<ApprovalDecision>((resolve) => {
 			const timer = setTimeout(() => {
