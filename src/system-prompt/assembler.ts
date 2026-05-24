@@ -88,6 +88,14 @@ export interface AssembleArgs {
      * set is already filtered upstream to the minimal allowlist.
      */
     subagentMode?: boolean;
+    /**
+     * When true, this assembled prompt is going INTO a cron-triggered run.
+     * Same operator-only section gating as `subagentMode`, but uses a
+     * different opener so the model knows it's running unattended on a
+     * schedule (not delegated by a parent). The two flags are mutually
+     * exclusive in practice — a cron-fired turn won't also be a sub-agent.
+     */
+    cronMode?: boolean;
     /** Web tools (`fetch_url` and/or `web_search`) wired into this session.
      *  Gates the ## Web behavioural guidance + untrusted-content posture. */
     web?: boolean;
@@ -134,6 +142,12 @@ function sortPersonaFiles(files: ContextFile[]): ContextFile[] {
 export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   const lines: string[] = [];
   const isSubagentMode = args.capabilities?.subagentMode === true;
+  const isCronMode = args.capabilities?.cronMode === true;
+  // Both modes share the operator-only-sections-gate-off shape. The opener
+  // differs (sub-agent vs cron banner); everything else collapses to one
+  // "minimal mode" check so the gates below don't need to know which kind
+  // triggered the minimal layout.
+  const isMinimalMode = isSubagentMode || isCronMode;
 
   // 1. Identity opener.
   // Eight words. One brand mention. No marketing nouns. An earlier
@@ -203,6 +217,48 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
       "caveats the parent should know about. Plain prose for short results; a fenced block when " +
       "you're returning structured data (json, code). Skip the meta — no \"I'll now\", \"as " +
       "requested\", \"hope this helps\".",
+    );
+    lines.push("");
+  } else if (isCronMode) {
+    lines.push("# Scheduled Task Context");
+    lines.push("");
+    lines.push("You are a SCHEDULED TASK running unattended inside Brigade.");
+    lines.push("");
+    lines.push(
+      "Your job: complete the task as defined by your first user message, then return a final " +
+      "assistant reply. The operator is NOT online — your reply is captured to the run log and " +
+      "(when delivery is configured) sent to the operator's channel. No one is on the other end " +
+      "to answer questions or approve mid-run prompts.",
+    );
+    lines.push("");
+    lines.push("## Rules");
+    lines.push(
+      "1. **Do the work, then stop** — the task message tells you exactly what to do. Don't " +
+      "expand scope, don't add nice-to-haves, don't ask for confirmation.",
+    );
+    lines.push(
+      "2. **No questions back** — there is no human to answer. If something is ambiguous, pick " +
+      "the most sensible interpretation and proceed; explain the choice in your final reply.",
+    );
+    lines.push(
+      "3. **Stay in your tool surface** — owner-only tools have been filtered out for unattended " +
+      "runs. If you need a tool that isn't available, say so in the reply rather than refusing.",
+    );
+    lines.push(
+      "4. **Be self-contained** — no \"I'll follow up next time\". This run ends when you reply. " +
+      "If the work isn't finished, summarise what's done and what's left.",
+    );
+    lines.push(
+      "5. **No retries by speculation** — if a tool fails, treat the error as a real result. " +
+      "Don't loop. Surface the failure in your reply.",
+    );
+    lines.push("");
+    lines.push("## Output Format");
+    lines.push(
+      "Your final reply IS the deliverable. Lead with the outcome (succeeded / partial / blocked + " +
+      "why), then the specifics the operator needs (results, file paths, error messages). Plain " +
+      "prose for short results; fenced code blocks for structured data. Skip the conversational " +
+      "wrapper — no greetings, no sign-offs, no \"hope this helps\".",
     );
     lines.push("");
   } else {
@@ -307,7 +363,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // Skipped in sub-agent mode: the sub-agent has a single-shot task; it
   // doesn't field operator approvals or send "progress updates", and the
   // banner already sets the "return a focused reply" bias.
-  if (!isSubagentMode) {
+  if (!isMinimalMode) {
     lines.push("## Execution Bias");
     lines.push(
       "If the user asks you to do the work, start doing it in the same turn.",
@@ -343,7 +399,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // result the parent receives as plain text, so fence discipline isn't
   // load-bearing there. The parent's prompt still carries the rules and
   // the parent decides how to render the final answer.
-  if (!isSubagentMode) {
+  if (!isMinimalMode) {
     lines.push("## Output Formatting");
     lines.push(
       "For any code, JSON, shell command, configuration, or tool output longer than ~20 chars, use a fenced Markdown code block with a language tag.",
@@ -400,7 +456,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // anchored by the persona files (SOUL/IDENTITY) + the SUB-AGENT banner.
   // It will not be addressing the user directly, so the "you are not
   // Gemini / ChatGPT" reframing isn't load-bearing.
-  if (!isSubagentMode) {
+  if (!isMinimalMode) {
     const familyBlock = pickModelFamilyGuidance(args.modelId);
     if (familyBlock) {
       lines.push(familyBlock);
@@ -419,7 +475,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // Skipped in sub-agent mode: managing the gateway daemon, onboarding,
   // and health checks are operator concerns — the sub-agent is task-
   // scoped and never needs to invoke these.
-  if (!isSubagentMode) {
+  if (!isMinimalMode) {
     lines.push("## Brigade CLI Quick Reference");
     lines.push("Brigade is controlled via subcommands. Do not invent commands.");
     lines.push("To manage the Gateway daemon (start/stop/restart):");
@@ -461,7 +517,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // concern. The sub-agent shouldn't write to it (its task is bounded)
   // and shouldn't recall from it (the parent already injected whatever
   // context the task needs as the first user message).
-  if (args.capabilities?.memory && !isSubagentMode) {
+  if (args.capabilities?.memory && !isMinimalMode) {
     lines.push(MEMORY_GUIDANCE);
     lines.push("");
   }
@@ -474,7 +530,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // of this block over-encouraged spawning; the model either ignored it (no
   // change in behaviour) or — worse — would have spawned for trivial work.
   // Skipped in sub-agent mode since the sub-agent can't spawn further.
-  if (args.capabilities?.subAgents && !isSubagentMode) {
+  if (args.capabilities?.subAgents && !isMinimalMode) {
     lines.push("## Delegation");
     lines.push(
       "If a task is more complex or takes longer, spawn a sub-agent with `spawn_agent`. " +
@@ -496,7 +552,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // significant token bloat. The parent already injected whatever context the
   // sub-agent needs as the first user message; a scoped task gets the answer
   // through its bounded tool surface, not the full skill index.
-  if (args.capabilities?.skills && !isSubagentMode) {
+  if (args.capabilities?.skills && !isMinimalMode) {
     lines.push(SKILLS_GUIDANCE);
     lines.push("");
     if (args.skillsPromptBlock && args.skillsPromptBlock.trim().length > 0) {
@@ -573,7 +629,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     // cache marker. Skipped in sub-agent mode: heartbeat is the parent's
     // cycle state (last operator activity, mode, time-since), which
     // doesn't belong in a task-scoped child's context.
-    if (args.heartbeatFile && !isSubagentMode) {
+    if (args.heartbeatFile && !isMinimalMode) {
       lines.push("# Dynamic Project Context");
       lines.push("");
       lines.push("## HEARTBEAT");
@@ -613,7 +669,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // so prompt caching works on the (very small) stable prefix.
   lines.push(CACHE_BOUNDARY_MARKER_LINE);
   lines.push("");
-  if (args.heartbeatFile && !isSubagentMode) {
+  if (args.heartbeatFile && !isMinimalMode) {
     lines.push("# Dynamic Project Context");
     lines.push("");
     lines.push("## HEARTBEAT");

@@ -72,6 +72,11 @@ import {
 	InMemoryApprovalBridge,
 	setActiveApprovalBridge,
 } from "../agents/approval-bridge.js";
+import { setActiveCronService } from "../cron/active-service.js";
+import { runCronIsolatedAgentJob } from "../cron/isolated-agent/run.js";
+import { createCronServiceState } from "../cron/service/state.js";
+import { start as cronStart, stop as cronStop } from "../cron/service/ops.js";
+import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { DEFAULT_AGENT_ID, resolveAgentDir, resolveAgentWorkspaceDir } from "../config/paths.js";
 import { defaultSessionKey } from "../sessions/session-store.js";
 import { makeExtractionLlm, runExtractionSweep } from "../agents/memory/extract.js";
@@ -613,6 +618,37 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		});
 	});
 	setActiveApprovalBridge(approvalBridge);
+
+	/* ──────────────── cron service boot ──────────────── */
+
+	// Construct the per-daemon cron service. Deps wire the timer's actual
+	// agent-execution path (`runCronIsolatedAgentJob`) and event logging.
+	// `enqueueSystemEvent` / `requestHeartbeatNow` / `sendCronFailureAlert`
+	// stay undefined for now — the scheduler logs a warning and degrades
+	// gracefully (no system-event injection, no failure-alert delivery)
+	// until those subsystems land.
+	const cronState = createCronServiceState({
+		deps: {
+			log: createSubsystemLogger("cron"),
+			runIsolatedAgentJob: runCronIsolatedAgentJob,
+			onEvent: (event) => {
+				broadcast("log", {
+					level: event.action === "finished" && event.status === "error" ? "warn" : "info",
+					message: `cron: ${event.action} ${event.jobId}`,
+					at: Date.now(),
+				});
+			},
+		},
+	});
+	setActiveCronService(cronState);
+	// Fire-and-forget — cronStart loads cron.json, replays bounded missed
+	// jobs with stagger, then arms the timer. A throw here would break
+	// the gateway boot, so we swallow + log.
+	void cronStart(cronState).catch((err) => {
+		createSubsystemLogger("cron").error("cron service failed to start", {
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
 
 	/* ──────────────── per-turn pi event forwarding ──────────────── */
 
@@ -1584,6 +1620,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// Detach the approval bridge so a late-arriving exec-gate call
 			// after stop() doesn't broadcast to dead clients.
 			setActiveApprovalBridge(null);
+			// Disarm the cron timer + detach the active-service singleton so
+			// the agent tool can no longer mutate state and the next CLI
+			// invocation gets a clean "not initialised" error rather than a
+			// half-torn-down state.
+			try {
+				cronStop(cronState);
+			} catch {
+				/* best-effort; service may already be down */
+			}
+			setActiveCronService(null);
 			// Stop all product capabilities (channels + services) first so no new
 			// inbound turn is enqueued during teardown. Routed through the lifecycle
 			// queue so it can't race an in-flight `system.reload`.

@@ -92,6 +92,14 @@ export function assembleBrigadeToolset(opts: {
 		parentProvider?: string;
 		parentModelId?: string;
 	};
+	/**
+	 * Cron-mode tool allowlist. When set, the resulting toolset (built-ins
+	 * AND brigade custom tools) is filtered down to ONLY these names.
+	 * Stacks AFTER the `senderIsOwner` ownerOnly filter — both layers
+	 * compose, with allowlist applied last. Empty array means "no tools";
+	 * undefined means "no filter, full surface".
+	 */
+	toolsAllow?: string[];
 }): BrigadeToolset {
 	const rawCustomTools = createBrigadeTools({
 		workspaceDir: opts.workspaceDir,
@@ -103,12 +111,24 @@ export function assembleBrigadeToolset(opts: {
 	const senderIsOwner = opts.senderIsOwner ?? true;
 	// Wrap every tool — `wrapOwnerOnlyToolExecution` is a no-op for the owner
 	// AND for non-ownerOnly tools, so the cost is one identity-check per tool.
-	const customTools = rawCustomTools.map((t) => wrapOwnerOnlyToolExecution(t, senderIsOwner));
+	const wrappedCustomTools = rawCustomTools.map((t) =>
+		wrapOwnerOnlyToolExecution(t, senderIsOwner),
+	);
+	// Per-job toolsAllow filter (cron). When omitted, every tool flows
+	// through. When supplied, only the named tools survive — both for the
+	// custom-tool array AND for the builtinToolNames allowlist below.
+	const allow = opts.toolsAllow;
+	const customTools = allow === undefined
+		? wrappedCustomTools
+		: wrappedCustomTools.filter((t) => allow.includes(t.name));
+	const builtinNames = allow === undefined
+		? [...BUILTIN_TOOL_NAMES]
+		: BUILTIN_TOOL_NAMES.filter((n) => allow.includes(n));
 	const brigadeToolNames = customTools.map((t) => t.name);
 	return {
-		builtinToolNames: [...BUILTIN_TOOL_NAMES],
+		builtinToolNames: builtinNames,
 		brigadeToolNames,
-		enabledToolNames: [...BUILTIN_TOOL_NAMES, ...brigadeToolNames],
+		enabledToolNames: [...builtinNames, ...brigadeToolNames],
 		customTools,
 		capabilities: {
 			memory: brigadeToolNames.includes("recall_memory"),

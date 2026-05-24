@@ -27,6 +27,8 @@ import {
 	DEFAULT_SUBAGENT_MAX_DEPTH,
 	filterToolsForSubagentDepth,
 } from "../subagent-policy.js";
+import { getActiveCronService } from "../../cron/active-service.js";
+import { makeCronTool } from "./cron-tool.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
 import { makeSpawnAgentTool } from "./spawn-agent-tool.js";
 import type { AnyBrigadeTool } from "./types.js";
@@ -154,6 +156,15 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 			maxDepth: opts.subagentMaxDepth ?? DEFAULT_SUBAGENT_MAX_DEPTH,
 		});
 		tools.push(...filtered);
+	}
+	// Cron primitive — register the `cron` tool when the gateway daemon's
+	// cron service is up. The agent uses it to add/list/run/wake jobs from
+	// inside chat. `ownerOnly: true` ensures non-operator senders can't
+	// mutate the cron set; the ownership wrapper at session-wiring rejects
+	// their calls before they reach the action handler.
+	const cronService = getActiveCronService();
+	if (cronService) {
+		tools.push(makeCronTool());
 	}
 	return tools;
 }

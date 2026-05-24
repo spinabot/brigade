@@ -116,6 +116,7 @@
     "chalk": "^5.3.0",
     "cli-highlight": "^2.1.11",
     "commander": "^12.1.0",
+    "croner": "^10.0.1",
     "json5": "^2.2.3",
     "linkedom": "^0.18.12",
     "playwright-core": "^1.59.0",

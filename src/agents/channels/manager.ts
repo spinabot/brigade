@@ -112,31 +112,31 @@ function buildOperatorFacingErrorReply(err: unknown): string {
 	switch (reason) {
 		case "billing":
 			return [
-				"⚠️  I'm out of credits to reply right now.",
+				"🦁  I'm tapped out — my model provider account just ran dry.",
 				"",
-				"The bot owner needs to top up the model provider account before I can answer. I'll be back online as soon as they do.",
+				"The owner needs to top it up before I can answer. Back the moment they do.",
 			].join("\n");
 		case "auth":
 		case "auth_permanent":
 			return [
-				"⚠️  I can't reach the model right now — my credentials need a refresh.",
+				"🦁  My credentials need a refresh — I can't reach the model until the owner sorts them out.",
 				"",
-				"I've pinged the bot owner. Try me again in a few minutes.",
+				"Usually a quick fix. Try me again in a few minutes.",
 			].join("\n");
 		case "rate_limit":
 		case "overloaded":
-			return "⏳  I'm at capacity for a moment — please send that again in 30 seconds.";
+			return "⏳  Catching my breath — give me 30 seconds and send that again.";
 		case "context_overflow":
-			return "🧠  That message pushed us over the model's memory limit. Let's start a fresh thread — say 'new chat' and I'll reset.";
+			return "🧠  Our chat's gotten too long for me to hold the whole thread. Say 'new chat' and we'll start fresh.";
 		case "model_not_found":
-			return "⚠️  The model I usually use isn't reachable right now. The bot owner has been notified.";
+			return "🦁  The model I usually use isn't reachable. The owner needs to pick a different one — back as soon as they do.";
 		case "timeout":
-			return "⏳  My reply timed out. Please send that again — it usually works on the second try.";
+			return "⏳  My reply timed out — give it one more shot, it usually works the second time.";
 		case "format":
 		case "session_expired":
 		case "unknown":
 		default:
-			return "⚠️  Sorry, I hit an error replying to that. Please try again in a moment — if it keeps happening, ping the bot owner.";
+			return "⚠️  Hit a snag replying to that. Give it another try — if it keeps happening, let the owner know.";
 	}
 }
 

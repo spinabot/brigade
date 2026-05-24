@@ -723,5 +723,347 @@ export function buildProgram(): Command {
       process.exit(await runExecFile({ json: opts.json }));
     });
 
+  // ──────────────── cron ────────────────
+  // Scheduled jobs: list / add / edit / remove / enable / disable / run / runs / status.
+  // All subcommands talk DIRECTLY to ~/.brigade/cron.json — the per-storePath
+  // lock in cron/service/locked.ts serialises against a running gateway, so
+  // there's no double-write race even with both processes touching the file.
+  const cron = program.command("cron").description("Manage scheduled cron jobs");
+
+  cron
+    .command("status")
+    .description("Show cron service status (job count, next wake time)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runCronStatus } = await import("../commands/cron.js");
+      process.exit(await runCronStatus({ json: opts.json }));
+    });
+
+  cron
+    .command("list")
+    .description("List cron jobs (enabled only by default)")
+    .option("--all", "include disabled jobs", false)
+    .option("--query <text>", "filter by name / description / id substring")
+    .option("--limit <n>", "max rows (default 50, max 200)", (v) => parseInt(v, 10))
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { all?: boolean; query?: string; limit?: number; json?: boolean }) => {
+      const { runCronList } = await import("../commands/cron.js");
+      process.exit(
+        await runCronList({
+          ...(opts.all !== undefined ? { all: opts.all } : {}),
+          ...(opts.query !== undefined ? { query: opts.query } : {}),
+          ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  cron
+    .command("add")
+    .description("Add a cron job (one of --at / --every / --cron required, plus --message or --system-event)")
+    .requiredOption("--name <name>", "human-readable label for this job")
+    .option("--description <text>", "longer description shown by `cron list`")
+    .option("--disabled", "create the job in disabled state", false)
+    .option("--at <iso-or-ms>", "one-shot fire time (ISO 8601 or ms-epoch)")
+    .option("--every <duration>", 'recurring interval, e.g. "5m" / "1h" / "30s"')
+    .option("--cron <expr>", 'cron expression (5/6/7-field), e.g. "0 9 * * *"')
+    .option("--tz <iana>", "timezone for --cron (default: host timezone)")
+    .option("--target <target>", '"main" | "isolated" | "session:<id>" (default: by payload)')
+    .option("--message <text>", "agent-turn payload — the prompt the cron sends to the model")
+    .option("--system-event <text>", "system-event payload — text injected into the main session")
+    .option("--model <id>", "model override for agent-turn payloads")
+    .option("--thinking <level>", '"off" | "low" | "medium" | "high"')
+    .option("--timeout-seconds <n>", "per-run timeout", (v) => parseInt(v, 10))
+    .option("--tools <csv>", "comma-separated tool allowlist (agent-turn only)")
+    .option("--light-context", "drop ALL workspace bootstrap files for a minimal prompt", false)
+    .option("--deliver", "set delivery.mode to announce (default: by payload)", false)
+    .option("--no-deliver", "set delivery.mode to none (silence)", false)
+    .option("--channel <id>", "delivery channel id")
+    .option("--to <recipient>", "delivery recipient (channel-specific)")
+    .option("--account <id>", "delivery account id")
+    .option("--best-effort-deliver", "tolerate delivery failures", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: CronAddCliOpts) => {
+      const { runCronAdd } = await import("../commands/cron.js");
+      const job = buildCronJobCreateFromCliOpts(opts);
+      if (typeof job === "string") {
+        process.stderr.write(`cron add: ${job}\n`);
+        process.exit(1);
+      }
+      process.exit(
+        await runCronAdd({
+          job,
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  cron
+    .command("edit <jobId>")
+    .description("Patch fields of an existing cron job")
+    .option("--name <name>", "rename the job")
+    .option("--description <text>", "set the description")
+    .option("--enable", "enable the job", false)
+    .option("--disable", "disable the job", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (jobId: string, opts: CronEditCliOpts) => {
+      const { runCronEdit } = await import("../commands/cron.js");
+      const patch: CronJobPatchInput = {};
+      if (opts.name !== undefined) patch.name = opts.name;
+      if (opts.description !== undefined) patch.description = opts.description;
+      if (opts.enable && opts.disable) {
+        process.stderr.write("cron edit: --enable and --disable are mutually exclusive\n");
+        process.exit(1);
+      }
+      if (opts.enable) patch.enabled = true;
+      if (opts.disable) patch.enabled = false;
+      process.exit(
+        await runCronEdit({
+          jobId,
+          patch,
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  cron
+    .command("rm <jobId>")
+    .alias("remove")
+    .alias("delete")
+    .description("Delete a cron job")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (jobId: string, opts: { json?: boolean }) => {
+      const { runCronRemove } = await import("../commands/cron.js");
+      process.exit(
+        await runCronRemove({ jobId, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
+      );
+    });
+
+  cron
+    .command("enable <jobId>")
+    .description("Enable a disabled cron job")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (jobId: string, opts: { json?: boolean }) => {
+      const { runCronEnable } = await import("../commands/cron.js");
+      process.exit(
+        await runCronEnable({ jobId, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
+      );
+    });
+
+  cron
+    .command("disable <jobId>")
+    .description("Disable an enabled cron job")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (jobId: string, opts: { json?: boolean }) => {
+      const { runCronDisable } = await import("../commands/cron.js");
+      process.exit(
+        await runCronDisable({ jobId, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
+      );
+    });
+
+  cron
+    .command("run <jobId>")
+    .description("Fire a cron job now (enqueues for the next gateway tick)")
+    .option("--due", "only run if the job is past its next-fire time", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (jobId: string, opts: { due?: boolean; json?: boolean }) => {
+      const { runCronRunCmd } = await import("../commands/cron.js");
+      process.exit(
+        await runCronRunCmd({
+          jobId,
+          mode: opts.due ? "due" : "force",
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  cron
+    .command("runs <jobId>")
+    .description("Show cron run history (most-recent first)")
+    .option("--limit <n>", "max entries (default 50)", (v) => parseInt(v, 10))
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (jobId: string, opts: { limit?: number; json?: boolean }) => {
+      const { runCronRuns } = await import("../commands/cron.js");
+      process.exit(
+        await runCronRuns({
+          jobId,
+          ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
   return program;
+}
+
+/* ────────────────── cron CLI flag → CronJobCreate translation ─────────── */
+
+interface CronAddCliOpts {
+  name: string;
+  description?: string;
+  disabled?: boolean;
+  at?: string;
+  every?: string;
+  cron?: string;
+  tz?: string;
+  target?: string;
+  message?: string;
+  systemEvent?: string;
+  model?: string;
+  thinking?: string;
+  timeoutSeconds?: number;
+  tools?: string;
+  lightContext?: boolean;
+  deliver?: boolean;
+  channel?: string;
+  to?: string;
+  account?: string;
+  bestEffortDeliver?: boolean;
+  json?: boolean;
+}
+
+interface CronEditCliOpts {
+  name?: string;
+  description?: string;
+  enable?: boolean;
+  disable?: boolean;
+  json?: boolean;
+}
+
+interface CronJobPatchInput {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+}
+
+/**
+ * Translate the flat CLI flag set into a `CronJobCreate`. Returns the
+ * structured object on success, or a string error message that the caller
+ * prints to stderr before exiting non-zero. Validation of the schedule /
+ * payload pairing happens server-side in `assertSupportedJobSpec`; this
+ * helper just owns the flag-shape conversion.
+ */
+function buildCronJobCreateFromCliOpts(
+  opts: CronAddCliOpts,
+): import("../../cron/types.js").CronJobCreate | string {
+  // Schedule resolution — exactly one of --at / --every / --cron.
+  const scheduleKindsSpecified = [opts.at, opts.every, opts.cron].filter((v) => v !== undefined).length;
+  if (scheduleKindsSpecified === 0) {
+    return "one of --at, --every, or --cron must be provided";
+  }
+  if (scheduleKindsSpecified > 1) {
+    return "only one of --at, --every, --cron may be provided";
+  }
+  let schedule: import("../../cron/types.js").CronSchedule;
+  if (opts.at !== undefined) {
+    const ms = parseAtSpec(opts.at);
+    if (ms === null) return `invalid --at value: ${opts.at}`;
+    schedule = { kind: "at", at: ms };
+  } else if (opts.every !== undefined) {
+    const ms = parseDurationToMs(opts.every);
+    if (ms === null) return `invalid --every value: ${opts.every}`;
+    schedule = { kind: "every", everyMs: ms };
+  } else {
+    schedule = {
+      kind: "cron",
+      expr: opts.cron!,
+      ...(opts.tz !== undefined ? { tz: opts.tz } : {}),
+    };
+  }
+
+  // Payload resolution — exactly one of --message / --system-event.
+  if ((opts.message === undefined) === (opts.systemEvent === undefined)) {
+    return "exactly one of --message or --system-event must be provided";
+  }
+  let payload: import("../../cron/types.js").CronPayload;
+  if (opts.systemEvent !== undefined) {
+    payload = { kind: "systemEvent", text: opts.systemEvent };
+  } else {
+    const thinking = (
+      opts.thinking === "off" || opts.thinking === "low" ||
+      opts.thinking === "medium" || opts.thinking === "high"
+    ) ? opts.thinking : undefined;
+    const toolsAllow = opts.tools
+      ? opts.tools.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
+      : undefined;
+    payload = {
+      kind: "agentTurn",
+      message: opts.message!,
+      ...(opts.model !== undefined ? { model: opts.model } : {}),
+      ...(thinking !== undefined ? { thinking } : {}),
+      ...(opts.timeoutSeconds !== undefined ? { timeoutSeconds: opts.timeoutSeconds } : {}),
+      ...(toolsAllow !== undefined ? { toolsAllow } : {}),
+      ...(opts.lightContext === true ? { lightContext: true } : {}),
+    };
+  }
+
+  // sessionTarget — explicit override or fall back to the payload-driven default.
+  let sessionTarget: import("../../cron/types.js").CronSessionTarget;
+  if (opts.target !== undefined) {
+    if (opts.target === "main" || opts.target === "isolated") {
+      sessionTarget = opts.target;
+    } else if (opts.target.startsWith("session:")) {
+      sessionTarget = opts.target as `session:${string}`;
+    } else {
+      return `invalid --target value: ${opts.target} (expected "main" | "isolated" | "session:<id>")`;
+    }
+  } else {
+    sessionTarget = payload.kind === "systemEvent" ? "main" : "isolated";
+  }
+
+  // Optional delivery block — only built when one of the flags was supplied.
+  const hasDeliveryFlag = opts.deliver || opts.channel || opts.to || opts.account || opts.bestEffortDeliver;
+  const delivery = hasDeliveryFlag
+    ? {
+        mode: (opts.deliver ? "announce" : "none") as "announce" | "none",
+        ...(opts.channel !== undefined ? { channel: opts.channel } : {}),
+        ...(opts.to !== undefined ? { to: opts.to } : {}),
+        ...(opts.account !== undefined ? { accountId: opts.account } : {}),
+        ...(opts.bestEffortDeliver === true ? { bestEffort: true } : {}),
+      }
+    : undefined;
+
+  return {
+    name: opts.name,
+    ...(opts.description !== undefined ? { description: opts.description } : {}),
+    enabled: opts.disabled !== true,
+    schedule,
+    sessionTarget,
+    payload,
+    ...(delivery !== undefined ? { delivery } : {}),
+  };
+}
+
+/**
+ * Parse `--at` — accepts ISO 8601 (`2026-06-15T09:00:00Z`) OR raw ms-epoch.
+ * Returns ms-since-epoch, or null on parse failure.
+ */
+function parseAtSpec(input: string): number | null {
+  const trimmed = input.trim();
+  // Try numeric first — operators frequently pipe `date +%s000` or similar.
+  const numeric = Number(trimmed);
+  if (Number.isFinite(numeric) && trimmed.match(/^\d+$/)) {
+    return Math.floor(numeric);
+  }
+  const parsed = Date.parse(trimmed);
+  if (!Number.isFinite(parsed)) return null;
+  return parsed;
+}
+
+/** Parse `--every 5m / 1h / 30s / 2w` → ms. Returns null on parse failure. */
+function parseDurationToMs(input: string): number | null {
+  const m = input.trim().match(/^(\d+)\s*(s|m|h|d|w)$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  const unit = (m[2] ?? "m").toLowerCase();
+  const multiplier: Record<string, number> = {
+    s: 1_000,
+    m: 60_000,
+    h: 3_600_000,
+    d: 86_400_000,
+    w: 604_800_000,
+  };
+  const mul = multiplier[unit];
+  if (mul === undefined) return null;
+  return n * mul;
 }

@@ -233,6 +233,19 @@ export interface RunSingleTurnArgs {
    * turns leave this unset.
    */
   subagentMetadata?: import("../sessions/session-store.js").SubagentSessionMetadata;
+  /**
+   * Cron-driven turn flags (Primitive: cron). Set by `src/cron/isolated-
+   * agent/run-executor.ts` when the cron service fires a scheduled run.
+   *   - `cronMode` — assembler swaps the identity opener for the cron
+   *     banner + gates operator-only sections (same shape as subagentMode).
+   *   - `lightContext` — drops EVERY workspace bootstrap file so the cron
+   *     turn runs with the minimal possible system prompt (cheap automation).
+   *   - `toolsAllow` — pre-filters the tool surface to this allowlist of
+   *     names; stacks AFTER the senderIsOwner ownerOnly filter.
+   */
+  cronMode?: boolean;
+  lightContext?: boolean;
+  toolsAllow?: string[];
 }
 
 export interface RunSingleTurnResult {
@@ -504,6 +517,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       parentProvider: args.provider,
       parentModelId: args.modelId,
     },
+    // Cron primitive: per-job toolsAllow filter — stacks AFTER ownerOnly.
+    // Undefined for non-cron turns, an array for cron-fired turns whose
+    // payload sets a tool allowlist.
+    ...(args.toolsAllow !== undefined ? { toolsAllow: args.toolsAllow } : {}),
   });
   const brigadeCustomTools = toolset.customTools;
   const enabledToolNames = toolset.enabledToolNames;
@@ -525,6 +542,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // operator-only sections; the workspace loader drops BOOTSTRAP.md +
     // MEMORY.md from the persona set; the heartbeat file is skipped.
     subagentMode: callerSubagentDepth > 0,
+    // Cron primitive — when the cron service fires a scheduled run, the
+    // executor passes `cronMode: true`. Assembler swaps the opener for the
+    // cron banner + gates operator-only sections (same shape as
+    // subagentMode). `lightContext` (passed downstream into the workspace
+    // loader) decides whether to also drop the persona files for the
+    // cheapest possible system prompt.
+    cronMode: args.cronMode === true,
   };
   // `agents.defaults.toolset` (when set in `brigade.json`) narrows the active
   // tool profile — e.g. `"minimal" | "coding" | "messaging"`. The registry
@@ -889,11 +913,15 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // would pollute the bounded context with content the task didn't ask for.
     // Gate on `!subagentMode` so the suffix stays clean for delegated runs.
     ephemeralSuffix: mergeEphemeralSuffix(
-      promptCapabilities?.memory && !promptCapabilities.subagentMode
+      promptCapabilities?.memory && !promptCapabilities.subagentMode && !promptCapabilities.cronMode
         ? await buildAutoRecallBlock(memoryCapability, args.message)
         : undefined,
       contextEngineAddition,
     ),
+    // Cron primitive: thread the `lightContext` flag down to the persona
+    // builder. When set, the entire workspace bootstrap surface is dropped
+    // for a minimal prompt (cron's task message carries the context).
+    ...(args.lightContext === true ? { lightContext: true } : {}),
   });
   if (personaPrompt) {
     applyPersonaOverrideToSession(session as AgentSession, personaPrompt);
@@ -1312,6 +1340,7 @@ async function buildPersonaPrompt(args: {
     skills?: boolean;
     subAgents?: boolean;
     subagentMode?: boolean;
+    cronMode?: boolean;
   };
   /**
    * Pre-rendered `<available_skills>` block (Primitive #5). Emitted in the
@@ -1325,6 +1354,12 @@ async function buildPersonaPrompt(args: {
   ephemeralSuffix?: string;
   /** The turn's config (read once upstream). Falls back to a read when omitted. */
   config?: BrigadeConfig;
+  /**
+   * Cron primitive: drop EVERY workspace bootstrap file from the persona
+   * set. Token-cheap automation runs (the cron knows what it needs from
+   * its task message; persona context is overhead).
+   */
+  lightContext?: boolean;
 }): Promise<string> {
   const config = args.config ?? readConfigOrInit();
   const override = resolveSystemPromptOverride({ config, agentId: args.agentId });
@@ -1337,9 +1372,18 @@ async function buildPersonaPrompt(args: {
   //      gates off operator-only sections (CLI quick ref, execution bias,
   //      output formatting, per-family identity override, memory wrapper).
   const subagentMode = args.capabilities?.subagentMode === true;
+  const cronMode = args.capabilities?.cronMode === true;
+  const lightContext = args.lightContext === true;
 
-  const personaFiles = await loadWorkspaceContextFiles(args.workspaceDir, { subagentMode });
-  const heartbeatFile = subagentMode ? undefined : await loadHeartbeatFile(args.workspaceDir);
+  // Cron-mode + lightContext drops the entire persona set; cron-mode alone
+  // still loads persona files (operator wants the agent to behave with its
+  // configured voice, just without the operator-onboarding ritual).
+  const personaFiles = lightContext
+    ? []
+    : await loadWorkspaceContextFiles(args.workspaceDir, { subagentMode: subagentMode || cronMode });
+  const heartbeatFile = (subagentMode || cronMode || lightContext)
+    ? undefined
+    : await loadHeartbeatFile(args.workspaceDir);
   if (personaFiles.length === 0 && !heartbeatFile) return "";
 
   const runtime = resolveRuntimeParams({
