@@ -25,6 +25,7 @@ import * as crypto from "node:crypto";
 
 import { recordApproval } from "../core/exec-approvals.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
 	type ChannelApprovalRoute,
 	dispatchChannelApproval,
@@ -62,6 +63,10 @@ export interface ApprovalRequest {
 	subagentLabel?: string;
 	subagentDepth?: number;
 	parentRunId?: string;
+	/** P1#3 (Wave H) — agent whose turn requested approval; lets the gateway route the WS broadcast to the right operator. */
+	agentId?: string;
+	/** P1#3 (Wave H) — session the approval belongs to; pairs with `agentId` for filtered fan-out. */
+	sessionId?: string;
 	/**
 	 * Channel routing — when set, the bridge sends the approval prompt to
 	 * the channel conversation (via the per-channel approval-router
@@ -126,6 +131,8 @@ export class InMemoryApprovalBridge implements ApprovalBridge {
 			...(req.subagentLabel !== undefined ? { subagentLabel: req.subagentLabel } : {}),
 			...(req.subagentDepth !== undefined ? { subagentDepth: req.subagentDepth } : {}),
 			...(req.parentRunId !== undefined ? { parentRunId: req.parentRunId } : {}),
+			...(req.agentId !== undefined ? { agentId: req.agentId } : {}),
+			...(req.sessionId !== undefined ? { sessionId: req.sessionId } : {}),
 			...(req.channelRoute !== undefined ? { channelRoute: req.channelRoute } : {}),
 		};
 		return new Promise<ApprovalDecision>((resolve) => {
@@ -187,16 +194,31 @@ export class InMemoryApprovalBridge implements ApprovalBridge {
 	}
 }
 
-let activeBridge: ApprovalBridge | null = null;
+type ActiveApprovalBridgeState = { activeBridge: ApprovalBridge | null };
 
-/** Set the process-wide bridge. Gateway calls this at boot. */
+const ACTIVE_APPROVAL_BRIDGE_KEY = Symbol.for("brigade.approval.activeBridge");
+
+function getActiveBridgeState(): ActiveApprovalBridgeState {
+	return resolveGlobalSingleton<ActiveApprovalBridgeState>(ACTIVE_APPROVAL_BRIDGE_KEY, () => ({
+		activeBridge: null,
+	}));
+}
+
+/**
+ * Set the process-wide bridge. Gateway calls this at boot.
+ *
+ * P1#9 (Wave H) — backed by `resolveGlobalSingleton` so dual-loaded
+ * Brigade modules share ONE slot. Without the pin an exec-gate importing
+ * a different copy of this module than the gateway boot path would see
+ * `null` even after a real bridge was set.
+ */
 export function setActiveApprovalBridge(bridge: ApprovalBridge | null): void {
-	activeBridge = bridge;
+	getActiveBridgeState().activeBridge = bridge;
 }
 
 /** Read the active bridge. Exec-gate calls this on every prompt branch. */
 export function getActiveApprovalBridge(): ApprovalBridge | null {
-	return activeBridge;
+	return getActiveBridgeState().activeBridge;
 }
 
 /**
@@ -218,20 +240,22 @@ export function getActiveApprovalBridge(): ApprovalBridge | null {
 export function applyApprovalDecision(args: {
 	command: string;
 	decision: ApprovalDecision;
+	/** Per-agent allowlist scope — defaults to the canonical agent. */
+	agentId?: string;
 }): "allow" | "deny" {
-	const { command, decision } = args;
+	const { command, decision, agentId } = args;
 	switch (decision.kind) {
 		case "deny":
 			return "deny";
 		case "allow-once":
 			return "allow";
 		case "allow-always":
-			recordApproval(command, "exact");
+			recordApproval(command, "exact", agentId);
 			return "allow";
 		case "allow-pattern": {
 			const pattern = decision.pattern?.trim();
 			if (pattern) {
-				recordApproval(pattern, "pattern");
+				recordApproval(pattern, "pattern", agentId);
 			}
 			// Even if no pattern was provided, this call IS allowed — the
 			// operator picked an "allow" disposition. Future calls miss the

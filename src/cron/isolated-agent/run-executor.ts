@@ -51,6 +51,40 @@ function resolveDefaultModel(config: BrigadeConfig): string {
 	return "claude-opus-4-7";
 }
 
+/** Pull the per-agent override block out of `config.agents.<agentId>` (when
+ *  present), with permissive shape so we don't drift away from the actual
+ *  config type's surface. */
+function readAgentOverride(
+	config: BrigadeConfig,
+	agentId: string,
+): { provider?: unknown; model?: { primary?: unknown } } | undefined {
+	const agents = config.agents as Record<string, unknown> | undefined;
+	if (!agents) return undefined;
+	const ov = agents[agentId];
+	if (!ov || typeof ov !== "object") return undefined;
+	return ov as { provider?: unknown; model?: { primary?: unknown } };
+}
+
+/** Per-agent provider — `cfg.agents.<agentId>.provider` wins, then the
+ *  workspace's `defaults.provider`, then "anthropic". */
+export function resolveAgentProvider(config: BrigadeConfig, agentId: string): string {
+	const ov = readAgentOverride(config, agentId);
+	if (ov && typeof ov.provider === "string" && ov.provider.length > 0) {
+		return ov.provider;
+	}
+	return resolveDefaultProvider(config);
+}
+
+/** Per-agent model — `cfg.agents.<agentId>.model.primary` wins, then the
+ *  workspace's `defaults.model.primary`, then "claude-opus-4-7". */
+export function resolveAgentModel(config: BrigadeConfig, agentId: string): string {
+	const ov = readAgentOverride(config, agentId);
+	if (ov?.model && typeof ov.model.primary === "string" && ov.model.primary.length > 0) {
+		return ov.model.primary;
+	}
+	return resolveDefaultModel(config);
+}
+
 /**
  * Derive the child session key for this cron's run.
  *   - `"isolated"`     → fresh per-fire: `cron:<jobId>:run:<uuid>`
@@ -96,8 +130,12 @@ export async function executeCronAgentRun(
 	const payload = job.payload as CronPayloadAgentTurn;
 	const config = readConfigOrInit();
 	const agentId = job.agentId ?? DEFAULT_AGENT_ID;
-	const provider = resolveDefaultProvider(config);
-	const modelId = payload.model ?? resolveDefaultModel(config);
+	// Per-agent provider/model resolution — `cfg.agents.<agentId>` wins over
+	// `cfg.agents.defaults`. Without this multi-agent installs would always
+	// run cron fires under the default agent's model even when the cron was
+	// scheduled by a non-default agent.
+	const provider = resolveAgentProvider(config, agentId);
+	const modelId = payload.model ?? resolveAgentModel(config, agentId);
 	const sessionKey = deriveCronSessionKey(job);
 
 	log.info("cron run starting", {

@@ -39,6 +39,7 @@
  */
 
 import type { BrigadeConfig } from "../config/io.js";
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import type { AnyBrigadeTool } from "./tools/types.js";
 
 export const DEFAULT_SUBAGENT_MAX_DEPTH = 1;
@@ -184,7 +185,12 @@ export interface ChildRunRecord {
 	error?: string;
 }
 
-const activeChildren = new Map<string, Map<string, ChildRunRecord>>();
+/** Pinned via global-singleton so hot-reload / dual-build share one active-children map. */
+const SUBAGENT_ACTIVE_CHILDREN_KEY = Symbol.for("brigade.subagentPolicy.activeChildren");
+const activeChildren = resolveGlobalSingleton<Map<string, Map<string, ChildRunRecord>>>(
+	SUBAGENT_ACTIVE_CHILDREN_KEY,
+	() => new Map<string, Map<string, ChildRunRecord>>(),
+);
 
 /**
  * Bounded ring of recently-ended child runs, oldest first. Survives the
@@ -192,7 +198,12 @@ const activeChildren = new Map<string, Map<string, ChildRunRecord>>();
  * "recent sub-agents" view) can answer "what just finished?".
  */
 const RECENT_HISTORY_CAP = 32;
-const recentlyEnded: ChildRunRecord[] = [];
+/** Pinned via global-singleton so hot-reload / dual-build share one recent-ended ring. */
+const SUBAGENT_RECENTLY_ENDED_KEY = Symbol.for("brigade.subagentPolicy.recentlyEnded");
+const recentlyEnded = resolveGlobalSingleton<ChildRunRecord[]>(
+	SUBAGENT_RECENTLY_ENDED_KEY,
+	() => [] as ChildRunRecord[],
+);
 
 export class SubagentLimitError extends Error {
 	readonly kind: "depth" | "concurrent";

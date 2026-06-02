@@ -202,9 +202,10 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// auto-fill `delivery.channel/to/threadId` and the eventual announce
 		// lands back in the SAME chat the operator created the job from.
 		tools.push(
-			makeCronTool(
-				opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {},
-			),
+			makeCronTool({
+				...(opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {}),
+				...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+			}),
 		);
 	}
 	// `send_message` — register only when a channel manager is mounted AND

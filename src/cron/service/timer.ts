@@ -205,24 +205,38 @@ export async function onTimer(state: CronServiceState): Promise<void> {
 	} finally {
 		// Session-reaper sweep — throttled to once per MIN_SWEEP_INTERVAL_MS
 		// (5 minutes) so the tick loop doesn't hammer the filesystem on
-		// every fire. Operates on the "main" agent's sessions for v1; a
-		// multi-agent setup can iterate later. Best-effort: a thrown sweep
-		// is caught + logged so it can't break the timer rearm below.
+		// every fire. Best-effort: a thrown sweep is caught + logged so it
+		// can't break the timer rearm below.
+		//
+		// Multi-agent: walk every distinct `job.agentId` in the store so a
+		// cron scheduled by a non-default agent gets its isolated-run
+		// transcripts pruned too. Always include `DEFAULT_AGENT_ID` so legacy
+		// jobs missing `agentId` (and the boot agent's surface) are still
+		// swept on a fresh install.
 		const sweepNow = state.deps.nowMs!();
 		if (shouldRunSweep(state.lastReapAtMs, sweepNow)) {
 			const retentionMs = parseSessionRetention(state.config.sessionRetention);
 			if (retentionMs !== null && retentionMs > 0) {
-				try {
-					await reapIsolatedCronSessions({
-						agentId: DEFAULT_AGENT_ID,
-						retentionMs,
-						nowMs: sweepNow,
-						log: state.deps.log,
-					});
-				} catch (err) {
-					state.deps.log.warn("session reaper sweep threw", {
-						error: err instanceof Error ? err.message : String(err),
-					});
+				const agentIds = new Set<string>([DEFAULT_AGENT_ID]);
+				for (const job of state.store.jobs) {
+					if (typeof job.agentId === "string" && job.agentId.trim().length > 0) {
+						agentIds.add(job.agentId);
+					}
+				}
+				for (const agentId of agentIds) {
+					try {
+						await reapIsolatedCronSessions({
+							agentId,
+							retentionMs,
+							nowMs: sweepNow,
+							log: state.deps.log,
+						});
+					} catch (err) {
+						state.deps.log.warn("session reaper sweep threw", {
+							agentId,
+							error: err instanceof Error ? err.message : String(err),
+						});
+					}
 				}
 			}
 			state.lastReapAtMs = sweepNow;
@@ -606,7 +620,11 @@ async function executeJobCore(
 				...(job.sessionKey !== undefined ? { sessionKey: job.sessionKey } : {}),
 			});
 			if (job.wakeMode === "now" && state.deps.requestHeartbeatNow) {
-				state.deps.requestHeartbeatNow({ reason: "cron-wake" });
+				state.deps.requestHeartbeatNow({
+					reason: "cron-wake",
+					...(job.agentId !== undefined ? { agentId: job.agentId } : {}),
+					...(job.sessionKey !== undefined ? { sessionKey: job.sessionKey } : {}),
+				});
 			}
 			return { status: "ok", summary: summariseSystemEventPayload(job.payload.text) };
 		} catch (err) {

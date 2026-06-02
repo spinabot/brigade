@@ -11,11 +11,26 @@
  * at boot, accessor returns `null` when no gateway is running). Tools that
  * find a null accessor refuse politely so unit tests + standalone CLI
  * invocations get a clear error instead of a confusing exception.
+ *
+ * P1#9 (Wave H) — pinned via `resolveGlobalSingleton` so dual-loaded
+ * Brigade modules (test harness + runtime in one process; hot-reload in
+ * dev) share ONE slot. Without the pin, an agent tool importing a
+ * different copy of this module than the boot path would silently see
+ * `null` even after the gateway started.
  */
 
+import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import type { ChannelManager } from "./manager.js";
 
-let activeManager: ChannelManager | null = null;
+type ActiveChannelManagerState = { activeManager: ChannelManager | null };
+
+const ACTIVE_CHANNEL_MANAGER_KEY = Symbol.for("brigade.channels.activeManager");
+
+function getState(): ActiveChannelManagerState {
+	return resolveGlobalSingleton<ActiveChannelManagerState>(ACTIVE_CHANNEL_MANAGER_KEY, () => ({
+		activeManager: null,
+	}));
+}
 
 /**
  * Mount the gateway's channel manager so process-wide tools can reach it.
@@ -24,10 +39,10 @@ let activeManager: ChannelManager | null = null;
  * Tests pass `null` in afterEach to clear leakage between cases.
  */
 export function setActiveChannelManager(manager: ChannelManager | null): void {
-	activeManager = manager;
+	getState().activeManager = manager;
 }
 
 /** Read the active channel manager. Returns `null` when none is mounted. */
 export function getActiveChannelManager(): ChannelManager | null {
-	return activeManager;
+	return getState().activeManager;
 }

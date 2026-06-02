@@ -47,6 +47,8 @@ export interface DispatchAgentRunParams {
 	extraSystemPrompt?: string;
 	spawnedBy?: string;
 	workspaceDir?: string;
+	/** Caller-supplied agent id; overrides `resolveAgentIdFromSessionKey(sessionKey)` when set. */
+	agentId?: string;
 }
 
 export interface DispatchAgentRunDeps {
@@ -78,7 +80,13 @@ export function dispatchAgentRun(
 	deps: DispatchAgentRunDeps,
 ): DispatchedRun {
 	const runId = params.idempotencyKey ?? crypto.randomUUID();
-	const agentId = resolveAgentIdFromSessionKey(params.sessionKey);
+	// Prefer the caller-supplied agentId (e.g. from a `prompt` RPC carrying an
+	// explicit `agentId`) over the sessionKey-derived id. This avoids dropping
+	// the routed agent on the floor when the sessionKey doesn't encode it.
+	const agentId =
+		params.agentId && params.agentId.trim().length > 0
+			? params.agentId.trim()
+			: resolveAgentIdFromSessionKey(params.sessionKey);
 	const lane = params.lane ?? resolveSessionLane(params.sessionKey);
 	const abortController = new AbortController();
 
@@ -110,7 +118,9 @@ export function dispatchAgentRun(
 
 	const settled = (async () => {
 		try {
-			const result = await deps.runAgentTurn({ ...params, runId });
+			// Forward the resolved agentId (caller-supplied OR sessionKey-derived)
+			// so downstream `runAgentTurn` adapters don't have to re-resolve it.
+			const result = await deps.runAgentTurn({ ...params, agentId, runId });
 			emitAgentEvent({
 				runId,
 				stream: "lifecycle",

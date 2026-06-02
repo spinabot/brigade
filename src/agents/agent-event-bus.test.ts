@@ -207,4 +207,83 @@ describe("agent-event-bus", () => {
 		assert.equal(events.length, 1, "no new event for self-disposed listener");
 		assert.equal(tail.length, 2, "tail keeps receiving");
 	});
+
+	// Wave I — every loop-lifecycle event variant now carries optional
+	// `agentId` + `sessionKey` so the gateway's WS broadcaster can tag the
+	// emitted `log` frame and the per-client subscription filter routes the
+	// frame to the operator watching THIS agent only. The test mirrors the
+	// gateway's "two operators on two agents" topology — two listeners each
+	// filtering on their own agentId — and asserts each one only sees its
+	// own agent's events.
+	it("loop-lifecycle events route by agentId+sessionKey (Wave I)", () => {
+		const opsEvents: AgentBusEvent[] = [];
+		const mainEvents: AgentBusEvent[] = [];
+		onAgentEvent((e) => {
+			if ("agentId" in e && e.agentId === "ops") opsEvents.push(e);
+		});
+		onAgentEvent((e) => {
+			if ("agentId" in e && e.agentId === "main") mainEvents.push(e);
+		});
+
+		emitAgentEvent({
+			type: "turn-retry-attempt",
+			runId: "r-ops-1",
+			agentId: "ops",
+			sessionKey: "agent:ops:main",
+			errorClass: "rate_limit",
+			reason: "retrying",
+		});
+		emitAgentEvent({
+			type: "turn-content-retry",
+			runId: "r-main-1",
+			agentId: "main",
+			sessionKey: "agent:main:main",
+			reason: "empty",
+		});
+		emitAgentEvent({
+			type: "turn-thinking-downgrade",
+			runId: "r-ops-2",
+			agentId: "ops",
+			sessionKey: "agent:ops:main",
+			from: "high",
+		});
+		// Untagged event (legacy callsite) — neither filter matches it.
+		emitAgentEvent({
+			type: "turn-heartbeat",
+			runId: "r-legacy",
+			elapsedMs: 5000,
+		});
+
+		assert.equal(opsEvents.length, 2, "ops listener sees only ops events");
+		assert.equal(mainEvents.length, 1, "main listener sees only main events");
+		assert.equal(opsEvents[0]?.type, "turn-retry-attempt");
+		assert.equal(opsEvents[1]?.type, "turn-thinking-downgrade");
+		assert.equal(mainEvents[0]?.type, "turn-content-retry");
+	});
+
+	// Wave I — tool-blocked events from exec-gate forward the live
+	// `sessionKey` from the GuardContextRef bag (in addition to runId +
+	// agentId). The gateway's lifecycle-bus subscriber lifts both fields onto
+	// the broadcast `log` payload so connWantsFrame can route the refusal
+	// only to the operator watching this session.
+	it("tool-blocked events carry agentId+sessionKey (Wave I)", () => {
+		const received: AgentBusEvent[] = [];
+		onAgentEvent((e) => received.push(e));
+
+		emitAgentEvent({
+			type: "tool-blocked",
+			runId: "r1",
+			agentId: "ops",
+			sessionKey: "agent:ops:main",
+			toolName: "bash",
+			reason: "requires approval",
+		});
+
+		assert.equal(received.length, 1);
+		const event = received[0];
+		assert.ok(event && event.type === "tool-blocked");
+		assert.equal(event.agentId, "ops");
+		assert.equal(event.sessionKey, "agent:ops:main");
+		assert.equal(event.toolName, "bash");
+	});
 });

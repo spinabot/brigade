@@ -28,6 +28,7 @@
  * touches them.
  */
 
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { acquireSessionWriteLock } from "./session-write-lock.js";
 
 export type SessionStoreLockTask = {
@@ -49,7 +50,20 @@ export type SessionStoreLockOptions = {
 	staleMs?: number;
 };
 
-export const LOCK_QUEUES = new Map<string, SessionStoreLockQueue>();
+/**
+ * P1#9 (Wave H) — pinned via `resolveGlobalSingleton` so dual-loaded copies
+ * of this module (test harness + runtime; hot-reload in dev) share ONE
+ * queue map. Without the pin, two copies of `withSessionStoreLock` would
+ * each maintain their own FIFO and a race between callers from each copy
+ * could see overlapping critical sections (the OS-level file lock still
+ * gates cross-process correctness, but in-process FIFO would split).
+ */
+const SESSION_STORE_LOCK_QUEUES_KEY = Symbol.for("brigade.sessionStoreLock.queues");
+
+export const LOCK_QUEUES = resolveGlobalSingleton<Map<string, SessionStoreLockQueue>>(
+	SESSION_STORE_LOCK_QUEUES_KEY,
+	() => new Map<string, SessionStoreLockQueue>(),
+);
 
 function getOrCreateLockQueue(storePath: string): SessionStoreLockQueue {
 	const existing = LOCK_QUEUES.get(storePath);

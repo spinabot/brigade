@@ -364,22 +364,40 @@ export async function runs(
 	return readCronRunLogEntries(jobId, opts);
 }
 
+/** Optional routing for a manual `wake` — when set, the system event +
+ *  forced heartbeat target this agent's session rather than the gateway's
+ *  boot default. Defaults to undefined for legacy single-agent installs. */
+export interface CronWakeOpts {
+	/** Target agent id (defaults to boot agent when omitted). */
+	agentId?: string;
+	/** Explicit session key override (defaults to that agent's main session). */
+	sessionKey?: string;
+}
+
 /**
  * Inject a system event into the operator's main session. Mode controls
  * urgency:
  *   - `"now"`            — force a heartbeat tick to deliver immediately.
  *   - `"next-heartbeat"` — queue and let the natural heartbeat pick it up.
+ *
+ * `opts.agentId` / `opts.sessionKey` route both the system-event enqueue and
+ * the forced heartbeat to a specific agent's session (multi-agent installs).
  */
 export function wake(
 	state: CronServiceState,
 	text: string,
 	mode: CronWakeMode = "next-heartbeat",
+	opts: CronWakeOpts = {},
 ): void {
 	state.pendingSystemEvents.push({ text, mode });
 	const enqueue = state.deps.enqueueSystemEvent;
 	if (enqueue) {
 		try {
-			enqueue({ text });
+			enqueue({
+				text,
+				...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+				...(opts.sessionKey !== undefined ? { sessionKey: opts.sessionKey } : {}),
+			});
 		} catch (err) {
 			state.deps.log.warn("wake: enqueueSystemEvent threw", {
 				error: err instanceof Error ? err.message : String(err),
@@ -388,7 +406,11 @@ export function wake(
 	}
 	if (mode === "now" && state.deps.requestHeartbeatNow) {
 		try {
-			state.deps.requestHeartbeatNow({ reason: "cron-wake" });
+			state.deps.requestHeartbeatNow({
+				reason: "cron-wake",
+				...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+				...(opts.sessionKey !== undefined ? { sessionKey: opts.sessionKey } : {}),
+			});
 		} catch (err) {
 			state.deps.log.warn("wake: requestHeartbeatNow threw", {
 				error: err instanceof Error ? err.message : String(err),

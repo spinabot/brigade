@@ -72,6 +72,10 @@ export interface BrigadeAgentDefaults {
   provider?: string;
   models?: Record<string, BrigadeModelEntry>;
   model?: BrigadeModelSelection;
+  /** Max in-flight turns on the global `Main` lane (default 4). */
+  maxConcurrent?: number;
+  /** Max in-flight sub-agent runs on the global `Subagent` lane (default 8). */
+  maxSubagentConcurrent?: number;
   [key: string]: unknown;
 }
 

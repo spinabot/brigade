@@ -32,6 +32,7 @@ import path from "node:path";
 import type { RetryReason } from "../agents/error-classifier.js";
 import { ensureDir, resolveAuthDir } from "../config/paths.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 
 const log = createSubsystemLogger("auth/cooldown");
 
@@ -114,6 +115,47 @@ export function calculateDisabledMs(reason: RetryReason, errorCount: number): nu
 // State file IO. Soft failures everywhere — we never want a corrupted state
 // file to block a real `brigade agent` run.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Per-agentId FIFO lock chain. Protects the read-modify-write sequence that
+// `markProfileFailure` / `markProfileSuccess` perform — two concurrent
+// `brigade agent` turns for the same agent would otherwise interleave their
+// in-memory snapshots and clobber each other's mark on save. Same shape as
+// `withCronStoreLock`: a per-key promise chain that each holder awaits before
+// running. Process-local — across processes, the file's PID-tagged atomic
+// rename keeps the rename itself safe but cannot prevent the inner snapshot
+// drift; the wave-c counterpart is a future file lock if we ever see
+// gateway+cron contend on the same agent.
+/** Pinned via global-singleton so hot-reload / dual-build keep one chain per agentId. */
+const COOLDOWN_LOCKS_KEY = Symbol.for("brigade.profileCooldown.locks");
+const cooldownLocks = resolveGlobalSingleton<Map<string, Promise<unknown>>>(
+  COOLDOWN_LOCKS_KEY,
+  () => new Map<string, Promise<unknown>>(),
+);
+
+/**
+ * Run `work` under the per-agent cooldown lock. The lock is process-local
+ * and FIFO; callers within the same process serialise per agentId. Returns
+ * the work's result. A previous holder's rejection does not block us — the
+ * chain swallows the error so the next holder runs.
+ */
+export function withProfileCooldownLock<T>(
+  agentId: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  const key = agentId || "main";
+  const previous = (cooldownLocks.get(key) ?? Promise.resolve()) as Promise<unknown>;
+  const next = previous.catch(() => undefined).then(() => work());
+  cooldownLocks.set(
+    key,
+    next.catch(() => undefined),
+  );
+  return next;
+}
+
+/** Test-only — clear every per-agent cooldown lock chain. */
+export function clearProfileCooldownLocksForTests(): void {
+  cooldownLocks.clear();
+}
 
 export function resolveProfileStatePath(agentId: string): string {
   return path.join(resolveAuthDir(agentId), "profile-state.json");
@@ -384,6 +426,55 @@ export function markProfileFailure(args: MarkFailureArgs): ProfileStateFile {
   writeStats(next, args.profileId, stats);
   if (args.save !== false) saveProfileState(args.agentId, next);
   return next;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transactional wrappers — load FRESH from disk under the lock, apply the
+// mark, then save. Use these on every concurrent surface (agent-loop +
+// cron). The non-transactional `markProfileFailure` / `markProfileSuccess`
+// still exist for callers that hold the state already (tests, single-shot
+// flows) — they remain race-prone if called concurrently.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Apply a profile-failure mark transactionally: under the per-agent cooldown
+ * lock, re-load fresh state from disk, merge `markProfileFailure` against
+ * THAT snapshot, then save. Returns the merged state so the caller can keep
+ * its in-memory copy aligned with what just landed on disk.
+ *
+ * `args.state` is the caller's last-known snapshot — used only to satisfy
+ * the function signature; the merged result is built from disk to defeat
+ * cross-process drift.
+ */
+export async function recordProfileFailureLocked(args: MarkFailureArgs): Promise<ProfileStateFile> {
+  return withProfileCooldownLock(args.agentId, async () => {
+    const fresh = loadProfileState(args.agentId);
+    return markProfileFailure({ ...args, state: fresh });
+  });
+}
+
+/**
+ * Apply a profile-success mark transactionally — same shape as
+ * `recordProfileFailureLocked`. Used on every successful turn so a sibling
+ * write that flipped the profile into cooldown 50ms ago doesn't get
+ * silently overwritten by our stale "everything's fine" snapshot.
+ */
+export async function recordProfileSuccessLocked(args: MarkSuccessArgs): Promise<ProfileStateFile> {
+  return withProfileCooldownLock(args.agentId, async () => {
+    const fresh = loadProfileState(args.agentId);
+    return markProfileSuccess({ ...args, state: fresh });
+  });
+}
+
+/**
+ * Load + sweep expired windows transactionally. Used at turn start so the
+ * read isn't racing against a concurrent peer's success-save.
+ */
+export async function loadProfileStateLocked(agentId: string): Promise<ProfileStateFile> {
+  return withProfileCooldownLock(agentId, async () => {
+    const fresh = loadProfileState(agentId);
+    return clearExpiredCooldowns(fresh);
+  });
 }
 
 // Sweep expired cooldowns/disabled windows in-place. Cheap to call before

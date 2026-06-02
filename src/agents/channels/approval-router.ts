@@ -42,6 +42,7 @@
  */
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
+import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import type { ApprovalDecision, ApprovalDecisionKind, ApprovalRequest } from "../approval-bridge.js";
 
 const log = createSubsystemLogger("brigade/channel-approvals");
@@ -53,6 +54,8 @@ export interface ChannelApprovalRoute {
 	threadId?: string;
 	/** Channel-specific account id when the channel supports multi-account. */
 	accountId?: string;
+	/** Resolved agent id (route-resolver output) so concurrent agents sharing one peer don't collide on the pending-approval slot. */
+	agentId?: string;
 }
 
 /**
@@ -66,7 +69,7 @@ export interface ChannelApprovalDispatcher {
 	sendText: (
 		conversationId: string,
 		text: string,
-		opts?: { threadId?: string },
+		opts?: { threadId?: string; accountId?: string },
 	) => Promise<void>;
 	/** Human-readable label for log lines + the prompt header (e.g. "WhatsApp"). */
 	prettyName: string;
@@ -83,41 +86,107 @@ interface PendingChannelApproval {
 	createdAtMs: number;
 }
 
-const dispatchers = new Map<string, ChannelApprovalDispatcher>();
-/** Keyed by `${channelId}::${conversationId}` — only one pending per peer at a time. */
-const pendingByPeer = new Map<string, PendingChannelApproval>();
-/** Keyed by approval-request id — for `cancelChannelApprovalById` cleanup. */
-const pendingById = new Map<string, PendingChannelApproval>();
+/** All three approval-router maps are pinned via global-singleton so a hot-reload / dual-build run shares one routing state. */
+const APPROVAL_ROUTER_DISPATCHERS_KEY = Symbol.for("brigade.approvalRouter.dispatchers");
+const APPROVAL_ROUTER_PENDING_BY_PEER_KEY = Symbol.for("brigade.approvalRouter.pendingByPeer");
+const APPROVAL_ROUTER_PENDING_BY_ID_KEY = Symbol.for("brigade.approvalRouter.pendingById");
 
-function peerKey(channelId: string, conversationId: string): string {
-	return `${channelId}::${conversationId}`;
+/** Keyed by `${channelId}::${accountId ?? '*'}` — multi-account adapters register one dispatcher per account. */
+const dispatchers = resolveGlobalSingleton<Map<string, ChannelApprovalDispatcher>>(
+	APPROVAL_ROUTER_DISPATCHERS_KEY,
+	() => new Map<string, ChannelApprovalDispatcher>(),
+);
+/**
+ * Keyed by `${channelId}::${accountId ?? '*'}::${threadId ?? '*'}::${conversationId}::${agentId ?? '*'}`.
+ * Disambiguates per (channel, account, thread, conversation, agent) so an
+ * approval prompt raised by one agent on one thread can't be matched by
+ * another agent's yes/no on a sibling thread / second account.
+ */
+const pendingByPeer = resolveGlobalSingleton<Map<string, PendingChannelApproval>>(
+	APPROVAL_ROUTER_PENDING_BY_PEER_KEY,
+	() => new Map<string, PendingChannelApproval>(),
+);
+/** Keyed by approval-request id — for `cancelChannelApprovalById` cleanup. */
+const pendingById = resolveGlobalSingleton<Map<string, PendingChannelApproval>>(
+	APPROVAL_ROUTER_PENDING_BY_ID_KEY,
+	() => new Map<string, PendingChannelApproval>(),
+);
+
+function dispatcherKey(channelId: string, accountId?: string | null): string {
+	return `${channelId}::${accountId && accountId.trim() ? accountId.trim() : "*"}`;
+}
+
+function peerKey(args: {
+	channelId: string;
+	accountId?: string;
+	threadId?: string;
+	conversationId: string;
+	agentId?: string;
+}): string {
+	const account = args.accountId && args.accountId.trim() ? args.accountId.trim() : "*";
+	const thread = args.threadId && args.threadId.trim() ? args.threadId.trim() : "*";
+	const agent = args.agentId && args.agentId.trim() ? args.agentId.trim() : "*";
+	return `${args.channelId}::${account}::${thread}::${args.conversationId}::${agent}`;
+}
+
+function peerKeyFromRoute(route: ChannelApprovalRoute): string {
+	return peerKey({
+		channelId: route.channelId,
+		conversationId: route.conversationId,
+		...(route.accountId !== undefined ? { accountId: route.accountId } : {}),
+		...(route.threadId !== undefined ? { threadId: route.threadId } : {}),
+		...(route.agentId !== undefined ? { agentId: route.agentId } : {}),
+	});
 }
 
 /**
  * Register an adapter's outbound surface so the bridge can route prompts
  * through it. Called by `startChannels` for every adapter that started
  * successfully. Idempotent — re-registering replaces the previous entry
- * (channel hot-reload friendly).
+ * (channel hot-reload friendly). `accountId` lets multi-account adapters
+ * (one Slack workspace per account, two linked WhatsApp numbers, …)
+ * register one dispatcher per account; pass `undefined` for single-account
+ * adapters and the default-account slot is taken.
  */
 export function registerChannelApprovalDispatcher(
 	channelId: string,
-	dispatcher: ChannelApprovalDispatcher,
+	accountIdOrDispatcher: string | undefined | ChannelApprovalDispatcher,
+	maybeDispatcher?: ChannelApprovalDispatcher,
 ): void {
-	dispatchers.set(channelId, dispatcher);
+	// Back-compat: keep the 2-arg call shape working for callers that don't
+	// (yet) thread an accountId — single-account adapters land on the default
+	// dispatcher slot via accountId === undefined.
+	if (typeof accountIdOrDispatcher === "object" && accountIdOrDispatcher !== null) {
+		dispatchers.set(dispatcherKey(channelId), accountIdOrDispatcher);
+		return;
+	}
+	if (!maybeDispatcher) {
+		throw new Error("registerChannelApprovalDispatcher: missing dispatcher arg");
+	}
+	dispatchers.set(dispatcherKey(channelId, accountIdOrDispatcher ?? null), maybeDispatcher);
 }
 
 /**
  * Drop a channel's dispatcher. Channel manager's `stop()` calls this for
  * every started adapter so a torn-down WhatsApp can't be asked to send
- * messages after the socket is gone.
+ * messages after the socket is gone. When `accountId` is omitted, drops
+ * every dispatcher belonging to the channel (multi-account-aware stop).
  */
-export function removeChannelApprovalDispatcher(channelId: string): void {
-	dispatchers.delete(channelId);
+export function removeChannelApprovalDispatcher(channelId: string, accountId?: string): void {
+	if (accountId !== undefined) {
+		dispatchers.delete(dispatcherKey(channelId, accountId));
+	} else {
+		const prefix = `${channelId}::`;
+		for (const key of [...dispatchers.keys()]) {
+			if (key === channelId || key.startsWith(prefix)) dispatchers.delete(key);
+		}
+	}
 	// Also reject any in-flight prompts the channel was carrying — the
 	// operator can't reply through a torn-down adapter, so we deny rather
 	// than leak.
 	for (const [key, entry] of pendingByPeer.entries()) {
 		if (entry.route.channelId !== channelId) continue;
+		if (accountId !== undefined && (entry.route.accountId ?? "") !== accountId) continue;
 		clearTimeout(entry.timer);
 		pendingByPeer.delete(key);
 		pendingById.delete(entry.request.id);
@@ -135,6 +204,9 @@ export function listPendingChannelApprovals(): Array<{
 	id: string;
 	channelId: string;
 	conversationId: string;
+	threadId?: string;
+	accountId?: string;
+	agentId?: string;
 	command: string;
 	ageMs: number;
 }> {
@@ -143,6 +215,9 @@ export function listPendingChannelApprovals(): Array<{
 		id: p.request.id,
 		channelId: p.route.channelId,
 		conversationId: p.route.conversationId,
+		...(p.route.threadId !== undefined ? { threadId: p.route.threadId } : {}),
+		...(p.route.accountId !== undefined ? { accountId: p.route.accountId } : {}),
+		...(p.route.agentId !== undefined ? { agentId: p.route.agentId } : {}),
 		command: p.request.command,
 		ageMs: now - p.createdAtMs,
 	}));
@@ -161,6 +236,7 @@ export function listPendingChannelApprovals(): Array<{
 function buildPromptText(args: {
 	command: string;
 	subagentLabel?: string;
+	agentId?: string;
 }): string {
 	const flat = args.command
 		.replace(/[\r\n]+/g, " ")
@@ -168,9 +244,13 @@ function buildPromptText(args: {
 		.replace(/\s+/g, " ")
 		.trim();
 	const preview = flat.length <= 180 ? flat : `${flat.slice(0, 177)}…`;
+	const agentSuffix =
+		args.agentId && args.agentId.trim() && args.agentId.trim() !== "main"
+			? ` [${args.agentId.trim()}]`
+			: "";
 	const who = args.subagentLabel
-		? `Sub-agent "${args.subagentLabel}"`
-		: "🦁 Brigade";
+		? `Sub-agent "${args.subagentLabel}"${agentSuffix}`
+		: `🦁 Brigade${agentSuffix}`;
 	return [
 		`${who} wants to run a shell command:`,
 		`\`${preview}\``,
@@ -251,15 +331,21 @@ export async function dispatchChannelApproval(args: {
 	resolveOnBridge: (decision: ApprovalDecision) => void;
 }): Promise<boolean> {
 	const { request, route, resolveOnBridge } = args;
-	const dispatcher = dispatchers.get(route.channelId);
+	// Prefer the per-account dispatcher when one is registered; fall back to
+	// the channel's default-account dispatcher so single-account adapters
+	// (registered without an accountId) keep working unchanged.
+	const dispatcher =
+		dispatchers.get(dispatcherKey(route.channelId, route.accountId ?? null)) ??
+		dispatchers.get(dispatcherKey(route.channelId));
 	if (!dispatcher) {
 		log.warn("no dispatcher for channel — falling back to WS broadcast", {
 			channelId: route.channelId,
 			conversationId: route.conversationId,
+			accountId: route.accountId,
 		});
 		return false;
 	}
-	const key = peerKey(route.channelId, route.conversationId);
+	const key = peerKeyFromRoute(route);
 	// If there's already a pending entry for this peer, deny the previous
 	// one. A second prompt overlapping the same peer means we'd be asking
 	// two questions at once — the operator can only answer one, the other
@@ -276,11 +362,38 @@ export async function dispatchChannelApproval(args: {
 	const prompt = buildPromptText({
 		command: request.command,
 		...(request.subagentLabel !== undefined ? { subagentLabel: request.subagentLabel } : {}),
+		...(route.agentId !== undefined ? { agentId: route.agentId } : {}),
 	});
+	// Wave L P2#9 — reserve the peer slot SYNCHRONOUSLY before awaiting
+	// sendText. Two `dispatchChannelApproval` calls racing on the same
+	// peer-key would otherwise both pass the `pendingByPeer.get(key)` check
+	// above (since neither has set the slot yet) and both `pendingByPeer.set`
+	// after the await — silently losing one of the resolveOnBridge handles.
+	// Placeholder is replaced with the real entry below; on sendText failure
+	// the placeholder is removed so the caller falls back to the WS path.
+	const reservationToken: PendingChannelApproval = {
+		request,
+		route,
+		resolveOnBridge,
+		timer: setTimeout(() => undefined, 0),
+		createdAtMs: Date.now(),
+	};
+	clearTimeout(reservationToken.timer);
+	pendingByPeer.set(key, reservationToken);
 	try {
-		const sendOpts = route.threadId ? { threadId: route.threadId } : undefined;
-		await dispatcher.sendText(route.conversationId, prompt, sendOpts);
+		const sendOpts: { threadId?: string; accountId?: string } = {};
+		if (route.threadId) sendOpts.threadId = route.threadId;
+		if (route.accountId) sendOpts.accountId = route.accountId;
+		await dispatcher.sendText(
+			route.conversationId,
+			prompt,
+			Object.keys(sendOpts).length > 0 ? sendOpts : undefined,
+		);
 	} catch (err) {
+		// Release the reserved slot so the WS-fallback path can run cleanly.
+		if (pendingByPeer.get(key) === reservationToken) {
+			pendingByPeer.delete(key);
+		}
 		log.warn("approval prompt send failed — falling back to WS broadcast", {
 			channelId: route.channelId,
 			conversationId: route.conversationId,
@@ -345,13 +458,45 @@ export function tryConsumeChannelApprovalReply(args: {
 	channelId: string;
 	conversationId: string;
 	text: string;
+	threadId?: string;
+	accountId?: string;
+	agentId?: string;
 }): { matched: true; decision: ApprovalDecisionKind; approvalId: string } | { matched: false } {
-	const key = peerKey(args.channelId, args.conversationId);
-	const entry = pendingByPeer.get(key);
+	// First, try the exact-route key (covers thread + account + agent
+	// disambiguation). If nothing matches AND the caller didn't pin all
+	// dimensions, scan for any pending entry whose route's pinned dimensions
+	// agree with the caller — that handles the WhatsApp-style flat-DM case
+	// where the inbound carries no threadId but the approval was raised on
+	// the same channel+conversation.
+	const exactKey = peerKey({
+		channelId: args.channelId,
+		conversationId: args.conversationId,
+		...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+		...(args.accountId !== undefined ? { accountId: args.accountId } : {}),
+		...(args.agentId !== undefined ? { agentId: args.agentId } : {}),
+	});
+	let entry = pendingByPeer.get(exactKey);
+	let entryKey = exactKey;
+	if (!entry) {
+		// Fall back to a per-channel + per-conversation scan that matches when
+		// the caller didn't pin every dimension (e.g. WhatsApp inbound has no
+		// thread/account). Stops on the first agreeing route to preserve the
+		// "one prompt per peer at a time" invariant.
+		for (const [k, candidate] of pendingByPeer.entries()) {
+			const r = candidate.route;
+			if (r.channelId !== args.channelId || r.conversationId !== args.conversationId) continue;
+			if (args.threadId !== undefined && r.threadId !== undefined && r.threadId !== args.threadId) continue;
+			if (args.accountId !== undefined && r.accountId !== undefined && r.accountId !== args.accountId) continue;
+			if (args.agentId !== undefined && r.agentId !== undefined && r.agentId !== args.agentId) continue;
+			entry = candidate;
+			entryKey = k;
+			break;
+		}
+	}
 	if (!entry) return { matched: false };
 	const kind = decodeReply(args.text);
 	if (kind === null) return { matched: false };
-	pendingByPeer.delete(key);
+	pendingByPeer.delete(entryKey);
 	pendingById.delete(entry.request.id);
 	clearTimeout(entry.timer);
 	const decision: ApprovalDecision = { kind };
@@ -373,7 +518,7 @@ export function tryConsumeChannelApprovalReply(args: {
 export function cancelChannelApprovalById(approvalId: string): void {
 	const entry = pendingById.get(approvalId);
 	if (!entry) return;
-	const key = peerKey(entry.route.channelId, entry.route.conversationId);
+	const key = peerKeyFromRoute(entry.route);
 	clearTimeout(entry.timer);
 	pendingByPeer.delete(key);
 	pendingById.delete(approvalId);

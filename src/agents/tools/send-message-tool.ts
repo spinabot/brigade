@@ -151,10 +151,16 @@ export function makeSendMessageTool(
 			let channel = channelRaw;
 			let to = toRaw;
 			let threadId = threadIdParam;
+			let resolvedAccountId = accountId;
 			if (!channel && !to && channelContext) {
 				channel = channelContext.channelId;
 				to = channelContext.conversationId;
 				threadId ??= channelContext.threadId;
+				// Inherit the routed inbound's accountId so a multi-account
+				// install's reply lands on the SAME socket the request arrived
+				// on. Caller-supplied `accountId` wins (operator may target a
+				// specific account explicitly).
+				resolvedAccountId ??= channelContext.accountId;
 			}
 			if (!channel || !to) {
 				const started = manager.started;
@@ -167,11 +173,14 @@ export function makeSendMessageTool(
 					{ channel: channel ?? "", to: to ?? "", textPreview: text.slice(0, 80) } as never,
 				);
 			}
-			const adapter = manager.adapter(channel);
+			const adapter = manager.adapter(channel, resolvedAccountId);
 			if (!adapter) {
 				const started = manager.started.join(", ") || "(none)";
+				const accountHint = resolvedAccountId
+					? ` (account "${resolvedAccountId}" not started for "${channel}")`
+					: "";
 				return failedTextResult(
-					`send_message: channel "${channel}" is not a started adapter — typo? available channels: ${started}.`,
+					`send_message: channel "${channel}" is not a started adapter${accountHint} — typo? available channels: ${started}.`,
 					{ channel, to, textPreview: text.slice(0, 80) } as never,
 				);
 			}
@@ -195,8 +204,9 @@ export function makeSendMessageTool(
 					);
 				}
 			}
-			const opts2: { threadId?: string } = {};
+			const opts2: { threadId?: string; accountId?: string } = {};
 			if (threadId) opts2.threadId = threadId;
+			if (resolvedAccountId) opts2.accountId = resolvedAccountId;
 			try {
 				await adapter.sendText(to, text, Object.keys(opts2).length > 0 ? opts2 : undefined);
 			} catch (err) {
@@ -211,14 +221,11 @@ export function makeSendMessageTool(
 					{ channel, to, textPreview: text.slice(0, 80) } as never,
 				);
 			}
-			// Suppress unused-marker for accountId — kept in the schema for OC
-			// shape parity; channel adapters that need it will read it from
-			// their per-channel state in a future iteration.
-			void accountId;
 			log.info("send_message dispatched", {
 				channel,
 				to,
 				threadId,
+				accountId,
 				textPreview: text.slice(0, 80),
 			});
 			return payloadTextResult({

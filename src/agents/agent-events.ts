@@ -24,11 +24,11 @@
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
-	setSubagentEndedHook,
+	addSubagentEndedHook,
 	type SubagentEndedHookPayload,
 	type SubagentEndedHookSource,
 } from "./subagent-registry-completion.js";
-import { setHeartbeatFiredHook } from "./heartbeat-runner.js";
+import { addHeartbeatFiredHook } from "./heartbeat-runner.js";
 import { onSessionStateChange } from "./session-registry.js";
 import { installSubagentCompletionBridge } from "./subagent-completion-bridge.js";
 import type {
@@ -118,6 +118,36 @@ export function clearAgentRunContext(runId: string): void {
 }
 
 /**
+ * Sweep stale run contexts that exceeded `maxAgeMs`. Guards against orphaned
+ * entries when a turn crashes between `registerAgentRunContext` and
+ * `clearAgentRunContext` (the finally block in `agent-dispatcher.ts` is the
+ * only authoritative clearer; long-running heartbeat / sub-agent runs can
+ * outlive a gateway hot-reload and never get cleared).
+ *
+ * Uses `lastActiveAt` (refreshed on every `emitAgentEvent`) as the freshness
+ * signal so an actively-emitting run stays in the map. Falls back to
+ * `registeredAt`, then treats missing timestamps as infinitely old.
+ *
+ * Returns the number of contexts swept. Called on a 60s interval inside
+ * `wireAgentEventsBridge` (see Wave H P2#2).
+ */
+export function sweepStaleRunContexts(maxAgeMs = 30 * 60 * 1000): number {
+	const state = getState();
+	const now = Date.now();
+	let swept = 0;
+	for (const [runId, ctx] of state.runContextById) {
+		const lastSeen = ctx.lastActiveAt ?? ctx.registeredAt;
+		const age = lastSeen ? now - lastSeen : Number.POSITIVE_INFINITY;
+		if (age > maxAgeMs) {
+			state.runContextById.delete(runId);
+			state.seqByRun.delete(runId);
+			swept++;
+		}
+	}
+	return swept;
+}
+
+/**
  * Emit an agent event. The bus stamps `seq` + `ts` and fans out to every
  * listener synchronously. Returns the enriched payload (handy for tests
  * + tracing).
@@ -193,24 +223,29 @@ export function wireAgentEventsBridge(): () => void {
 		return state.disposeBridge;
 	}
 
-	setSubagentEndedHook((payload: SubagentEndedHookPayload, source: SubagentEndedHookSource) => {
-		emitAgentEvent({
-			runId: source.runId,
-			stream: "subagent_lifecycle",
-			data: {
-				kind: "subagent_ended",
-				childSessionKey: source.childSessionKey,
-				requesterSessionKey: source.requesterSessionKey,
+	// P1#8 (Wave H) — use `add*Hook` so this bridge composes with the
+	// gateway's later registrations (`setHeartbeatFiredHook` in server.ts
+	// previously REPLACED us; the multi-listener Set now lets both fire).
+	const disposeSubagentEndedHook = addSubagentEndedHook(
+		(payload: SubagentEndedHookPayload, source: SubagentEndedHookSource) => {
+			emitAgentEvent({
 				runId: source.runId,
-				reason: payload.reason,
-				outcome: payload.outcome,
-				error: payload.error,
-			},
-			...(source.requesterSessionKey ? { sessionKey: source.requesterSessionKey } : {}),
-		});
-	});
+				stream: "subagent_lifecycle",
+				data: {
+					kind: "subagent_ended",
+					childSessionKey: source.childSessionKey,
+					requesterSessionKey: source.requesterSessionKey,
+					runId: source.runId,
+					reason: payload.reason,
+					outcome: payload.outcome,
+					error: payload.error,
+				},
+				...(source.requesterSessionKey ? { sessionKey: source.requesterSessionKey } : {}),
+			});
+		},
+	);
 
-	setHeartbeatFiredHook((params) => {
+	const disposeHeartbeatHook = addHeartbeatFiredHook((params) => {
 		emitAgentEvent({
 			runId: `heartbeat:${params.agentId}:${params.sessionKey}`,
 			stream: "heartbeat",
@@ -251,11 +286,34 @@ export function wireAgentEventsBridge(): () => void {
 	// and enqueues a completion announce into the parent's inbox.
 	const disposeSubagentCompletion = installSubagentCompletionBridge();
 
+	// P2#2 (Wave H) — 60s sweeper. Without this, the `runContextById` map
+	// grows forever when a turn registers a context and crashes / hot-
+	// reloads before `clearAgentRunContext` runs. A 30-minute TTL keeps
+	// every active turn alive (`lastActiveAt` refreshes on every emit)
+	// while orphans get GC'd. Unref the timer so it never blocks process
+	// exit.
+	const sweeperTimer = setInterval(() => {
+		try {
+			const swept = sweepStaleRunContexts();
+			if (swept > 0) {
+				log.debug("swept stale run contexts", { count: swept });
+			}
+		} catch (err) {
+			log.warn("run-context sweeper threw", { error: (err as Error)?.message });
+		}
+	}, 60_000);
+	if (typeof sweeperTimer.unref === "function") sweeperTimer.unref();
+
 	const dispose = () => {
-		setSubagentEndedHook(null);
-		setHeartbeatFiredHook(null);
+		// Only drop the hooks WE registered — leave any later-registered
+		// composed hooks alone (e.g. the gateway's synthetic-turn dispatcher
+		// in `server.ts`). Calling the original `set*Hook(null)` setters
+		// would clear EVERY registered hook, which would defeat composition.
+		disposeSubagentEndedHook();
+		disposeHeartbeatHook();
 		disposeSessionListener();
 		disposeSubagentCompletion();
+		clearInterval(sweeperTimer);
 		state.bridgeInstalled = false;
 		state.disposeBridge = null;
 	};

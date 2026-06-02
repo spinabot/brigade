@@ -133,3 +133,81 @@ describe("BrigadeExtensionRegistry.lookupWebSearchProviderById — per-call over
 		assert.equal(exa?.id, "exa");
 	});
 });
+
+describe("BrigadeExtensionRegistry — b.tool({ create }) per-turn factory (Wave K)", () => {
+	it("invokes create({ agentId, sessionKey }) at toPiExtensionFactory replay", () => {
+		const r = new BrigadeExtensionRegistry();
+		const ctx = r.context({
+			agentId: "boot",
+			workspaceDir: "/tmp",
+			cwd: "/tmp",
+			config: {} as never,
+			moduleConfig: undefined,
+		});
+		const seen: Array<{ agentId: string; sessionKey: string }> = [];
+		ctx.tool({
+			create: (factoryCtx) => {
+				seen.push({ agentId: factoryCtx.agentId, sessionKey: factoryCtx.sessionKey });
+				return {
+					name: "scoped-tool",
+					label: "Scoped",
+					description: "per-turn scoped tool",
+					parameters: { type: "object", properties: {} },
+					execute: async () => ({}),
+				} as never;
+			},
+		});
+		const registered: Array<{ name: string }> = [];
+		const pi = {
+			registerTool: (t: { name: string }) => {
+				registered.push({ name: t.name });
+			},
+			on: () => {},
+			registerCommand: () => {},
+		};
+		r.toPiExtensionFactory({ agentId: "ops", sessionKey: "agent:ops:main" })(pi as never);
+		assert.equal(seen.length, 1, "factory invoked once per session-init");
+		assert.equal(seen[0]?.agentId, "ops");
+		assert.equal(seen[0]?.sessionKey, "agent:ops:main");
+		assert.equal(registered.length, 1);
+		assert.equal(registered[0]?.name, "scoped-tool");
+	});
+
+	it("legacy bare tool keeps working alongside factory tools", () => {
+		const r = new BrigadeExtensionRegistry();
+		const ctx = r.context({
+			agentId: "boot",
+			workspaceDir: "/tmp",
+			cwd: "/tmp",
+			config: {} as never,
+			moduleConfig: undefined,
+		});
+		const bare = {
+			name: "bare-tool",
+			label: "Bare",
+			description: "legacy bare tool",
+			parameters: { type: "object", properties: {} },
+			execute: async () => ({}),
+		};
+		ctx.tool(bare as never);
+		ctx.tool({
+			create: () => ({
+				name: "factory-tool",
+				label: "Factory",
+				description: "factory tool",
+				parameters: { type: "object", properties: {} },
+				execute: async () => ({}),
+			}) as never,
+		});
+		const registered: string[] = [];
+		const pi = {
+			registerTool: (t: { name: string }) => {
+				registered.push(t.name);
+			},
+			on: () => {},
+			registerCommand: () => {},
+		};
+		r.toPiExtensionFactory({ agentId: "main", sessionKey: "agent:main:main" })(pi as never);
+		assert.deepEqual(registered.sort(), ["bare-tool", "factory-tool"]);
+	});
+});

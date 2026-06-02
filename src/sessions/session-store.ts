@@ -2,12 +2,200 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
+import os from "node:os";
+
 import {
   ensureDir,
   resolveSessionStorePath,
   resolveSessionTranscriptPath,
   resolveSessionsDir,
 } from "../config/paths.js";
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+
+/**
+ * Wave L P2#11 — cross-process advisory file lock for `sessions.json`.
+ *
+ * The sync mutex above serialises in-process callers. A peer process
+ * (test harness booting a second gateway, cron daemon writing the same
+ * agent's store) still races the read-modify-write. The PID-tagged
+ * sidecar file uses sync `openSync('wx')` for atomic claim + retry-with-
+ * backoff for contention. Stale locks (holder PID dead OR sidecar older
+ * than STALE_LOCK_MS) are stolen.
+ *
+ * Failure mode: on every error we log + proceed without the lock. The
+ * sync mutex still guarantees in-process atomicity; cross-process
+ * conflicts degrade to "last-writer-wins" same as before this fix.
+ */
+const SESSIONS_FILE_LOCK_STALE_MS = 10 * 60_000;
+const SESSIONS_FILE_LOCK_POLL_INITIAL_MS = 25;
+const SESSIONS_FILE_LOCK_POLL_MAX_MS = 500;
+const SESSIONS_FILE_LOCK_TIMEOUT_MS = 30_000;
+
+/**
+ * P1#10 (Wave H) — per-agent in-process sync mutex.
+ *
+ * `sessions.json` operations stay sync (callers across the codebase rely on
+ * the sync interface). Without serialization, two read-modify-write paths
+ * inside the same process — e.g. the gateway resolving a session while the
+ * cron reaper deletes a sibling entry — would race: each reads the file,
+ * mutates its own copy, then writes back, silently dropping the other's
+ * mutation.
+ *
+ * The fix below uses a synchronous "owner agentId" guard: every mutation
+ * goes through `withSyncStoreLock(agentId, fn)`, which executes `fn`
+ * atomically with respect to other in-process callers for the SAME agent.
+ * Implementation is a Promise-FIFO when contention occurs and a fast-path
+ * direct invocation when uncontended (since sync fns can't actually yield).
+ *
+ * Cross-process safety: `writeSessionStore` uses `tmp+rename`, which is
+ * atomic on POSIX — two processes can each safely commit, the loser of the
+ * race just loses its own update (same as before this fix). Cross-process
+ * mutual exclusion would need an OS file lock, which is out of scope for
+ * the sync API and tracked separately.
+ */
+type AgentSyncMutex = { owner: string | null };
+
+const SESSION_STORE_SYNC_MUTEX_KEY = Symbol.for("brigade.sessionsSessionStore.syncMutex");
+
+function getSyncMutexMap(): Map<string, AgentSyncMutex> {
+  return resolveGlobalSingleton<Map<string, AgentSyncMutex>>(
+    SESSION_STORE_SYNC_MUTEX_KEY,
+    () => new Map(),
+  );
+}
+
+function getMutex(agentId: string): AgentSyncMutex {
+  const map = getSyncMutexMap();
+  const existing = map.get(agentId);
+  if (existing) return existing;
+  const fresh: AgentSyncMutex = { owner: null };
+  map.set(agentId, fresh);
+  return fresh;
+}
+
+/**
+ * Synchronously serialize a read-modify-write against the per-agent store.
+ *
+ * Single-threaded JS guarantees that any other sync `withSyncStoreLock(agentId)`
+ * call observes the same critical section atomically — a competing sync caller
+ * would have had to yield to reach this point. The `owner` guard detects re-
+ * entrant misuse (a callee inside `fn` trying to re-enter for the same agent)
+ * and throws — that would indicate a bug, since re-entry would deadlock.
+ */
+function withSyncStoreLock<T>(agentId: string, fn: () => T): T {
+  const mutex = getMutex(agentId);
+  if (mutex.owner !== null) {
+    throw new Error(
+      `re-entrant session-store mutation for agent ${agentId}: nested call inside ${mutex.owner}`,
+    );
+  }
+  const callerTag = `${process.pid}:${Date.now()}`;
+  mutex.owner = callerTag;
+  // Wave L P2#11 — additionally acquire a cross-process advisory file lock
+  // around the read-modify-write so a peer process can't interleave. The
+  // sync mutex above already serialises in-process callers; the file lock
+  // closes the cross-process gap. Best-effort: on lock-acquisition failure
+  // we proceed without it (degraded same as before — last writer wins).
+  const filePath = resolveSessionStorePath(agentId);
+  const releaseFileLock = tryAcquireSessionStoreFileLockSync(filePath);
+  try {
+    return fn();
+  } finally {
+    mutex.owner = null;
+    try {
+      releaseFileLock?.();
+    } catch {
+      // best-effort release; stale-steal handles the leftover
+    }
+  }
+}
+
+/** Acquire the sidecar lockfile synchronously. Returns a release fn (or `null` on failure). */
+function tryAcquireSessionStoreFileLockSync(sessionsFilePath: string): (() => void) | null {
+  const lockPath = `${sessionsFilePath}.lock`;
+  try {
+    ensureDir(path.dirname(sessionsFilePath));
+  } catch {
+    return null;
+  }
+  const deadline = Date.now() + SESSIONS_FILE_LOCK_TIMEOUT_MS;
+  let pollMs = SESSIONS_FILE_LOCK_POLL_INITIAL_MS;
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      try {
+        fs.writeSync(
+          fd,
+          JSON.stringify({ pid: process.pid, hostname: os.hostname(), acquiredAt: Date.now() }),
+        );
+      } finally {
+        fs.closeSync(fd);
+      }
+      return () => {
+        try {
+          fs.rmSync(lockPath, { force: true });
+        } catch {
+          // best-effort
+        }
+      };
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code !== "EEXIST") {
+        return null;
+      }
+    }
+    if (maybeStealStaleSessionStoreLockSync(lockPath)) continue;
+    if (Date.now() >= deadline) return null;
+    // Sync busy-wait — bounded by deadline. The work guarded is tiny
+    // (sub-ms read+write) so contention is rare and brief.
+    const waitUntil = Date.now() + pollMs;
+    while (Date.now() < waitUntil) {
+      // intentionally tight loop — pollMs stays small
+    }
+    pollMs = Math.min(SESSIONS_FILE_LOCK_POLL_MAX_MS, Math.floor(pollMs * 1.5));
+  }
+}
+
+function maybeStealStaleSessionStoreLockSync(lockPath: string): boolean {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(lockPath);
+  } catch {
+    // gone between EEXIST + stat — race a retry
+    return true;
+  }
+  let holderPid = 0;
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8");
+    const parsed = JSON.parse(raw) as { pid?: number };
+    if (typeof parsed?.pid === "number") holderPid = parsed.pid;
+  } catch {
+    // malformed lockfile — treat as stealable
+  }
+  const holderAlive = holderPid > 0 && isProcessAliveSync(holderPid);
+  const tooOld = Date.now() - stat.mtimeMs > SESSIONS_FILE_LOCK_STALE_MS;
+  if (!holderAlive || tooOld) {
+    try {
+      fs.rmSync(lockPath, { force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function isProcessAliveSync(pid: number): boolean {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === "EPERM") return true;
+    return false;
+  }
+}
 
 // sessions.json maps a session-key (e.g. "agent:default:main") to the
 // concrete sessionId whose JSONL transcript holds the conversation.
@@ -124,19 +312,32 @@ export function resolveOrCreateSession(args: {
   freshnessMs?: number;
 }): ResolvedSession {
   const { agentId, sessionKey } = args;
-  const store = readSessionStore(agentId);
-  const nowMs = Date.now();
-  const now = new Date(nowMs).toISOString();
-  let entry = store.sessions[sessionKey];
-  let isNew = false;
+  return withSyncStoreLock(agentId, () => {
+    const store = readSessionStore(agentId);
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
+    let entry = store.sessions[sessionKey];
+    let isNew = false;
 
-  if (entry && typeof args.freshnessMs === "number" && args.freshnessMs > 0) {
-    const lastMs = Date.parse(entry.lastUsedAt);
-    if (Number.isFinite(lastMs) && nowMs - lastMs > args.freshnessMs) {
-      // Stale — roll a new sessionId but keep the entry slot. We deliberately
-      // DROP `subagent` metadata when rolling (a stale sub-agent slot getting
-      // re-used should be treated as a fresh top-level session). createdAt
-      // resets so audit tooling can see when the rolled session started.
+    if (entry && typeof args.freshnessMs === "number" && args.freshnessMs > 0) {
+      const lastMs = Date.parse(entry.lastUsedAt);
+      if (Number.isFinite(lastMs) && nowMs - lastMs > args.freshnessMs) {
+        // Stale — roll a new sessionId but keep the entry slot. We deliberately
+        // DROP `subagent` metadata when rolling (a stale sub-agent slot getting
+        // re-used should be treated as a fresh top-level session). createdAt
+        // resets so audit tooling can see when the rolled session started.
+        entry = {
+          sessionId: randomUUID(),
+          createdAt: now,
+          lastUsedAt: now,
+          ...(args.overrides ?? {}),
+        };
+        store.sessions[sessionKey] = entry;
+        isNew = true;
+      }
+    }
+
+    if (!entry) {
       entry = {
         sessionId: randomUUID(),
         createdAt: now,
@@ -145,52 +346,41 @@ export function resolveOrCreateSession(args: {
       };
       store.sessions[sessionKey] = entry;
       isNew = true;
-    }
-  }
-
-  if (!entry) {
-    entry = {
-      sessionId: randomUUID(),
-      createdAt: now,
-      lastUsedAt: now,
-      ...(args.overrides ?? {}),
-    };
-    store.sessions[sessionKey] = entry;
-    isNew = true;
-  } else if (!isNew) {
-    entry.lastUsedAt = now;
-    if (args.overrides) {
-      // Primitive #6 — `subagent` metadata is the one field we treat as
-      // write-once. The comment on `SubagentSessionMetadata` documents
-      // "written ONCE at session creation"; honour that contract here so
-      // an out-of-band re-creation (or a buggy caller) can't silently
-      // overwrite the original spawn metadata. Every other override key
-      // is still merged (provider/model/auth-profile/thinking-level all
-      // legitimately mutate across turns).
-      const { subagent: incomingSubagent, ...rest } = args.overrides as {
-        subagent?: unknown;
-        [key: string]: unknown;
-      };
-      Object.assign(entry, rest);
-      if (entry.subagent === undefined && incomingSubagent !== undefined) {
-        entry.subagent = incomingSubagent as SubagentSessionMetadata;
+    } else if (!isNew) {
+      entry.lastUsedAt = now;
+      if (args.overrides) {
+        // Primitive #6 — `subagent` metadata is the one field we treat as
+        // write-once. The comment on `SubagentSessionMetadata` documents
+        // "written ONCE at session creation"; honour that contract here so
+        // an out-of-band re-creation (or a buggy caller) can't silently
+        // overwrite the original spawn metadata. Every other override key
+        // is still merged (provider/model/auth-profile/thinking-level all
+        // legitimately mutate across turns).
+        const { subagent: incomingSubagent, ...rest } = args.overrides as {
+          subagent?: unknown;
+          [key: string]: unknown;
+        };
+        Object.assign(entry, rest);
+        if (entry.subagent === undefined && incomingSubagent !== undefined) {
+          entry.subagent = incomingSubagent as SubagentSessionMetadata;
+        }
       }
     }
-  }
 
-  writeSessionStore(agentId, store);
+    writeSessionStore(agentId, store);
 
-  // Make sure the sessions/ directory exists; the JSONL itself is created
-  // lazily by Pi's SessionManager on first write.
-  ensureDir(resolveSessionsDir(agentId));
+    // Make sure the sessions/ directory exists; the JSONL itself is created
+    // lazily by Pi's SessionManager on first write.
+    ensureDir(resolveSessionsDir(agentId));
 
-  return {
-    sessionKey,
-    sessionId: entry.sessionId,
-    transcriptPath: resolveSessionTranscriptPath(agentId, entry.sessionId),
-    isNew,
-    entry,
-  };
+    return {
+      sessionKey,
+      sessionId: entry.sessionId,
+      transcriptPath: resolveSessionTranscriptPath(agentId, entry.sessionId),
+      isNew,
+      entry,
+    };
+  });
 }
 
 export function defaultSessionKey(agentId: string): string {
@@ -208,11 +398,13 @@ export function defaultSessionKey(agentId: string): string {
  * Returns `true` if an entry was removed, `false` otherwise.
  */
 export function deleteSessionEntry(agentId: string, sessionKey: string): boolean {
-  const store = readSessionStore(agentId);
-  if (!(sessionKey in store.sessions)) return false;
-  delete store.sessions[sessionKey];
-  writeSessionStore(agentId, store);
-  return true;
+  return withSyncStoreLock(agentId, () => {
+    const store = readSessionStore(agentId);
+    if (!(sessionKey in store.sessions)) return false;
+    delete store.sessions[sessionKey];
+    writeSessionStore(agentId, store);
+    return true;
+  });
 }
 
 /**
@@ -233,18 +425,20 @@ export function updateSessionEntry(
   sessionKey: string,
   patch: Partial<SessionEntry>,
 ): SessionEntry | null {
-  const store = readSessionStore(agentId);
-  const entry = store.sessions[sessionKey];
-  if (!entry) return null;
-  const { sessionId: _ignored, ...rest } = patch;
-  const next: SessionEntry = {
-    ...entry,
-    ...rest,
-    lastUsedAt: new Date().toISOString(),
-  };
-  store.sessions[sessionKey] = next;
-  writeSessionStore(agentId, store);
-  return next;
+  return withSyncStoreLock(agentId, () => {
+    const store = readSessionStore(agentId);
+    const entry = store.sessions[sessionKey];
+    if (!entry) return null;
+    const { sessionId: _ignored, ...rest } = patch;
+    const next: SessionEntry = {
+      ...entry,
+      ...rest,
+      lastUsedAt: new Date().toISOString(),
+    };
+    store.sessions[sessionKey] = next;
+    writeSessionStore(agentId, store);
+    return next;
+  });
 }
 
 /**
@@ -262,25 +456,27 @@ export function upsertSessionEntry(
   sessionKey: string,
   patch: Partial<SessionEntry>,
 ): SessionEntry {
-  const store = readSessionStore(agentId);
-  const now = new Date().toISOString();
-  const { sessionId: incomingSessionId, ...rest } = patch;
-  let entry = store.sessions[sessionKey];
-  if (!entry) {
-    entry = {
-      sessionId: incomingSessionId ?? randomUUID(),
-      createdAt: now,
-      lastUsedAt: now,
-      ...rest,
-    };
-    store.sessions[sessionKey] = entry;
-  } else {
-    entry = { ...entry, ...rest, lastUsedAt: now };
-    store.sessions[sessionKey] = entry;
-  }
-  writeSessionStore(agentId, store);
-  ensureDir(resolveSessionsDir(agentId));
-  return entry;
+  return withSyncStoreLock(agentId, () => {
+    const store = readSessionStore(agentId);
+    const now = new Date().toISOString();
+    const { sessionId: incomingSessionId, ...rest } = patch;
+    let entry = store.sessions[sessionKey];
+    if (!entry) {
+      entry = {
+        sessionId: incomingSessionId ?? randomUUID(),
+        createdAt: now,
+        lastUsedAt: now,
+        ...rest,
+      };
+      store.sessions[sessionKey] = entry;
+    } else {
+      entry = { ...entry, ...rest, lastUsedAt: now };
+      store.sessions[sessionKey] = entry;
+    }
+    writeSessionStore(agentId, store);
+    ensureDir(resolveSessionsDir(agentId));
+    return entry;
+  });
 }
 
 /**

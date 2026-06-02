@@ -658,9 +658,10 @@ export function buildProgram(): Command {
     .command("list")
     .description("Print all approved commands + patterns")
     .option("--json", "emit JSON instead of human-readable text", false)
-    .action(async (opts: { json?: boolean }) => {
+    .option("--agent <id>", "agent id whose allowlist to inspect", "main")
+    .action(async (opts: { json?: boolean; agent?: string }) => {
       const { runExecList } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecList({ json: opts.json }));
+      process.exit(await runExecList({ json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -671,9 +672,10 @@ export function buildProgram(): Command {
         "  Tip: quote complex commands so the shell doesn't reinterpret them.",
     )
     .option("--json", "emit JSON status instead of human text", false)
-    .action(async (parts: string[], opts: { json?: boolean }) => {
+    .option("--agent <id>", "agent id whose allowlist to mutate", "main")
+    .action(async (parts: string[], opts: { json?: boolean; agent?: string }) => {
       const { runExecAllow } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecAllow(parts.join(" "), { json: opts.json }));
+      process.exit(await runExecAllow(parts.join(" "), { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -685,9 +687,10 @@ export function buildProgram(): Command {
         "    brigade exec allow-pattern '^cat package\\.json$'",
     )
     .option("--json", "emit JSON status instead of human text", false)
-    .action(async (regex: string, opts: { json?: boolean }) => {
+    .option("--agent <id>", "agent id whose allowlist to mutate", "main")
+    .action(async (regex: string, opts: { json?: boolean; agent?: string }) => {
       const { runExecAllowPattern } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecAllowPattern(regex, { json: opts.json }));
+      process.exit(await runExecAllowPattern(regex, { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -697,9 +700,10 @@ export function buildProgram(): Command {
         "  Brigade looks in both commands AND patterns; if the value is in either, it's dropped.",
     )
     .option("--json", "emit JSON status instead of human text", false)
-    .action(async (parts: string[], opts: { json?: boolean }) => {
+    .option("--agent <id>", "agent id whose allowlist to mutate", "main")
+    .action(async (parts: string[], opts: { json?: boolean; agent?: string }) => {
       const { runExecRemove } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecRemove(parts.join(" "), { json: opts.json }));
+      process.exit(await runExecRemove(parts.join(" "), { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -709,18 +713,20 @@ export function buildProgram(): Command {
         "  Useful for sanity-checking before approving.",
     )
     .option("--json", "emit JSON instead of human-readable text", false)
-    .action(async (parts: string[], opts: { json?: boolean }) => {
+    .option("--agent <id>", "agent id whose allowlist to consult", "main")
+    .action(async (parts: string[], opts: { json?: boolean; agent?: string }) => {
       const { runExecDenyTest } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecDenyTest(parts.join(" "), { json: opts.json }));
+      process.exit(await runExecDenyTest(parts.join(" "), { json: opts.json, agentId: opts.agent }));
     });
 
   exec
     .command("file")
     .description("Print the absolute path to exec-approvals.json")
     .option("--json", "emit JSON instead of bare-path output", false)
-    .action(async (opts: { json?: boolean }) => {
+    .option("--agent <id>", "agent id whose allowlist path to print", "main")
+    .action(async (opts: { json?: boolean; agent?: string }) => {
       const { runExecFile } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecFile({ json: opts.json }));
+      process.exit(await runExecFile({ json: opts.json, agentId: opts.agent }));
     });
 
   // ──────────────── cron ────────────────

@@ -36,7 +36,8 @@ import crypto from "node:crypto";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { emitAgentEvent } from "./agent-events.js";
 import { callGateway } from "./gateway-call.js";
-import { CommandLane } from "../process/lanes.js";
+import { subagentLane } from "../process/lanes.js";
+import { withSubagentSlot } from "./subagent-budget.js";
 import {
 	isValidAgentId,
 	normalizeAgentId,
@@ -304,7 +305,7 @@ export async function spawnSubagentDirect(
 	});
 
 	try {
-		await callGateway({
+		await withSubagentSlot(() => callGateway({
 			method: "agent",
 			params: {
 				message: task,
@@ -315,7 +316,10 @@ export async function spawnSubagentDirect(
 				threadId: ctx.agentThreadId,
 				idempotencyKey: runId,
 				deliver: false,
-				lane: CommandLane.Subagent,
+				// Per-parent FIFO lane so spawns from different parents run in
+				// parallel; the global semaphore in `subagent-budget.ts` caps
+				// total in-flight spawns process-wide.
+				lane: subagentLane(ctx.agentSessionKey),
 				thinking: params.thinking,
 				timeout: params.runTimeoutSeconds,
 				label: label || undefined,
@@ -331,7 +335,7 @@ export async function spawnSubagentDirect(
 					: {}),
 			},
 			timeoutMs: 10_000,
-		});
+		}));
 	} catch (err) {
 		// Roll back the registration so the registry doesn't grow phantom
 		// entries. Best-effort: a concurrent reader might still see the

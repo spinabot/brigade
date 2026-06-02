@@ -17,8 +17,8 @@
  *      of the JS realm".
  *
  * `key` must be `Symbol.for("brigade.<area>.<purpose>")` — the brand-scrub
- * audit (`tests/integration/brand-scrub.test.ts`) refuses any non-`brigade.*`
- * symbol key under `src/`.
+ * audit (`src/shared/brand-scrub.test.ts`) AST-walks `src/` and refuses any
+ * non-`brigade.*` Symbol.for() arg.
  *
  * The factory runs exactly once per key per realm. Subsequent calls with the
  * same key reuse the cached value; the factory is not re-invoked.

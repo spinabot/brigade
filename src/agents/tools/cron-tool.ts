@@ -66,6 +66,9 @@ import type { BrigadeTool } from "./types.js";
  */
 export interface MakeCronToolOptions {
 	channelContext?: ChannelApprovalRoute;
+	/** Active agent id — defaulted onto `job.agentId` when the caller omits it,
+	 *  so cron fires routes back to the agent that scheduled them. */
+	agentId?: string;
 }
 
 /**
@@ -180,6 +183,7 @@ export function makeCronTool(
 	opts: MakeCronToolOptions = {},
 ): BrigadeTool<typeof CronToolParams, CronToolDetails> {
 	const channelContext = opts.channelContext;
+	const callerAgentId = opts.agentId;
 	return {
 		name: "cron",
 		label: "cron",
@@ -330,7 +334,15 @@ export function makeCronTool(
 						jobInput as Record<string, unknown>,
 						channelContext,
 					);
-					const created = await cronAdd(state, jobWithDelivery as unknown as CronJobCreate);
+					// Default `job.agentId` onto the input so the cron service
+					// remembers which agent scheduled the job — drives heartbeat
+					// routing + per-agent model resolution + the announce-fallback
+					// session key. Caller-supplied `agentId` always wins.
+					const jobWithAgent: Record<string, unknown> =
+						callerAgentId && typeof jobWithDelivery.agentId !== "string"
+							? { ...jobWithDelivery, agentId: callerAgentId }
+							: jobWithDelivery;
+					const created = await cronAdd(state, jobWithAgent as unknown as CronJobCreate);
 					return payloadTextResult({ action, job: created });
 				}
 				case "update": {
@@ -390,7 +402,15 @@ export function makeCronTool(
 					const text = readStringParam(params, "text", { required: true });
 					const wakeModeRaw = readStringParam(params, "wakeMode");
 					const mode: CronWakeMode = wakeModeRaw === "now" ? "now" : "next-heartbeat";
-					cronWake(state, text, mode);
+					// Route the wake to the agent that called the tool — without
+					// this the wake lands on the gateway's boot default agent
+					// even when the caller is a non-default routed agent.
+					cronWake(
+						state,
+						text,
+						mode,
+						callerAgentId !== undefined ? { agentId: callerAgentId } : {},
+					);
 					return payloadTextResult({ action, mode });
 				}
 			}

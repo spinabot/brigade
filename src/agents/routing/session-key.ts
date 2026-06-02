@@ -288,6 +288,14 @@ export function buildAgentPeerSessionKey(params: {
 	}
 	const channel = normalizeLowercaseStringOrEmpty(params.channel) || "unknown";
 	const peerId = normalizeLowercaseStringOrEmpty(params.peerId) || "unknown";
+	// Mirror the DM branch's account-aware shape when the operator opted into
+	// `per-account-channel-peer`: a single agent serving two accounts of the
+	// same channel (Slack workspace A + workspace B) must keep group/channel
+	// histories separate per account, not collapse them onto one peer id.
+	if (params.dmScope === "per-account-channel-peer") {
+		const accountId = normalizeAccountId(params.accountId);
+		return `agent:${normalizeAgentId(params.agentId)}:${channel}:${accountId}:${peerKind}:${peerId}`;
+	}
 	return `agent:${normalizeAgentId(params.agentId)}:${channel}:${peerKind}:${peerId}`;
 }
 

@@ -52,6 +52,56 @@ afterEach(() => {
 	mod._resetApprovalsCacheForTests();
 });
 
+describe("per-agent allowlist isolation", () => {
+	it("default agent + non-default agent see independent allowlists", () => {
+		mod.recordApproval("ls -la", "exact"); // default = "main"
+		mod.recordApproval("rm dist", "exact", "scratch");
+		assert.equal(mod.decideApproval("ls -la"), "allow");
+		assert.equal(mod.decideApproval("ls -la", "scratch"), "prompt");
+		assert.equal(mod.decideApproval("rm dist", "scratch"), "allow");
+		assert.equal(mod.decideApproval("rm dist"), "prompt");
+		// Paths actually differ.
+		assert.notEqual(mod.getApprovalsFilePath(), mod.getApprovalsFilePath("scratch"));
+	});
+
+	it("removeApproval is scoped per agent", () => {
+		mod.recordApproval("ls", "exact");
+		mod.recordApproval("ls", "exact", "other");
+		const r = mod.removeApproval("ls", "other");
+		assert.equal(r.removedCommands, 1);
+		assert.equal(mod.decideApproval("ls", "other"), "prompt");
+		// Default agent untouched.
+		assert.equal(mod.decideApproval("ls"), "allow");
+	});
+
+	it("legacy ~/.brigade/exec-approvals.json migrates into the default agent slot", () => {
+		// Plant a legacy global file BEFORE the per-agent slot exists.
+		// Compute the legacy path off the state-dir root, mirroring the
+		// module's resolveLegacyExecApprovalsPath helper.
+		mod._resetApprovalsCacheForTests();
+		const legacy = path.join(tmpHome, ".brigade", "exec-approvals.json");
+		fs.mkdirSync(path.dirname(legacy), { recursive: true });
+		fs.writeFileSync(
+			legacy,
+			JSON.stringify({ version: 1, commands: ["legacy-cmd"], patterns: [] }),
+			"utf8",
+		);
+		// Per-agent file does NOT exist yet — wipe defensively.
+		try {
+			fs.rmSync(mod.getApprovalsFilePath(), { force: true });
+		} catch {
+			/* ignore */
+		}
+		// First read triggers the migration.
+		assert.equal(mod.decideApproval("legacy-cmd"), "allow");
+		assert.ok(fs.existsSync(mod.getApprovalsFilePath()), "per-agent file should exist after migration");
+		assert.ok(
+			fs.existsSync(`${legacy}.migrated`) || !fs.existsSync(legacy),
+			"legacy file should be renamed",
+		);
+	});
+});
+
 describe("decideApproval — hard-deny patterns", () => {
 	it("blocks rm -rf /", () => {
 		assert.equal(mod.decideApproval("rm -rf /"), "deny");

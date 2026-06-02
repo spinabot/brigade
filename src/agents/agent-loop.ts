@@ -97,10 +97,9 @@ import {
   type FallbackAttempt,
 } from "./model-fallback.js";
 import {
-  clearExpiredCooldowns,
-  loadProfileState,
-  markProfileFailure,
-  markProfileSuccess,
+  loadProfileStateLocked,
+  recordProfileFailureLocked,
+  recordProfileSuccessLocked,
 } from "../auth/profile-cooldown.js";
 import { orderProfilesForSelection } from "../auth/profile-cooldown.js";
 import {
@@ -314,8 +313,13 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // sweep expired windows up-front so a profile that was rate-limited an
   // hour ago is eligible again now, then pass the eligibility filter to
   // the credential-map builder so cooled profiles don't get handed to Pi.
-  let cooldownState = loadProfileState(agentId);
-  cooldownState = clearExpiredCooldowns(cooldownState);
+  //
+  // Locked variant: serialises the load+sweep against concurrent
+  // markProfileFailure/Success writes for the SAME agent. Two `brigade
+  // agent` runs hitting the same agentId from the same process can no
+  // longer interleave their snapshots — each waits for the previous
+  // mark to land on disk before reading.
+  let cooldownState = await loadProfileStateLocked(agentId);
   const authBuild = buildAuthStorage(authProfilesPath, {
     cooldownState,
     provider: args.provider,
@@ -591,7 +595,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    extensionFactories: [extensionRegistry.toPiExtensionFactory({ toolset: toolsetProfile })],
+    extensionFactories: [
+      extensionRegistry.toPiExtensionFactory({
+        toolset: toolsetProfile,
+        // Wave K — surface per-turn agent + session ctx so `b.tool({ create })`
+        // factories can scope state to THIS turn instead of closing over boot
+        // metadata.
+        agentId,
+        sessionKey: resolved.sessionKey,
+      }),
+    ],
   } as never);
   await (brigadeResourceLoader as unknown as { reload: () => Promise<void> }).reload();
 
@@ -1063,6 +1076,17 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // up across the gateway's long-running process. This is the standard
   // global agent-events registry pattern.
   const runId = randomUUID();
+  // Wave L P2#10 — per-turn bound logger. Every log emitted via
+  // `turnLog` automatically carries `agentId / sessionId / runId`
+  // so observability tooling can correlate without each call-site
+  // threading the trio by hand. Existing `log.*` callsites still
+  // work unchanged.
+  const turnLog = log.bind({
+    agentId,
+    sessionId: resolved.sessionId,
+    runId,
+  });
+  void turnLog;
   // Publish runId+agentId+sessionKey to the closure-bag so any
   // `tool-blocked` events emitted during this turn carry accurate
   // correlation ids AND the loop detector keys its ring buffer to
@@ -1165,7 +1189,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   await runWithRetry({
     ctx: { provider: args.provider, model: args.modelId },
     signal: args.signal,
-    onAttemptFailed: (info) => {
+    onAttemptFailed: async (info) => {
       const fields = {
         agentId,
         sessionId: resolved.sessionId,
@@ -1187,6 +1211,8 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         emitAgentEvent({
           type: "turn-retry-attempt",
           runId,
+          agentId,
+          sessionKey: resolved.sessionKey,
           errorClass: String((info as { class?: string }).class ?? "unknown"),
           reason: String(info.reason ?? info.errorSummary ?? "transient error"),
         });
@@ -1194,8 +1220,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       // Update the on-disk cooldown state so this profile rotates out on
       // the next run if its failure category warrants a cooldown. Skipped
       // when no profile id was tracked (single-profile fallback path).
+      //
+      // Locked variant: re-loads fresh state under the per-agent cooldown
+      // lock, merges THIS failure against THAT snapshot, then saves. The
+      // surrounding retry orchestrator awaits the returned Promise so the
+      // next attempt's `loadProfileStateLocked` sees this write.
       if (selectedProfileId) {
-        cooldownState = markProfileFailure({
+        cooldownState = await recordProfileFailureLocked({
           agentId,
           state: cooldownState,
           profileId: selectedProfileId,
@@ -1252,6 +1283,8 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
                 emitAgentEvent({
                   type: "turn-content-retry",
                   runId,
+                  agentId,
+                  sessionKey: resolved.sessionKey,
                   reason: reason as "empty" | "reasoning-only" | "planning-only",
                 });
               },
@@ -1273,6 +1306,8 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
             emitAgentEvent({
               type: "turn-thinking-downgrade",
               runId,
+              agentId,
+              sessionKey: resolved.sessionKey,
               from: String(originalLevel),
             });
           },
@@ -1320,9 +1355,12 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   }
 
   // Successful turn — clear any prior failure state on the profile so the
-  // next run prefers it again under the round-robin order.
+  // next run prefers it again under the round-robin order. Locked variant:
+  // re-loads fresh state under the per-agent cooldown lock, applies the
+  // mark against THAT snapshot, then saves — so a sibling turn's recent
+  // failure-write isn't silently clobbered by our pre-failure snapshot.
   if (selectedProfileId) {
-    cooldownState = markProfileSuccess({
+    cooldownState = await recordProfileSuccessLocked({
       agentId,
       state: cooldownState,
       profileId: selectedProfileId,

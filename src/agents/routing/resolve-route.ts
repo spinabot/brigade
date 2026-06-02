@@ -884,5 +884,21 @@ export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentR
 		}
 	}
 
+	// Tier 7.5 — channel-scoped default agent. When the operator sets
+	// `cfg.channels.<channelId>.defaultAgentId`, route any inbound on that
+	// channel to that agent BEFORE falling through to the gateway-wide
+	// `resolveDefaultAgentId`. Lets operators say "all telegram traffic
+	// without a more specific binding goes to agent:ops" in one line of
+	// config instead of writing a binding entry per peer.
+	const channelsCfg = (input.cfg as { channels?: Record<string, { defaultAgentId?: unknown }> } | undefined)
+		?.channels;
+	const channelDefault = channelsCfg?.[channel]?.defaultAgentId;
+	if (typeof channelDefault === "string" && channelDefault.trim().length > 0) {
+		if (shouldLogDebug) {
+			logDebug(`[routing] match: matchedBy=channel.defaultAgentId agentId=${channelDefault.trim()}`);
+		}
+		return choose(channelDefault.trim(), "default");
+	}
+
 	return choose(resolveDefaultAgentId(input.cfg), "default");
 }

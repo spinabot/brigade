@@ -21,13 +21,24 @@ import type {
 	ChannelStartContext,
 	OutboundSendOptions,
 } from "../../extensions/types.js";
+import {
+	listWhatsAppAccountIds,
+	resolveWhatsAppAccountAuthDir,
+	whatsappChannelEnabled,
+} from "./account-config.js";
 import { connectWhatsApp, toWhatsAppJid, type WhatsAppConnection } from "./connection.js";
 
 const CHANNEL_ID = "whatsapp";
 
-/** Read `channels.whatsapp` from config (loosely — schema keeps it open). */
-function whatsappConfig(cfg: BrigadeConfig): { enabled?: boolean; verbose?: boolean } | undefined {
-	return (cfg as { channels?: Record<string, { enabled?: boolean; verbose?: boolean }> }).channels?.[CHANNEL_ID];
+/** Default account id for legacy single-account installs. */
+const DEFAULT_ACCOUNT_ID = "default";
+
+/** Adapter construction options — all optional for back-compat. */
+export interface CreateWhatsAppAdapterOptions {
+	/** Per-account scope (multi-account plugin path). Defaults to `"default"`. */
+	accountId?: string;
+	/** Override the on-disk auth directory. When omitted, derived from `accountId`. */
+	authDir?: string;
 }
 
 /** Render a QR to the terminal (lazy-imports qrcode-terminal). */
@@ -46,7 +57,11 @@ async function printQr(qr: string): Promise<void> {
 	}
 }
 
-export function createWhatsAppAdapter(): ChannelAdapter {
+export function createWhatsAppAdapter(opts: CreateWhatsAppAdapterOptions = {}): ChannelAdapter {
+	/** Account id this adapter instance represents — stamped on every inbound. */
+	const accountId = opts.accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	/** Auth directory override (multi-account plugin path), else derived per-account in start(). */
+	const authDirOverride = opts.authDir?.trim();
 	let connection: WhatsAppConnection | null = null;
 	// Health state captured from the connection's lifecycle callbacks. The
 	// adapter is otherwise stateless about session liveness — Baileys owns
@@ -70,11 +85,25 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 		label: "WhatsApp",
 
 		isConfigured(cfg: BrigadeConfig): boolean {
-			return whatsappConfig(cfg)?.enabled === true;
+			if (!whatsappChannelEnabled(cfg)) return false;
+			// Legacy single-adapter boot: when the operator declared
+			// `channels.whatsapp.accounts:[...]` with more than one entry, the
+			// plugin path owns lifecycle — the legacy adapter steps aside so
+			// the gateway doesn't double-spawn the default-account socket.
+			const isLegacyAdapter =
+				!authDirOverride && accountId === DEFAULT_ACCOUNT_ID;
+			if (isLegacyAdapter && listWhatsAppAccountIds(cfg).length > 1) return false;
+			return true;
 		},
 
 		async start(ctx: ChannelStartContext): Promise<void> {
-			const authDir = path.join(resolveChannelStateDir(CHANNEL_ID), "auth");
+			// When the plugin path resolved a per-account auth dir, use it; legacy
+			// single-adapter callers fall back to the channel-state-dir layout.
+			const authDir =
+				authDirOverride ??
+				(accountId === DEFAULT_ACCOUNT_ID
+					? path.join(resolveChannelStateDir(CHANNEL_ID), "auth")
+					: resolveWhatsAppAccountAuthDir(accountId));
 			ensureDir(authDir);
 			connection = await connectWhatsApp({
 				authDir,
@@ -112,6 +141,13 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 				onMessage: (msg) => {
 					void ctx.onInbound({
 						channel: CHANNEL_ID,
+						// Stamp the per-account scope on every inbound so the channel
+						// manager + 8-tier router can disambiguate sibling accounts
+						// (e.g. personal vs work) sharing the same `from` phone digits.
+						// Closure-bound — there's one adapter instance per account in
+						// the plugin path; the legacy single-adapter path stamps the
+						// default id transparently for back-compat.
+						accountId,
 						conversationId: msg.conversationId,
 						messageId: msg.messageId,
 						participantId: msg.participantId,

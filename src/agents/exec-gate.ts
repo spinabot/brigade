@@ -90,6 +90,10 @@ const EXEC_GATED_TOOLS = new Set(["bash", "exec", "shell", "sh"]);
 export interface ExecGateContext {
 	runId?: string;
 	agentId?: string;
+	/** Wave I — session key the gated tool call ran under. Threaded into the
+	 *  `tool-blocked` bus event so the WS subscription filter can route the
+	 *  refusal log to the operator watching THIS session only. */
+	sessionKey?: string;
 	/** When this turn IS running inside a sub-agent, these surface so the
 	 *  operator's approval prompt can show "Sub-agent '<label>' wants to run
 	 *  …" instead of the default attribution. Top-level turns leave them
@@ -135,6 +139,10 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 			agentId: c.agentId ?? "",
 			toolName,
 			reason,
+			// Wave I — forward the session key so the gateway's per-client
+			// subscription filter routes the refusal log to the operator
+			// watching THIS session only.
+			...(c.sessionKey !== undefined ? { sessionKey: c.sessionKey } : {}),
 		});
 	};
 	return async (ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> => {
@@ -247,9 +255,15 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 		// the tool call with the typed error's message rather than letting
 		// the throw escape into Pi (which would surface a generic stream
 		// error far from the actual cause).
+		//
+		// agentId scopes the allowlist per-agent — top-level + sub-agent turns
+		// both flow through here and ctxRef.value.agentId carries the active
+		// agent id from runSingleTurn. Falls back to the default agent when
+		// no ctxRef is supplied (unit tests).
+		const gateAgentId = ctxRef.value.agentId;
 		let decision: ReturnType<typeof decideApproval>;
 		try {
-			decision = decideApproval(cmd);
+			decision = decideApproval(cmd, gateAgentId);
 		} catch (err) {
 			if (err instanceof BrigadeApprovalFileVersionError) {
 				const reason =
@@ -300,6 +314,14 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 					...(c.subagentDepth !== undefined ? { subagentDepth: c.subagentDepth } : {}),
 					...(c.parentRunId !== undefined ? { parentRunId: c.parentRunId } : {}),
 					...(c.channelRoute !== undefined ? { channelRoute: c.channelRoute } : {}),
+					// Wave K (R3) — forward the per-turn agentId + sessionKey-as-sessionId
+					// so the gateway's WS subscription filter routes the approval
+					// prompt to the operator watching THIS agent's session only. Without
+					// these the broadcaster's filter sees an un-tagged frame and falls
+					// back to fan-out-to-everyone, so a TUI bound to a different agent
+					// would see (and could answer) someone else's approval.
+					...(c.agentId !== undefined ? { agentId: c.agentId } : {}),
+					...(c.sessionKey !== undefined ? { sessionId: c.sessionKey } : {}),
 				});
 				if (decision.timedOut) {
 					const reason =
@@ -308,7 +330,7 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 					emitBlocked(name, reason);
 					return { block: true, reason };
 				}
-				const outcome = applyApprovalDecision({ command: cmd, decision });
+				const outcome = applyApprovalDecision({ command: cmd, decision, agentId: gateAgentId });
 				if (outcome === "allow") return undefined;
 				// Deny → refuse with a short, agent-friendly reason.
 				const reason = `Bash refused by operator: "${preview}" was explicitly denied. Don't retry the same command — ask the user what they want instead.`;

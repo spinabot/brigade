@@ -69,6 +69,9 @@ export type AgentBusEvent =
 			type: "tool-blocked";
 			runId: string;
 			agentId: string;
+			/** Session key the blocked tool call ran under. Optional for back-
+			 *  compat: pre-Wave-I callsites don't thread it. */
+			sessionKey?: string;
 			toolName: string;
 			reason: string;
 	  }
@@ -119,6 +122,11 @@ export type AgentBusEvent =
 			/** Model fallback attempt: primary failed with `reason`, switching to `to`. */
 			type: "turn-fallback-attempt";
 			runId: string;
+			/** Wave I — agent that produced this lifecycle event. Optional for
+			 *  back-compat: older callsites omit it. */
+			agentId?: string;
+			/** Wave I — session that produced this lifecycle event. */
+			sessionKey?: string;
 			reason: string;
 			toProvider: string | undefined;
 			toModelId: string | undefined;
@@ -127,18 +135,30 @@ export type AgentBusEvent =
 			/** All fallback candidates exhausted with their final error. */
 			type: "turn-fallback-exhausted";
 			runId: string;
+			/** Wave I — agent that produced this lifecycle event. */
+			agentId?: string;
+			/** Wave I — session that produced this lifecycle event. */
+			sessionKey?: string;
 			reason: string;
 	  }
 	| {
 			/** No streaming activity for `intervalMs`; surface "still working" UX. */
 			type: "turn-heartbeat";
 			runId: string;
+			/** Wave I — agent that produced this lifecycle event. */
+			agentId?: string;
+			/** Wave I — session that produced this lifecycle event. */
+			sessionKey?: string;
 			elapsedMs: number;
 	  }
 	| {
 			/** Per-attempt idle-stream watchdog tripped after `idleMs`. */
 			type: "turn-stream-timeout";
 			runId: string;
+			/** Wave I — agent that produced this lifecycle event. */
+			agentId?: string;
+			/** Wave I — session that produced this lifecycle event. */
+			sessionKey?: string;
 			idleMs: number;
 	  }
 	| {
@@ -146,6 +166,10 @@ export type AgentBusEvent =
 			 *  and the loop re-prompted the model to continue. */
 			type: "turn-length-continue";
 			runId: string;
+			/** Wave I — agent that produced this lifecycle event. */
+			agentId?: string;
+			/** Wave I — session that produced this lifecycle event. */
+			sessionKey?: string;
 	  }
 	| {
 			/** Content-quality retry fired with reason: empty / reasoning-only /
@@ -153,6 +177,10 @@ export type AgentBusEvent =
 			 *  produce an actual visible answer / actually do the work. */
 			type: "turn-content-retry";
 			runId: string;
+			/** Wave I — agent that produced this lifecycle event. */
+			agentId?: string;
+			/** Wave I — session that produced this lifecycle event. */
+			sessionKey?: string;
 			reason: "empty" | "reasoning-only" | "planning-only";
 	  }
 	| {
@@ -160,6 +188,10 @@ export type AgentBusEvent =
 			 *  from `from` to "off"; the loop retries the same user message. */
 			type: "turn-thinking-downgrade";
 			runId: string;
+			/** Wave I — agent that produced this lifecycle event. */
+			agentId?: string;
+			/** Wave I — session that produced this lifecycle event. */
+			sessionKey?: string;
 			from: string;
 	  }
 	| {
@@ -169,6 +201,10 @@ export type AgentBusEvent =
 			 *  gateway can log to subscribers. */
 			type: "turn-retry-attempt";
 			runId: string;
+			/** Wave I — agent that produced this lifecycle event. */
+			agentId?: string;
+			/** Wave I — session that produced this lifecycle event. */
+			sessionKey?: string;
 			errorClass: string;
 			reason: string;
 	  }
@@ -177,11 +213,22 @@ export type AgentBusEvent =
 			 *  retry on the same model. */
 			type: "turn-compact-before-retry";
 			runId: string;
+			/** Wave I — agent that produced this lifecycle event. */
+			agentId?: string;
+			/** Wave I — session that produced this lifecycle event. */
+			sessionKey?: string;
 	  };
 
 export type AgentEventListener = (event: AgentBusEvent) => void;
 
-const listeners = new Set<AgentEventListener>();
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+
+/** Pinned via global-singleton so hot-reload / dual-build setups share one Set. */
+const AGENT_EVENT_BUS_LISTENERS_KEY = Symbol.for("brigade.agentEventBus.listeners");
+const listeners = resolveGlobalSingleton<Set<AgentEventListener>>(
+	AGENT_EVENT_BUS_LISTENERS_KEY,
+	() => new Set<AgentEventListener>(),
+);
 
 /**
  * Subscribe to ALL agent events fired in this process. Returns a

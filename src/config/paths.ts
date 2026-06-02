@@ -172,16 +172,26 @@ export function resolveExtensionsDir(): string {
 // Per-channel access-control files: the list of allowed senders + any pending
 // pairing codes. Co-located with the channel's other state so the existing
 // `rm -rf ~/.brigade/channels/<id>` reset wipes them along with the creds.
-export function resolveChannelAllowFromPath(channelId: string): string {
-  return path.join(resolveChannelStateDir(channelId), "allow-from.json");
+// Multi-account channels (WhatsApp personal + work) partition the lists under
+// `accounts/<accountId>/` so revoking one account never affects the other.
+// Legacy single-account installs (no accountId, or accountId === "default")
+// keep the historical path so existing approvals stay valid.
+export function resolveChannelAllowFromPath(channelId: string, accountId?: string | null): string {
+  const id = (accountId ?? "").trim();
+  if (!id || id === "default") return path.join(resolveChannelStateDir(channelId), "allow-from.json");
+  return path.join(resolveChannelStateDir(channelId), "accounts", id, "allow-from.json");
 }
 // Group allow-from is a separate file so revoking a group's access doesn't
 // kick the operator out of their own DMs and vice-versa.
-export function resolveChannelGroupAllowFromPath(channelId: string): string {
-  return path.join(resolveChannelStateDir(channelId), "group-allow-from.json");
+export function resolveChannelGroupAllowFromPath(channelId: string, accountId?: string | null): string {
+  const id = (accountId ?? "").trim();
+  if (!id || id === "default") return path.join(resolveChannelStateDir(channelId), "group-allow-from.json");
+  return path.join(resolveChannelStateDir(channelId), "accounts", id, "group-allow-from.json");
 }
-export function resolveChannelPairingPath(channelId: string): string {
-  return path.join(resolveChannelStateDir(channelId), "pairing.json");
+export function resolveChannelPairingPath(channelId: string, accountId?: string | null): string {
+  const id = (accountId ?? "").trim();
+  if (!id || id === "default") return path.join(resolveChannelStateDir(channelId), "pairing.json");
+  return path.join(resolveChannelStateDir(channelId), "accounts", id, "pairing.json");
 }
 
 export function resolveConfigAuditLogPath(): string {

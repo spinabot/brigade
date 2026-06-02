@@ -24,7 +24,7 @@
 import crypto from "node:crypto";
 
 import { callGateway } from "../../gateway-call.js";
-import { CommandLane } from "../../../process/lanes.js";
+import { nestedLane } from "../../../process/lanes.js";
 import { enqueueSystemEvent } from "../../session-inbox.js";
 import {
 	describeSessionsSendTool,
@@ -110,9 +110,11 @@ export function createSessionsSendTool(
 				},
 			);
 
-			// Trigger the target's next turn via the nested lane (won't bump
-			// the caller's main lane).
+			// Trigger the target's next turn via the per-caller nested lane so
+			// concurrent sends from different callers don't queue head-of-line
+			// behind each other (won't bump the caller's main lane either).
 			const idempotencyKey = crypto.randomUUID();
+			const lane = nestedLane(opts.agentSessionKey);
 			try {
 				await callGateway({
 					method: "agent",
@@ -120,7 +122,7 @@ export function createSessionsSendTool(
 						message: parsed.message,
 						sessionKey: parsed.sessionKey,
 						deliver: false,
-						lane: CommandLane.Nested,
+						lane,
 						idempotencyKey,
 						spawnedBy: opts.agentSessionKey ?? "main",
 						timeout: parsed.timeoutSeconds,
@@ -137,7 +139,7 @@ export function createSessionsSendTool(
 			return jsonToolResult({
 				status: "accepted",
 				sessionKey: parsed.sessionKey,
-				delivery: { mode: "queued", lane: CommandLane.Nested },
+				delivery: { mode: "queued", lane },
 				idempotencyKey,
 			});
 		},

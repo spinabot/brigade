@@ -1,17 +1,49 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+// Repoint HOME at a tempdir before importing the module so the locked-IO
+// tests below don't clobber the operator's real ~/.brigade/agents/<id>/agent.
+const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-cooldown-"));
+const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
+const originalBrigadeStateDir = process.env.BRIGADE_STATE_DIR;
+process.env.HOME = tmpHome;
+process.env.USERPROFILE = tmpHome;
+process.env.BRIGADE_STATE_DIR = path.join(tmpHome, ".brigade");
 
 import {
   calculateCooldownMs,
   calculateDisabledMs,
   clearExpiredCooldowns,
+  clearProfileCooldownLocksForTests,
   getCooldownStatus,
   isProfileEligible,
+  loadProfileState,
   markProfileFailure,
   markProfileSuccess,
   orderProfilesForSelection,
+  recordProfileFailureLocked,
+  recordProfileSuccessLocked,
+  withProfileCooldownLock,
   type ProfileStateFile,
 } from "./profile-cooldown.js";
+
+process.on("exit", () => {
+  if (originalHome !== undefined) process.env.HOME = originalHome;
+  else delete process.env.HOME;
+  if (originalUserProfile !== undefined) process.env.USERPROFILE = originalUserProfile;
+  else delete process.env.USERPROFILE;
+  if (originalBrigadeStateDir !== undefined) process.env.BRIGADE_STATE_DIR = originalBrigadeStateDir;
+  else delete process.env.BRIGADE_STATE_DIR;
+  try {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+});
 
 function freshState(): ProfileStateFile {
   return { version: 1, usageStats: {} };
@@ -245,4 +277,106 @@ test("markProfileFailure: error count decays after failure window expires", () =
   // Decayed → next error counts as 1, not 5.
   const stats = next.usageStats!["p1"]!;
   assert.equal(stats.errorCount, 1);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cooldown lock (P1#7) — concurrent read-modify-write must not lose marks.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("withProfileCooldownLock: serialises per-agent FIFO", async () => {
+  clearProfileCooldownLocksForTests();
+  const order: number[] = [];
+  let active = 0;
+  let maxActive = 0;
+  async function task(id: number, delayMs: number): Promise<void> {
+    await withProfileCooldownLock("locktest-agent", async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, delayMs));
+      order.push(id);
+      active--;
+    });
+  }
+  await Promise.all([task(1, 20), task(2, 5), task(3, 5)]);
+  assert.equal(maxActive, 1, "lock must serialise — only one holder at a time");
+  assert.deepEqual(order, [1, 2, 3], "FIFO order required");
+});
+
+test("withProfileCooldownLock: a rejected holder doesn't block subsequent ones", async () => {
+  clearProfileCooldownLocksForTests();
+  await assert.rejects(
+    withProfileCooldownLock("a2", async () => {
+      throw new Error("boom");
+    }),
+  );
+  const result = await withProfileCooldownLock("a2", async () => 42);
+  assert.equal(result, 42);
+});
+
+test("recordProfileFailureLocked: two concurrent calls do not lose either mark", async () => {
+  clearProfileCooldownLocksForTests();
+  // Each call independently loads fresh from disk under the lock so each
+  // mark accumulates against the other's write, not against a stale snapshot.
+  const agentId = "race-agent";
+  // Ensure clean state.
+  try {
+    fs.rmSync(path.join(tmpHome, ".brigade", "agents", agentId), {
+      recursive: true,
+      force: true,
+    });
+  } catch {
+    /* ignore */
+  }
+  const a = recordProfileFailureLocked({
+    agentId,
+    state: freshState(),
+    profileId: "anthropic:default",
+    reason: "rate_limit",
+  });
+  const b = recordProfileFailureLocked({
+    agentId,
+    state: freshState(),
+    profileId: "openai:default",
+    reason: "rate_limit",
+  });
+  await Promise.all([a, b]);
+  const final = loadProfileState(agentId);
+  const stats = final.usageStats ?? {};
+  // BOTH profiles must be in the file. The pre-lock implementation lost one
+  // because each call carried its own freshState snapshot that didn't see
+  // the sibling's write.
+  assert.ok(stats["anthropic:default"], "anthropic mark must persist");
+  assert.ok(stats["openai:default"], "openai mark must persist");
+  assert.equal(stats["anthropic:default"]!.cooldownReason, "rate_limit");
+  assert.equal(stats["openai:default"]!.cooldownReason, "rate_limit");
+});
+
+test("recordProfileSuccessLocked: success after failure clears state and persists", async () => {
+  clearProfileCooldownLocksForTests();
+  const agentId = "success-agent";
+  try {
+    fs.rmSync(path.join(tmpHome, ".brigade", "agents", agentId), {
+      recursive: true,
+      force: true,
+    });
+  } catch {
+    /* ignore */
+  }
+  await recordProfileFailureLocked({
+    agentId,
+    state: freshState(),
+    profileId: "p",
+    reason: "rate_limit",
+  });
+  await recordProfileSuccessLocked({
+    agentId,
+    state: freshState(),
+    profileId: "p",
+    provider: "anthropic",
+  });
+  const final = loadProfileState(agentId);
+  const stats = final.usageStats?.["p"];
+  assert.ok(stats, "stats present after success");
+  assert.equal(stats!.cooldownUntil, undefined, "success clears cooldown");
+  assert.equal(final.lastGood?.["anthropic"], "p");
 });

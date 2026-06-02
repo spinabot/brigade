@@ -34,6 +34,7 @@ import { createHash } from "node:crypto";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import type { BrigadeConfig } from "../config/types.js";
+import { buildBrigadeMainSessionKey } from "./routing/session-key.js";
 
 const log = createSubsystemLogger("agents/heartbeat-scheduler");
 
@@ -370,12 +371,19 @@ export function createHeartbeatScheduler(deps: HeartbeatSchedulerDeps): Heartbea
 				const nextDueMs = preserveSchedule
 					? prev.nextDueMs
 					: computeNextDueMs(now, intervalMs, phaseMs);
+				// Wave L P2#5 — default sessionKey to the agent's canonical `:main`
+				// when config omits it. Without this, intervalMs-only configs
+				// produced an entry whose `sessionKey === undefined`, which the
+				// runner then skips (no session to gate / drain). Defaulting
+				// keeps the agent's primary FIFO ticking on schedule.
+				const effectiveSessionKey =
+					hb?.sessionKey?.trim() || buildBrigadeMainSessionKey({ agentId });
 				nextAgents.set(agentId, {
 					agentId,
 					intervalMs,
 					phaseMs,
 					nextDueMs,
-					...(hb?.sessionKey ? { sessionKey: hb.sessionKey } : {}),
+					sessionKey: effectiveSessionKey,
 					...(hb?.quietHours ? { quietHours: hb.quietHours } : {}),
 				});
 			}

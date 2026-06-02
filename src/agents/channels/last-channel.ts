@@ -30,6 +30,7 @@
  * had time to fire anything that would need it.
  */
 
+import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import type { ChannelApprovalRoute } from "./approval-router.js";
 
 /** One operator's most recently active channel + peer + thread. */
@@ -41,7 +42,12 @@ export interface LastChannelRecord {
 	updatedAtMs: number;
 }
 
-const lastChannelByAgent = new Map<string, LastChannelRecord>();
+/** Pinned via global-singleton so hot-reload / dual-build keep one per-agent record map. */
+const LAST_CHANNEL_BY_AGENT_KEY = Symbol.for("brigade.lastChannel.byAgent");
+const lastChannelByAgent = resolveGlobalSingleton<Map<string, LastChannelRecord>>(
+	LAST_CHANNEL_BY_AGENT_KEY,
+	() => new Map<string, LastChannelRecord>(),
+);
 
 /**
  * Record this turn's channel as the agent's most recent. Called from the

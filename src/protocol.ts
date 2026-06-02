@@ -99,7 +99,17 @@ export type RequestMethod =
 	 * void (the response fires before the process exits, so the client can
 	 * confirm the daemon is shutting down).
 	 */
-	| "shutdown";
+	| "shutdown"
+	/**
+	 * P1#3 (Wave H) — opt the connection into receiving events tagged with
+	 * the supplied agentId / sessionId only. Multi-agent gateways fan
+	 * approval prompts, pi events, and logs out per turn; a UI watching
+	 * one agent uses this to mute the others. Without any subscribe call
+	 * the connection still receives every event (back-compat).
+	 */
+	| "subscribe"
+	/** Drop a previously-recorded subscribe entry. */
+	| "unsubscribe";
 
 /* ─────────────────────────── event names ─────────────────────────── */
 
@@ -142,13 +152,54 @@ export type EventName =
 
 /** Params for each request method. `void` = no params required. */
 export interface RequestParams {
-	prompt: { text: string };
-	abort: void;
-	steer: { text: string };
-	"set-model": { provider: string; modelId: string };
-	"switch-model-mid-turn": { provider: string; modelId: string; replayMessage: string };
-	"set-thinking": { level: string };
-	compact: void;
+	prompt: {
+		text: string;
+		/** Target agent id; defaults to the gateway's boot default when omitted. */
+		agentId?: string;
+		/** Canonical session key; defaults to `defaultSessionKey(agentId)` when omitted. */
+		sessionKey?: string;
+	};
+	abort: {
+		/** Session key to abort; defaults to the gateway's boot session for back-compat. */
+		sessionKey?: string;
+		/** Agent id whose default session should be aborted when `sessionKey` is omitted. */
+		agentId?: string;
+	};
+	steer: {
+		text: string;
+		/** Session key whose in-flight turn receives the steer; defaults to boot session. */
+		sessionKey?: string;
+		/** Agent id whose default session is steered when `sessionKey` is omitted. */
+		agentId?: string;
+	};
+	"set-model": {
+		provider: string;
+		modelId: string;
+		/** Agent id whose runtime entry is mutated; defaults to caller's bound agent. */
+		agentId?: string;
+	};
+	"switch-model-mid-turn": {
+		provider: string;
+		modelId: string;
+		replayMessage: string;
+		/** Session key whose in-flight session is hot-swapped; defaults to boot session. */
+		sessionKey?: string;
+		/** Agent id whose runtime entry + (if running) live session is swapped. */
+		agentId?: string;
+	};
+	"set-thinking": {
+		level: string;
+		/** Agent id whose thinking level is updated; defaults to caller's bound agent. */
+		agentId?: string;
+		/** Session key whose in-flight session also has its level set live. */
+		sessionKey?: string;
+	};
+	compact: {
+		/** Session key whose in-flight session is compacted; defaults to boot session. */
+		sessionKey?: string;
+		/** Agent id whose default session is compacted when `sessionKey` is omitted. */
+		agentId?: string;
+	} | void;
 	"approval-resolve": {
 		/** Matches the `approval-request` event's `id`. */
 		id: string;
@@ -161,6 +212,18 @@ export interface RequestParams {
 	"refresh-models": void;
 	"get-state": void;
 	shutdown: void;
+	subscribe: {
+		/** Subscribe to events tagged with this agentId. */
+		agentId?: string;
+		/** Subscribe to events tagged with this sessionId. */
+		sessionId?: string;
+	};
+	unsubscribe: {
+		/** Drop a prior agentId subscription. */
+		agentId?: string;
+		/** Drop a prior sessionId subscription. */
+		sessionId?: string;
+	};
 }
 
 /** Payload for each request method's response. `void` = no payload. */
@@ -177,6 +240,8 @@ export interface ResponseFor {
 	"refresh-models": void;
 	"get-state": SessionStateSnapshot;
 	shutdown: void;
+	subscribe: void;
+	unsubscribe: void;
 }
 
 /** Payload shape for each event. */
@@ -187,10 +252,24 @@ export interface EventPayload {
 		 *  child sub-agent; the TUI indents nested rendering by this value.
 		 *  Top-level turns leave it undefined. */
 		subagentDepth?: number;
+		/** P1#3 (Wave H) — agent that produced this Pi event. Lets the gateway
+		 *  filter broadcast to subscribers of THIS agent only. */
+		agentId?: string;
+		/** P1#3 (Wave H) — session that produced this Pi event. Lets the gateway
+		 *  filter broadcast to subscribers of THIS session only. */
+		sessionId?: string;
 	};
 	state: SessionStateSnapshot;
 	error: { message: string };
-	log: { level: "info" | "warn" | "error"; message: string; at: number };
+	log: {
+		level: "info" | "warn" | "error";
+		message: string;
+		at: number;
+		/** P1#3 (Wave H) — agent that produced this log entry, when known. */
+		agentId?: string;
+		/** P1#3 (Wave H) — session that produced this log entry, when known. */
+		sessionId?: string;
+	};
 	"system-event": {
 		/** Text the TUI renders as a Brigade-side chat line. */
 		text: string;
@@ -206,6 +285,10 @@ export interface EventPayload {
 		jobId?: string;
 		/** Optional human-readable name of the cron job that fired. */
 		jobName?: string;
+		/** P1#3 (Wave H) — agent the system event targets, when known. */
+		agentId?: string;
+		/** P1#3 (Wave H) — session the system event targets, when known. */
+		sessionId?: string;
 	};
 	"approval-request": {
 		/** Opaque server-side id; echo back in `approval-resolve`. */
@@ -226,6 +309,12 @@ export interface EventPayload {
 		subagentLabel?: string;
 		subagentDepth?: number;
 		parentRunId?: string;
+		/** P1#3 (Wave H) — agent whose turn requested this approval. Used to
+		 *  route the prompt to the right operator when more than one agent is
+		 *  live; absent for legacy single-agent installs. */
+		agentId?: string;
+		/** P1#3 (Wave H) — session the approval belongs to. */
+		sessionId?: string;
 	};
 }
 

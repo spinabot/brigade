@@ -171,7 +171,7 @@ describe("brigade exec allow-pattern", () => {
 	it("warns when pattern is unanchored (no '^' prefix) — but still approves", async () => {
 		const code = await execCmd.runExecAllowPattern("git status");
 		assert.equal(code, 0);
-		assert.match(out(), /allowed \(pattern\)/);
+		assert.match(out(), /allowed \(pattern,/);
 		// The dim note about anchoring should appear on stdout.
 		assert.match(out(), /does not start with `\^`/);
 	});

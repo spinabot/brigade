@@ -1,10 +1,13 @@
 /**
  * `brigade exec <list|allow|allow-pattern|remove|deny-test|file>` — CRUD over
- * the exec-approvals allowlist that gates `bash` tool calls. The allowlist
- * file lives at `~/.brigade/exec-approvals.json` and is consulted at every
- * tool-call boundary by `src/agents/exec-gate.ts`.
+ * a per-agent exec-approvals allowlist that gates `bash` tool calls. The
+ * allowlist file lives at `<agentDir>/exec-approvals.json` and is consulted
+ * at every tool-call boundary by `src/agents/exec-gate.ts`.
  *
- * v1 shape (single-user, file-backed):
+ * Pass `--agent <id>` to target a non-default agent's allowlist; without the
+ * flag the canonical default agent ("main") is used.
+ *
+ * v1 shape (per-agent, file-backed):
  *   - exact-command approvals: the literal command string must match (after
  *     trim) for the gate to allow.
  *   - pattern approvals: operator-supplied regex; gate skips malformed
@@ -12,12 +15,6 @@
  *   - hard-deny patterns (rm -rf /, dd to raw disk, fork bomb, etc.) are
  *     coded into `exec-approvals.ts` and CANNOT be allowlisted. Operators
  *     can verify a command's classification via `brigade exec deny-test`.
- *
- * No interactive prompt UI in v1. Channels + async approval flows ship
- * in Phase 2 alongside multi-user mode.
- *
- * Mirrors the shape of `src/cli/commands/config-cmd.ts` — same exit-code
- * contract, same `--json` flag, same chalk-tinted human output.
  */
 
 import chalk from "chalk";
@@ -29,31 +26,49 @@ import {
 	recordApproval,
 	removeApproval,
 } from "../../core/exec-approvals.js";
+import { DEFAULT_AGENT_ID } from "../../config/paths.js";
 import * as fs from "node:fs";
 
 export interface ExecListOptions {
 	json?: boolean;
+	/** Agent id whose allowlist to inspect — defaults to the canonical agent. */
+	agentId?: string;
 }
 export interface ExecAllowOptions {
 	json?: boolean;
+	/** Agent id whose allowlist to mutate — defaults to the canonical agent. */
+	agentId?: string;
 }
 export interface ExecAllowPatternOptions {
 	json?: boolean;
+	/** Agent id whose allowlist to mutate — defaults to the canonical agent. */
+	agentId?: string;
 }
 export interface ExecRemoveOptions {
 	json?: boolean;
+	/** Agent id whose allowlist to mutate — defaults to the canonical agent. */
+	agentId?: string;
 }
 export interface ExecDenyTestOptions {
 	json?: boolean;
+	/** Agent id whose allowlist to consult — defaults to the canonical agent. */
+	agentId?: string;
 }
 export interface ExecFileOptions {
 	json?: boolean;
+	/** Agent id whose allowlist path to print — defaults to the canonical agent. */
+	agentId?: string;
 }
 
 interface ApprovalsFileShape {
 	version: number;
 	commands: string[];
 	patterns: string[];
+}
+
+function resolveAgentId(agentId: string | undefined): string {
+	const trimmed = (agentId ?? "").trim();
+	return trimmed.length > 0 ? trimmed : DEFAULT_AGENT_ID;
 }
 
 /**
@@ -63,8 +78,8 @@ interface ApprovalsFileShape {
  * diagnose a future-version file or a corrupted entry. Returns null if
  * the file can't be read or parsed at all.
  */
-function readApprovalsRaw(): ApprovalsFileShape | null {
-	const filePath = getApprovalsFilePath();
+function readApprovalsRaw(agentId: string): ApprovalsFileShape | null {
+	const filePath = getApprovalsFilePath(agentId);
 	try {
 		const raw = fs.readFileSync(filePath, "utf8");
 		if (raw.trim().length === 0) return { version: 1, commands: [], patterns: [] };
@@ -86,16 +101,17 @@ function readApprovalsRaw(): ApprovalsFileShape | null {
 /* ───────────────────────── list ───────────────────────── */
 
 export async function runExecList(opts: ExecListOptions = {}): Promise<number> {
-	const approvals = readApprovalsRaw() ?? { version: 1, commands: [], patterns: [] };
+	const agentId = resolveAgentId(opts.agentId);
+	const approvals = readApprovalsRaw(agentId) ?? { version: 1, commands: [], patterns: [] };
 	if (opts.json) {
-		process.stdout.write(`${JSON.stringify(approvals, null, 2)}\n`);
+		process.stdout.write(`${JSON.stringify({ agentId, ...approvals }, null, 2)}\n`);
 		return 0;
 	}
-	process.stdout.write(`${chalk.bold("exec-approvals")} (${getApprovalsFilePath()})\n`);
+	process.stdout.write(
+		`${chalk.bold("exec-approvals")} ${chalk.dim(`(agent: ${agentId})`)} (${getApprovalsFilePath(agentId)})\n`,
+	);
 	// Surface a future-version file inline — operator sees the data they have
-	// AND the warning that the gate refuses to operate on it. Without this
-	// the operator would only learn about the version mismatch on the next
-	// `brigade exec allow` or agent turn.
+	// AND the warning that the gate refuses to operate on it.
 	if (approvals.version !== 1) {
 		process.stdout.write(
 			`${chalk.yellow("⚠ schema version:")} file declares v${approvals.version}; this Brigade build only understands v1.\n`,
@@ -104,7 +120,7 @@ export async function runExecList(opts: ExecListOptions = {}): Promise<number> {
 			`${chalk.dim("  the gate REFUSES to operate on a future-version file. Move it aside and re-approve:")}\n`,
 		);
 		process.stdout.write(
-			`${chalk.dim(`  mv "${getApprovalsFilePath()}" "${getApprovalsFilePath()}.from-v${approvals.version}.bak"`)}\n`,
+			`${chalk.dim(`  mv "${getApprovalsFilePath(agentId)}" "${getApprovalsFilePath(agentId)}.from-v${approvals.version}.bak"`)}\n`,
 		);
 	}
 	if (approvals.commands.length === 0 && approvals.patterns.length === 0) {
@@ -133,17 +149,14 @@ export async function runExecList(opts: ExecListOptions = {}): Promise<number> {
 /* ───────────────────────── allow ───────────────────────── */
 
 export async function runExecAllow(rawCommand: string, opts: ExecAllowOptions = {}): Promise<number> {
+	const agentId = resolveAgentId(opts.agentId);
 	const cmd = rawCommand.trim();
 	if (!cmd) {
 		writeError(opts.json, "brigade exec: command is empty", { code: "empty" });
 		return 1;
 	}
-	// Surface hard-deny patterns BEFORE writing, so the operator gets an
-	// immediate rejection instead of silently writing a command that the
-	// gate will refuse anyway. `recordApproval` ALSO refuses to persist
-	// hard-denied commands (defence in depth) — the catch below covers
-	// the symlink-guard refusal too, since both share BrigadeApprovalRefusedError.
-	if (decideApproval(cmd) === "deny") {
+	// Surface hard-deny patterns BEFORE writing.
+	if (decideApproval(cmd, agentId) === "deny") {
 		writeError(opts.json, `brigade exec: "${cmd}" matches a hard-deny pattern and cannot be allowlisted`, {
 			code: "hard-denied",
 			command: cmd,
@@ -154,7 +167,7 @@ export async function runExecAllow(rawCommand: string, opts: ExecAllowOptions = 
 		return 1;
 	}
 	try {
-		recordApproval(cmd, "exact");
+		recordApproval(cmd, "exact", agentId);
 	} catch (err) {
 		if (err instanceof BrigadeApprovalRefusedError) {
 			writeError(opts.json, `brigade exec: ${err.message}`, { code: "refused", command: cmd });
@@ -163,9 +176,9 @@ export async function runExecAllow(rawCommand: string, opts: ExecAllowOptions = 
 		throw err;
 	}
 	if (opts.json) {
-		process.stdout.write(`${JSON.stringify({ ok: true, kind: "exact", command: cmd }, null, 2)}\n`);
+		process.stdout.write(`${JSON.stringify({ ok: true, kind: "exact", command: cmd, agentId }, null, 2)}\n`);
 	} else {
-		process.stdout.write(`${chalk.green("allowed")} (exact): ${cmd}\n`);
+		process.stdout.write(`${chalk.green("allowed")} (exact, agent ${agentId}): ${cmd}\n`);
 	}
 	return 0;
 }
@@ -176,13 +189,12 @@ export async function runExecAllowPattern(
 	rawPattern: string,
 	opts: ExecAllowPatternOptions = {},
 ): Promise<number> {
+	const agentId = resolveAgentId(opts.agentId);
 	const pat = rawPattern.trim();
 	if (!pat) {
 		writeError(opts.json, "brigade exec: pattern is empty", { code: "empty" });
 		return 1;
 	}
-	// Reject malformed regexes up front. The gate skips bad patterns at
-	// runtime but warn-on-write is better UX than silent-no-op.
 	try {
 		// eslint-disable-next-line no-new
 		new RegExp(pat);
@@ -194,7 +206,7 @@ export async function runExecAllowPattern(
 		return 1;
 	}
 	try {
-		recordApproval(pat, "pattern");
+		recordApproval(pat, "pattern", agentId);
 	} catch (err) {
 		if (err instanceof BrigadeApprovalRefusedError) {
 			writeError(opts.json, `brigade exec: ${err.message}`, { code: "refused", pattern: pat });
@@ -203,13 +215,9 @@ export async function runExecAllowPattern(
 		throw err;
 	}
 	if (opts.json) {
-		process.stdout.write(`${JSON.stringify({ ok: true, kind: "pattern", pattern: pat }, null, 2)}\n`);
+		process.stdout.write(`${JSON.stringify({ ok: true, kind: "pattern", pattern: pat, agentId }, null, 2)}\n`);
 	} else {
-		process.stdout.write(`${chalk.green("allowed")} (pattern): /${pat}/\n`);
-		// Anchoring warning. A pattern like `git status` matches `evil-cmd && git status`
-		// because the operator's regex isn't anchored. We don't refuse (some
-		// operators DO want unanchored substring matches) but a one-line
-		// nudge prevents the common footgun.
+		process.stdout.write(`${chalk.green("allowed")} (pattern, agent ${agentId}): /${pat}/\n`);
 		if (!pat.startsWith("^")) {
 			process.stdout.write(
 				`${chalk.dim("  note: pattern does not start with `^` — it matches anywhere in the command line.")}\n`,
@@ -225,6 +233,7 @@ export async function runExecAllowPattern(
 /* ───────────────────────── remove ───────────────────────── */
 
 export async function runExecRemove(rawValue: string, opts: ExecRemoveOptions = {}): Promise<number> {
+	const agentId = resolveAgentId(opts.agentId);
 	const value = rawValue.trim();
 	if (!value) {
 		writeError(opts.json, "brigade exec: command/pattern is empty", { code: "empty" });
@@ -232,7 +241,7 @@ export async function runExecRemove(rawValue: string, opts: ExecRemoveOptions = 
 	}
 	let result: { removedCommands: number; removedPatterns: number };
 	try {
-		result = removeApproval(value);
+		result = removeApproval(value, agentId);
 	} catch (err) {
 		if (err instanceof BrigadeApprovalRefusedError) {
 			writeError(opts.json, `brigade exec: ${err.message}`, { code: "refused", value });
@@ -250,13 +259,13 @@ export async function runExecRemove(rawValue: string, opts: ExecRemoveOptions = 
 	}
 	if (opts.json) {
 		process.stdout.write(
-			`${JSON.stringify({ ok: true, removedCommands, removedPatterns }, null, 2)}\n`,
+			`${JSON.stringify({ ok: true, removedCommands, removedPatterns, agentId }, null, 2)}\n`,
 		);
 	} else {
 		const parts: string[] = [];
 		if (removedCommands > 0) parts.push(`${removedCommands} command(s)`);
 		if (removedPatterns > 0) parts.push(`${removedPatterns} pattern(s)`);
-		process.stdout.write(`${chalk.yellow("removed")}: ${parts.join(", ")} matching "${value}"\n`);
+		process.stdout.write(`${chalk.yellow("removed")} (agent ${agentId}): ${parts.join(", ")} matching "${value}"\n`);
 	}
 	return 0;
 }
@@ -264,14 +273,15 @@ export async function runExecRemove(rawValue: string, opts: ExecRemoveOptions = 
 /* ───────────────────────── deny-test ───────────────────────── */
 
 export async function runExecDenyTest(rawCommand: string, opts: ExecDenyTestOptions = {}): Promise<number> {
+	const agentId = resolveAgentId(opts.agentId);
 	const cmd = rawCommand.trim();
 	if (!cmd) {
 		writeError(opts.json, "brigade exec: command is empty", { code: "empty" });
 		return 1;
 	}
-	const decision = decideApproval(cmd);
+	const decision = decideApproval(cmd, agentId);
 	if (opts.json) {
-		process.stdout.write(`${JSON.stringify({ command: cmd, decision }, null, 2)}\n`);
+		process.stdout.write(`${JSON.stringify({ command: cmd, decision, agentId }, null, 2)}\n`);
 		return 0;
 	}
 	const colored =
@@ -280,7 +290,7 @@ export async function runExecDenyTest(rawCommand: string, opts: ExecDenyTestOpti
 			: decision === "deny"
 				? chalk.red("deny")
 				: chalk.yellow("prompt");
-	process.stdout.write(`${cmd} → ${colored}\n`);
+	process.stdout.write(`${cmd} → ${colored} ${chalk.dim(`(agent ${agentId})`)}\n`);
 	if (decision === "prompt") {
 		process.stdout.write(
 			`${chalk.dim("  approve with:  brigade exec allow ")}${JSON.stringify(cmd)}\n`,
@@ -297,9 +307,10 @@ export async function runExecDenyTest(rawCommand: string, opts: ExecDenyTestOpti
 /* ───────────────────────── file ───────────────────────── */
 
 export async function runExecFile(opts: ExecFileOptions = {}): Promise<number> {
-	const filePath = getApprovalsFilePath();
+	const agentId = resolveAgentId(opts.agentId);
+	const filePath = getApprovalsFilePath(agentId);
 	if (opts.json) {
-		process.stdout.write(`${JSON.stringify({ path: filePath }, null, 2)}\n`);
+		process.stdout.write(`${JSON.stringify({ path: filePath, agentId }, null, 2)}\n`);
 	} else {
 		process.stdout.write(`${filePath}\n`);
 	}

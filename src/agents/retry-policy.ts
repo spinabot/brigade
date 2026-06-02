@@ -217,8 +217,10 @@ export interface RunWithRetryArgs<T> {
   // External cancel signal. Aborting it short-circuits the loop.
   signal?: AbortSignal;
   // Observation hook — called once per failure with the classified reason
-  // and the chosen action (retry vs fail).
-  onAttemptFailed?: (info: AttemptFailedInfo) => void;
+  // and the chosen action (retry vs fail). May be async; the orchestrator
+  // awaits it so persistence-side-effects (e.g. profile-cooldown writes)
+  // finish before the next attempt starts.
+  onAttemptFailed?: (info: AttemptFailedInfo) => void | Promise<void>;
 }
 
 export interface AttemptFailedInfo {
@@ -303,7 +305,14 @@ export async function runWithRetry<T>(args: RunWithRetryArgs<T>): Promise<T> {
         error: err,
       };
       attempts.push(info);
-      args.onAttemptFailed?.(info);
+      const observerResult = args.onAttemptFailed?.(info);
+      if (observerResult && typeof (observerResult as Promise<void>).then === "function") {
+        try {
+          await observerResult;
+        } catch {
+          // Observer errors must never abort the retry decision below.
+        }
+      }
 
       if (!willRetry) {
         if (isBrigadeRetryError(err)) throw err;

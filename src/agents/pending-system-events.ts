@@ -29,6 +29,7 @@
  */
 
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 
 const log = createSubsystemLogger("brigade/pending-events");
 
@@ -47,8 +48,12 @@ export interface PendingSystemEvent {
 /** Max events held per session. Older events drop oldest-first on overflow. */
 const MAX_EVENTS_PER_SESSION = 20;
 
-/** Module-level queue map. Keyed by session key. */
-const queues = new Map<string, PendingSystemEvent[]>();
+/** Module-level queue map. Keyed by session key. Pinned via global-singleton. */
+const PENDING_SYSTEM_EVENTS_QUEUES_KEY = Symbol.for("brigade.pendingSystemEvents.queues");
+const queues = resolveGlobalSingleton<Map<string, PendingSystemEvent[]>>(
+	PENDING_SYSTEM_EVENTS_QUEUES_KEY,
+	() => new Map<string, PendingSystemEvent[]>(),
+);
 
 /**
  * Append a pending event to the queue for `sessionKey`. Bounded — once a

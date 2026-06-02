@@ -80,9 +80,25 @@ export class BrigadeExtensionRegistry {
 			cwd: meta.cwd,
 			config: meta.config,
 			moduleConfig: meta.moduleConfig,
-			// agent-level → recorded, replayed into each Pi session
+			// agent-level → recorded, replayed into each Pi session.
+			// Wave K — accept either a bare `AnyBrigadeTool` or a
+			// `BrigadeToolFactory` whose `create(ctx)` runs at session-init
+			// with the per-turn `{ agentId, sessionKey }` so third-party
+			// tools can scope state to the active turn.
 			tool: (tool, opts) => {
-				this.toolRegs.push({ tool, toolset: opts?.toolset, eligible: opts?.eligible });
+				if (tool && typeof (tool as { create?: unknown }).create === "function") {
+					this.toolRegs.push({
+						factory: tool as import("./types.js").BrigadeToolFactory,
+						toolset: opts?.toolset,
+						eligible: opts?.eligible,
+					});
+				} else {
+					this.toolRegs.push({
+						tool: tool as AnyBrigadeTool,
+						toolset: opts?.toolset,
+						eligible: opts?.eligible,
+					});
+				}
 			},
 			hook: (event, handler, opts) => {
 				this.hookRegs.push({ event, handler, priority: opts?.priority });
@@ -315,7 +331,14 @@ export class BrigadeExtensionRegistry {
 				if (t.toolset === "*") return true;
 				return t.toolset === profile;
 			})
-			.map((t) => t.tool);
+			.map((t) => {
+				// Wave K — factory entries materialise with an empty ctx for
+				// diagnostic queries (the per-turn ctx isn't known here). The
+				// real per-turn build runs inside `toPiExtensionFactory` below.
+				if (t.tool) return t.tool;
+				if (t.factory) return t.factory.create({ agentId: "", sessionKey: "" });
+				throw new Error("ToolRegistration has neither tool nor factory");
+			});
 	}
 
 	/** Names of eligible tools — feed into `enabledToolNames` so the unknown-tool guard allows them. */
@@ -367,9 +390,17 @@ export class BrigadeExtensionRegistry {
 	 * Pi. The same value must be threaded into both `toolNames(opts)` (for the
 	 * unknown-tool guard's allowlist) and the factory so the two views agree.
 	 */
-	toPiExtensionFactory(opts: { toolset?: string } = {}): ExtensionFactory {
+	toPiExtensionFactory(
+		opts: { toolset?: string; agentId?: string; sessionKey?: string } = {},
+	): ExtensionFactory {
 		const profile = opts.toolset?.trim();
 		const profileActive = profile !== undefined && profile.length > 0 && profile !== "full";
+		// Wave K — per-turn ctx for `b.tool({ create })` factory entries. Bare
+		// tool entries (legacy path) ignore the ctx and replay verbatim.
+		const factoryCtx: import("./types.js").BrigadeToolFactoryContext = {
+			agentId: opts.agentId ?? "",
+			sessionKey: opts.sessionKey ?? "",
+		};
 		return (pi: ExtensionAPI) => {
 			for (const t of this.toolRegs) {
 				if (t.eligible && !t.eligible()) continue;
@@ -380,7 +411,9 @@ export class BrigadeExtensionRegistry {
 				// `ctx` as a trailing positional arg, which Brigade's 4-arg execute
 				// simply ignores; the required fields (name/label/description/parameters)
 				// all match. Cast bridges the nominal gap without changing authoring.
-				pi.registerTool(t.tool as never);
+				const built = t.tool ?? t.factory?.create(factoryCtx);
+				if (!built) continue;
+				pi.registerTool(built as never);
 			}
 			// Pi has no native hook priority — handlers fire in registration order — so
 			// we replay in Brigade's priority order (higher first).

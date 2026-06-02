@@ -63,8 +63,17 @@ import { runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop
 import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
 import type { GatewayCaller, GatewayMethodHandler, HttpRoute, Service } from "../agents/extensions/index.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
+import { extractFrameTags, shouldDeliverFrame } from "./ws-subscription-filter.js";
 import { setActiveChannelManager } from "../agents/channels/active-manager.js";
 import { type ChannelManager, startChannels } from "../agents/channels/manager.js";
+import {
+	createChannelPluginManager,
+	type ChannelPluginManager,
+} from "../agents/channels/channel-plugin-manager.js";
+import { listWhatsAppAccountIds, whatsappChannelEnabled } from "../agents/channels/whatsapp/account-config.js";
+import { createWhatsAppPlugin, type WhatsAppPluginHandle } from "../agents/channels/whatsapp/plugin.js";
+import { createPluginChannelManagerFacade } from "../agents/channels/plugin-channel-manager-facade.js";
+import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { switchModelMidTurn as piSwitchModelMidTurn } from "../agents/mid-turn-switch.js";
@@ -79,7 +88,17 @@ import { createCronServiceState } from "../cron/service/state.js";
 import { start as cronStart, stop as cronStop } from "../cron/service/ops.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { DEFAULT_AGENT_ID, resolveAgentDir, resolveAgentWorkspaceDir } from "../config/paths.js";
-import { runHeartbeatNow } from "../agents/heartbeat.js";
+import { resolveDefaultAgentId } from "../agents/agent-scope.js";
+import type { BrigadeConfig } from "../config/types.js";
+import {
+	abortAllSessions,
+	countActiveLiveSessions,
+	countActiveLiveSessionsForAgent,
+	hasLiveSession,
+	registerLiveSession,
+	unregisterLiveSession,
+} from "../agents/session-registry.js";
+import crypto from "node:crypto";
 import { enqueuePendingSystemEvent } from "../agents/pending-system-events.js";
 // Multi-routing wiring (Step 1-27 lift): in-process gateway-call dispatcher,
 // per-method handlers (sessions.*, health), agent-events bridge, heartbeat
@@ -89,6 +108,7 @@ import {
 	installInProcessGatewayCaller,
 	registerGatewayHandler,
 } from "./gateway-caller-impl.js";
+import { dispatchAgentRun } from "./agent-dispatcher.js";
 import { handleHealthMethod } from "./server-methods/health.js";
 import {
 	handleSessionsHistory,
@@ -100,7 +120,8 @@ import {
 import { wireAgentEventsBridge } from "../agents/agent-events.js";
 import { requestHeartbeatNow, setHeartbeatsEnabled } from "../agents/heartbeat-wake.js";
 import {
-	setHeartbeatFiredHook,
+	addHeartbeatFiredHook,
+	setHeartbeatBootAgentId,
 	startHeartbeatRunner,
 	type HeartbeatRunnerHandle,
 } from "../agents/heartbeat-runner.js";
@@ -108,7 +129,12 @@ import {
 	createHeartbeatScheduler,
 	type HeartbeatScheduler,
 } from "../agents/heartbeat-scheduler.js";
-import { markGatewayDraining, waitForActiveTasks } from "../process/lanes.js";
+import { markGatewayDraining, resetAllLanes, waitForActiveTasks } from "../process/lanes.js";
+import { applyGatewayLaneConcurrency } from "./server-lanes.js";
+import {
+	detectDmScopeCollapseRisk,
+	formatDmScopeWarning,
+} from "../agents/routing/dm-scope-warning.js";
 import { ensureDir } from "../config/paths.js";
 import {
 	CommandLane,
@@ -118,6 +144,7 @@ import {
 	sessionLane,
 } from "../process/lanes.js";
 import { defaultSessionKey } from "../sessions/session-store.js";
+import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
 import { makeExtractionLlm, runExtractionSweep } from "../agents/memory/extract.js";
 import { runDecayGc } from "../agents/memory/decay.js";
 import {
@@ -274,6 +301,24 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 		bootLog("loading configuration…");
 		const config = await loadConfig();
 
+		// Push lane concurrency budgets from config into the command-queue engine
+		// BEFORE channels / cron / heartbeat boot so the first enqueues already
+		// see the resolved caps. `system.reload` re-applies this below.
+		applyGatewayLaneConcurrency(config);
+
+		// Boot warning when `session.dmScope` is unset AND bindings reference
+		// multiple peers on the same channel — the back-compat default
+		// (`"main"`) silently collapses every DM into one session.
+		try {
+			const dmScopeWarnings = detectDmScopeCollapseRisk(config as never);
+			for (const w of dmScopeWarnings) {
+				const log = createSubsystemLogger("routing");
+				log.warn(formatDmScopeWarning(w));
+			}
+		} catch {
+			/* best-effort warning; never block boot */
+		}
+
 		// Phase 4 — Resolving authentication. Emits the standard
 		// "resolving authentication…" line.
 		bootLog("resolving authentication…");
@@ -324,6 +369,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 			provider,
 			modelId,
 			bootLog,
+			bootConfig: config,
 		});
 	} catch (err) {
 		// Lock acquired but boot failed downstream — release the lock so a
@@ -345,42 +391,142 @@ interface BootContinueArgs {
 	provider: string;
 	modelId: string;
 	bootLog: (message: string) => void;
+	/** Boot-time loaded config used to seed `perAgentRuntime` + resolve the default agent id. */
+	bootConfig: Config;
 }
 
 async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const { opts, port, host, startupStartedAt, lockHandle, modelRegistry, authStorage, bootLog } = args;
 	const modelsFile = `${BRIGADE_DIR}/models.json`;
 
-	// Gateway-held turn parameters. There is NO long-lived Pi session: each
-	// inbound `prompt` builds a fresh session per turn (see the `prompt`
-	// handler). These vars carry the "current selection" between turns and
-	// are mutated by set-model / set-thinking / switch-model-mid-turn. The
-	// next turn reads them when it constructs its session.
-	let provider = args.provider;
-	let modelId = args.modelId;
-	let model = args.model;
-	let thinkingLevel: ThinkingLevel = pickInitialThinkingLevel(model);
+	// Wave L P2#3 — clear stale lane state from any prior in-process boot
+	// (test harness double-boots, dev hot-reload). `markGatewayDraining`
+	// from a previous stop() may still be set on the pinned queue singleton;
+	// without this, the first enqueue here rejects with GatewayDrainingError
+	// and the gateway looks alive but accepts nothing.
+	try {
+		resetAllLanes();
+	} catch {
+		// best-effort — lane reset never blocks boot
+	}
+
+	/**
+	 * Per-agent runtime state. Each entry carries the active `provider`,
+	 * `modelId`, resolved `Model`, and `thinkingLevel` for one agent. Seeded
+	 * on boot from `cfg.agents.defaults` + every named `cfg.agents.<id>`,
+	 * mutated by `set-model` / `set-thinking` / `switch-model-mid-turn`.
+	 *
+	 * Replaces the four closure-scoped singletons (provider/modelId/model/
+	 * thinkingLevel) that used to be shared across every agent — those caused
+	 * a `set-model` for agent A to silently retarget agent B's next turn.
+	 */
+	type AgentRuntime = {
+		provider: string;
+		modelId: string;
+		model: Model<string>;
+		thinkingLevel: ThinkingLevel;
+	};
+	const perAgentRuntime = new Map<string, AgentRuntime>();
 
 	// The agent identity + session key the gateway drives. A single
 	// long-lived sessionKey gives conversation continuity across turns:
 	// every turn resumes the same JSONL transcript (the per-turn mirror —
-	// state lives on disk, not in a held session object).
-	const agentId = DEFAULT_AGENT_ID;
+	// state lives on disk, not in a held session object). The boot default
+	// agent is now config-derived (resolveDefaultAgentId) rather than hard-
+	// coded so operators who pin a non-`main` agent are honoured.
+	const agentId = resolveDefaultAgentId(args.bootConfig as unknown as BrigadeConfig);
 	const sessionKey = defaultSessionKey(agentId);
 
-	// The in-flight Pi session, surfaced via `runResilientTurn`'s
-	// `onSessionReady` for the DURATION of a turn only. Null between turns.
-	// abort / steer / switch-model-mid-turn / compact operate on it; when
-	// no turn is active they no-op (there is nothing to steer).
-	let inFlightSession: AgentSession | null = null;
-	// Per-turn cleanup: detaches the gateway's Pi-event subscription + the
-	// JSONL event logger for the active turn. Set when a turn starts, called
-	// (idempotently) when it settles.
-	let currentTurnCleanup: (() => void) | null = null;
+	/**
+	 * Per-agent memoised AuthStorage. Each non-boot agent has its own
+	 * `~/.brigade/agents/<id>/agent/auth-profiles.json` and may carry
+	 * agent-specific keys; the boot agent re-uses the boot-loaded storage so
+	 * we don't double-read its profile. Used by the boot runtime seed, the
+	 * memory sweep, and the set-model / switch-model-mid-turn validation
+	 * paths — anywhere a non-boot agent's credentials could otherwise be
+	 * silently substituted with the boot agent's keys.
+	 */
+	const authStorageByAgent = new Map<string, AuthStorage>();
+	const getAuthStorageForAgent = (id: string): AuthStorage => {
+		const cached = authStorageByAgent.get(id);
+		if (cached) return cached;
+		const built = id === agentId ? authStorage : (loadBrigadeAuthStorage(id) as AuthStorage);
+		authStorageByAgent.set(id, built);
+		return built;
+	};
+
+	// Seed perAgentRuntime: defaults entry under the boot agent id, then every
+	// per-agent override (resolving overrides through the registry). Failures
+	// fall back to the boot defaults — a misconfigured agent doesn't kill boot.
+	perAgentRuntime.set(agentId, {
+		provider: args.provider,
+		modelId: args.modelId,
+		model: args.model,
+		thinkingLevel: pickInitialThinkingLevel(args.model),
+	});
+	{
+		const bootAgentsMap = (args.bootConfig.agents as
+			| { [id: string]: { provider?: string; model?: { primary?: string } } | undefined }
+			| undefined) ?? {};
+		for (const [id, entry] of Object.entries(bootAgentsMap)) {
+			if (id === "defaults" || !entry || typeof entry !== "object") continue;
+			const aProvider = typeof entry.provider === "string" ? entry.provider : undefined;
+			const aModelId =
+				typeof entry.model === "object" && entry.model && typeof entry.model.primary === "string"
+					? entry.model.primary
+					: undefined;
+			if (!aProvider || !aModelId) continue;
+			// Validate against the per-agent auth — never use the boot agent's
+			// keys to vouch for another agent's model selection.
+			const aModel =
+				modelRegistry.find(aProvider, aModelId) ??
+				((await resolveModelNeverMiss({
+					modelRegistry,
+					provider: aProvider,
+					modelId: aModelId,
+					modelsFile,
+					authStorage: getAuthStorageForAgent(id),
+				})) as Model<string> | undefined);
+			if (!aModel) continue;
+			perAgentRuntime.set(id, {
+				provider: aProvider,
+				modelId: aModelId,
+				model: aModel,
+				thinkingLevel: pickInitialThinkingLevel(aModel),
+			});
+		}
+	}
+
+	/** Look up runtime entry for an agent id, falling back to the boot default. */
+	const getAgentRuntime = (id: string | undefined): AgentRuntime => {
+		const target = id && perAgentRuntime.has(id) ? id : agentId;
+		const entry = perAgentRuntime.get(target);
+		if (entry) return entry;
+		// Hard fallback: if even the boot default vanished from the map (it
+		// shouldn't), fabricate one from args so callers never crash.
+		const fab: AgentRuntime = {
+			provider: args.provider,
+			modelId: args.modelId,
+			model: args.model,
+			thinkingLevel: pickInitialThinkingLevel(args.model),
+		};
+		perAgentRuntime.set(agentId, fab);
+		return fab;
+	};
 
 	// Channel manager (WhatsApp/Slack/…): started after the WS listener is up
 	// (see below), torn down in handle.stop(). Null when no channel is configured.
 	let channelManager: ChannelManager | undefined;
+	// Plugin-shaped channel manager (Wave F multi-account WhatsApp ride-along).
+	// Coexists with the legacy `channelManager` above: legacy is the v1
+	// `ChannelAdapter` path (single-account; covers Slack/Telegram/etc. when
+	// they ship), this one is the `ChannelPlugin` path for multi-account
+	// channels (WhatsApp personal+work). Both fan into the same `runGatewayTurn`.
+	let channelPluginManager: ChannelPluginManager | undefined;
+	// Plugins we hand to the plugin manager. Currently bundled-only (WhatsApp);
+	// future channels can register through the seam. Captured here so the
+	// `getChannelPlugin` lookup stays O(n) with a small in-memory list.
+	let bundledChannelPlugins: ChannelPlugin[] = [];
 
 	// Extension registry + the product capabilities it yields (services, HTTP
 	// routes, gateway methods). Populated in Phase 11 after the listener is up.
@@ -417,13 +563,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const memoryExtractEnabled = process.env.BRIGADE_DISABLE_MEMORY_EXTRACT !== "1";
 	const EXTRACT_DEBOUNCE_MS = 45_000;
 	let extractTimer: ReturnType<typeof setTimeout> | null = null;
-	// Keyed by sessionId so turns from DIFFERENT conversations (e.g. a WhatsApp
-	// chat and the TUI) that settle inside the same debounce window each keep
-	// their own pending batch — a single slot would let one overwrite another
-	// and silently drop its turns. Re-setting the same sessionId just refreshes
-	// that conversation's batch with the latest transcript.
-	const pendingExtracts = new Map<string, unknown[]>();
-	let extracting = false;
+	// Per-agent → per-session pending batches. Turns from DIFFERENT agents (and
+	// DIFFERENT conversations within an agent) that settle inside the same
+	// debounce window each keep their own pending batch. A single shared slot
+	// would let one overwrite another and silently drop its turns. Re-setting
+	// the same (agentId, sessionId) just refreshes that conversation's batch
+	// with the latest transcript.
+	const pendingExtracts = new Map<string, Map<string, unknown[]>>();
+	/** Agents currently mid-extraction. Replaces the process-wide `extracting`
+	 * boolean so N agents can sweep concurrently without blocking each other. */
+	const extractingAgents = new Set<string>();
 
 	const armExtractTimer = (): void => {
 		if (serverStopped) return; // never re-arm after shutdown
@@ -434,67 +583,98 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 	const runExtractionNow = async (): Promise<void> => {
 		if (pendingExtracts.size === 0 || serverStopped) return;
-		// Defer while a turn is active OR another sweep is in flight — never
-		// compete with the user-facing call or run two extractions at once.
-		// CRITICAL: re-arm rather than DROP the pending batches (otherwise a sweep
-		// that fires mid-turn would silently lose the turns it was meant to
-		// distill, with nothing to retrigger it until the next prompt).
-		if (isAgentRunning || extracting) {
+		// Defer while ANY turn is active — never compete with the user-facing
+		// call. Per-agent sweeps run concurrently below, but the in-flight
+		// check is global (any agent's live turn defers all sweeps).
+		// CRITICAL: re-arm rather than DROP the pending batches.
+		if (countActiveLiveSessions() > 0) {
 			armExtractTimer();
 			return;
 		}
-		// Drain every pending conversation's batch this window.
-		const batches = [...pendingExtracts.entries()];
+		// Drain every pending agent's per-session batches this window.
+		const agentBatches = [...pendingExtracts.entries()];
 		pendingExtracts.clear();
-		extracting = true;
-		try {
-			const workspaceDir = resolveAgentWorkspaceDir(agentId);
-			const llm = makeExtractionLlm({
-				workspaceDir,
-				agentDir: resolveAgentDir(agentId),
-				authStorage,
-				modelRegistry,
-				model,
-			});
-			for (const [sessionId, messages] of batches) {
-				await runExtractionSweep({ workspaceDir, sessionId, messages, llm });
-			}
-			// Cheap, no-model-call decay GC in the same quiet window — ages out
-			// neglected facts so the structured store self-prunes. Runs once per
-			// drain regardless of how many conversations were swept.
-			runDecayGc(workspaceDir);
-			// Lean semantic consolidation (1 LLM call) — THROTTLED to ~once/30min:
-			// archives contradicted/duplicate facts that lexical write-time dedup
-			// can't see. Off the hot path, rare, batched. Best-effort. The window
-			// is tunable via BRIGADE_CONSOLIDATE_INTERVAL_MS (set 0 to run it on
-			// every sweep — useful for manually verifying consolidation).
-			const envInterval = Number(process.env.BRIGADE_CONSOLIDATE_INTERVAL_MS);
-			const consolidateInterval =
-				Number.isFinite(envInterval) && envInterval >= 0 ? envInterval : undefined;
-			if (shouldRunConsolidation(workspaceDir, consolidateInterval)) {
-				const consolidateLlm = makeConsolidationLlm({
-					workspaceDir,
-					agentDir: resolveAgentDir(agentId),
-					authStorage,
-					modelRegistry,
-					model,
-				});
-				await runConsolidation({ workspaceDir, llm: consolidateLlm });
-				markConsolidationRun(workspaceDir);
-			}
-		} catch (err) {
-			// Best-effort — extraction never affects the user-facing turn.
-			opts.consoleStream?.info?.(
-				`memory extraction error: ${err instanceof Error ? err.message : String(err)}`,
-			);
-		} finally {
-			extracting = false;
-		}
+		// Run agents concurrently; within an agent, sweeps are sequential so
+		// the cursor advance order stays deterministic per session.
+		await Promise.all(
+			agentBatches.map(async ([targetAgentId, sessions]) => {
+				// Re-queue agents that are already sweeping (and skip — they'll be
+				// picked up on the next armed timer). Set membership is per-agent so
+				// a slow sweep in one agent doesn't block another.
+				if (extractingAgents.has(targetAgentId)) {
+					for (const [sid, msgs] of sessions) {
+						const existing = pendingExtracts.get(targetAgentId);
+						if (existing) existing.set(sid, msgs);
+						else pendingExtracts.set(targetAgentId, new Map([[sid, msgs]]));
+					}
+					armExtractTimer();
+					return;
+				}
+				extractingAgents.add(targetAgentId);
+				try {
+					const workspaceDir = resolveAgentWorkspaceDir(targetAgentId);
+					const agentDir = resolveAgentDir(targetAgentId);
+					const agentAuth = getAuthStorageForAgent(targetAgentId);
+					const agentModel = getAgentRuntime(targetAgentId).model;
+					const llm = makeExtractionLlm({
+						workspaceDir,
+						agentDir,
+						authStorage: agentAuth,
+						modelRegistry,
+						model: agentModel,
+					});
+					for (const [sessionId, messages] of sessions) {
+						await runExtractionSweep({ workspaceDir, sessionId, messages, llm });
+					}
+					// Cheap, no-model-call decay GC in the same quiet window for THIS
+					// agent's workspace. Runs once per drain per agent.
+					runDecayGc(workspaceDir);
+					// Lean semantic consolidation (1 LLM call) per agent — THROTTLED
+					// per-workspace via shouldRunConsolidation's mtime gate, so each
+					// agent's workspace tracks its own consolidation cadence.
+					const envInterval = Number(process.env.BRIGADE_CONSOLIDATE_INTERVAL_MS);
+					const consolidateInterval =
+						Number.isFinite(envInterval) && envInterval >= 0 ? envInterval : undefined;
+					if (shouldRunConsolidation(workspaceDir, consolidateInterval)) {
+						const consolidateLlm = makeConsolidationLlm({
+							workspaceDir,
+							agentDir,
+							authStorage: agentAuth,
+							modelRegistry,
+							model: agentModel,
+						});
+						await runConsolidation({ workspaceDir, llm: consolidateLlm });
+						markConsolidationRun(workspaceDir);
+					}
+				} catch (err) {
+					// Best-effort — extraction never affects the user-facing turn.
+					opts.consoleStream?.info?.(
+						`memory extraction error (agent=${targetAgentId}): ${
+							err instanceof Error ? err.message : String(err)
+						}`,
+					);
+				} finally {
+					extractingAgents.delete(targetAgentId);
+				}
+			}),
+		);
 	};
 
-	const scheduleExtraction = (result: { sessionId: string; messages: unknown[] }): void => {
+	/** Schedule an off-hot-path extraction sweep for the agent that owns `sessionId`. */
+	const scheduleExtraction = (result: {
+		/** Routed agent id — defaults to the boot agent for single-agent callers. */
+		agentId?: string;
+		sessionId: string;
+		messages: unknown[];
+	}): void => {
 		if (!memoryExtractEnabled || serverStopped) return;
-		pendingExtracts.set(result.sessionId, result.messages);
+		const targetAgentId = result.agentId ?? agentId;
+		let perAgent = pendingExtracts.get(targetAgentId);
+		if (!perAgent) {
+			perAgent = new Map<string, unknown[]>();
+			pendingExtracts.set(targetAgentId, perAgent);
+		}
+		perAgent.set(result.sessionId, result.messages);
 		armExtractTimer();
 	};
 
@@ -503,7 +683,6 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	let totalIn = 0;
 	let totalOut = 0;
 	let totalCost = 0;
-	let isAgentRunning = false;
 
 	// Snapshot fields that can only be read from a LIVE Pi session
 	// (context usage %, message count, thinking capabilities). With no
@@ -511,8 +690,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// model at boot, refreshed from the in-flight session during each turn.
 	let lastContextUsagePercent: number | null = null;
 	let lastMessageCount = 0;
-	let cachedSupportsThinking = !!model.reasoning;
-	let cachedThinkingLevels: string[] = deriveThinkingLevels(model);
+	let cachedSupportsThinking = !!args.model.reasoning;
+	let cachedThinkingLevels: string[] = deriveThinkingLevels(args.model);
 
 	// Refresh the session-derived caches from a live Pi session. Called on
 	// every forwarded event during a turn so the snapshot tracks the live
@@ -572,9 +751,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 *
 	 * Sync I/O for the same reason as computeFirstRunBootstrap above:
 	 * snapshot is built per state broadcast, IDENTITY.md is tiny + local.
+	 *
+	 * Wave K — accepts an optional `targetAgentId`. When omitted, falls back
+	 * to the boot agent's workspace (legacy behaviour). When supplied, reads
+	 * THAT agent's IDENTITY.md so a per-binding snapshot shows the right
+	 * persona name.
 	 */
-	const computeAgentName = (): string | undefined => {
-		const wsDir = getBrigadeWorkspaceDir();
+	const computeAgentName = (targetAgentId?: string): string | undefined => {
+		const wsDir = targetAgentId && targetAgentId !== agentId
+			? resolveAgentWorkspaceDir(targetAgentId)
+			: getBrigadeWorkspaceDir();
 		try {
 			const identityText = readFileSync(joinPath(wsDir, "IDENTITY.md"), "utf8");
 			return extractIdentityName(identityText);
@@ -583,30 +769,54 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		}
 	};
 
-	const buildSnapshot = (): SessionStateSnapshot => {
+	const buildSnapshot = (snapshotAgentId?: string): SessionStateSnapshot => {
+		// Wave K — per-binding snapshot. When the caller supplies a
+		// `snapshotAgentId`, the snapshot reflects THAT agent's runtime entry
+		// + workspace-derived persona name + per-agent live-session count, so
+		// a TUI bound to a non-boot agent sees its own header rather than the
+		// boot agent's stale state. When omitted, falls back to the boot
+		// agent's view (legacy behaviour, default broadcast target).
+		const targetAgentId = snapshotAgentId?.trim() || agentId;
+		const isBoot = targetAgentId === agentId;
+		const rt = getAgentRuntime(targetAgentId);
+		// Thinking caps are only cached for the boot agent (cached at
+		// session-init + refreshed by boot-agent set-model). Non-boot
+		// snapshots derive on the fly from the agent's selected model — the
+		// derivation is pure + cheap (no I/O).
+		const supportsThinking = isBoot ? cachedSupportsThinking : !!rt.model?.reasoning;
+		const availableThinkingLevels = isBoot
+			? cachedThinkingLevels
+			: rt.model ? deriveThinkingLevels(rt.model) : [];
+		// Per-binding session targeting: the TUI bound to `targetAgentId`
+		// defaults to that agent's canonical session key when nothing else
+		// is bound. Falls back to the gateway's boot `sessionKey` for the
+		// boot agent to keep legacy unchanged.
+		const targetSessionKey = isBoot ? sessionKey : defaultSessionKey(targetAgentId);
 		return {
-			provider,
-			modelId,
-			modelName: model?.name,
-			thinkingLevel,
-			supportsThinking: cachedSupportsThinking,
-			availableThinkingLevels: cachedThinkingLevels,
+			provider: rt.provider,
+			modelId: rt.modelId,
+			modelName: rt.model?.name,
+			thinkingLevel: rt.thinkingLevel,
+			supportsThinking,
+			availableThinkingLevels,
 			contextUsagePercent: lastContextUsagePercent,
 			totalTokensIn: totalIn,
 			totalTokensOut: totalOut,
 			totalCostUsd: totalCost,
-			isAgentRunning,
+			// Wave K — per-agent live-session count. Was process-wide before,
+			// which lit the boot-agent header as "running" while only a
+			// channel-routed turn on agent:ops was busy — leading the operator
+			// to route a fresh prompt through the mid-turn steer path which
+			// throws.
+			isAgentRunning: countActiveLiveSessionsForAgent(targetAgentId) > 0,
 			messageCount: lastMessageCount,
 			firstRunBootstrap: computeFirstRunBootstrap(),
-			agentName: computeAgentName(),
+			agentName: computeAgentName(targetAgentId),
 			// Multi-agent visibility: surface the agent id + session key the
 			// TUI is bound to so the operator sees `agent main · agent:main:main`
-			// next to the model in the header. Multi-agent gateways with
-			// per-binding routing show the gateway's BOOT agentId here; the
-			// per-inbound routed agent (for channels) lives on each turn's
-			// own dispatcher state, not on this gateway-level snapshot.
-			agentId,
-			sessionKey,
+			// next to the model in the header.
+			agentId: targetAgentId,
+			sessionKey: targetSessionKey,
 		};
 	};
 
@@ -632,13 +842,103 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	});
 
 	const clients = new Set<WebSocket>();
+	/**
+	 * P1#3 (Wave H) — per-client subscription filter. Each connected client
+	 * gets a unique `connId`, registered in `clientConnIds`. A client opts
+	 * into one or more agentIds via `subscribeAgent`; when no subscriptions
+	 * are recorded (legacy single-agent TUI) the client receives every
+	 * event (default-deny would break existing clients).
+	 *
+	 * Subscriptions are scoped to the connection — `ws.on("close")` drops
+	 * them. The filter is consulted by `broadcast()` when the payload
+	 * carries an `agentId` and/or `sessionId`. Today only the approval
+	 * router, pi events, and log events thread those fields; future
+	 * subscribers can opt into per-session filtering on top.
+	 */
+	const clientConnIds = new WeakMap<WebSocket, string>();
+	const clientAgentSubs = new Map<string, Set<string>>();
+	const clientSessionSubs = new Map<string, Set<string>>();
 
-	/** Send one event to all connected clients. */
+	const subscribeAgent = (connId: string, agentIdValue: string): void => {
+		let set = clientAgentSubs.get(connId);
+		if (!set) {
+			set = new Set();
+			clientAgentSubs.set(connId, set);
+		}
+		set.add(agentIdValue);
+	};
+	const unsubscribeAgent = (connId: string, agentIdValue: string): void => {
+		clientAgentSubs.get(connId)?.delete(agentIdValue);
+	};
+	const subscribeSession = (connId: string, sessionIdValue: string): void => {
+		let set = clientSessionSubs.get(connId);
+		if (!set) {
+			set = new Set();
+			clientSessionSubs.set(connId, set);
+		}
+		set.add(sessionIdValue);
+	};
+	const unsubscribeSession = (connId: string, sessionIdValue: string): void => {
+		clientSessionSubs.get(connId)?.delete(sessionIdValue);
+	};
+
+	/**
+	 * Filter predicate: should `connId` receive an event tagged with the
+	 * supplied agent/session ids? Delegates to the pure helper in
+	 * `ws-subscription-filter.ts` so the behaviour is exercised by a focused
+	 * unit test without spinning a live WS server.
+	 */
+	const connWantsFrame = (
+		connId: string,
+		frameAgentId: string | undefined,
+		frameSessionId: string | undefined,
+	): boolean =>
+		shouldDeliverFrame(
+			clientAgentSubs.get(connId),
+			clientSessionSubs.get(connId),
+			{ agentId: frameAgentId, sessionId: frameSessionId },
+		);
+
+	/** Send one event to all connected clients (or a filtered subset). */
 	const broadcast = <K extends EventName>(event: K, payload: EventPayload[K]): void => {
 		const frame: Frame = { type: "event", event, payload };
 		const json = JSON.stringify(frame);
+		// Untagged payloads broadcast to everyone (state, error, basic log).
+		// Tagged payloads (pi, log with agent/session, approval-request,
+		// system-event with target) consult the subscription filter so the
+		// approval prompt for agent A doesn't pop on operator B's TUI.
+		const { agentId: frameAgentId, sessionId: frameSessionId } = extractFrameTags(payload);
 		for (const ws of clients) {
-			if (ws.readyState === ws.OPEN) ws.send(json);
+			if (ws.readyState !== ws.OPEN) continue;
+			const connId = clientConnIds.get(ws);
+			// No connId yet (race between socket open + onConnection assign):
+			// best-effort send (matches old behaviour).
+			if (!connId) {
+				ws.send(json);
+				continue;
+			}
+			if (connWantsFrame(connId, frameAgentId, frameSessionId)) ws.send(json);
+		}
+	};
+
+	/**
+	 * Wave K — fan out a state snapshot to every binding. Sends the boot-agent
+	 * snapshot (untagged → reaches legacy un-subscribed clients) PLUS one
+	 * tagged snapshot per distinct non-boot agentId any connected client is
+	 * subscribed to. The per-conn filter delivers each tagged frame only to
+	 * that agent's subscribers — so a TUI bound to `agent:ops` sees `ops`'s
+	 * header while an un-bound TUI keeps seeing the boot header.
+	 */
+	const broadcastStateAllBindings = (): void => {
+		const seen = new Set<string>();
+		for (const subs of clientAgentSubs.values()) {
+			for (const id of subs) {
+				if (id && id !== agentId) seen.add(id);
+			}
+		}
+		broadcast("state", buildSnapshot());
+		for (const id of seen) {
+			broadcast("state", buildSnapshot(id));
 		}
 	};
 
@@ -662,6 +962,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			...(request.subagentLabel !== undefined ? { subagentLabel: request.subagentLabel } : {}),
 			...(request.subagentDepth !== undefined ? { subagentDepth: request.subagentDepth } : {}),
 			...(request.parentRunId !== undefined ? { parentRunId: request.parentRunId } : {}),
+			// P1#3 (Wave H): forward agent/session ids so the per-client
+			// subscription filter can route the prompt to the operator
+			// watching THIS agent's turn — and not surface it to a TUI
+			// connected only to a different agent.
+			...(request.agentId !== undefined ? { agentId: request.agentId } : {}),
+			...(request.sessionId !== undefined ? { sessionId: request.sessionId } : {}),
 		});
 	});
 	setActiveApprovalBridge(approvalBridge);
@@ -709,12 +1015,21 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// `cli/commands/connect.ts`). This is what makes the operator
 				// see "🦁 [cron \"X\"] <reply>" the moment the cron fires
 				// instead of waiting for their next prompt.
+				// Wave I — tag the broadcast with the routed agent + session so
+				// the per-client subscription filter delivers the system-event
+				// only to operators watching THIS agent. Falls back to the
+				// gateway's boot defaults for legacy un-tagged cron jobs.
+				const cronTargetAgentId = args.agentId ?? agentId;
+				const cronTargetSessionKey =
+					args.sessionKey ?? defaultSessionKey(cronTargetAgentId);
 				broadcast("system-event", {
 					text: args.text,
 					at,
 					source: "cron",
 					...(args.jobId !== undefined ? { jobId: args.jobId } : {}),
 					...(args.jobName !== undefined ? { jobName: args.jobName } : {}),
+					agentId: cronTargetAgentId,
+					sessionId: cronTargetSessionKey,
 				});
 				// TRACK 2 — model awareness. ALSO queue the text per-session so
 				// the NEXT agent turn for that session picks it up via
@@ -768,18 +1083,25 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// agentId), route the heartbeat to THAT agent's session.
 				// Falls back to the gateway's boot-default for un-tagged jobs
 				// (legacy single-agent installs).
+				//
+				// Routes through the wake layer (`requestHeartbeatNow` from
+				// `heartbeat-wake.ts`) so the cron-fire path uses the SAME
+				// three-tier gate (enabled flag → per-session lane → live
+				// session) as the scheduler-driven interval wakes. The
+				// firedHook installed below turns the consumed events into a
+				// `runGatewayTurn` dispatch — single canonical synthetic-turn
+				// path instead of two parallel runners.
 				const targetAgentId = opts?.agentId?.trim() || agentId;
 				const targetSessionKey = opts?.sessionKey?.trim() || defaultSessionKey(targetAgentId);
-				void runHeartbeatNow({
-					agentId: targetAgentId,
-					sessionKey: targetSessionKey,
-					provider,
-					modelId,
-					thinkingLevel: thinkingLevel as "off" | "low" | "medium" | "high",
-					...(opts?.reason !== undefined ? { reason: opts.reason } : {}),
-				}).catch(() => {
-					/* runHeartbeatNow logs its own failures */
-				});
+				try {
+					requestHeartbeatNow({
+						reason: opts?.reason ?? "cron-wake",
+						agentId: targetAgentId,
+						sessionKey: targetSessionKey,
+					});
+				} catch {
+					/* best-effort wake; the runner logs its own failures */
+				}
 			},
 			deliverCronAnnounce: async (args) => {
 				if (!channelManager || !args.channel || !args.to) return false;
@@ -818,19 +1140,36 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 							.filter(Boolean)
 							.join("\n");
 						const at = Date.now();
+						// Wave I — tag with the cron job's agent + session so the
+						// per-client subscription filter delivers the failure only
+						// to the operator watching this agent. Falls back to the
+						// gateway's boot default for legacy un-tagged jobs.
+						const failureAgentId = args.job.agentId ?? agentId;
+						const failureSessionKey =
+							args.job.sessionKey ?? defaultSessionKey(failureAgentId);
 						broadcast("system-event", {
 							text: failureText,
 							at,
 							source: "cron",
 							jobId: args.job.id,
 							jobName: args.job.name,
+							agentId: failureAgentId,
+							sessionId: failureSessionKey,
 						});
-						enqueuePendingSystemEvent(defaultSessionKey(agentId), {
-							text: failureText,
-							queuedAtMs: at,
-							jobId: args.job.id,
-							jobName: args.job.name,
-						});
+						// Route to the agent that scheduled the cron job (multi-
+						// agent). Falls back to the boot agent for legacy jobs
+						// missing `agentId`. Mirrors the enqueueSystemEvent
+						// resolution above — `job.sessionKey` (explicit override)
+						// wins over `agentId → defaultSessionKey()`.
+						enqueuePendingSystemEvent(
+							args.job.sessionKey ?? defaultSessionKey(args.job.agentId ?? agentId),
+							{
+								text: failureText,
+								queuedAtMs: at,
+								jobId: args.job.id,
+								jobName: args.job.name,
+							},
+						);
 						return false;
 					}
 				}
@@ -853,19 +1192,31 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					// instead of wondering why their reminder never arrived.
 					const failureText = `🦁 Cron "${args.job.name}" couldn't deliver via ${args.channel}: ${errMsg}`;
 					const at = Date.now();
+					// Wave I — tag with the cron job's agent + session so the
+					// per-client subscription filter delivers the send-failure
+					// only to the operator watching this agent.
+					const sendFailureAgentId = args.job.agentId ?? agentId;
+					const sendFailureSessionKey =
+						args.job.sessionKey ?? defaultSessionKey(sendFailureAgentId);
 					broadcast("system-event", {
 						text: failureText,
 						at,
 						source: "cron",
 						jobId: args.job.id,
 						jobName: args.job.name,
+						agentId: sendFailureAgentId,
+						sessionId: sendFailureSessionKey,
 					});
-					enqueuePendingSystemEvent(defaultSessionKey(agentId), {
-						text: failureText,
-						queuedAtMs: at,
-						jobId: args.job.id,
-						jobName: args.job.name,
-					});
+					// Same multi-agent routing as the health-check branch above.
+					enqueuePendingSystemEvent(
+						args.job.sessionKey ?? defaultSessionKey(args.job.agentId ?? agentId),
+						{
+							text: failureText,
+							queuedAtMs: at,
+							jobId: args.job.id,
+							jobName: args.job.name,
+						},
+					);
 					return false;
 				}
 			},
@@ -883,6 +1234,19 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 	/* ──────────────── per-turn pi event forwarding ──────────────── */
 
+	/**
+	 * Map from sessionKey → currently-running Pi session. Each entry's
+	 * presence here is what abort / steer / compact / set-thinking-live /
+	 * switch-model-mid-turn look up (keyed by RPC sessionKey). Replaces the
+	 * old `inFlightSession` module-level singleton, which clobbered when two
+	 * concurrent peer turns overlapped.
+	 *
+	 * Wire owner: `attachTurnSession` adds an entry as the session is built;
+	 * the cleanup returned by `attachTurnSession` removes it. Two distinct
+	 * peer turns therefore each carry their own entry under their own key.
+	 */
+	const liveSessionsByKey = new Map<string, AgentSession>();
+
 	// Wire a fresh per-turn Pi session into the gateway's broadcast +
 	// logging plumbing. Called from the `prompt` handler's `onSessionReady`
 	// the moment `runResilientTurn` finishes constructing the session (after
@@ -890,17 +1254,26 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// cleanup that detaches both the Pi subscription and the JSONL logger;
 	// the prompt handler calls it when the turn settles so nothing leaks
 	// across turns (the per-turn mirror — no subscription outlives its turn).
-	const attachTurnSession = (session: AgentSession): (() => void) => {
-		inFlightSession = session;
+	//
+	// Wave I — `agentIdForTurn` is captured into the per-event broadcast
+	// payload so the per-client subscription filter (`connWantsFrame`) routes
+	// Pi events to the operator watching THIS agent only. Falls back to the
+	// gateway's boot-default agent id when omitted (legacy single-agent path).
+	const attachTurnSession = (
+		session: AgentSession,
+		sessionKeyForTurn: string,
+		agentIdForTurn: string,
+	): (() => void) => {
+		liveSessionsByKey.set(sessionKeyForTurn, session);
 		// Stream this turn's Pi events to the JSONL log file. Logger silently
 		// degrades on I/O errors so log loss never crashes the server.
 		const detachLogger = attachEventLogger(session);
 		const detachPi = session.subscribe((piEvent: AgentSessionEvent) => {
-			// NOTE: `isAgentRunning` is owned by the `prompt` handler's
-			// try/finally — NOT by Pi's per-run agent_start/agent_end. A single
-			// logical turn fires multiple `session.prompt()` runs (content-quality
-			// retry, thinking-fallback, max_tokens continuations), each emitting
-			// its own agent_start/agent_end. Toggling the flag here would flap it
+			// NOTE: per-turn liveness is tracked in the session-registry, NOT
+			// by Pi's per-run agent_start/agent_end. A single logical turn fires
+			// multiple `session.prompt()` runs (content-quality retry, thinking-
+			// fallback, max_tokens continuations), each emitting its own
+			// agent_start/agent_end. Toggling registry state here would flap it
 			// false mid-turn, flicker the connect header, and re-open the
 			// single-turn concurrency guard. We only forward the events.
 			if (piEvent.type === "turn_end") {
@@ -917,8 +1290,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// Live console stream (verbose mode). Mirrors the JSONL file but
 			// human-readable. Same event sequence in both places.
 			opts.consoleStream?.pi(piEvent);
-			broadcast("pi", { event: piEvent });
-			broadcast("state", buildSnapshot());
+			// Wave I — tag every broadcast frame with the routed agentId +
+			// sessionId so `connWantsFrame` routes pi events to the operator
+			// watching THIS agent's turn only. Untagged frames fall through
+			// to the back-compat "broadcast to everyone" branch.
+			broadcast("pi", {
+				event: piEvent,
+				agentId: agentIdForTurn,
+				sessionId: sessionKeyForTurn,
+			});
+			broadcastStateAllBindings();
 		});
 		let cleaned = false;
 		return () => {
@@ -937,7 +1318,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// Final cache refresh so the idle snapshot reflects the settled
 			// turn, then drop the session reference (no session between turns).
 			refreshCachesFromSession(session);
-			if (inFlightSession === session) inFlightSession = null;
+			if (liveSessionsByKey.get(sessionKeyForTurn) === session) {
+				liveSessionsByKey.delete(sessionKeyForTurn);
+			}
 		};
 	};
 
@@ -954,12 +1337,35 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const detachSubagentPiBus = onAgentEvent((event) => {
 		if (event.type !== "pi") return;
 		if (!event.subagentDepth || event.subagentDepth <= 0) return;
-		broadcast("pi", { event: event.piEvent, subagentDepth: event.subagentDepth });
+		// Wave I — forward the parent's agentId + sessionId from the bus
+		// event so child pi frames carry the same routing tags as the
+		// top-level pi frames; the operator's subscription filter applies
+		// identically to top-level and sub-agent events.
+		broadcast("pi", {
+			event: event.piEvent,
+			subagentDepth: event.subagentDepth,
+			agentId: event.agentId,
+			sessionId: event.sessionId,
+		});
 	});
 
 	// Lifecycle bus subscriber (Phase 5b): translate `runBrigadeTurnLoop`
 	// events into broadcast("log", ...) frames so connect-mode TUI clients
 	// see the same status messages the inline composition used to emit.
+	//
+	// Wave I — each loop-lifecycle bus event carries the agent + session it
+	// fired against (added in agent-event-bus.ts variants + agent-loop emit
+	// sites). Forward those onto the `log` payload so `connWantsFrame` routes
+	// the status line to the operator watching THIS agent/session only.
+	const tagsFor = (event: {
+		agentId?: string;
+		sessionKey?: string;
+	}): { agentId?: string; sessionId?: string } => {
+		const out: { agentId?: string; sessionId?: string } = {};
+		if (event.agentId !== undefined) out.agentId = event.agentId;
+		if (event.sessionKey !== undefined) out.sessionId = event.sessionKey;
+		return out;
+	};
 	const detachLifecycleBus = onAgentEvent((event) => {
 		switch (event.type) {
 			case "turn-heartbeat":
@@ -967,6 +1373,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					level: "info",
 					message: `still working… ${Math.round(event.elapsedMs / 1000)}s elapsed`,
 					at: Date.now(),
+					...tagsFor(event),
 				});
 				break;
 			case "turn-stream-timeout":
@@ -974,6 +1381,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					level: "warn",
 					message: `no response for ${Math.round(event.idleMs / 1000)}s — aborting`,
 					at: Date.now(),
+					...tagsFor(event),
 				});
 				break;
 			case "turn-length-continue":
@@ -981,6 +1389,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					level: "info",
 					message: "reply was truncated — asking the model to continue",
 					at: Date.now(),
+					...tagsFor(event),
 				});
 				break;
 			case "turn-content-retry":
@@ -988,6 +1397,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					level: "info",
 					message: `${event.reason} — re-prompting for a usable answer`,
 					at: Date.now(),
+					...tagsFor(event),
 				});
 				break;
 			case "turn-thinking-downgrade":
@@ -995,6 +1405,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					level: "info",
 					message: `model doesn't support thinking — switching from ${event.from} to off and retrying`,
 					at: Date.now(),
+					...tagsFor(event),
 				});
 				break;
 			case "turn-fallback-attempt":
@@ -1002,6 +1413,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					level: "warn",
 					message: `primary failed (${event.reason}) — trying ${event.toModelId ?? "fallback"}`,
 					at: Date.now(),
+					...tagsFor(event),
 				});
 				break;
 			case "turn-fallback-exhausted":
@@ -1009,6 +1421,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					level: "error",
 					message: `all fallback models failed: ${event.reason}`,
 					at: Date.now(),
+					...tagsFor(event),
 				});
 				break;
 			case "turn-retry-attempt":
@@ -1016,6 +1429,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					level: event.errorClass === "context_overflow" ? "info" : "warn",
 					message: event.reason,
 					at: Date.now(),
+					...tagsFor(event),
 				});
 				break;
 			case "turn-compact-before-retry":
@@ -1023,6 +1437,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					level: "info",
 					message: "context overflow — compacting then retrying same model",
 					at: Date.now(),
+					...tagsFor(event),
 				});
 				break;
 			case "tool-blocked":
@@ -1034,6 +1449,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					level: "warn",
 					message: `${event.toolName} blocked: ${event.reason.split("\n")[0]}`,
 					at: Date.now(),
+					// Wave I — tool-blocked carries `agentId` directly + sessionKey
+					// via the optional Wave I extension; route accordingly.
+					...(event.agentId ? { agentId: event.agentId } : {}),
+					...(event.sessionKey !== undefined ? { sessionId: event.sessionKey } : {}),
 				});
 				break;
 			default:
@@ -1114,21 +1533,62 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		 */
 		channelApprovalRoute?: import("../agents/channels/approval-router.js").ChannelApprovalRoute;
 	}): Promise<RunSingleTurnResult> => {
-		// Pick the lane: channel-routed turns get their own per-session lane
-		// (so multiple peers run concurrently); TUI / direct-RPC turns share
-		// the single Main lane (a TUI user can only type one prompt at a time
-		// anyway, and direct-RPC callers are the operator).
-		const lane = turn.channelApprovalRoute
-			? sessionLane(turn.sessionKey)
-			: CommandLane.Main;
+		// Pick the lane:
+		//   - The BOOT operator's primary session (`agent:<bootAgentId>:main`)
+		//     lands on the global `Main` lane — TUI / direct-RPC callers +
+		//     heartbeat turns for that single session share that FIFO.
+		//   - EVERY other shape (other-agent primary sessions like
+		//     `agent:ops:main`, channel-routed peers, sub-agent children,
+		//     cron sessions, A2A targets) lands on its own per-session lane
+		//     so concurrent agents / peers run in parallel rather than
+		//     funnelling onto Main. agentId is part of the discriminator —
+		//     `rest === "main"` alone would route every agent's primary
+		//     session onto Main and force all-agents to share one FIFO.
+		const parsedKey = parseAgentSessionKey(turn.sessionKey);
+		const isBootMainSession =
+			parsedKey !== null &&
+			parsedKey.agentId === agentId &&
+			parsedKey.rest === "main";
+		const lane = isBootMainSession ? CommandLane.Main : sessionLane(turn.sessionKey);
 		return runOnLane(lane, async () => {
-			isAgentRunning = true;
-			broadcast("state", buildSnapshot());
+			// Per-turn cleanup — LOCAL to this invocation. Turn A's onSessionReady
+			// (a fallback rebuild inside the same turn) calls THIS cleanup, not a
+			// neighbouring turn's. Replaces the old module-level `currentTurnCleanup`
+			// singleton that two concurrent turns would clobber.
+			//
+			// Wrapped in a holder object so the assignment from inside the
+			// `onSessionReady` callback doesn't get narrowed away by TS's
+			// flow analysis in the `finally` block.
+			const turnState: {
+				cleanup: (() => void) | null;
+				activeSession: AgentSession | null;
+			} = { cleanup: null, activeSession: null };
+			// Per-turn abort controller registered in session-registry. A graceful
+			// shutdown calls `abortAllSessions("shutdown")` which fires every
+			// turn's controller in parallel.
+			const turnAbortController = new AbortController();
+			const targetAgentId = turn.agentId ?? agentId;
+			const turnSessionKey = turn.sessionKey;
+			const runId = crypto.randomUUID();
+
+			registerLiveSession({
+				sessionKey: turnSessionKey,
+				sessionId: runId,
+				agentId: targetAgentId,
+				runId,
+				lane,
+				abortController: turnAbortController,
+			});
+			broadcastStateAllBindings();
+
 			// Hoist the abort listener so the finally can detach it without a
 			// scope issue (a `const` inside `try` is invisible from `finally`).
 			const onAbort = () => {
-				inFlightSession?.abort().catch(() => {});
+				turnState.activeSession?.abort().catch(() => {});
 			};
+			// Also abort the in-flight Pi session when our own per-turn controller
+			// fires (e.g. session-registry's `abortAllSessions` during shutdown).
+			turnAbortController.signal.addEventListener("abort", onAbort, { once: true });
 			try {
 				// Resolve fallback model fresh per turn — the user may have edited
 				// config (or rotated keys) between turns. F:\Brigade's shape:
@@ -1145,32 +1605,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const fallbacks =
 					fallbackProvider && fallbackModelId ? [{ provider: fallbackProvider, modelId: fallbackModelId }] : [];
 
-				// Per-agent dispatch: the channel manager hands us a routed
-				// agentId via the 8-tier resolver; we honour it here so the
-				// turn loads the right workspace + model + persona. Single-
-				// agent gateways (TUI, cron, direct-RPC) leave `turn.agentId`
-				// undefined and fall back to the boot-time default. When the
-				// routed agent has a per-agent provider/model in
-				// `cfg.agents.<id>`, those override the boot defaults so e.g.
-				// `agent:ops` can run on a different model than `agent:main`.
-				const targetAgentId = turn.agentId ?? agentId;
-				const agentOverride = (() => {
-					if (!targetAgentId || targetAgentId === agentId) return undefined;
-					const map = cfgNow.agents as
-						| { [id: string]: { provider?: string; model?: { primary?: string } } }
-						| undefined;
-					const entry = map?.[targetAgentId];
-					if (!entry || typeof entry !== "object") return undefined;
-					return {
-						provider: typeof entry.provider === "string" ? entry.provider : undefined,
-						modelId:
-							typeof entry.model === "object" && entry.model && typeof entry.model.primary === "string"
-								? entry.model.primary
-								: undefined,
-					};
-				})();
-				const turnProvider = agentOverride?.provider ?? provider;
-				const turnModelId = agentOverride?.modelId ?? modelId;
+				// Per-agent dispatch: read the target agent's currently-selected
+				// model + thinking level from `perAgentRuntime`. Each agent's
+				// runtime is mutated independently by set-model / set-thinking,
+				// so a turn for `agent:ops` no longer sees mutations meant for
+				// `agent:main`.
+				const turnRuntime = getAgentRuntime(targetAgentId);
+				const turnProvider = turnRuntime.provider;
+				const turnModelId = turnRuntime.modelId;
+				const turnThinkingLevel = turnRuntime.thinkingLevel;
 
 				// If a channel inbound passed an AbortSignal, abort the in-flight Pi
 				// session when it fires (so `/stop` from the chat actually cancels).
@@ -1181,7 +1624,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					modelId: turnModelId,
 					message: turn.text,
 					sessionKey: turn.sessionKey,
-					thinkingLevel: thinkingLevel as "off" | "low" | "medium" | "high",
+					thinkingLevel: turnThinkingLevel as "off" | "low" | "medium" | "high",
 					fallbacks,
 					signal: turn.signal,
 					// Forward the channel's senderIsOwner verdict (defaults to true
@@ -1196,23 +1639,38 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					onSessionReady: (session) => {
 						// A fallback candidate builds a fresh session; tear down the
 						// previous candidate's wiring before attaching the new one.
-						if (currentTurnCleanup) currentTurnCleanup();
-						currentTurnCleanup = attachTurnSession(session);
+						// IMPORTANT: this only tears down THIS turn's cleanup, never a
+						// sibling turn's — `turnState` is a per-invocation local.
+						if (turnState.cleanup) turnState.cleanup();
+						turnState.activeSession = session;
+						turnState.cleanup = attachTurnSession(session, turnSessionKey, targetAgentId);
 					},
 				});
 				// Queue a debounced, batched memory-extraction sweep over the settled
-				// transcript (off the hot path; see scheduleExtraction).
-				scheduleExtraction({ sessionId: result.sessionId, messages: result.messages });
+				// transcript (off the hot path; see scheduleExtraction). Thread the
+				// routed agent id so the sweep runs against the right workspace and
+				// uses the right model — boot agent for single-agent callers, the
+				// resolved agent for channel-routed multi-agent inbounds.
+				scheduleExtraction({
+					agentId: targetAgentId,
+					sessionId: result.sessionId,
+					messages: result.messages,
+				});
 				return result;
 			} finally {
 				turn.signal?.removeEventListener("abort", onAbort);
-				if (currentTurnCleanup) {
-					currentTurnCleanup();
-					currentTurnCleanup = null;
+				turnAbortController.signal.removeEventListener("abort", onAbort);
+				if (turnState.cleanup) {
+					turnState.cleanup();
+					turnState.cleanup = null;
 				}
-				inFlightSession = null;
-				isAgentRunning = false;
-				broadcast("state", buildSnapshot());
+				turnState.activeSession = null;
+				try {
+					unregisterLiveSession(turnSessionKey);
+				} catch {
+					/* best-effort unregister */
+				}
+				broadcastStateAllBindings();
 			}
 		});
 	};
@@ -1239,33 +1697,66 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		switch (method) {
 			case "prompt": {
 				const p = params as RequestParams["prompt"];
-				// One turn at a time. Fast-reject if a turn is already streaming so
-				// the interactive client gets immediate feedback rather than a
-				// silently-queued duplicate. Correctness (no overlap) is guaranteed
-				// by `runGatewayTurn`'s serialized queue regardless — this check is
-				// just UX. The TUI prompt drives the gateway's main session key.
-				if (isAgentRunning) throw new Error("a turn is already in progress");
-				await runGatewayTurn({ text: p.text, sessionKey });
+				// Resolve which agent + sessionKey this RPC targets. When the
+				// caller omits both, fall back to the gateway's boot binding —
+				// preserving single-agent semantics for legacy callers. When the
+				// caller supplies an agentId but no sessionKey, materialise the
+				// canonical default for that agent so the per-agent session lane
+				// stays consistent across requests.
+				const targetAgentId = p.agentId?.trim() || agentId;
+				const targetSessionKey =
+					p.sessionKey?.trim() ||
+					(targetAgentId === agentId ? sessionKey : defaultSessionKey(targetAgentId));
+				// Fast-reject if THIS session is already streaming so the
+				// interactive client gets immediate feedback rather than a
+				// silently-queued duplicate. Correctness (no overlap on the same
+				// session) is guaranteed by `runGatewayTurn`'s per-lane queue
+				// regardless — this check is just UX. Concurrent peer turns on
+				// different sessionKeys are fine and explicitly allowed.
+				if (hasLiveSession(targetSessionKey)) {
+					throw new Error("a turn is already in progress");
+				}
+				await runGatewayTurn({
+					text: p.text,
+					sessionKey: targetSessionKey,
+					agentId: targetAgentId,
+				});
 				return undefined as ResponseFor[M];
 			}
 			case "abort": {
-				// Abort only means something mid-turn. With no held session,
-				// abort the in-flight one if present; otherwise harmless no-op.
-				if (inFlightSession) await inFlightSession.abort().catch(() => {});
-				broadcast("state", buildSnapshot());
+				const p = (params ?? {}) as RequestParams["abort"];
+				// Pick the session to abort: explicit sessionKey > agentId-default
+				// > boot default. Looks the session up in the registry; if found,
+				// abort just THAT session's in-flight Pi session. Harmless no-op
+				// when nothing is live.
+				const targetKey =
+					p?.sessionKey?.trim() ||
+					(p?.agentId ? defaultSessionKey(p.agentId.trim()) : sessionKey);
+				const liveSession = liveSessionsByKey.get(targetKey);
+				if (liveSession) await liveSession.abort().catch(() => {});
+				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
 			}
 			case "steer": {
 				const p = params as RequestParams["steer"];
-				// Steer injects a mid-turn user message. Only valid while a turn
-				// is active — there's no session to enqueue into otherwise.
-				if (!inFlightSession) throw new Error("nothing to steer — no turn in progress");
-				await inFlightSession.steer(p.text);
-				broadcast("state", buildSnapshot());
+				const targetKey =
+					p.sessionKey?.trim() ||
+					(p.agentId ? defaultSessionKey(p.agentId.trim()) : sessionKey);
+				const liveSession = liveSessionsByKey.get(targetKey);
+				if (!liveSession) throw new Error("nothing to steer — no turn in progress");
+				await liveSession.steer(p.text);
+				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
 			}
 			case "set-model": {
 				const p = params as RequestParams["set-model"];
+				// Resolve against the TARGET agent's auth so a per-agent key
+				// (e.g. agent:ops has its own anthropic key) is honoured during
+				// validation. Boot agent reuses the boot AuthStorage. The previous
+				// closure-captured `authStorage` would silently use main's creds
+				// for an ops set-model and reject a valid ops key — see Wave B P0#5.
+				const targetAgentId = p.agentId?.trim() || agentId;
+				const targetAuth = getAuthStorageForAgent(targetAgentId);
 				const target =
 					modelRegistry.find(p.provider, p.modelId) ??
 					((await resolveModelNeverMiss({
@@ -1273,25 +1764,58 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						provider: p.provider,
 						modelId: p.modelId,
 						modelsFile,
-						authStorage,
+						authStorage: targetAuth,
 					})) as Model<string> | undefined);
 				if (!target) throw new Error(`model ${p.provider}/${p.modelId} not found`);
-				// No live session to mutate — update the gateway's current
-				// selection so the NEXT turn builds with this model. Re-pick a
-				// safe thinking level (reasoning models reject "off") + refresh
-				// the snapshot's thinking caps from the new model.
-				provider = p.provider;
-				modelId = p.modelId;
-				model = target;
-				thinkingLevel = pickInitialThinkingLevel(target);
-				cachedSupportsThinking = !!target.reasoning;
-				cachedThinkingLevels = deriveThinkingLevels(target);
-				await saveConfig(persistDefaultModel(await loadConfig(), p.provider, p.modelId));
-				broadcast("state", buildSnapshot());
+				// Mutate ONLY this agent's runtime entry — never spill model
+				// changes for one agent onto another's next turn.
+				perAgentRuntime.set(targetAgentId, {
+					provider: p.provider,
+					modelId: p.modelId,
+					model: target,
+					thinkingLevel: pickInitialThinkingLevel(target),
+				});
+				// Boot agent's set-model also refreshes the snapshot's cached
+				// thinking caps (since the snapshot mirrors the boot agent).
+				if (targetAgentId === agentId) {
+					cachedSupportsThinking = !!target.reasoning;
+					cachedThinkingLevels = deriveThinkingLevels(target);
+				}
+				// Persist into cfg.agents.<id>. The boot/default agent writes
+				// through the existing wizard-shape (`agents.defaults`) so the
+				// onboard wizard + set-model stay coherent; per-agent overrides
+				// land under `agents.<id>` so they don't bleed into defaults.
+				if (targetAgentId === agentId) {
+					await saveConfig(persistDefaultModel(await loadConfig(), p.provider, p.modelId));
+				} else {
+					const cur = await loadConfig();
+					const next: Config = { ...cur };
+					const agentsMap = {
+						...((next.agents as Record<string, unknown> | undefined) ?? {}),
+					} as Record<string, unknown>;
+					const prevEntry =
+						(agentsMap[targetAgentId] as { model?: { fallbacks?: string[] } } | undefined) ??
+						{};
+					const prevModel = prevEntry.model ?? {};
+					agentsMap[targetAgentId] = {
+						...(typeof agentsMap[targetAgentId] === "object" && agentsMap[targetAgentId]
+							? (agentsMap[targetAgentId] as Record<string, unknown>)
+							: {}),
+						provider: p.provider,
+						model: { ...prevModel, primary: p.modelId },
+					};
+					(next as Record<string, unknown>).agents = agentsMap;
+					await saveConfig(next);
+				}
+				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
 			}
 			case "switch-model-mid-turn": {
 				const p = params as RequestParams["switch-model-mid-turn"];
+				// Same per-agent auth resolution as set-model above — never validate
+				// agent:ops's new model against agent:main's keys.
+				const targetAgentId = p.agentId?.trim() || agentId;
+				const targetAuth = getAuthStorageForAgent(targetAgentId);
 				const target =
 					modelRegistry.find(p.provider, p.modelId) ??
 					((await resolveModelNeverMiss({
@@ -1299,55 +1823,97 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						provider: p.provider,
 						modelId: p.modelId,
 						modelsFile,
-						authStorage,
+						authStorage: targetAuth,
 					})) as Model<string> | undefined);
 				if (!target) throw new Error(`model ${p.provider}/${p.modelId} not found`);
+				const targetKey =
+					p.sessionKey?.trim() ||
+					(targetAgentId === agentId ? sessionKey : defaultSessionKey(targetAgentId));
 				// A live mid-turn switch (abort → swap → replay) only applies
-				// when a turn is actually running. If one is, perform it on the
-				// in-flight session; either way, update the gateway selection so
-				// subsequent turns continue on the new model.
-				if (inFlightSession) {
-					await piSwitchModelMidTurn(inFlightSession, target, p.replayMessage);
+				// when a turn is actually running for the target session. If one
+				// is, perform it on that session; either way, update the
+				// agent's runtime so subsequent turns continue on the new model.
+				const liveSession = liveSessionsByKey.get(targetKey);
+				if (liveSession) {
+					await piSwitchModelMidTurn(liveSession, target, p.replayMessage);
 				}
-				provider = p.provider;
-				modelId = p.modelId;
-				model = target;
-				thinkingLevel = pickInitialThinkingLevel(target);
-				cachedSupportsThinking = !!target.reasoning;
-				cachedThinkingLevels = deriveThinkingLevels(target);
-				await saveConfig(persistDefaultModel(await loadConfig(), p.provider, p.modelId));
-				broadcast("state", buildSnapshot());
+				perAgentRuntime.set(targetAgentId, {
+					provider: p.provider,
+					modelId: p.modelId,
+					model: target,
+					thinkingLevel: pickInitialThinkingLevel(target),
+				});
+				if (targetAgentId === agentId) {
+					cachedSupportsThinking = !!target.reasoning;
+					cachedThinkingLevels = deriveThinkingLevels(target);
+					await saveConfig(persistDefaultModel(await loadConfig(), p.provider, p.modelId));
+				} else {
+					const cur = await loadConfig();
+					const next: Config = { ...cur };
+					const agentsMap = {
+						...((next.agents as Record<string, unknown> | undefined) ?? {}),
+					} as Record<string, unknown>;
+					const prevEntry =
+						(agentsMap[targetAgentId] as { model?: { fallbacks?: string[] } } | undefined) ??
+						{};
+					const prevModel = prevEntry.model ?? {};
+					agentsMap[targetAgentId] = {
+						...(typeof agentsMap[targetAgentId] === "object" && agentsMap[targetAgentId]
+							? (agentsMap[targetAgentId] as Record<string, unknown>)
+							: {}),
+						provider: p.provider,
+						model: { ...prevModel, primary: p.modelId },
+					};
+					(next as Record<string, unknown>).agents = agentsMap;
+					await saveConfig(next);
+				}
+				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
 			}
 			case "set-thinking": {
 				const p = params as RequestParams["set-thinking"];
-				// Update the gateway's current level; the next turn passes it
-				// into its session. If a turn is live, set it on the in-flight
-				// session too so it takes effect immediately. Pi clamps to the
-				// model's capabilities either way.
-				thinkingLevel = p.level as ThinkingLevel;
-				if (inFlightSession) {
+				const targetAgentId = p.agentId?.trim() || agentId;
+				const cur = getAgentRuntime(targetAgentId);
+				// Mutate only the target agent's thinking level. The next turn
+				// for that agent reads it back; other agents' turns are unaffected.
+				perAgentRuntime.set(targetAgentId, {
+					...cur,
+					thinkingLevel: p.level as ThinkingLevel,
+				});
+				// If a turn is live for this agent's selected session, push the
+				// level into the in-flight session so it takes effect immediately.
+				const targetKey =
+					p.sessionKey?.trim() ||
+					(targetAgentId === agentId ? sessionKey : defaultSessionKey(targetAgentId));
+				const liveSession = liveSessionsByKey.get(targetKey);
+				if (liveSession) {
 					try {
-						inFlightSession.setThinkingLevel(p.level as never);
+						liveSession.setThinkingLevel(p.level as never);
 					} catch {
 						/* clamp / unsupported — snapshot still reflects intent */
 					}
 				}
-				broadcast("state", buildSnapshot());
+				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
 			}
 			case "compact": {
+				const p = (params ?? {}) as RequestParams["compact"];
 				// Compaction operates on a live session. Between turns there's
 				// nothing loaded — compaction auto-triggers at the start of the
 				// next turn when usage crosses the threshold (maybeTriggerCompaction
-				// in agent-loop.ts). If a turn IS live, compact it now.
-				if (!inFlightSession) {
+				// in agent-loop.ts). If a turn IS live for the target session,
+				// compact it now.
+				const targetKey =
+					p?.sessionKey?.trim() ||
+					(p?.agentId ? defaultSessionKey(p.agentId.trim()) : sessionKey);
+				const liveSession = liveSessionsByKey.get(targetKey);
+				if (!liveSession) {
 					throw new Error(
 						"nothing to compact yet — compaction runs during a turn and auto-triggers near the context limit",
 					);
 				}
-				await (inFlightSession as AgentSession & { compact?: () => Promise<unknown> }).compact?.();
-				broadcast("state", buildSnapshot());
+				await (liveSession as AgentSession & { compact?: () => Promise<unknown> }).compact?.();
+				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
 			}
 			case "approval-resolve": {
@@ -1372,7 +1938,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			case "refresh-models": {
 				modelRegistry.refresh();
-				broadcast("state", buildSnapshot());
+				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
 			}
 			case "get-state": {
@@ -1439,6 +2005,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 	wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 		clients.add(ws);
+		// P1#3 (Wave H) — per-connection id used to key subscription
+		// filters. Cheap UUID; client never sees it.
+		const connId = crypto.randomUUID();
+		clientConnIds.set(ws, connId);
 		const clientLabel = `${req.socket.remoteAddress ?? "?"}:${req.socket.remotePort ?? "?"}`;
 		opts.consoleStream?.clientConnected(clientLabel, clients.size);
 
@@ -1497,6 +2067,57 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			rateRing.push(now);
 			opts.consoleStream?.wsRequest(reqFrame.method, reqFrame.id, clientLabel);
 			const startedAt = Date.now();
+
+			// P1#3 (Wave H) — subscribe / unsubscribe live at the WS layer
+			// (the registry is per-connection) so handle them inline before
+			// touching the cross-cutting `handleRequest` dispatcher.
+			if (reqFrame.method === "subscribe" || reqFrame.method === "unsubscribe") {
+				const p =
+					(reqFrame.params ?? {}) as { agentId?: string; sessionId?: string };
+				try {
+					if (reqFrame.method === "subscribe") {
+						if (p.agentId) subscribeAgent(connId, p.agentId.trim());
+						if (p.sessionId) subscribeSession(connId, p.sessionId.trim());
+					} else {
+						if (p.agentId) unsubscribeAgent(connId, p.agentId.trim());
+						if (p.sessionId) unsubscribeSession(connId, p.sessionId.trim());
+					}
+					const response: Frame = { type: "res", id: reqFrame.id, ok: true };
+					if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(response));
+					// Wave K — push a fresh per-binding snapshot on subscribe so
+					// the client's header reflects the agent it just bound to
+					// (model / persona / running flag) without waiting for the
+					// next mutation. The per-conn filter will deliver it because
+					// the snapshot frame carries the same agentId tag.
+					if (reqFrame.method === "subscribe" && p.agentId && ws.readyState === ws.OPEN) {
+						const snapFrame: Frame = {
+							type: "event",
+							event: "state",
+							payload: buildSnapshot(p.agentId.trim()),
+						};
+						ws.send(JSON.stringify(snapFrame));
+					}
+					opts.consoleStream?.wsResponse(
+						reqFrame.method,
+						reqFrame.id,
+						true,
+						Date.now() - startedAt,
+					);
+				} catch (err) {
+					const response: Frame = {
+						type: "res",
+						id: reqFrame.id,
+						ok: false,
+						error: {
+							code: "internal",
+							message: err instanceof Error ? err.message : String(err),
+						},
+					};
+					if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(response));
+				}
+				return;
+			}
+
 			try {
 				const payload = await handleRequest(reqFrame.method, reqFrame.params, caller);
 				const response: Frame = {
@@ -1529,11 +2150,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 		ws.on("close", () => {
 			clients.delete(ws);
+			clientConnIds.delete(ws);
+			clientAgentSubs.delete(connId);
+			clientSessionSubs.delete(connId);
 			opts.consoleStream?.clientDisconnected(clientLabel, clients.size);
 		});
 
 		ws.on("error", () => {
 			clients.delete(ws);
+			clientConnIds.delete(ws);
+			clientAgentSubs.delete(connId);
+			clientSessionSubs.delete(connId);
 		});
 	});
 
@@ -1543,7 +2170,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// detect a dead server (no frames in 2× this interval = close + reconnect).
 	// Sending the snapshot doubles as keep-alive AND consistency check.
 	const tickTimer = setInterval(() => {
-		broadcast("state", buildSnapshot());
+		broadcastStateAllBindings();
 	}, TICK_INTERVAL_MS);
 	tickTimer.unref(); // don't block process exit on timer
 
@@ -1627,6 +2254,82 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			handleSessionsPatch(params as Parameters<typeof handleSessionsPatch>[0]),
 		),
 	);
+	// `agent` method: legacy sub-agent fan-out path the spawn engine uses to
+	// hand off the initial child turn (see `subagent-spawn.ts` calling
+	// `callGateway({method:"agent", ...})`). Dispatches through `dispatchAgentRun`
+	// + `runGatewayTurn` so the sub-agent run rides the same serialized lane +
+	// lifecycle hooks as a direct `sessions.send`. Mirrors the upstream
+	// `agent` server-method (see `server-methods/agent.ts` in the reference
+	// codebase). Coexists with the in-process `spawn_agent` tool — both call
+	// sites resolve to the same dispatcher today.
+	disposeHandlers.push(
+		registerGatewayHandler("agent", async (params: unknown) => {
+			const p = (params ?? {}) as {
+				message?: string;
+				sessionKey?: string;
+				idempotencyKey?: string;
+				thinking?: string;
+				timeout?: number;
+				deliver?: boolean;
+				channel?: string;
+				accountId?: string;
+				to?: string;
+				threadId?: string | number;
+				lane?: string;
+				label?: string;
+				spawnedBy?: string;
+				workspaceDir?: string;
+				agentId?: string;
+				extraSystemPrompt?: string;
+			};
+			const text = (p.message ?? "").trim();
+			const sessionKey = (p.sessionKey ?? "").trim();
+			if (!text || !sessionKey) {
+				return { ok: false, error: "agent: message + sessionKey required" };
+			}
+			const run = dispatchAgentRun(
+				{
+					sessionKey,
+					message: text,
+					...(p.idempotencyKey ? { idempotencyKey: p.idempotencyKey } : {}),
+					...(p.thinking ? { thinking: p.thinking } : {}),
+					...(typeof p.timeout === "number" ? { timeout: p.timeout } : {}),
+					...(typeof p.deliver === "boolean" ? { deliver: p.deliver } : {}),
+					...(p.channel ? { channel: p.channel } : {}),
+					...(p.accountId ? { accountId: p.accountId } : {}),
+					...(p.to ? { to: p.to } : {}),
+					...(p.threadId !== undefined ? { threadId: p.threadId } : {}),
+					...(p.lane ? { lane: p.lane } : {}),
+					...(p.label ? { label: p.label } : {}),
+					...(p.spawnedBy ? { spawnedBy: p.spawnedBy } : {}),
+					...(p.workspaceDir ? { workspaceDir: p.workspaceDir } : {}),
+					...(p.agentId ? { agentId: p.agentId } : {}),
+					...(p.extraSystemPrompt ? { extraSystemPrompt: p.extraSystemPrompt } : {}),
+				},
+				{
+					runAgentTurn: async (turn) => {
+						try {
+							await runGatewayTurn({
+								text: turn.message,
+								sessionKey: turn.sessionKey,
+								...(turn.agentId ? { agentId: turn.agentId } : {}),
+							});
+							return { ok: true };
+						} catch (err) {
+							return {
+								ok: false,
+								error: err instanceof Error ? err.message : String(err),
+							};
+						}
+					},
+				},
+			);
+			// Same fire-and-forget pattern as sessions.send — return runId now,
+			// let the lifecycle stream surface the settled outcome.
+			void run.settled.catch(() => undefined);
+			return { ok: true, runId: run.runId };
+		}),
+	);
 
 	// Wire the agent-events bridge. Subagent-ended hooks (Step 10) +
 	// heartbeat-fired hooks (Step 14) + session-state listeners (Step 11)
@@ -1638,11 +2341,23 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// disable via BRIGADE_DISABLE_HEARTBEAT=1).
 	setHeartbeatsEnabled(process.env.BRIGADE_DISABLE_HEARTBEAT !== "1");
 
+	// Tell the heartbeat runner which agent owns the global `Main` lane so
+	// its lane gate only Main-checks the BOOT operator's `:main` session.
+	// Other agents' `:main` sessions route to per-session lanes and must
+	// NOT be cross-gated against the boot operator's Main FIFO.
+	setHeartbeatBootAgentId(agentId);
+
 	// Install the heartbeat-fired hook BEFORE starting the runner so the
 	// runner can dispatch a synthetic turn the first time it fires. The
 	// hook formats the consumed events as the user message and routes
 	// through `runGatewayTurn` (same path as a channel inbound).
-	setHeartbeatFiredHook(async (params) => {
+	//
+	// P1#8 (Wave H) — `addHeartbeatFiredHook` returns a disposer so this
+	// hook COMPOSES with whatever `wireAgentEventsBridge()` registered
+	// above (which emits `heartbeat` bus events). Without this both hooks
+	// would have raced for the single slot and the bridge's emit would
+	// have silently lost.
+	const disposeHeartbeatHook = addHeartbeatFiredHook(async (params) => {
 		if (!params.consumedEvents.length && params.reason !== "interval") return;
 		const text =
 			params.consumedEvents.length > 0
@@ -1757,8 +2472,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	});
 
 	// Phase 7 — agent model resolved. Emits the standard
-	// `agent model: <provider>/<model>` line.
-	bootLog(`agent model: ${provider}/${modelId}`);
+	// `agent model: <provider>/<model>` line for the boot agent.
+	{
+		const bootRt = getAgentRuntime(agentId);
+		bootLog(`agent model: ${bootRt.provider}/${bootRt.modelId}`);
+	}
 
 	// Phase 8 — Listening on bound port. Emits the standard
 	// `listening on ws://${host}:${port}` verbose-banner line.
@@ -1914,6 +2632,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// Stop every started product capability (channels + services). Idempotent;
 	// used by both shutdown and reload.
 	const stopExtensions = async (): Promise<void> => {
+		if (channelPluginManager) {
+			// Stop every per-account socket the plugin manager holds; the
+			// `ChannelPlugin.gateway.stopAccount` for each bundled plugin runs
+			// per accountId so the per-account `Map<accountId, socket>` drains
+			// cleanly. Idempotent — `stopChannel` on an already-stopped channel
+			// no-ops.
+			for (const plugin of bundledChannelPlugins) {
+				await channelPluginManager.stopChannel(plugin.id).catch(() => {});
+			}
+			channelPluginManager = undefined;
+			bundledChannelPlugins = [];
+		}
 		if (channelManager) {
 			await channelManager.stop().catch(() => {});
 			channelManager = undefined;
@@ -1994,6 +2724,72 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					await stopExtensions();
 					clearDiscoveryCache(); // re-scan ~/.brigade/extensions on reload
 					await startExtensions();
+					// Wave L — per-agent caches that read from disk-backed config
+					// must be invalidated alongside the extension reload, or a
+					// post-reload turn still uses pre-reload model/auth bindings.
+					// Drop every cached AuthStorage entry; the next turn rebuilds
+					// from the agent's auth-profiles.json file.
+					try {
+						authStorageByAgent.clear();
+					} catch {
+						// best-effort — clearing the cache must never block reload
+					}
+					// Re-apply lane budgets + propagate the fresh config to the
+					// heartbeat scheduler + cron config consumers. Each block runs
+					// independently so one failure doesn't gate the others.
+					let cfgAfterReload: BrigadeConfig | undefined;
+					try {
+						cfgAfterReload = (await loadConfig()) as BrigadeConfig;
+					} catch (err) {
+						opts.consoleStream?.info?.(
+							`config-reload error: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
+					try {
+						if (cfgAfterReload) applyGatewayLaneConcurrency(cfgAfterReload as never);
+					} catch (err) {
+						opts.consoleStream?.info?.(
+							`lane-concurrency reload error: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
+					try {
+						if (cfgAfterReload && heartbeatScheduler) {
+							heartbeatScheduler.updateConfig(cfgAfterReload as never);
+						}
+					} catch (err) {
+						opts.consoleStream?.info?.(
+							`heartbeat-scheduler reload error: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
+					// Wave L P2#8 — perAgentRuntime caches a `Model` whose internal
+					// auth binding is from boot. After `system.reload`, the auth
+					// storage map was cleared above; rebuild each entry's Model
+					// under the agent's fresh AuthStorage so the next turn uses
+					// the post-reload keys. Falls back to keeping the existing
+					// Model if resolveModelNeverMiss can't locate one.
+					try {
+						for (const [id, rt] of [...perAgentRuntime.entries()]) {
+							try {
+								const freshAuth = getAuthStorageForAgent(id);
+								const rebuilt =
+									modelRegistry.find(rt.provider, rt.modelId) ??
+									((await resolveModelNeverMiss({
+										modelRegistry,
+										provider: rt.provider,
+										modelId: rt.modelId,
+										modelsFile,
+										authStorage: freshAuth,
+									})) as Model<string> | undefined);
+								if (rebuilt) {
+									perAgentRuntime.set(id, { ...rt, model: rebuilt });
+								}
+							} catch {
+								// per-agent rebuild is best-effort; old Model still works
+							}
+						}
+					} catch {
+						// outer guard — never break reload on runtime rebuild
+					}
 					for (const m of extensionRegistry?.loadedModules ?? []) {
 						try {
 							await m.reload?.();
@@ -2038,6 +2834,51 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// quietly stays out of the surface.
 			setActiveChannelManager(channelManager);
 			if (channelManager.started.length > 0) bootLog(`channels: ${channelManager.started.join(", ")}`);
+		}
+
+		// Plugin-shaped channel manager (Wave F). Only activates when at least
+		// one channel plugin reports a multi-account config — today that's
+		// WhatsApp with `channels.whatsapp.accounts: [...]`. Single-account
+		// installs fall through to the legacy `startChannels` path above and
+		// this manager simply never spins up an account.
+		const whatsappAccounts = whatsappChannelEnabled(cfg as never)
+			? listWhatsAppAccountIds(cfg as never)
+			: [];
+		const wantMultiAccount = whatsappAccounts.length > 1;
+		if (wantMultiAccount) {
+			const whatsappPlugin = createWhatsAppPlugin({
+				defaultAgentId: agentId,
+				loadConfig: () => cfg as never,
+				runTurn: (turn) => runGatewayTurn(turn),
+				onPairing: (channelId, accountId, info) => {
+					const line =
+						info.kind === "qr"
+							? `[${channelId}/${accountId}] scan the QR code shown in the gateway logs to link your account`
+							: `[${channelId}/${accountId}] pairing code: ${info.value}`;
+					bootLog(line);
+					broadcast("log", { level: "info", message: line, at: Date.now() });
+				},
+			});
+			bundledChannelPlugins = [whatsappPlugin];
+			const pluginById = new Map(bundledChannelPlugins.map((p) => [p.id, p] as const));
+			channelPluginManager = createChannelPluginManager({
+				loadConfig: () => cfg as never,
+				listChannelPlugins: () => bundledChannelPlugins,
+				getChannelPlugin: (id) => pluginById.get(id),
+			});
+			await channelPluginManager.startChannels();
+			// Mount a thin manager facade so the `send_message` agent tool's
+			// `getActiveChannelManager().adapter("whatsapp")` lookup returns a
+			// working per-account adapter on multi-account installs. Without
+			// this the tool quietly hid from the surface because the legacy
+			// `startChannels` manager only runs when there's <= 1 account.
+			const whatsappHandles: WhatsAppPluginHandle[] = [whatsappPlugin];
+			if (!channelManager) {
+				setActiveChannelManager(
+					createPluginChannelManagerFacade({ plugins: whatsappHandles }),
+				);
+			}
+			bootLog(`channels (multi-account): whatsapp x${whatsappAccounts.length}`);
 		}
 
 		// Background services — start each; a failing one is skipped, not fatal.
@@ -2117,6 +2958,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// from firing through a half-torn-down dispatcher.
 			try {
 				heartbeatRunnerHandle?.stop();
+				setHeartbeatBootAgentId(null);
+				// Remove only our composed hook, not every registered one
+				// (the agent-events bridge's hook is owned by that bridge).
+				disposeHeartbeatHook();
 			} catch {
 				/* best-effort */
 			}
@@ -2168,11 +3013,21 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// inbound turn is enqueued during teardown. Routed through the lifecycle
 			// queue so it can't race an in-flight `system.reload`.
 			await queueExtensionsOp(stopExtensions).catch(() => {});
-			// Best-effort abort of a turn that's still streaming, then WAIT for the
-			// turn queue to drain so an in-flight (or just-queued) turn's finally —
-			// cleanup, broadcast, scheduleExtraction — can't run against a
-			// torn-down server after stop() returns.
-			if (inFlightSession) await inFlightSession.abort().catch(() => {});
+			// Best-effort abort of EVERY turn still streaming via the registry's
+			// abort-all helper, then also defensively abort any live Pi session
+			// indexed by sessionKey (a turn may have registered a session ref
+			// without yet enrolling its abortController). WAIT for the turn
+			// queue to drain so an in-flight turn's finally — cleanup,
+			// broadcast, scheduleExtraction — can't run against a torn-down
+			// server after stop() returns.
+			try {
+				abortAllSessions("shutdown");
+			} catch {
+				/* best-effort */
+			}
+			for (const session of liveSessionsByKey.values()) {
+				await session.abort().catch(() => {});
+			}
 			// Serialize the per-lane drain. `markGatewayDraining()` above
 			// already rejected new enqueues; this waits up to 10s for the
 			// in-flight tasks in every lane to settle.
@@ -2182,12 +3037,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				/* best-effort drain */
 			}
 			await turnChainTail.catch(() => {});
-			// Tear down any in-flight turn's Pi subscription + JSONL logger.
-			// Between turns there's nothing attached, so this is a no-op then.
-			if (currentTurnCleanup) {
-				currentTurnCleanup();
-				currentTurnCleanup = null;
-			}
+			// `runGatewayTurn`'s per-invocation finally already detached each
+			// turn's Pi subscription + JSONL logger as the turns settled. The
+			// `liveSessionsByKey` map should be empty here; if it isn't (a
+			// turn raced shutdown), the registry's `abortAllSessions` above
+			// kicked them and their finally chains will fire as the queue drains.
 			detachLifecycleBus();
 			detachSubagentPiBus();
 			for (const ws of clients) {

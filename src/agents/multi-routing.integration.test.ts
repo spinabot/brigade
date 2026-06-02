@@ -31,6 +31,7 @@ import {
 import {
 	abortAllSessions,
 	countActiveLiveSessions,
+	countActiveLiveSessionsForAgent,
 	getLiveSession,
 	listLiveSessions,
 	registerLiveSession,
@@ -153,6 +154,34 @@ describe("multi-routing spine (Steps 9-18)", () => {
 		} finally {
 			dispose();
 		}
+	});
+
+	it("countActiveLiveSessionsForAgent scopes the running count per agent (Wave K)", () => {
+		registerLiveSession({
+			sessionKey: "agent:main:main",
+			sessionId: "run-main",
+			agentId: "main",
+			runId: "run-main",
+			lane: "session:agent:main:main",
+			abortController: new AbortController(),
+		});
+		registerLiveSession({
+			sessionKey: "agent:ops:main",
+			sessionId: "run-ops",
+			agentId: "ops",
+			runId: "run-ops",
+			lane: "session:agent:ops:main",
+			abortController: new AbortController(),
+		});
+		assert.equal(countActiveLiveSessions(), 2);
+		assert.equal(countActiveLiveSessionsForAgent("main"), 1);
+		assert.equal(countActiveLiveSessionsForAgent("ops"), 1);
+		assert.equal(
+			countActiveLiveSessionsForAgent("nobody"),
+			0,
+			"unknown agent → 0 (no false positive)",
+		);
+		assert.equal(countActiveLiveSessionsForAgent(""), 0, "empty id → 0");
 	});
 
 	it("abortAllSessions terminates every registered session", () => {

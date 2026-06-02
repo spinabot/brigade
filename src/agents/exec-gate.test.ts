@@ -23,6 +23,7 @@ void _ensureLoaded;
 
 const { makeExecGate } = await import("./exec-gate.js");
 const busMod = await import("./agent-event-bus.js");
+const approvalBridgeMod = await import("./approval-bridge.js");
 
 before(() => {
 	process.on("exit", () => {
@@ -381,6 +382,58 @@ describe("makeExecGate — tool-blocked bus events", () => {
 		} finally {
 			process.emitWarning = originalWarning;
 		}
+	});
+});
+
+describe("makeExecGate — Wave K operator attribution", () => {
+	beforeEach(() => {
+		approvalBridgeMod.setActiveApprovalBridge(null);
+	});
+
+	it("forwards agentId + sessionId (from ctxRef.sessionKey) to bridge.requestApproval", async () => {
+		const seen: Array<{ agentId?: string; sessionId?: string; subagentLabel?: string }> = [];
+		approvalBridgeMod.setActiveApprovalBridge({
+			requestApproval: async (req) => {
+				seen.push({
+					agentId: req.agentId,
+					sessionId: req.sessionId,
+					subagentLabel: req.subagentLabel,
+				});
+				return { kind: "allow-once" };
+			},
+			resolveApproval: () => false,
+			listPending: () => [],
+		});
+		const ctxRef = {
+			value: {
+				runId: "turn-77",
+				agentId: "ops",
+				sessionKey: "agent:ops:main",
+			},
+		};
+		const gate = makeExecGate({ ctxRef });
+		const r = await gate({ toolCall: { name: "bash", arguments: { command: "ls" } } } as never);
+		assert.equal(r, undefined, "operator allowed once → gate passes through");
+		assert.equal(seen.length, 1);
+		assert.equal(seen[0]?.agentId, "ops");
+		assert.equal(seen[0]?.sessionId, "agent:ops:main");
+	});
+
+	it("omits agentId + sessionId when ctxRef has neither (back-compat)", async () => {
+		const seen: Array<{ agentId?: string; sessionId?: string }> = [];
+		approvalBridgeMod.setActiveApprovalBridge({
+			requestApproval: async (req) => {
+				seen.push({ agentId: req.agentId, sessionId: req.sessionId });
+				return { kind: "allow-once" };
+			},
+			resolveApproval: () => false,
+			listPending: () => [],
+		});
+		const gate = makeExecGate();
+		await gate({ toolCall: { name: "bash", arguments: { command: "ls" } } } as never);
+		assert.equal(seen.length, 1);
+		assert.equal(seen[0]?.agentId, undefined);
+		assert.equal(seen[0]?.sessionId, undefined);
 	});
 });
 

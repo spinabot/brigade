@@ -6,28 +6,34 @@
  * session metadata to disk) and `subagent-registry.ts` (which tracks
  * sub-agent runs spawned BY sessions).
  *
- * Why have a separate live registry at all (upstream doesn't): the upstream
- * codebase distributes "is this session currently running?" across a
- * subagent-runs Map + a session-store + ad-hoc Promise refs in the
- * dispatcher. Brigade folds that into one explicit Map so the heartbeat
- * runner (Step 14), the channel manager (Step 16), the approval router
- * (Step 17), and the gateway dispatcher (Step 25) all have ONE place to
- * ask "is X live?" — and ONE place to abort it on graceful shutdown.
+ * Why have a separate live registry at all: the heartbeat runner (Step 14),
+ * the channel manager (Step 16), the approval router (Step 17), and the
+ * gateway dispatcher (Step 25) all need ONE place to ask "is X live?" —
+ * and ONE place to abort it on graceful shutdown.
  *
- * Backing store: a `resolveGlobalSingleton`-pinned Map keyed by
- * canonical session key (`agent:<id>:...`). Lives for the process
- * lifetime; never persisted. A fresh process boots with an empty Map.
+ * Backing store: a `resolveGlobalSingleton`-pinned Map keyed by `runId`.
+ * Lives for the process lifetime; never persisted. A fresh process boots
+ * with an empty Map.
+ *
+ * P2#1 (Wave H) — keyed by runId, not sessionKey. A single sessionKey can
+ * host MULTIPLE live entries when, for example, a heartbeat synthetic
+ * turn fires while the operator's prompt is still streaming, or when a
+ * crash-recovery race re-registers before unregister. Previously the
+ * Map-by-sessionKey silently REPLACED the prior entry, dropping its
+ * abort controller and losing the original turn's lifecycle stamp. Now:
+ *
+ *   - Each `registerLiveSession` mints a unique entry keyed by `runId`.
+ *   - `hasLiveSession(sessionKey)` looks up by sessionKey via secondary
+ *     index (sessionKey → Set<runId>).
+ *   - `abortLiveSession(sessionKey)` aborts ALL non-terminated entries
+ *     for that sessionKey (channels can no longer leak across turn
+ *     boundaries).
  *
  * Hook surface:
  *   - `onStateChange(listener)` for observers (Step 18 agent-events fan-out).
  *   - Abort propagation: each entry carries the turn's `AbortController`,
  *     so a graceful shutdown can call `abortAllSessions("shutdown")`
  *     and every in-flight turn unwinds promptly.
- *
- * Reentrancy: re-registering a sessionKey replaces the prior entry (with
- * a debug log). The dispatcher should always `unregister` before
- * `register`-ing the same key; the replacement is a safety net for
- * crash-recovery races, not a primary path.
  */
 
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
@@ -57,19 +63,23 @@ export type SessionStateChangeEvent = {
 	previousState: SessionLifecycleState | "registered";
 	newState: SessionLifecycleState;
 	timestamp: number;
+	runId?: string;
 };
 
 type SessionStateListener = (event: SessionStateChangeEvent) => void;
 
 type SessionRegistryState = {
-	sessions: Map<string, LiveSessionRecord>;
+	/** Primary index — every live entry keyed by its (unique) `runId`. */
+	byRunId: Map<string, LiveSessionRecord>;
+	/** Secondary index — `sessionKey` → Set of live `runId`s for that key. */
+	runIdsBySessionKey: Map<string, Set<string>>;
 	listeners: Set<SessionStateListener>;
 };
 
 const SESSION_REGISTRY_STATE_KEY = Symbol.for("brigade.sessionRegistry.state");
 
 function createState(): SessionRegistryState {
-	return { sessions: new Map(), listeners: new Set() };
+	return { byRunId: new Map(), runIdsBySessionKey: new Map(), listeners: new Set() };
 }
 
 function getState(): SessionRegistryState {
@@ -90,6 +100,22 @@ function emit(event: SessionStateChangeEvent): void {
 	}
 }
 
+function indexAdd(state: SessionRegistryState, sessionKey: string, runId: string): void {
+	let set = state.runIdsBySessionKey.get(sessionKey);
+	if (!set) {
+		set = new Set();
+		state.runIdsBySessionKey.set(sessionKey, set);
+	}
+	set.add(runId);
+}
+
+function indexRemove(state: SessionRegistryState, sessionKey: string, runId: string): void {
+	const set = state.runIdsBySessionKey.get(sessionKey);
+	if (!set) return;
+	set.delete(runId);
+	if (set.size === 0) state.runIdsBySessionKey.delete(sessionKey);
+}
+
 export interface RegisterSessionParams {
 	sessionKey: string;
 	sessionId: string;
@@ -101,15 +127,29 @@ export interface RegisterSessionParams {
 }
 
 /**
- * Register a fresh live session. If `sessionKey` is already registered,
- * the existing entry is replaced (logged) — the dispatcher should have
- * `unregister`-ed first; replacement is a crash-recovery safety net.
+ * Register a fresh live session. Each call mints a distinct entry keyed by
+ * `runId`; multiple live entries for the same sessionKey are allowed (e.g.
+ * a heartbeat turn racing the operator's prompt). The dispatcher should
+ * still pass DISTINCT runIds per turn — colliding runIds replace the
+ * existing entry (logged) the same way the old Map-by-sessionKey did.
  */
 export function registerLiveSession(params: RegisterSessionParams): LiveSessionRecord {
 	const state = getState();
 	const now = Date.now();
-	if (state.sessions.has(params.sessionKey)) {
-		log.debug("replacing existing live-session entry", { sessionKey: params.sessionKey });
+	if (!params.runId) {
+		throw new Error("registerLiveSession: runId is required");
+	}
+	const existingByRunId = state.byRunId.get(params.runId);
+	if (existingByRunId) {
+		log.debug("replacing existing live-session entry (same runId)", {
+			sessionKey: params.sessionKey,
+			runId: params.runId,
+		});
+		// Detach the old sessionKey index entry if the new entry's sessionKey
+		// differs (it shouldn't, but defend against the dispatcher mutating).
+		if (existingByRunId.sessionKey !== params.sessionKey) {
+			indexRemove(state, existingByRunId.sessionKey, params.runId);
+		}
 	}
 	const record: LiveSessionRecord = {
 		sessionKey: params.sessionKey,
@@ -124,31 +164,64 @@ export function registerLiveSession(params: RegisterSessionParams): LiveSessionR
 		abortController: params.abortController,
 		metadata: params.metadata,
 	};
-	state.sessions.set(params.sessionKey, record);
+	state.byRunId.set(params.runId, record);
+	indexAdd(state, params.sessionKey, params.runId);
 	emit({
 		sessionKey: params.sessionKey,
 		previousState: "registered",
 		newState: "running",
 		timestamp: now,
+		runId: params.runId,
 	});
 	return record;
 }
 
-/** Lookup by canonical session key. */
+/** Lookup the newest live entry for a session key (or undefined). */
 export function getLiveSession(sessionKey: string): LiveSessionRecord | undefined {
 	if (!sessionKey) return undefined;
-	return getState().sessions.get(sessionKey);
+	const state = getState();
+	const runIds = state.runIdsBySessionKey.get(sessionKey);
+	if (!runIds || runIds.size === 0) return undefined;
+	let newest: LiveSessionRecord | undefined;
+	for (const runId of runIds) {
+		const rec = state.byRunId.get(runId);
+		if (!rec) continue;
+		if (!newest || rec.createdAt > newest.createdAt) newest = rec;
+	}
+	return newest;
 }
 
-/** `true` while the session is registered in any non-terminated state. */
+/** Lookup a specific live entry by runId. */
+export function getLiveSessionByRunId(runId: string): LiveSessionRecord | undefined {
+	if (!runId) return undefined;
+	return getState().byRunId.get(runId);
+}
+
+/** Every live entry for a session key (every non-terminated runId). */
+export function getLiveSessionsForKey(sessionKey: string): LiveSessionRecord[] {
+	if (!sessionKey) return [];
+	const state = getState();
+	const runIds = state.runIdsBySessionKey.get(sessionKey);
+	if (!runIds || runIds.size === 0) return [];
+	const out: LiveSessionRecord[] = [];
+	for (const runId of runIds) {
+		const rec = state.byRunId.get(runId);
+		if (rec) out.push(rec);
+	}
+	return out;
+}
+
+/** `true` while at least one entry for the sessionKey is in a non-terminated state. */
 export function hasLiveSession(sessionKey: string): boolean {
-	const entry = getLiveSession(sessionKey);
-	return Boolean(entry && entry.state !== "terminated");
+	for (const entry of getLiveSessionsForKey(sessionKey)) {
+		if (entry.state !== "terminated") return true;
+	}
+	return false;
 }
 
 /** Snapshot every currently registered session. */
 export function listLiveSessions(): LiveSessionRecord[] {
-	return [...getState().sessions.values()];
+	return [...getState().byRunId.values()];
 }
 
 /**
@@ -165,15 +238,25 @@ export function listLiveSessionsWhere(
 /** Count of currently-running (non-idle, non-draining, non-terminated) sessions. */
 export function countActiveLiveSessions(): number {
 	let n = 0;
-	for (const entry of getState().sessions.values()) {
+	for (const entry of getState().byRunId.values()) {
 		if (entry.state === "running") n += 1;
 	}
 	return n;
 }
 
-function transitionState(sessionKey: string, newState: SessionLifecycleState): boolean {
+/** Per-agent variant — only counts entries whose `agentId` matches. Wave K. */
+export function countActiveLiveSessionsForAgent(agentIdValue: string): number {
+	if (!agentIdValue) return 0;
+	let n = 0;
+	for (const entry of getState().byRunId.values()) {
+		if (entry.state === "running" && entry.agentId === agentIdValue) n += 1;
+	}
+	return n;
+}
+
+function transitionStateByRunId(runId: string, newState: SessionLifecycleState): boolean {
 	const state = getState();
-	const entry = state.sessions.get(sessionKey);
+	const entry = state.byRunId.get(runId);
 	if (!entry) return false;
 	if (entry.state === newState) return false;
 	const previousState = entry.state;
@@ -181,69 +264,141 @@ function transitionState(sessionKey: string, newState: SessionLifecycleState): b
 	entry.state = newState;
 	entry.lastStateChangeAt = now;
 	entry.lastActivityAt = now;
-	emit({ sessionKey, previousState, newState, timestamp: now });
+	emit({
+		sessionKey: entry.sessionKey,
+		previousState,
+		newState,
+		timestamp: now,
+		runId,
+	});
 	return true;
 }
 
-/** Mark a session idle (waiting on inbound) without unregistering. */
+function transitionAllForSessionKey(
+	sessionKey: string,
+	newState: SessionLifecycleState,
+): boolean {
+	let any = false;
+	for (const entry of getLiveSessionsForKey(sessionKey)) {
+		if (transitionStateByRunId(entry.runId, newState)) any = true;
+	}
+	return any;
+}
+
+/** Mark every live entry for `sessionKey` idle (waiting on inbound). */
 export function markSessionIdle(sessionKey: string): boolean {
-	return transitionState(sessionKey, "idle");
+	return transitionAllForSessionKey(sessionKey, "idle");
 }
 
-/** Move a session into draining state (stop accepting new work, finish active). */
+/** Move every live entry for `sessionKey` into draining state. */
 export function markSessionDraining(sessionKey: string): boolean {
-	return transitionState(sessionKey, "draining");
+	return transitionAllForSessionKey(sessionKey, "draining");
 }
 
-/** Mark a session running again after an idle/draining pause. */
+/** Mark every live entry for `sessionKey` running again after an idle/draining pause. */
 export function markSessionRunning(sessionKey: string): boolean {
-	return transitionState(sessionKey, "running");
+	return transitionAllForSessionKey(sessionKey, "running");
 }
 
-/** Touch `lastActivityAt` without changing state. Used by heartbeat + inbound dispatch. */
+/** Touch `lastActivityAt` on every entry for `sessionKey` without changing state. */
 export function touchSessionActivity(sessionKey: string): boolean {
-	const entry = getLiveSession(sessionKey);
-	if (!entry) return false;
-	entry.lastActivityAt = Date.now();
+	const entries = getLiveSessionsForKey(sessionKey);
+	if (entries.length === 0) return false;
+	const now = Date.now();
+	for (const entry of entries) entry.lastActivityAt = now;
 	return true;
 }
 
 /**
- * Abort a session's in-flight turn (if it holds an abort controller) and
- * mark it terminated. Returns `true` if the entry was found.
+ * Abort EVERY live entry for the sessionKey (a single sessionKey may host
+ * multiple in-flight turns — heartbeat racing operator, retry races, etc.).
+ * Each matching entry's abort controller fires; each is transitioned to
+ * `terminated`. Returns `true` if at least one entry was found.
  */
 export function abortLiveSession(sessionKey: string, reason?: string): boolean {
+	const entries = getLiveSessionsForKey(sessionKey);
+	if (entries.length === 0) return false;
+	for (const entry of entries) {
+		try {
+			entry.abortController?.abort(reason ?? "session-aborted");
+		} catch (err) {
+			log.warn("abortController threw on abort()", {
+				sessionKey,
+				runId: entry.runId,
+				error: (err as Error)?.message,
+			});
+		}
+		transitionStateByRunId(entry.runId, "terminated");
+	}
+	return true;
+}
+
+/**
+ * Abort a single live entry by runId. Used when the caller knows the
+ * specific turn (not just the sessionKey) to cancel — heartbeat dispatcher
+ * cancelling its own synthetic turn, sub-agent runner cancelling a child.
+ */
+export function abortLiveSessionByRunId(runId: string, reason?: string): boolean {
 	const state = getState();
-	const entry = state.sessions.get(sessionKey);
+	const entry = state.byRunId.get(runId);
 	if (!entry) return false;
 	try {
 		entry.abortController?.abort(reason ?? "session-aborted");
 	} catch (err) {
 		log.warn("abortController threw on abort()", {
-			sessionKey,
+			runId,
 			error: (err as Error)?.message,
 		});
 	}
-	transitionState(sessionKey, "terminated");
+	transitionStateByRunId(runId, "terminated");
 	return true;
 }
 
 /**
- * Remove a session from the registry. Does NOT call `abort()` — the caller
- * is expected to have completed the turn (or to call `abortLiveSession`
- * first). Returns `true` if the entry was present.
+ * Remove a live entry from the registry. Resolves by runId when there's a
+ * unique entry, otherwise by sessionKey (when only one live entry exists).
+ * Does NOT call `abort()` — the caller is expected to have completed the
+ * turn (or to call `abortLiveSession` first). Returns `true` if the entry
+ * was present.
+ *
+ * Callers that hold a specific `runId` should prefer
+ * `unregisterLiveSessionByRunId` to avoid the ambiguity branch.
  */
 export function unregisterLiveSession(sessionKey: string): boolean {
+	const entries = getLiveSessionsForKey(sessionKey);
+	if (entries.length === 0) return false;
 	const state = getState();
-	const entry = state.sessions.get(sessionKey);
+	let any = false;
+	for (const entry of entries) {
+		const previousState = entry.state;
+		state.byRunId.delete(entry.runId);
+		indexRemove(state, entry.sessionKey, entry.runId);
+		emit({
+			sessionKey: entry.sessionKey,
+			previousState,
+			newState: "terminated",
+			timestamp: Date.now(),
+			runId: entry.runId,
+		});
+		any = true;
+	}
+	return any;
+}
+
+/** Remove a single live entry by runId. Returns `true` if the entry was present. */
+export function unregisterLiveSessionByRunId(runId: string): boolean {
+	const state = getState();
+	const entry = state.byRunId.get(runId);
 	if (!entry) return false;
 	const previousState = entry.state;
-	state.sessions.delete(sessionKey);
+	state.byRunId.delete(runId);
+	indexRemove(state, entry.sessionKey, runId);
 	emit({
-		sessionKey,
+		sessionKey: entry.sessionKey,
 		previousState,
 		newState: "terminated",
 		timestamp: Date.now(),
+		runId,
 	});
 	return true;
 }
@@ -257,7 +412,7 @@ export function unregisterLiveSession(sessionKey: string): boolean {
 export function abortAllSessions(reason?: string): number {
 	const state = getState();
 	let n = 0;
-	for (const entry of state.sessions.values()) {
+	for (const entry of state.byRunId.values()) {
 		if (entry.state === "terminated") continue;
 		try {
 			entry.abortController?.abort(reason ?? "shutdown");
@@ -272,6 +427,7 @@ export function abortAllSessions(reason?: string): number {
 			previousState: previous,
 			newState: "terminated",
 			timestamp: Date.now(),
+			runId: entry.runId,
 		});
 		n += 1;
 	}
@@ -294,6 +450,7 @@ export function onSessionStateChange(listener: SessionStateListener): () => void
 /** Test-only — drop every entry + every listener. */
 export function resetSessionRegistryForTests(): void {
 	const state = getState();
-	state.sessions.clear();
+	state.byRunId.clear();
+	state.runIdsBySessionKey.clear();
 	state.listeners.clear();
 }

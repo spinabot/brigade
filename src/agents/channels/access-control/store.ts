@@ -136,19 +136,36 @@ interface AllowFromFile {
 	allowFrom: string[];
 }
 
-/** Read the deduped, normalized allow-from list for a channel. */
-export function readAllowFrom(channelId: string): string[] {
-	const data = readJson<AllowFromFile>(resolveChannelAllowFromPath(channelId), { version: 1, allowFrom: [] });
-	return [...new Set((data.allowFrom ?? []).map((x) => normalizeId(x)))].filter(Boolean);
+/**
+ * Read the deduped, normalized allow-from list for a channel account. When
+ * `accountId` is omitted (or `"default"`), the legacy single-account file at
+ * `~/.brigade/channels/<id>/allow-from.json` is read. Multi-account installs
+ * additionally MERGE the legacy file in so an operator who approved a sender
+ * before per-account partitioning landed isn't kicked off the list.
+ */
+export function readAllowFrom(channelId: string, accountId?: string | null): string[] {
+	const acct = (accountId ?? "").trim();
+	const data = readJson<AllowFromFile>(resolveChannelAllowFromPath(channelId, acct || null), { version: 1, allowFrom: [] });
+	const entries = (data.allowFrom ?? []).map((x) => normalizeId(x)).filter(Boolean);
+	// Multi-account legacy-merge: pull in the channel-wide legacy file too.
+	if (acct && acct !== "default") {
+		const legacy = readJson<AllowFromFile>(resolveChannelAllowFromPath(channelId, null), { version: 1, allowFrom: [] });
+		for (const raw of legacy.allowFrom ?? []) {
+			const id = normalizeId(raw);
+			if (id) entries.push(id);
+		}
+	}
+	return [...new Set(entries)];
 }
 
 /** Add a sender to the allow-from list. Returns true if newly added. */
-export function addAllowFrom(channelId: string, senderId: string): boolean {
+export function addAllowFrom(channelId: string, senderId: string, accountId?: string | null): boolean {
 	const id = normalizeId(senderId);
 	if (!id) return false;
-	const filePath = resolveChannelAllowFromPath(channelId);
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelAllowFromPath(channelId, acct || null);
 	return withFileLock(filePath, () => {
-		const current = readAllowFrom(channelId);
+		const current = readAllowFrom(channelId, acct || null);
 		if (current.includes(id)) return false;
 		writeJsonAtomic(filePath, { version: 1, allowFrom: [...current, id] } satisfies AllowFromFile);
 		return true;
@@ -156,29 +173,39 @@ export function addAllowFrom(channelId: string, senderId: string): boolean {
 }
 
 /** Remove a sender from the allow-from list. Returns true if it was present. */
-export function removeAllowFrom(channelId: string, senderId: string): boolean {
+export function removeAllowFrom(channelId: string, senderId: string, accountId?: string | null): boolean {
 	const id = normalizeId(senderId);
 	if (!id) return false;
-	const filePath = resolveChannelAllowFromPath(channelId);
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelAllowFromPath(channelId, acct || null);
 	return withFileLock(filePath, () => {
-		const current = readAllowFrom(channelId);
+		const current = readAllowFrom(channelId, acct || null);
 		if (!current.includes(id)) return false;
 		writeJsonAtomic(filePath, { version: 1, allowFrom: current.filter((x) => x !== id) } satisfies AllowFromFile);
 		return true;
 	});
 }
 
-/** Read the deduped, normalized GROUP allow-from list for a channel. */
-export function readGroupAllowFrom(channelId: string): string[] {
-	const data = readJson<AllowFromFile>(resolveChannelGroupAllowFromPath(channelId), { version: 1, allowFrom: [] });
-	return [...new Set((data.allowFrom ?? []).map((x) => normalizeId(x)))].filter(Boolean);
+/** Read the deduped, normalized GROUP allow-from list for a channel account. */
+export function readGroupAllowFrom(channelId: string, accountId?: string | null): string[] {
+	const acct = (accountId ?? "").trim();
+	const data = readJson<AllowFromFile>(resolveChannelGroupAllowFromPath(channelId, acct || null), { version: 1, allowFrom: [] });
+	const entries = (data.allowFrom ?? []).map((x) => normalizeId(x)).filter(Boolean);
+	if (acct && acct !== "default") {
+		const legacy = readJson<AllowFromFile>(resolveChannelGroupAllowFromPath(channelId, null), { version: 1, allowFrom: [] });
+		for (const raw of legacy.allowFrom ?? []) {
+			const id = normalizeId(raw);
+			if (id) entries.push(id);
+		}
+	}
+	return [...new Set(entries)];
 }
 
 /** True when `senderId` is in the channel's allow-from list. */
-export function isAllowed(channelId: string, senderId: string): boolean {
+export function isAllowed(channelId: string, senderId: string, accountId?: string | null): boolean {
 	const id = normalizeId(senderId);
 	if (!id) return false;
-	return readAllowFrom(channelId).includes(id);
+	return readAllowFrom(channelId, accountId).includes(id);
 }
 
 /* ─────────────────────────── pairing codes ─────────────────────────── */
@@ -221,8 +248,9 @@ function pruneRequests(requests: PairingRequest[], now = Date.now()): PairingReq
 }
 
 /** Read pending pairing requests; prunes expired/over-cap on read (under lock). */
-export function readPendingPairings(channelId: string): PairingRequest[] {
-	const filePath = resolveChannelPairingPath(channelId);
+export function readPendingPairings(channelId: string, accountId?: string | null): PairingRequest[] {
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelPairingPath(channelId, acct || null);
 	return withFileLock(filePath, () => {
 		const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
 		const pruned = pruneRequests(data.requests ?? []);
@@ -244,10 +272,12 @@ export function upsertPairingRequest(args: {
 	channelId: string;
 	senderId: string;
 	senderName?: string;
+	accountId?: string | null;
 }): { code: string; isNew: boolean } {
 	const senderId = normalizeId(args.senderId);
 	if (!senderId) throw new Error("upsertPairingRequest: senderId required");
-	const filePath = resolveChannelPairingPath(args.channelId);
+	const acct = (args.accountId ?? "").trim();
+	const filePath = resolveChannelPairingPath(args.channelId, acct || null);
 	return withFileLock(filePath, () => {
 	const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
 	const now = new Date().toISOString();
@@ -280,9 +310,10 @@ export function upsertPairingRequest(args: {
  * its sender to the allow-from list. Returns the request that was approved,
  * or `null` if the code is unknown / expired.
  */
-export function approvePairingCode(channelId: string, code: string): PairingRequest | null {
+export function approvePairingCode(channelId: string, code: string, accountId?: string | null): PairingRequest | null {
 	const wanted = normalizeCode(code);
-	const filePath = resolveChannelPairingPath(channelId);
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelPairingPath(channelId, acct || null);
 	const approved = withFileLock(filePath, (): PairingRequest | null => {
 		const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
 		const fresh = pruneRequests(data.requests ?? []);
@@ -293,14 +324,15 @@ export function approvePairingCode(channelId: string, code: string): PairingRequ
 		writeJsonAtomic(filePath, { version: 1, requests: fresh } satisfies PairingFile);
 		return a;
 	});
-	if (approved) addAllowFrom(channelId, approved.senderId); // separate lock, allow-from file
+	if (approved) addAllowFrom(channelId, approved.senderId, acct || null);
 	return approved;
 }
 
 /** Drop a pending code without approving it (operator declines). Returns true if found. */
-export function revokePairingCode(channelId: string, code: string): boolean {
+export function revokePairingCode(channelId: string, code: string, accountId?: string | null): boolean {
 	const wanted = normalizeCode(code);
-	const filePath = resolveChannelPairingPath(channelId);
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelPairingPath(channelId, acct || null);
 	return withFileLock(filePath, () => {
 		const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
 		const fresh = pruneRequests(data.requests ?? []);

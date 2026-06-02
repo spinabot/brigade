@@ -44,7 +44,10 @@ export interface SubsystemLogger {
   warn(message: string, fields?: Record<string, unknown>): void;
   error(message: string, fields?: Record<string, unknown>): void;
   fatal(message: string, fields?: Record<string, unknown>): void;
+  /** Append `name` to the subsystem tag. */
   child(name: string): SubsystemLogger;
+  /** Return a logger that auto-merges `boundFields` into every emit's field bag. */
+  bind(boundFields: Record<string, unknown>): SubsystemLogger;
 }
 
 // Process-level mutable state — single-process expectation; the logger is a
@@ -76,17 +79,33 @@ export function getActiveLogLevel(): LogLevel {
 }
 
 export function createSubsystemLogger(subsystem: string): SubsystemLogger {
-  const tag = sanitiseSubsystem(subsystem);
+  return buildLoggerForTag(sanitiseSubsystem(subsystem), undefined);
+}
+
+/** Internal: build a logger for a (tag, optional bound-fields) pair. */
+function buildLoggerForTag(
+  tag: string,
+  boundFields: Record<string, unknown> | undefined,
+): SubsystemLogger {
+  const merge = (f?: Record<string, unknown>): Record<string, unknown> | undefined => {
+    if (!boundFields) return f;
+    if (!f) return boundFields;
+    return { ...boundFields, ...f };
+  };
   return {
     subsystem: tag,
-    trace: (m, f) => emit("trace", tag, m, f),
-    debug: (m, f) => emit("debug", tag, m, f),
-    info: (m, f) => emit("info", tag, m, f),
-    warn: (m, f) => emit("warn", tag, m, f),
-    error: (m, f) => emit("error", tag, m, f),
-    fatal: (m, f) => emit("fatal", tag, m, f),
+    trace: (m, f) => emit("trace", tag, m, merge(f)),
+    debug: (m, f) => emit("debug", tag, m, merge(f)),
+    info: (m, f) => emit("info", tag, m, merge(f)),
+    warn: (m, f) => emit("warn", tag, m, merge(f)),
+    error: (m, f) => emit("error", tag, m, merge(f)),
+    fatal: (m, f) => emit("fatal", tag, m, merge(f)),
     child(name: string): SubsystemLogger {
-      return createSubsystemLogger(`${tag}/${sanitiseSubsystem(name)}`);
+      return buildLoggerForTag(`${tag}/${sanitiseSubsystem(name)}`, boundFields);
+    },
+    bind(extraFields: Record<string, unknown>): SubsystemLogger {
+      const next = { ...(boundFields ?? {}), ...extraFields };
+      return buildLoggerForTag(tag, next);
     },
   };
 }

@@ -196,6 +196,60 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// up where we left off instead of zeroing the totals on the user's screen.
 	let lastSnapshot: SessionStateSnapshot | null = null;
 	let isAgentRunning = false;
+	// Connection-bound agent id. Defaults to the gateway's boot agent (filled
+	// in from the first `state` snapshot) so legacy single-agent gateways keep
+	// working unchanged. The `/agent <id>` slash command rebinds the connection
+	// so subsequent prompt / abort / steer / set-model / set-thinking RPCs all
+	// target that agent without the operator having to repeat it every turn.
+	let boundAgentId: string | undefined = undefined;
+	// Wave K — connection-bound session key. Lets the operator point this
+	// TUI at a per-peer session (e.g. a channel-routed turn under
+	// `agent:main:whatsapp:<jid>`) so abort / steer / compact / set-model
+	// target THAT lane instead of the boot agent's `main`. Seeded from the
+	// first snapshot, overridden by `/session <key>`.
+	let boundSessionKey: string | undefined = undefined;
+	// Residual P0 (post-Wave K integration audit) — the WS broadcast filter
+	// at server.ts:903 keys on per-connection subscription Sets populated by
+	// the `subscribe` RPC. Without an explicit subscribe, the filter falls
+	// through to back-compat "deliver everything", so two operators each
+	// running /agent <id> still see each other's pi/log/approval frames.
+	// Track the last-committed sub pair so we can `unsubscribe` it before
+	// re-subscribing to the new binding (server keeps sets — leaving stale
+	// entries widens what the operator sees).
+	let lastSubscribedAgentId: string | undefined = undefined;
+	let lastSubscribedSessionKey: string | undefined = undefined;
+	const applySubscription = async (): Promise<void> => {
+		try {
+			const priorParams: Record<string, string> = {};
+			if (lastSubscribedAgentId !== undefined)
+				priorParams.agentId = lastSubscribedAgentId;
+			if (lastSubscribedSessionKey !== undefined)
+				priorParams.sessionId = lastSubscribedSessionKey;
+			if (Object.keys(priorParams).length > 0) {
+				await client.request("unsubscribe", priorParams);
+			}
+			const nextParams: Record<string, string> = {};
+			if (boundAgentId !== undefined) nextParams.agentId = boundAgentId;
+			if (boundSessionKey !== undefined) nextParams.sessionId = boundSessionKey;
+			if (Object.keys(nextParams).length > 0) {
+				await client.request("subscribe", nextParams);
+			}
+			lastSubscribedAgentId = boundAgentId;
+			lastSubscribedSessionKey = boundSessionKey;
+		} catch {
+			// Best-effort. Server falls back to the back-compat branch on
+			// failure (deliver everything), which matches the pre-fix surface.
+		}
+	};
+	// Build the standard `{ agentId?, sessionKey?, ...rest }` payload shape
+	// every RPC uses. Keeps the call sites compact and ensures sessionKey
+	// is threaded uniformly so the server's per-session targeting works.
+	const withBinding = <T extends Record<string, unknown>>(extra: T = {} as T)
+		: T & { agentId?: string; sessionKey?: string } => ({
+			...(boundAgentId !== undefined ? { agentId: boundAgentId } : {}),
+			...(boundSessionKey !== undefined ? { sessionKey: boundSessionKey } : {}),
+			...extra,
+		});
 	// Streaming-assistant buffers keyed by sub-agent depth (Primitive #6).
 	// Depth 0 = top-level agent's stream; depth ≥ 1 = sub-agent at that nesting
 	// level. Each depth gets its own Markdown block that grows in place as
@@ -364,6 +418,16 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 					.filter((o) => o.startsWith(prefix.toLowerCase()))
 					.map((o) => ({ value: o, label: o }));
 			},
+		},
+		{
+			name: "agent",
+			description: "show/bind the connection's active agent id",
+			argumentHint: "[<agent-id>]",
+		},
+		{
+			name: "session",
+			description: "show/bind the connection's active session key",
+			argumentHint: "[<session-key>]",
 		},
 	];
 	editor.setAutocompleteProvider(new CombinedAutocompleteProvider(SLASH_COMMANDS, process.cwd()));
@@ -534,6 +598,18 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	client.on("state", (snap) => {
 		lastSnapshot = snap;
 		isAgentRunning = snap.isAgentRunning;
+		// Seed the connection-bound agent from the first snapshot the
+		// gateway pushes. The operator can override via `/agent <id>` —
+		// once set explicitly, snapshot updates no longer reset the binding.
+		if (boundAgentId === undefined && typeof snap.agentId === "string" && snap.agentId.length > 0) {
+			boundAgentId = snap.agentId;
+		}
+		// Wave K — seed the connection-bound session key from the first
+		// snapshot. Once set explicitly via `/session <key>`, snapshot
+		// updates no longer reset it (mirrors boundAgentId semantics).
+		if (boundSessionKey === undefined && typeof snap.sessionKey === "string" && snap.sessionKey.length > 0) {
+			boundSessionKey = snap.sessionKey;
+		}
 		updateHeader();
 	});
 
@@ -912,6 +988,61 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			return;
 		}
 
+		// /session [key] — print or rebind the connection's bound session key.
+		// Wave K — without this the TUI can only steer/abort/compact the boot
+		// agent's `main` lane. With `/session agent:main:whatsapp:<jid>` an
+		// operator can intervene in a runaway channel turn from the TUI.
+		// No-arg form prints the current binding.
+		if (trimmed === "/session" || trimmed.startsWith("/session ")) {
+			editor.setText("");
+			const arg = trimmed === "/session" ? "" : trimmed.slice("/session ".length).trim();
+			if (!arg) {
+				const cur = boundSessionKey ?? lastSnapshot?.sessionKey ?? "(unset)";
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("bound session:")} ${brand.amber(cur)}`, 0, 0),
+				);
+				return;
+			}
+			boundSessionKey = arg;
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.amber("✓")} ${brand.dim("bound to session")} ${brand.amber(arg)}`,
+					0,
+					0,
+				),
+			);
+			updateHeader();
+			void applySubscription();
+			return;
+		}
+
+		// /agent [id] — print or rebind the connection's bound agent. When the
+		// gateway runs multi-agent (cfg.agents.<id> with per-agent runtime),
+		// the operator uses this to switch which agent their typing targets
+		// without reconnecting. No-arg form prints the current binding.
+		if (trimmed === "/agent" || trimmed.startsWith("/agent ")) {
+			editor.setText("");
+			const arg = trimmed === "/agent" ? "" : trimmed.slice("/agent ".length).trim();
+			if (!arg) {
+				const cur = boundAgentId ?? lastSnapshot?.agentId ?? "(unset)";
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("bound agent:")} ${brand.amber(cur)}`, 0, 0),
+				);
+				return;
+			}
+			boundAgentId = arg;
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.amber("✓")} ${brand.dim("bound to agent")} ${brand.amber(arg)}`,
+					0,
+					0,
+				),
+			);
+			updateHeader();
+			void applySubscription();
+			return;
+		}
+
 		// /abort — explicit slash-form for the same action Ctrl+C performs.
 		// Returning true from `handle.abort()` means a turn was running; the
 		// chat loop's SIGINT path uses the same primitive.
@@ -922,7 +1053,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				return;
 			}
 			try {
-				await client.request("abort");
+				await client.request("abort", withBinding());
 				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.dim("aborted")}`, 0, 0));
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
@@ -998,7 +1129,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		if (isAgentRunning) {
 			editor.setText("");
 			try {
-				await client.request("steer", { text: trimmed });
+				await client.request("steer", withBinding({ text: trimmed }));
 				insertBeforeEditor(
 					new Markdown(`${brand.user("you")}  ${trimmed}`, 1, 0, markdownTheme),
 				);
@@ -1022,7 +1153,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			editor.setText("");
 			insertBeforeEditor(new Text(`  ${brand.dim("Compacting…")}`, 0, 0));
 			try {
-				await client.request("compact", undefined, { timeoutMs: 0 });
+				await client.request("compact", withBinding(), { timeoutMs: 0 });
 				insertBeforeEditor(new Text(`  ${brand.amber("✓")} ${brand.dim("Compacted")}`, 0, 0));
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
@@ -1078,7 +1209,10 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				return;
 			}
 			try {
-				await client.request("set-model", { provider: target.provider, modelId: target.id });
+				await client.request(
+					"set-model",
+					withBinding({ provider: target.provider, modelId: target.id }),
+				);
 				insertBeforeEditor(
 					new Text(
 						`  ${brand.amber("✓")} ${brand.dim("switched to")} ${brand.white(`${target.provider} · ${target.id}`)}`,
@@ -1110,7 +1244,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				return;
 			}
 			try {
-				await client.request("set-thinking", { level: arg });
+				await client.request("set-thinking", withBinding({ level: arg }));
 				insertBeforeEditor(
 					new Text(
 						`  ${brand.amber("✓")} ${brand.dim("thinking set to")} ${brand.amber(arg)}`,
@@ -1133,7 +1267,11 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		insertBeforeEditor(new Markdown(`${brand.user("you")}  ${trimmed}`, 1, 0, markdownTheme));
 		editor.setText("");
 		try {
-			await client.request("prompt", { text: trimmed }, { timeoutMs: 0 });
+			// Carry the connection's bound agentId when set so the gateway
+			// routes this turn to that agent's session lane + runtime entry.
+			// Legacy single-agent gateways receive the same boot agent the
+			// snapshot reported, so behaviour is unchanged.
+			await client.request("prompt", withBinding({ text: trimmed }), { timeoutMs: 0 });
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
@@ -1145,7 +1283,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	return {
 		abort: () => {
 			if (!isAgentRunning) return false;
-			void client.request("abort").catch(() => {});
+			void client.request("abort", withBinding()).catch(() => {});
 			isAgentRunning = false;
 			agentStartedAt = null;
 			editor.disableSubmit = false;

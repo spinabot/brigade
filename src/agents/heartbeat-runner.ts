@@ -57,6 +57,7 @@ import {
 import { inspectPendingSessionEvents } from "./session-event-prompt.js";
 import { hasLiveSession } from "./session-registry.js";
 import { resolveAgentIdFromSessionKey } from "./routing/session-key.js";
+import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
 
 const log = createSubsystemLogger("agents/heartbeat-runner");
 
@@ -70,13 +71,57 @@ export type HeartbeatFiredHook = (params: {
 type HeartbeatRunnerState = {
 	stopped: boolean;
 	disposeWakeHandler: (() => void) | null;
-	firedHook: HeartbeatFiredHook | null;
+	/**
+	 * P1#8 (Wave H) — multi-listener set so `setHeartbeatFiredHook` /
+	 * `addHeartbeatFiredHook` composes rather than overwrites. Older callers
+	 * still get single-slot semantics (clearing on `null`); new wiring uses
+	 * the disposer returned by `addHeartbeatFiredHook` to chain
+	 * registrations (e.g. the agent-events bridge + the gateway's
+	 * synthetic-turn dispatcher).
+	 */
+	firedHooks: Set<HeartbeatFiredHook>;
+	/** Boot operator agentId — only this agent's `:main` session shares the global `CommandLane.Main` FIFO. */
+	bootAgentId: string | null;
 };
 
 const HEARTBEAT_RUNNER_STATE_KEY = Symbol.for("brigade.heartbeatRunner.state");
 
 function createState(): HeartbeatRunnerState {
-	return { stopped: false, disposeWakeHandler: null, firedHook: null };
+	return {
+		stopped: false,
+		disposeWakeHandler: null,
+		firedHooks: new Set(),
+		bootAgentId: null,
+	};
+}
+
+/**
+ * Tell the runner which agentId owns the gateway's primary `Main` lane.
+ * Pass `null` to clear (tests / shutdown). When unset the runner skips
+ * the Main-lane gate entirely (per-session gate still applies).
+ *
+ * Wave L P2#12 — Brigade runs one gateway per process (the Main lane is a
+ * process-wide singleton). Calling this twice with different IDs without
+ * an intervening `null` clear would be a multi-gateway-in-one-process
+ * shape this runner does not support; warn rather than silently overwrite
+ * so the operator sees the misuse. To support that shape, convert
+ * `bootAgentId` to a `Set<string>` and update the targetsBootMain check
+ * to test membership.
+ */
+export function setHeartbeatBootAgentId(id: string | null): void {
+	const trimmed = id?.trim() || null;
+	const state = getState();
+	if (
+		trimmed !== null &&
+		state.bootAgentId !== null &&
+		state.bootAgentId !== trimmed
+	) {
+		log.warn("setHeartbeatBootAgentId double-set without clear", {
+			previous: state.bootAgentId,
+			next: trimmed,
+		});
+	}
+	state.bootAgentId = trimmed;
 }
 
 function getState(): HeartbeatRunnerState {
@@ -88,16 +133,36 @@ function skipped(reason: string): HeartbeatRunResult {
 }
 
 /**
- * Install a `heartbeat-fired` hook. Called once per successful run with
- * the consumed events. Use this to drive Step 25's dispatcher
- * (enqueue an LLM turn payload) without coupling the runner to the
- * dispatcher implementation directly.
+ * Add a `heartbeat-fired` hook. Called once per successful run with the
+ * consumed events. Returns a disposer that removes ONLY this hook —
+ * idempotent (calling twice is a no-op). Multiple hooks compose
+ * (run sequentially per fire; one throwing does not block the others).
  *
- * Pass `null` to clear. Only one hook at a time; setting a new hook
- * replaces the previous one (no fan-out at this layer).
+ * Use this from anywhere that needs to react to a heartbeat: the
+ * agent-events bridge, the gateway's synthetic-turn dispatcher, tests.
+ */
+export function addHeartbeatFiredHook(hook: HeartbeatFiredHook): () => void {
+	const state = getState();
+	state.firedHooks.add(hook);
+	return () => {
+		state.firedHooks.delete(hook);
+	};
+}
+
+/**
+ * Legacy single-slot setter. Pass a hook to ADD it (returns void, not a
+ * disposer — call `addHeartbeatFiredHook` for that). Pass `null` to clear
+ * every registered hook (used by tests + `resetAgentEventsForTests`).
+ *
+ * Prefer `addHeartbeatFiredHook` from new wiring so composition is opt-in.
  */
 export function setHeartbeatFiredHook(hook: HeartbeatFiredHook | null): void {
-	getState().firedHook = hook;
+	const state = getState();
+	if (hook === null) {
+		state.firedHooks.clear();
+		return;
+	}
+	state.firedHooks.add(hook);
 }
 
 /**
@@ -121,16 +186,31 @@ export async function processHeartbeatWakeIntent(
 	const agentId =
 		(intent.agentId ?? "").trim() || resolveAgentIdFromSessionKey(sessionKey);
 
-	// Global main-lane gate — operator's primary turn pre-empts any
-	// heartbeat run. The wake layer retries us in 1s.
-	if (getLaneQueueSize(CommandLane.Main) > 0) {
-		return skipped("requests-in-flight");
-	}
-
-	// Per-session lane gate — an active streaming turn for THIS session
-	// also pre-empts. Same retry behaviour.
+	// Per-session lane gate — an active turn for THIS session pre-empts the
+	// heartbeat; the wake layer retries us in 1s. We no longer gate on the
+	// global `Main` lane unconditionally because non-main sessions now run on
+	// their own per-session lanes; a busy `Main` (operator typing) should
+	// NOT block a heartbeat for a channel session that has its own queue.
 	const sessionLaneKey = sessionLane(sessionKey);
 	if (getLaneQueueSize(sessionLaneKey) > 0) {
+		return skipped("requests-in-flight");
+	}
+	// Main-session heartbeats still need the global gate — those land on
+	// `CommandLane.Main`, so an in-flight operator turn would race a
+	// synthetic heartbeat turn on the same FIFO. Only the BOOT agent's
+	// `:main` session shares the Main lane; other agents' `:main` sessions
+	// route to per-session lanes and are NOT gated against Main here.
+	//
+	// Wave L P2#6 — unify on `parseAgentSessionKey` so the agentId-arm /
+	// rest-arm match (the agentId-arm above already calls
+	// `resolveAgentIdFromSessionKey` which round-trips through the parser).
+	// Raw `split(":")` would return `cron` for `agent:<id>:cron:<job>:run:<runId>`
+	// and miss the parser's lowercasing / segment normalisation.
+	const restPart = parseAgentSessionKey(sessionKey)?.rest ?? "";
+	const bootAgentId = state.bootAgentId;
+	const targetsBootMain =
+		restPart === "main" && bootAgentId !== null && agentId === bootAgentId;
+	if (targetsBootMain && getLaneQueueSize(CommandLane.Main) > 0) {
 		return skipped("requests-in-flight");
 	}
 
@@ -165,12 +245,27 @@ export async function processHeartbeatWakeIntent(
 		// stays queued for the next drain. Returns the actual list consumed
 		// so the hook can surface them downstream.
 		const consumed = consumeSystemEventEntries(sessionKey, inspection.events);
-		await state.firedHook?.({
+		const params = {
 			reason,
 			agentId,
 			sessionKey,
 			consumedEvents: consumed,
-		});
+		};
+		// Fire every registered hook. Snapshot the set so a hook that adds /
+		// removes hooks mid-fire doesn't perturb this run. Each hook is
+		// awaited sequentially; a throwing hook is logged + skipped so one
+		// bad listener doesn't drop events for the others.
+		for (const hook of [...state.firedHooks]) {
+			try {
+				await hook(params);
+			} catch (err) {
+				log.warn("heartbeat-fired hook threw", {
+					reason,
+					sessionKey,
+					error: (err as Error)?.message,
+				});
+			}
+		}
 		return { status: "ran", durationMs: Date.now() - startedAt };
 	} catch (err) {
 		const message = (err as Error)?.message ?? String(err);
@@ -216,5 +311,6 @@ export function resetHeartbeatRunnerStateForTests(): void {
 	const state = getState();
 	state.stopped = false;
 	state.disposeWakeHandler = null;
-	state.firedHook = null;
+	state.firedHooks.clear();
+	state.bootAgentId = null;
 }

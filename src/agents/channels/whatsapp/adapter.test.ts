@@ -23,6 +23,46 @@ describe("WhatsApp adapter", () => {
 		assert.equal(a.isConfigured({ channels: { whatsapp: { enabled: true } } } as unknown as BrigadeConfig), true);
 	});
 
+	it("legacy adapter steps aside when multi-account config is declared (Wave F back-compat)", () => {
+		// `b.channel(createWhatsAppAdapter())` (legacy boot, no opts) must
+		// refuse to start when the operator has declared multiple accounts —
+		// otherwise the plugin path would double-spawn the default socket.
+		const legacy = createWhatsAppAdapter();
+		const multiCfg = {
+			channels: {
+				whatsapp: {
+					enabled: true,
+					accounts: [{ id: "personal" }, { id: "work" }],
+				},
+			},
+		} as unknown as BrigadeConfig;
+		assert.equal(legacy.isConfigured(multiCfg), false);
+		// A single-account `accounts:[{id:"default"}]` still goes through the
+		// legacy boot — the plugin manager only takes over for >1 accounts.
+		const singleAccountCfg = {
+			channels: {
+				whatsapp: { enabled: true, accounts: [{ id: "default" }] },
+			},
+		} as unknown as BrigadeConfig;
+		assert.equal(legacy.isConfigured(singleAccountCfg), true);
+	});
+
+	it("explicit-account adapters keep their own configuration check (plugin path)", () => {
+		// When the plugin path constructs a per-account adapter it passes
+		// `accountId` + `authDir`; that instance always reports configured
+		// (the plugin manager decides which accounts to spin up).
+		const work = createWhatsAppAdapter({ accountId: "work", authDir: "/tmp/work" });
+		const multiCfg = {
+			channels: {
+				whatsapp: {
+					enabled: true,
+					accounts: [{ id: "personal" }, { id: "work" }],
+				},
+			},
+		} as unknown as BrigadeConfig;
+		assert.equal(work.isConfigured(multiCfg), true);
+	});
+
 	it("refuses sendText before start()", async () => {
 		const a = createWhatsAppAdapter();
 		await assert.rejects(() => a.sendText("123@s.whatsapp.net", "hi"), /not started/);

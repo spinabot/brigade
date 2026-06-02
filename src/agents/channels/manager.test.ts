@@ -97,7 +97,13 @@ describe("startChannels", () => {
 		await f.ctx().onInbound(msg);
 		assert.equal(calls.length, 1);
 		assert.equal(calls[0]?.text, "ping");
-		assert.match(calls[0]?.sessionKey ?? "", /^agent:main:fake:c1\.[0-9a-f]{8}$/);
+		// Wave E switched the manager from the legacy per-conversation
+		// `channelSessionKey()` shape to the canonical resolver output.
+		// `dmScope` defaults to "main" in resolve-route.ts, so a single-agent
+		// install with no `session.dmScope` config lands every DM on
+		// `agent:main:main` — a deliberate collapse that matches the route
+		// resolver's contract.
+		assert.equal(calls[0]?.sessionKey ?? "", "agent:main:main");
 		assert.deepEqual(f.sent, [{ conversationId: "c1", text: "pong" }]);
 		await mgr.stop();
 	});
@@ -929,6 +935,196 @@ describe("startChannels", () => {
 		});
 		assert.equal(f.sentWithOpts.length, 2);
 		assert.equal(f.sentWithOpts[1]?.opts, undefined, "no threadId → no opts passed");
+		await mgr.stop();
+	});
+
+	it("forwards inbound accountId as opts.accountId on adapter.sendText for multi-account adapters", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "reply-from-acct-A" }),
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "peer-1",
+			from: "u",
+			text: "ping",
+			accountId: "acct-A",
+		});
+		assert.equal(f.sentWithOpts.length, 1);
+		assert.equal(
+			f.sentWithOpts[0]?.opts?.accountId,
+			"acct-A",
+			"accountId must be forwarded as opts.accountId",
+		);
+		await mgr.stop();
+	});
+
+	it("two inbounds with same conversationId but different threadIds get distinct lanes (independent turns, no cross-thread bleed)", async () => {
+		// Without per-thread lane keying, a second inbound on the same
+		// conversation but in a sibling thread would either be queued behind
+		// the first turn (gateway-level serialisation) or, worse, be aborted
+		// by a "stop" answered in the sibling thread. The lane-key change in
+		// Wave E lifts that constraint: distinct threadId → distinct lane →
+		// distinct inflight controller + distinct dispatch.
+		const f = makeFakeChannel();
+		const turns: Array<{ text: string; sessionKey: string }> = [];
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async (a) => {
+				turns.push({ text: a.text, sessionKey: a.sessionKey });
+				return { reply: `done:${a.text}` };
+			},
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "c-room",
+			from: "u-1",
+			text: "alpha",
+			threadId: "t-1",
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "c-room",
+			from: "u-2",
+			text: "beta",
+			threadId: "t-2",
+		});
+		assert.equal(turns.length, 2, "both threads must dispatch independently");
+		assert.notEqual(
+			turns[0]?.sessionKey,
+			turns[1]?.sessionKey,
+			"distinct threadId → distinct sessionKey",
+		);
+		// Replies must each carry their own threadId in opts.
+		assert.equal(f.sentWithOpts.length, 2);
+		assert.equal(f.sentWithOpts[0]?.opts?.threadId, "t-1");
+		assert.equal(f.sentWithOpts[1]?.opts?.threadId, "t-2");
+		await mgr.stop();
+	});
+
+	it("approval prompts in two different threads of the same conversation are tracked independently", async () => {
+		// Without thread/account dimensions in peerKey, an approval raised in
+		// thread A and another in thread B (same channel + conversation)
+		// would collide: the second dispatch would deny-cancel the first.
+		// With Wave E's expanded peerKey both prompts coexist; only the
+		// matching thread's reply settles each.
+		const { dispatchChannelApproval, registerChannelApprovalDispatcher, tryConsumeChannelApprovalReply, resetChannelApprovalRouterForTests } =
+			await import("./approval-router.js");
+		resetChannelApprovalRouterForTests();
+		const sends: Array<{ conversationId: string; text: string; opts?: { threadId?: string; accountId?: string } }> = [];
+		registerChannelApprovalDispatcher("fake", undefined, {
+			sendText: async (conversationId, text, opts) => {
+				sends.push({ conversationId, text, opts });
+			},
+			prettyName: "Fake",
+		});
+		const settled: Array<{ id: string; kind: string }> = [];
+		const reqA = {
+			id: "appr-A",
+			command: "ls -la",
+			toolName: "bash",
+			timeoutMs: 60_000,
+			decisions: ["allow-once", "allow-always", "deny"] as const,
+		};
+		const reqB = {
+			id: "appr-B",
+			command: "rm -rf /tmp/x",
+			toolName: "bash",
+			timeoutMs: 60_000,
+			decisions: ["allow-once", "allow-always", "deny"] as const,
+		};
+		await dispatchChannelApproval({
+			request: reqA,
+			route: { channelId: "fake", conversationId: "c-room", threadId: "t-1", agentId: "main" },
+			resolveOnBridge: (d) => settled.push({ id: "appr-A", kind: d.kind }),
+		});
+		await dispatchChannelApproval({
+			request: reqB,
+			route: { channelId: "fake", conversationId: "c-room", threadId: "t-2", agentId: "main" },
+			resolveOnBridge: (d) => settled.push({ id: "appr-B", kind: d.kind }),
+		});
+		// Two distinct lanes → two prompts dispatched, NO deny-cancel of the
+		// first. Pre-Wave-E this would have produced a deny on appr-A.
+		assert.equal(sends.length, 2);
+		assert.equal(settled.length, 0, "neither approval has resolved yet");
+		// Reply "yes" in thread t-1 → settles ONLY appr-A.
+		const r1 = tryConsumeChannelApprovalReply({
+			channelId: "fake",
+			conversationId: "c-room",
+			threadId: "t-1",
+			text: "yes",
+		});
+		assert.equal(r1.matched, true);
+		if (r1.matched) {
+			assert.equal(r1.approvalId, "appr-A");
+			assert.equal(r1.decision, "allow-once");
+		}
+		assert.equal(settled.length, 1);
+		assert.equal(settled[0]?.id, "appr-A");
+		// Reply "no" in thread t-2 → settles ONLY appr-B.
+		const r2 = tryConsumeChannelApprovalReply({
+			channelId: "fake",
+			conversationId: "c-room",
+			threadId: "t-2",
+			text: "no",
+		});
+		assert.equal(r2.matched, true);
+		if (r2.matched) {
+			assert.equal(r2.approvalId, "appr-B");
+			assert.equal(r2.decision, "deny");
+		}
+		assert.equal(settled.length, 2);
+		assert.equal(settled[1]?.id, "appr-B");
+		resetChannelApprovalRouterForTests();
+	});
+
+	it("two inbounds with same conversationId but different accountIds use distinct sessionKeys + opts.accountId on the reply", async () => {
+		// Per-account-channel-peer dmScope produces distinct session keys for
+		// the same conversation on two different accounts; the manager must
+		// also forward accountId on the outbound so the reply lands in the
+		// account that received the inbound.
+		const f = makeFakeChannel();
+		const turns: Array<{ sessionKey: string }> = [];
+		const cfg = {
+			channels: { fake: { dmPolicy: "open" } },
+			session: { dmScope: "per-account-channel-peer" },
+		} as unknown as BrigadeConfig;
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: cfg,
+			agentId: "main",
+			runTurn: async (a) => {
+				turns.push({ sessionKey: a.sessionKey });
+				return { reply: "ack" };
+			},
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "+1555000",
+			from: "+1555000",
+			text: "from acct A",
+			accountId: "acct-A",
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "+1555000",
+			from: "+1555000",
+			text: "from acct B",
+			accountId: "acct-B",
+		});
+		assert.equal(turns.length, 2);
+		assert.notEqual(
+			turns[0]?.sessionKey,
+			turns[1]?.sessionKey,
+			"distinct accountId → distinct sessionKey under per-account-channel-peer dmScope",
+		);
+		assert.equal(f.sentWithOpts[0]?.opts?.accountId, "acct-A");
+		assert.equal(f.sentWithOpts[1]?.opts?.accountId, "acct-B");
 		await mgr.stop();
 	});
 });

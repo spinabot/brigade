@@ -123,6 +123,39 @@ function resolveDefaultModel(config: BrigadeConfig): string {
 	return "claude-opus-4-7";
 }
 
+/** Read the per-agent override block from `config.agents.<agentId>` — used
+ *  so a sub-agent inherits its parent agent's model rather than always
+ *  falling back to `agents.defaults`. */
+function readAgentOverride(
+	config: BrigadeConfig,
+	agentId: string | undefined,
+): { provider?: unknown; model?: { primary?: unknown } } | undefined {
+	if (!agentId) return undefined;
+	const agents = config.agents as Record<string, unknown> | undefined;
+	if (!agents) return undefined;
+	const ov = agents[agentId];
+	if (!ov || typeof ov !== "object") return undefined;
+	return ov as { provider?: unknown; model?: { primary?: unknown } };
+}
+
+/** Per-agent provider — `cfg.agents.<agentId>.provider` wins, then defaults. */
+function resolveAgentProvider(config: BrigadeConfig, agentId: string | undefined): string {
+	const ov = readAgentOverride(config, agentId);
+	if (ov && typeof ov.provider === "string" && ov.provider.length > 0) {
+		return ov.provider;
+	}
+	return resolveDefaultProvider(config);
+}
+
+/** Per-agent model — `cfg.agents.<agentId>.model.primary` wins, then defaults. */
+function resolveAgentModel(config: BrigadeConfig, agentId: string | undefined): string {
+	const ov = readAgentOverride(config, agentId);
+	if (ov?.model && typeof ov.model.primary === "string" && ov.model.primary.length > 0) {
+		return ov.model.primary;
+	}
+	return resolveDefaultModel(config);
+}
+
 /**
  * Build the child's first user message. Wraps the raw task in structured
  * prefixes so the model can distinguish framing-from-system vs the actual
@@ -236,8 +269,11 @@ export async function runSubagent(args: RunSubagentArgs): Promise<RunSubagentRes
 
 	const combinedSignal = combineAbortSignals(args.parentSignal, timeoutController.signal);
 
-	const provider = args.provider ?? resolveDefaultProvider(config);
-	const modelId = args.modelId ?? resolveDefaultModel(config);
+	// Per-agent override resolution — when the parent agent has a non-default
+	// `cfg.agents.<parentAgentId>` block, the child inherits its provider/
+	// model from there rather than falling back to `cfg.agents.defaults`.
+	const provider = args.provider ?? resolveAgentProvider(config, args.parentAgentId);
+	const modelId = args.modelId ?? resolveAgentModel(config, args.parentAgentId);
 	const startMs = Date.now();
 	const childDepth = callerDepth + 1;
 

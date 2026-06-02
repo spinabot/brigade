@@ -216,7 +216,13 @@ export function createChannelPluginManager(
 				});
 			}
 			// Auto-restart unless the operator pulled the plug.
-			if (runtime.manuallyStopped || aborts.signal.aborted) return;
+			if (runtime.manuallyStopped || aborts.signal.aborted) {
+				// Natural exit (operator stop OR abort fired) — drop the runtime
+				// entry so a future startChannel call doesn't see a stale
+				// aborted entry and skip via the "already running" guard.
+				channelState.accounts.delete(accountId);
+				return;
+			}
 			const nextAttempt = runtime.restartAttempts + 1;
 			runtime.restartAttempts = nextAttempt;
 			if (nextAttempt > RESTART_MAX_ATTEMPTS) {
@@ -225,6 +231,10 @@ export function createChannelPluginManager(
 					accountId,
 					attempts: nextAttempt,
 				});
+				// Same cleanup: drop the runtime entry so the operator can
+				// `brigade channels start` a fresh attempt later without
+				// tripping the "already running" guard.
+				channelState.accounts.delete(accountId);
 				return;
 			}
 			const delayMs = computeBackoff(nextAttempt);
@@ -235,7 +245,14 @@ export function createChannelPluginManager(
 				delayMs,
 			});
 			await sleepWithAbort(delayMs, aborts.signal);
-			if (aborts.signal.aborted || runtime.manuallyStopped) return;
+			if (aborts.signal.aborted || runtime.manuallyStopped) {
+				channelState.accounts.delete(accountId);
+				return;
+			}
+			// Drop the prior runtime entry BEFORE recursing so the inner
+			// `existing && !existing.aborts.signal.aborted` guard sees the
+			// fresh slot land.
+			channelState.accounts.delete(accountId);
 			await startAccountLoop(plugin, accountId, {
 				preserveRestartAttempts: true,
 				preserveManualStop: true,

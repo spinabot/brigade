@@ -127,6 +127,8 @@ export interface InboundMessage {
 	 * and session-key for thread-scoped routing.
 	 */
 	threadId?: string;
+	/** Parent thread id when this inbound is a reply nested under another thread; channels without parent-thread tracking leave it undefined. */
+	threadParentId?: string;
 	/** Media attachments saved to disk, when the inbound carried any. */
 	media?: InboundMediaAttachment[];
 	/**
@@ -209,6 +211,8 @@ export interface ChannelStartContext {
 export interface OutboundSendOptions {
 	/** Reply within this thread (Slack thread_ts, Discord thread id). */
 	threadId?: string;
+	/** Which channel account to send from on multi-account adapters (e.g. Slack with two workspaces, WhatsApp with two linked numbers); `undefined` falls back to the adapter's default account. */
+	accountId?: string;
 }
 
 /**
@@ -930,9 +934,33 @@ export interface HookRegistration {
 	priority?: number;
 }
 
+/** Wave K — per-turn context handed to a tool factory at session-init. */
+export interface BrigadeToolFactoryContext {
+	/** The agent this Pi session belongs to. */
+	readonly agentId: string;
+	/** The session key the per-turn lane uses. */
+	readonly sessionKey: string;
+}
+
+/** Wave K — factory shape `b.tool()` accepts in addition to a bare tool. */
+export interface BrigadeToolFactory {
+	create: (ctx: BrigadeToolFactoryContext) => AnyBrigadeTool;
+}
+
+/** Either a pre-built tool or a per-turn factory that produces one. */
+export type BrigadeToolOrFactory = AnyBrigadeTool | BrigadeToolFactory;
+
 /** A recorded tool registration + its enablement gate. */
 export interface ToolRegistration {
-	tool: AnyBrigadeTool;
+	/**
+	 * Either a frozen tool (legacy / closure-over-meta path) or a factory
+	 * whose `create({ agentId, sessionKey })` runs at session-init so the
+	 * tool can scope state to the active turn. Both shapes coexist; the
+	 * replay layer in `toPiExtensionFactory` dispatches on the field that's
+	 * present.
+	 */
+	tool?: AnyBrigadeTool;
+	factory?: BrigadeToolFactory;
 	/**
 	 * Toolset grouping (e.g. `"minimal" | "coding" | "messaging" | "full"`)
 	 * — the registry filters by the active profile when one is set.
@@ -958,6 +986,15 @@ export interface ToolRegistration {
  * gateway-level capability registries. (Recording — not live delegation — because
  * Brigade's gateway is per-turn: agent-level wiring re-applies each session, while
  * channels/services start once at gateway boot.)
+ *
+ * CAPTURE TRAP — every field on this context is AGENT-SCOPED. Modules that close
+ * over `agentId` / `workspaceDir` / `cwd` / `config` / `moduleConfig` in handlers
+ * passed to `tool()` / `hook()` / `modelProvider()` get those values frozen INTO
+ * the recorded registration, which `toPiExtensionFactory` then replays per Pi
+ * session. The registry-cache layer is keyed by `agentId` precisely so the meta
+ * captured by agent A's modules never leaks into agent B's tools. Modules that
+ * want per-turn / per-session values should read them from the runtime call
+ * (e.g. the Pi tool `ctx`) rather than the context closure.
  */
 export interface BrigadeExtensionContext {
 	/** Active agent id. */
@@ -976,7 +1013,16 @@ export interface BrigadeExtensionContext {
 	readonly moduleConfig: unknown;
 
 	/* agent-level → replayed into Pi's ExtensionAPI per session */
-	tool(tool: AnyBrigadeTool, opts?: { toolset?: string; eligible?: () => boolean }): void;
+	/**
+	 * Register a tool — either a pre-built `AnyBrigadeTool` (legacy path; the
+	 * module closes over agent meta itself) or a `BrigadeToolFactory` whose
+	 * `create({ agentId, sessionKey })` runs once per Pi-session init so the
+	 * tool can scope state to the active turn (Wave K).
+	 */
+	tool(
+		tool: BrigadeToolOrFactory,
+		opts?: { toolset?: string; eligible?: () => boolean },
+	): void;
 	/**
 	 * Subscribe to a Pi lifecycle event (replayed via `pi.on`). `priority` orders
 	 * Brigade's recorded hooks before replay (higher = earlier; Pi has no native

@@ -69,6 +69,28 @@ export function sessionLane(sessionKey: string): string {
 }
 
 /**
+ * Per-parent sub-agent lane id. Each parent session gets its own FIFO
+ * lane (`subagent:<parentSessionKey>`) so spawns from different parents
+ * never block one another. The PROCESS-WIDE in-flight cap lives outside
+ * the lane engine — see `agents/subagent-budget.ts` for the semaphore the
+ * gateway pushes `resolveSubagentMaxConcurrent(cfg)` into.
+ */
+export function subagentLane(parentSessionKey: string | undefined | null): string {
+	const trimmed = (parentSessionKey ?? "").trim();
+	return trimmed ? `subagent:${trimmed}` : CommandLane.Subagent;
+}
+
+/**
+ * Per-parent A2A / nested lane id. Same shape as `subagentLane` but keyed
+ * for cross-session sends originated by the same caller so a chatty caller
+ * doesn't starve siblings.
+ */
+export function nestedLane(parentSessionKey: string | undefined | null): string {
+	const trimmed = (parentSessionKey ?? "").trim();
+	return trimmed ? `nested:${trimmed}` : CommandLane.Nested;
+}
+
+/**
  * Run `work` on the named lane. Resolves with the work's result. Backed
  * by the generation-aware engine in `./command-queue.js` — same FIFO
  * semantics as before, but a `resetAllLanes()` call (e.g. from a config
