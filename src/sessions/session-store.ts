@@ -104,16 +104,49 @@ export interface ResolvedSession {
 
 // Resolve the sessionId for a given session-key. Creates a new entry the
 // first time a key is seen; touches lastUsedAt every time.
+//
+// Freshness TTL (Audit 24 gap): when `freshnessMs` is set AND the existing
+// entry's `lastUsedAt` is older than that window, the function mints a
+// NEW `sessionId` for the same session-key. This is how operators get a
+// "fresh context every morning" behaviour without losing the key→session
+// mapping. The previous `sessionId`'s transcript stays on disk (cleanup
+// is a separate concern); the session-key just points at the new one.
+//
+// Default: no TTL (existing call sites preserve previous behaviour).
+// Callers that want the rollover behaviour pass `freshnessMs` derived
+// from operator config (`cfg.session.freshnessMs` or similar) — keeping
+// the policy at the caller layer instead of hard-coding here.
 export function resolveOrCreateSession(args: {
   agentId: string;
   sessionKey: string;
   overrides?: Partial<SessionEntry>;
+  /** Roll a new sessionId if the entry hasn't been touched within this many ms. */
+  freshnessMs?: number;
 }): ResolvedSession {
   const { agentId, sessionKey } = args;
   const store = readSessionStore(agentId);
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   let entry = store.sessions[sessionKey];
   let isNew = false;
+
+  if (entry && typeof args.freshnessMs === "number" && args.freshnessMs > 0) {
+    const lastMs = Date.parse(entry.lastUsedAt);
+    if (Number.isFinite(lastMs) && nowMs - lastMs > args.freshnessMs) {
+      // Stale — roll a new sessionId but keep the entry slot. We deliberately
+      // DROP `subagent` metadata when rolling (a stale sub-agent slot getting
+      // re-used should be treated as a fresh top-level session). createdAt
+      // resets so audit tooling can see when the rolled session started.
+      entry = {
+        sessionId: randomUUID(),
+        createdAt: now,
+        lastUsedAt: now,
+        ...(args.overrides ?? {}),
+      };
+      store.sessions[sessionKey] = entry;
+      isNew = true;
+    }
+  }
 
   if (!entry) {
     entry = {
@@ -124,7 +157,7 @@ export function resolveOrCreateSession(args: {
     };
     store.sessions[sessionKey] = entry;
     isNew = true;
-  } else {
+  } else if (!isNew) {
     entry.lastUsedAt = now;
     if (args.overrides) {
       // Primitive #6 — `subagent` metadata is the one field we treat as

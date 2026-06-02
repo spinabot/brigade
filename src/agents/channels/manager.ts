@@ -805,7 +805,14 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					// to `agent:ops` while Slack messages to `#engineering` go to
 					// `agent:work`. Single-agent installs simply land on
 					// `args.agentId` via the default tier.
-					const normalizedAccountId = normalizeAccountId(msg.conversationId);
+					//
+					// Account-id source: prefer the adapter-supplied `msg.accountId`
+					// (set by multi-account adapters like WhatsApp personal+work);
+					// fall back to `msg.conversationId` for single-account
+					// adapters. Normalized to canonical form for cache + binding
+					// match.
+					const rawAccountId = msg.accountId?.trim() || msg.conversationId;
+					const normalizedAccountId = normalizeAccountId(rawAccountId);
 					const peerKind = isGroup ? "group" : "direct";
 					// Cross-channel peer alias resolution (Step 5). If the operator
 					// configured `session.identityLinks: { kartheek: ["whatsapp:+91…",
@@ -825,19 +832,57 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 						peer: canonicalPeerId
 							? { id: canonicalPeerId, kind: peerKind }
 							: undefined,
+						// Tiers 4-6 fields. Channel adapters populate these on
+						// inbounds that originated from a guild/team — Discord
+						// adapters fill `guildId` + `memberRoleIds`, Slack fills
+						// `teamId`. Undefined for channels without these
+						// concepts (WhatsApp, SMS, etc.), in which case the
+						// resolver's `enabled` flag suppresses those tiers and
+						// dispatch falls through to peer/account/channel/default.
+						...(msg.guildId ? { guildId: msg.guildId } : {}),
+						...(msg.teamId ? { teamId: msg.teamId } : {}),
+						...(msg.memberRoleIds?.length
+							? { memberRoleIds: msg.memberRoleIds }
+							: {}),
 					});
 					const resolvedAgentId = route.agentId || args.agentId;
-					// Thread-aware session key: when a channel carries a thread id
-					// (Slack/Discord), scope the session per thread so a busy room
-					// doesn't pool every thread's history into one transcript.
-					// Brigade keeps its per-conversation session-key shape
-					// (channelSessionKey) rather than the OC `dmScope`-driven key,
-					// so existing conversation isolation isn't broken by the
-					// routing migration. Only the agent id changes per-inbound.
-					const convScope = msg.threadId
-						? `${msg.conversationId}#${msg.threadId}`
-						: msg.conversationId;
-					const sessionKey = channelSessionKey(resolvedAgentId, adapter.id, convScope);
+					// Debug log: which tier actually matched. Useful when an
+					// operator's binding doesn't seem to fire — `route.matchedBy`
+					// tells us whether peer/guild/team/account/channel/default
+					// won the cascade. Always logged; cheap one-liner.
+					log.debug("inbound routed", {
+						channel: adapter.id,
+						from: msg.from,
+						agentId: resolvedAgentId,
+						matchedBy: route.matchedBy,
+					});
+					// Session-key shape: respect `cfg.session.dmScope` when it's
+					// set so an operator can opt into OC's per-peer /
+					// per-channel-peer / per-account-channel-peer / main shapes.
+					// Without a config opt-in, Brigade keeps its v1 per-
+					// conversation `channelSessionKey()` shape (each conversation
+					// gets its own JSONL transcript) — that's the default that
+					// has shipped from day one.
+					const sessionScopeCfg = (args.config as {
+						session?: { dmScope?: string };
+					}).session;
+					const dmScope = sessionScopeCfg?.dmScope?.trim();
+					const sessionKey =
+						dmScope && dmScope !== "" && dmScope !== "default"
+							? route.sessionKey || channelSessionKey(
+									resolvedAgentId,
+									adapter.id,
+									msg.threadId
+										? `${msg.conversationId}#${msg.threadId}`
+										: msg.conversationId,
+								)
+							: channelSessionKey(
+									resolvedAgentId,
+									adapter.id,
+									msg.threadId
+										? `${msg.conversationId}#${msg.threadId}`
+										: msg.conversationId,
+								);
 					// Channel routing for approval prompts — exec-gate sends "want
 					// to run <cmd>?" prompts into THIS conversation instead of
 					// (only) the gateway WS, and the next inbound from the same

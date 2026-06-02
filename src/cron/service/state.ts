@@ -118,8 +118,20 @@ export interface CronServiceDeps {
 	runIsolatedAgentJob?: (args: CronIsolatedRunArgs) => Promise<CronIsolatedRunOutcome>;
 	/** Inject text as a system event into the operator's main session. */
 	enqueueSystemEvent?: (args: CronSystemEventArgs) => void;
-	/** Force a heartbeat tick (for `wakeMode: "now"`). */
-	requestHeartbeatNow?: (opts?: { reason?: string }) => void;
+	/**
+	 * Force a heartbeat tick (for `wakeMode: "now"`).
+	 *
+	 * Multi-agent: `opts.agentId` + `opts.sessionKey` route the heartbeat
+	 * to a specific agent's session. When a cron job carries its own
+	 * `agentId` (set when the job was added), the timer passes it
+	 * through so the fire lands on the right session rather than the
+	 * gateway's boot default. Omit both for legacy single-agent jobs.
+	 */
+	requestHeartbeatNow?: (opts?: {
+		reason?: string;
+		agentId?: string;
+		sessionKey?: string;
+	}) => void;
 	/** Send a failure-alert message via the configured channel/webhook. */
 	sendCronFailureAlert?: (args: CronFailureAlertSendArgs) => Promise<void>;
 	/**

@@ -37,12 +37,22 @@ import type { BrigadeConfig } from "../config/types.js";
 
 const log = createSubsystemLogger("agents/heartbeat-scheduler");
 
+interface QuietHoursWindow {
+	/** Minutes-since-midnight of the start of the quiet window (local TZ). */
+	startMinutes: number;
+	/** Minutes-since-midnight of the end of the quiet window (local TZ). */
+	endMinutes: number;
+	/** IANA timezone or `undefined` for system-local. */
+	timezone?: string;
+}
+
 interface AgentSchedule {
 	agentId: string;
 	intervalMs: number;
 	phaseMs: number;
 	nextDueMs: number;
 	sessionKey?: string;
+	quietHours?: QuietHoursWindow;
 }
 
 export interface HeartbeatSchedulerDeps {
@@ -89,43 +99,169 @@ function computeNextDueMs(now: number, intervalMs: number, phaseMs: number): num
 	return now + (delta || intervalMs);
 }
 
+/**
+ * Parse an "HH:MM" string into minutes-since-midnight. Returns `null` on
+ * anything malformed (the scheduler skips quiet-hours config that doesn't
+ * parse — fail-open rather than refusing to fire).
+ */
+function parseHHMM(value: unknown): number | null {
+	if (typeof value !== "string") return null;
+	const match = /^([0-2]?\d):([0-5]\d)$/.exec(value.trim());
+	if (!match) return null;
+	const hours = Number.parseInt(match[1] ?? "", 10);
+	const minutes = Number.parseInt(match[2] ?? "", 10);
+	if (!Number.isFinite(hours) || hours < 0 || hours > 23) return null;
+	if (!Number.isFinite(minutes) || minutes < 0 || minutes > 59) return null;
+	return hours * 60 + minutes;
+}
+
+/**
+ * Minutes-since-midnight for `nowMs` in the supplied IANA timezone (or
+ * system-local when `timezone` is undefined). Used by quiet-hours to
+ * decide whether the agent is currently inside its do-not-disturb window.
+ *
+ * Intl.DateTimeFormat does the heavy lifting — TZ-aware without pulling
+ * a heavy library. Falls back to local when the timezone arg is invalid.
+ */
+function minutesSinceMidnightInTz(nowMs: number, timezone?: string): number {
+	const date = new Date(nowMs);
+	const options: Intl.DateTimeFormatOptions = {
+		hour12: false,
+		hour: "2-digit",
+		minute: "2-digit",
+	};
+	if (timezone) options.timeZone = timezone;
+	let parts: Intl.DateTimeFormatPart[];
+	try {
+		parts = new Intl.DateTimeFormat("en-US", options).formatToParts(date);
+	} catch {
+		// Bad TZ string — drop back to system-local. The operator still gets
+		// quiet hours; they just don't get TZ-shifted ones.
+		parts = new Intl.DateTimeFormat("en-US", {
+			hour12: false,
+			hour: "2-digit",
+			minute: "2-digit",
+		}).formatToParts(date);
+	}
+	const hour = parts.find((p) => p.type === "hour")?.value ?? "00";
+	const minute = parts.find((p) => p.type === "minute")?.value ?? "00";
+	// Intl returns "24" at midnight on some engines — normalise to 0.
+	const hoursNum = Number.parseInt(hour, 10);
+	const minutesNum = Number.parseInt(minute, 10);
+	const safeHours = Number.isFinite(hoursNum) ? hoursNum % 24 : 0;
+	const safeMinutes = Number.isFinite(minutesNum) ? minutesNum : 0;
+	return safeHours * 60 + safeMinutes;
+}
+
+/**
+ * `true` when `nowMs` falls inside the quiet window. Windows that wrap
+ * midnight (start > end, e.g. "22:00" → "07:00") are handled — both halves
+ * count as quiet.
+ */
+function isInQuietWindow(nowMs: number, window: QuietHoursWindow): boolean {
+	const current = minutesSinceMidnightInTz(nowMs, window.timezone);
+	if (window.startMinutes === window.endMinutes) return false;
+	if (window.startMinutes < window.endMinutes) {
+		return current >= window.startMinutes && current < window.endMinutes;
+	}
+	// Wraps midnight: e.g. 22:00 → 07:00.
+	return current >= window.startMinutes || current < window.endMinutes;
+}
+
+/**
+ * Compute the wall-clock ms for the END of the quiet window relative to
+ * `nowMs`. Used to defer `nextDueMs` until the operator's wake window
+ * opens.
+ */
+function endOfQuietWindowMs(nowMs: number, window: QuietHoursWindow): number {
+	const current = minutesSinceMidnightInTz(nowMs, window.timezone);
+	let minutesUntilEnd: number;
+	if (window.startMinutes < window.endMinutes) {
+		// Same-day window: defer to today's end.
+		minutesUntilEnd = window.endMinutes - current;
+	} else {
+		// Wraps midnight. We're inside iff current >= start OR current < end.
+		if (current >= window.startMinutes) {
+			minutesUntilEnd = 24 * 60 - current + window.endMinutes;
+		} else {
+			minutesUntilEnd = window.endMinutes - current;
+		}
+	}
+	return nowMs + Math.max(60_000, minutesUntilEnd * 60_000);
+}
+
+function readQuietHours(raw: unknown): QuietHoursWindow | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const obj = raw as { start?: unknown; end?: unknown; timezone?: unknown; tz?: unknown };
+	const startMinutes = parseHHMM(obj.start);
+	const endMinutes = parseHHMM(obj.end);
+	if (startMinutes === null || endMinutes === null) return undefined;
+	const tz = typeof obj.timezone === "string"
+		? obj.timezone.trim()
+		: typeof obj.tz === "string"
+			? obj.tz.trim()
+			: "";
+	return {
+		startMinutes,
+		endMinutes,
+		...(tz ? { timezone: tz } : {}),
+	};
+}
+
+interface ResolvedHeartbeatConfig {
+	intervalMs?: number;
+	sessionKey?: string;
+	/** `undefined` defaults to enabled (back-compat); `false` skips this agent. */
+	enabled?: boolean;
+	quietHours?: QuietHoursWindow;
+}
+
+function readHeartbeatBlock(raw: unknown): ResolvedHeartbeatConfig | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const hb = raw as {
+		intervalMs?: unknown;
+		sessionKey?: unknown;
+		enabled?: unknown;
+		quietHours?: unknown;
+	};
+	const intervalMs = typeof hb.intervalMs === "number" ? hb.intervalMs : undefined;
+	const sessionKey = typeof hb.sessionKey === "string" ? hb.sessionKey : undefined;
+	const enabled = typeof hb.enabled === "boolean" ? hb.enabled : undefined;
+	const quietHours = readQuietHours(hb.quietHours);
+	return {
+		...(intervalMs !== undefined ? { intervalMs } : {}),
+		...(sessionKey !== undefined ? { sessionKey } : {}),
+		...(enabled !== undefined ? { enabled } : {}),
+		...(quietHours ? { quietHours } : {}),
+	};
+}
+
 function readAgentHeartbeatConfig(
 	cfg: BrigadeConfig,
 	agentId: string,
-): { intervalMs?: number; sessionKey?: string } | undefined {
+): ResolvedHeartbeatConfig | undefined {
 	const agents = cfg.agents as
-		| Record<
-				string,
-				| { heartbeat?: { intervalMs?: number; sessionKey?: string } }
-				| undefined
-		  >
+		| Record<string, { heartbeat?: unknown } | undefined>
 		| undefined;
 	const agentEntry = agents?.[agentId];
-	if (agentEntry && typeof agentEntry === "object" && "heartbeat" in agentEntry) {
-		const hb = (agentEntry as { heartbeat?: { intervalMs?: number; sessionKey?: string } }).heartbeat;
-		if (hb && typeof hb === "object") {
-			return {
-				intervalMs: typeof hb.intervalMs === "number" ? hb.intervalMs : undefined,
-				sessionKey: typeof hb.sessionKey === "string" ? hb.sessionKey : undefined,
-			};
-		}
-	}
-	const defaults = agents?.defaults as
-		| { heartbeat?: { intervalMs?: number; sessionKey?: string } }
-		| undefined;
-	if (defaults?.heartbeat && typeof defaults.heartbeat === "object") {
-		return {
-			intervalMs:
-				typeof defaults.heartbeat.intervalMs === "number"
-					? defaults.heartbeat.intervalMs
-					: undefined,
-			sessionKey:
-				typeof defaults.heartbeat.sessionKey === "string"
-					? defaults.heartbeat.sessionKey
-					: undefined,
-		};
-	}
-	return undefined;
+	const agentHb = agentEntry && typeof agentEntry === "object" && "heartbeat" in agentEntry
+		? readHeartbeatBlock((agentEntry as { heartbeat?: unknown }).heartbeat)
+		: undefined;
+	const defaults = agents?.defaults as { heartbeat?: unknown } | undefined;
+	const defaultHb = readHeartbeatBlock(defaults?.heartbeat);
+	// Per-agent overrides per-key; defaults fill the gaps. This matches how
+	// every other agents.defaults consumer in the codebase works.
+	if (!agentHb && !defaultHb) return undefined;
+	const merged: ResolvedHeartbeatConfig = {};
+	const intervalMs = agentHb?.intervalMs ?? defaultHb?.intervalMs;
+	if (intervalMs !== undefined) merged.intervalMs = intervalMs;
+	const sessionKey = agentHb?.sessionKey ?? defaultHb?.sessionKey;
+	if (sessionKey !== undefined) merged.sessionKey = sessionKey;
+	const enabled = agentHb?.enabled ?? defaultHb?.enabled;
+	if (enabled !== undefined) merged.enabled = enabled;
+	const quietHours = agentHb?.quietHours ?? defaultHb?.quietHours;
+	if (quietHours) merged.quietHours = quietHours;
+	return merged;
 }
 
 function listAgentIds(cfg: BrigadeConfig): string[] {
@@ -174,6 +310,18 @@ export function createHeartbeatScheduler(deps: HeartbeatSchedulerDeps): Heartbea
 		const now = Date.now();
 		for (const agent of state.agents.values()) {
 			if (now < agent.nextDueMs) continue;
+			// Quiet-hours suppression. When we wake inside the window, skip the
+			// fire and defer `nextDueMs` until the window's end — the operator
+			// gets one heartbeat at "wake up" time, not a backlog of suppressed
+			// fires hammering when they unsilence.
+			if (agent.quietHours && isInQuietWindow(now, agent.quietHours)) {
+				agent.nextDueMs = endOfQuietWindowMs(now, agent.quietHours);
+				log.debug("heartbeat suppressed (quiet hours)", {
+					agentId: agent.agentId,
+					nextDueMs: agent.nextDueMs,
+				});
+				continue;
+			}
 			try {
 				deps.onInterval({ agentId: agent.agentId, sessionKey: agent.sessionKey });
 			} catch (err) {
@@ -209,6 +357,12 @@ export function createHeartbeatScheduler(deps: HeartbeatSchedulerDeps): Heartbea
 				const hb = readAgentHeartbeatConfig(cfg, agentId);
 				const intervalMs = hb?.intervalMs;
 				if (!intervalMs || !Number.isFinite(intervalMs) || intervalMs <= 0) continue;
+				// Audit 9 gap: per-agent kill-switch. Explicit `enabled: false`
+				// suppresses the agent's schedule entirely — useful for parking
+				// an agent without losing its interval config, and for the
+				// agents.defaults pattern where the default is to enable but
+				// one agent opts out.
+				if (hb?.enabled === false) continue;
 				const phaseMs = resolvePhaseMs(agentId, intervalMs);
 				const prev = state.agents.get(agentId);
 				const preserveSchedule =
@@ -222,6 +376,7 @@ export function createHeartbeatScheduler(deps: HeartbeatSchedulerDeps): Heartbea
 					phaseMs,
 					nextDueMs,
 					...(hb?.sessionKey ? { sessionKey: hb.sessionKey } : {}),
+					...(hb?.quietHours ? { quietHours: hb.quietHours } : {}),
 				});
 			}
 			state.agents.clear();

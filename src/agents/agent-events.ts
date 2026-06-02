@@ -30,6 +30,7 @@ import {
 } from "./subagent-registry-completion.js";
 import { setHeartbeatFiredHook } from "./heartbeat-runner.js";
 import { onSessionStateChange } from "./session-registry.js";
+import { installSubagentCompletionBridge } from "./subagent-completion-bridge.js";
 import type {
 	AgentEventPayload,
 	AgentEventStream,
@@ -243,10 +244,18 @@ export function wireAgentEventsBridge(): () => void {
 		});
 	});
 
+	// Sub-agent completion bridge — closes the loop where Step 10's
+	// `markSubagentRunCompleted` was never called. Listens for
+	// `lifecycle:phase:end` events from sub-agent runs, stamps the
+	// registry entry as ended (firing the hook above as a side-effect),
+	// and enqueues a completion announce into the parent's inbox.
+	const disposeSubagentCompletion = installSubagentCompletionBridge();
+
 	const dispose = () => {
 		setSubagentEndedHook(null);
 		setHeartbeatFiredHook(null);
 		disposeSessionListener();
+		disposeSubagentCompletion();
 		state.bridgeInstalled = false;
 		state.disposeBridge = null;
 	};

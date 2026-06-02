@@ -91,7 +91,7 @@ export function createSessionsHistoryTool(
 			let raw: { messages?: unknown[] };
 			try {
 				raw = await callGateway<{ messages?: unknown[] }>({
-					method: "chat.history",
+					method: "sessions.history",
 					params: {
 						sessionKey: parsed.sessionKey,
 						limit: parsed.limit,

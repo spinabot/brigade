@@ -763,9 +763,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			 * turn will drain naturally) or when there's nothing queued.
 			 */
 			requestHeartbeatNow: (opts) => {
+				// Multi-agent cron: when a job carries `opts.agentId` (set by
+				// the cron service when the job was added with an explicit
+				// agentId), route the heartbeat to THAT agent's session.
+				// Falls back to the gateway's boot-default for un-tagged jobs
+				// (legacy single-agent installs).
+				const targetAgentId = opts?.agentId?.trim() || agentId;
+				const targetSessionKey = opts?.sessionKey?.trim() || defaultSessionKey(targetAgentId);
 				void runHeartbeatNow({
-					agentId,
-					sessionKey: defaultSessionKey(agentId),
+					agentId: targetAgentId,
+					sessionKey: targetSessionKey,
 					provider,
 					modelId,
 					thinkingLevel: thinkingLevel as "off" | "low" | "medium" | "high",

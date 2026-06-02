@@ -147,6 +147,12 @@ export async function processHeartbeatWakeIntent(
 		return skipped("session-busy");
 	}
 
+	// Audit 11 — lazy inbox consumption. We INSPECT (non-destructive peek
+	// via `peekSystemEventEntries` under the hood) until every gate has
+	// passed. Skip branches above return without ever calling
+	// `consumeSystemEventEntries`, so a gated wake leaves the inbox intact
+	// for the next attempt — no events lost when the runner can't yet
+	// surface them.
 	const inspection = inspectPendingSessionEvents(sessionKey);
 	const isIntervalReason = reason === "interval";
 	if (!isIntervalReason && !inspection.hasSurfaceable) {
@@ -154,10 +160,10 @@ export async function processHeartbeatWakeIntent(
 	}
 
 	try {
-		// Atomically remove the inspected prefix from the inbox. Anything
-		// that arrived AFTER `inspectPendingSystemEvents` stays queued for
-		// the next drain. Returns the actual list consumed so the hook can
-		// surface them downstream.
+		// Only NOW do we drain. Atomically remove the inspected prefix from
+		// the inbox. Anything that arrived AFTER `inspectPendingSystemEvents`
+		// stays queued for the next drain. Returns the actual list consumed
+		// so the hook can surface them downstream.
 		const consumed = consumeSystemEventEntries(sessionKey, inspection.events);
 		await state.firedHook?.({
 			reason,

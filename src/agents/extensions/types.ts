@@ -129,6 +129,33 @@ export interface InboundMessage {
 	threadId?: string;
 	/** Media attachments saved to disk, when the inbound carried any. */
 	media?: InboundMediaAttachment[];
+	/**
+	 * Discord guild id this message originated in. Populated by Discord
+	 * adapters; left undefined by every other channel. The 8-tier route
+	 * resolver uses `guildId` (with optional `memberRoleIds`) to pick the
+	 * binding tier for guild + role-aware routing.
+	 */
+	guildId?: string;
+	/**
+	 * Slack team id (workspace id) this message originated in. Populated
+	 * by Slack adapters; left undefined elsewhere. Feeds the route
+	 * resolver's `binding.team` tier.
+	 */
+	teamId?: string;
+	/**
+	 * Discord member role ids carried with this inbound (role names are
+	 * NOT used — only ids). Populated by Discord adapters when the
+	 * message arrived in a guild. The resolver's `binding.guild+roles`
+	 * tier matches if ANY role overlaps with the binding's `roles[]`.
+	 */
+	memberRoleIds?: string[];
+	/**
+	 * Per-account-channel-peer scope: the channel account id this inbound
+	 * arrived on (for adapters that run multiple accounts of the same
+	 * channel — e.g. WhatsApp personal + work). When omitted, falls back
+	 * to the channel-manager-level account-id resolution.
+	 */
+	accountId?: string;
 	/** Raw provider payload (for adapters that need more). */
 	raw?: unknown;
 }
