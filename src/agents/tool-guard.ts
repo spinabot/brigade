@@ -49,6 +49,9 @@ const PARAMETERLESS_TOOLS = new Set([
 	"version",
 	"help",
 	"now",
+	// Brigade tools with empty `Type.Object({})` schemas — calling with
+	// `{}` is the CORRECT shape, not a malformed-args bug.
+	"agents_list",
 ]);
 
 export function trimToolCallName(name: unknown): string {

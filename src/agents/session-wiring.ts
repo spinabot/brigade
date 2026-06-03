@@ -23,6 +23,7 @@
 import type { ChannelApprovalRoute } from "./channels/approval-router.js";
 import type { MemoryCapability } from "./extensions/types.js";
 import { makeExecGate } from "./exec-gate.js";
+import { makePathWriteGuard } from "./path-write-guard.js";
 import type { SessionContext } from "./session-context.js";
 import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-guard.js";
 import { makeToolLoopDetector } from "./tool-loop-detector.js";
@@ -224,10 +225,16 @@ export interface ComposeGuardsOptions {
 /**
  * Compose Brigade's canonical `beforeToolCall` chain. Order, fixed:
  *
- *   decodeArgs → unknown-tool guard → loop detector → exec-gate → userHook
+ *   decodeArgs → unknown-tool guard → path-write guard → loop detector → exec-gate → userHook
  *
  * - **decodeArgs** (optional): provider arg cleanup before anything reads them.
  * - **unknown-tool guard**: refuse hallucinated names + malformed args.
+ * - **path-write guard**: refuse `write`/`edit` to protected roots
+ *   (install dir's `skills/`, `~/.brigade/brigade.json`,
+ *   `~/.brigade/agents/<id>/agent/` internals) and redirect the model to
+ *   the right tool (`manage_skill` / `manage_agent`). Strict gate ahead
+ *   of the loop detector + exec-gate — those are downstream of "is the
+ *   destination even legal".
  * - **loop detector**: block a model stuck repeating the same call.
  * - **exec-gate**: bash/exec/shell/sh approval + workdir/env refusal.
  * - **userHook** (optional): operator policy, only if nothing blocked.
@@ -239,6 +246,7 @@ export function composeBrigadeBeforeToolCall(
 	opts: ComposeGuardsOptions,
 ): BrigadeBeforeToolCallHook {
 	const nameGuard = makeUnknownToolGuard(opts.enabledToolNames);
+	const pathGuard = makePathWriteGuard();
 	const loopDetector = makeToolLoopDetector({ ctxRef: opts.gateCtxRef });
 	const execGate = makeExecGate({ ctxRef: opts.gateCtxRef, displayCwd: opts.displayCwd });
 	return async (ctx, signal) => {
@@ -252,6 +260,8 @@ export function composeBrigadeBeforeToolCall(
 		}
 		const named = await nameGuard(ctx, signal);
 		if (named?.block) return named;
+		const pathBlock = await pathGuard(ctx, signal);
+		if (pathBlock?.block) return pathBlock;
 		const loop = await loopDetector(ctx, signal);
 		if (loop?.block) return loop;
 		const gate = await execGate(ctx, signal);

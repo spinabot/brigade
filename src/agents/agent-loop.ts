@@ -46,6 +46,9 @@ import { BUNDLED_MODULES } from "./extensions/index.js";
 import { getActiveChannelManager } from "./channels/active-manager.js";
 import { getOrLoadExtensionRegistry } from "./extensions/registry-cache.js";
 import { assembleSystemPrompt } from "../system-prompt/assembler.js";
+import { listAgentEntries } from "../cli/commands/agents-config.js";
+import { loadConfig } from "../core/config.js";
+import { normalizeAgentId as normalizeAgentIdForPeerList } from "./routing/session-key.js";
 import {
   loadHeartbeatFile,
   loadWorkspaceContextFiles,
@@ -1640,6 +1643,12 @@ async function buildPersonaPrompt(args: {
     thinkingLevel: args.thinkingLevel,
   });
 
+  // Resolve peer agents from cfg so the system prompt's `## Agents` block
+  // can list them without the model needing to call `agents_list` first.
+  // Excludes the caller itself. Empty array when there are no peers (just
+  // `main`) — the assembler then skips the section.
+  const peerAgents = resolvePeerAgents(args.agentId);
+
   const assembled = assembleSystemPrompt({
     runtime,
     personaFiles,
@@ -1655,8 +1664,45 @@ async function buildPersonaPrompt(args: {
     skillsPromptBlock: args.skillsPromptBlock,
     ephemeralSuffix: args.ephemeralSuffix,
     ...(args.channels !== undefined ? { channels: args.channels } : {}),
+    ...(peerAgents.length > 0 ? { peerAgents } : {}),
   });
   return assembled.text;
+}
+
+/**
+ * Resolve peer agents for the `## Agents` system-prompt section.
+ *
+ * Returns every configured agent EXCEPT the caller — so the assembled
+ * block lists who-else-exists without redundantly naming the caller. Each
+ * entry carries an optional `role` line pulled from the peer's
+ * `cfg.agents.<id>.identity.theme` (the most accurate one-line role).
+ *
+ * Best-effort: if cfg can't be read (mid-init, corrupted file), returns
+ * an empty array so the section is silently omitted instead of crashing
+ * the turn.
+ */
+function resolvePeerAgents(
+  callerAgentId: string,
+): Array<{ id: string; role?: string }> {
+  try {
+    const cfg = loadConfig();
+    const callerNorm = normalizeAgentIdForPeerList(callerAgentId);
+    const entries = listAgentEntries(cfg);
+    return entries
+      .map(({ id, entry }) => {
+        const norm = normalizeAgentIdForPeerList(id);
+        if (norm === callerNorm) return null;
+        const identity = entry.identity as { theme?: unknown } | undefined;
+        const themeRaw =
+          identity && typeof identity.theme === "string" ? identity.theme.trim() : "";
+        const peer: { id: string; role?: string } = { id: norm };
+        if (themeRaw.length > 0) peer.role = themeRaw;
+        return peer;
+      })
+      .filter((p): p is { id: string; role?: string } => p !== null);
+  } catch {
+    return [];
+  }
 }
 
 // AuthStorage in Pi 0.70.x exposes multiple factories across versions

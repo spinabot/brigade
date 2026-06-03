@@ -53,12 +53,19 @@ after(() => {
 });
 
 describe("assembleBrigadeToolset", () => {
-	it("returns 7 builtins + 3 memory tools = 10 enabled names", () => {
+	it("returns 7 builtins + 3 memory tools + agents_list + manage_agent + manage_skill = 13 enabled names", () => {
 		const ts = assembleBrigadeToolset({ workspaceDir: workspace, agentId: "main", cwd: workspace });
 		assert.deepEqual(ts.builtinToolNames, ["read", "write", "edit", "bash", "grep", "find", "ls"]);
-		assert.deepEqual(ts.brigadeToolNames.sort(), ["read_memory", "recall_memory", "write_memory"]);
-		assert.equal(ts.enabledToolNames.length, 10);
-		assert.equal(ts.customTools.length, 3);
+		assert.deepEqual(ts.brigadeToolNames.sort(), [
+			"agents_list",
+			"manage_agent",
+			"manage_skill",
+			"read_memory",
+			"recall_memory",
+			"write_memory",
+		]);
+		assert.equal(ts.enabledToolNames.length, 13);
+		assert.equal(ts.customTools.length, 6);
 	});
 
 	it("derives capabilities.memory=true when recall_memory present", () => {

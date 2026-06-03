@@ -31,7 +31,10 @@ import {
 	filterToolsForSubagentDepth,
 } from "../subagent-policy.js";
 import { getActiveCronService } from "../../cron/active-service.js";
+import { makeAgentsListTool } from "./agents-list-tool.js";
 import { makeCronTool } from "./cron-tool.js";
+import { makeManageAgentTool } from "./manage-agent-tool.js";
+import { makeManageSkillTool } from "./manage-skill-tool.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
 import { makeSendMessageTool } from "./send-message-tool.js";
 import { makeSpawnAgentTool } from "./spawn-agent-tool.js";
@@ -173,6 +176,24 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		makeReadMemoryTool(fileStore),
 		// write_memory persists distilled structured facts through the capability.
 		makeWriteMemoryTool(capability),
+		// agents_list — read-only enumeration of agents the caller can target.
+		// Mirrors the reference codebase's posture: the model can SEE the agent
+		// catalog without any privilege check.
+		makeAgentsListTool(opts.agentId !== undefined ? { requesterAgentId: opts.agentId } : {}),
+		// manage_agent — owner-only LLM-driven agent CRUD. Same posture as the
+		// reference codebase's `gateway` tool (also owner-only) but with a
+		// dedicated action surface (add/delete/set-identity) that wraps the
+		// existing CLI helpers so workspace bootstrap + atomic rollback +
+		// soft-delete-to-trash all come for free instead of the model
+		// hand-constructing a config.patch.
+		makeManageAgentTool(),
+		// manage_skill — owner-only LLM-driven skill CRUD. Pairs with the
+		// path-write guard that refuses raw `write`/`edit` into the install
+		// dir's `skills/` directory: the model can't accidentally land a new
+		// SKILL.md in the bundled tree, so the only correct surface is this
+		// tool, which resolves the right scope root (`agent` workspace OR
+		// `~/.brigade/skills/` managed) for the user.
+		makeManageSkillTool(opts.agentId !== undefined ? { requesterAgentId: opts.agentId } : {}),
 	];
 	// Primitive #6 — register `spawn_agent` only when the caller supplied a
 	// parent context AND the child wouldn't be a leaf. `filterToolsForSubagentDepth`

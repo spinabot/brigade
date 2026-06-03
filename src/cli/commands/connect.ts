@@ -290,6 +290,34 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	const activeAssistants = new Map<number, Markdown>();
 	let activeLoader: CancellableLoader | null = null;
 	const pendingTools = new Map<string, Text>();
+	// Streaming render coalescer. pi-tui caps paints to ~60Hz internally, but
+	// firing `tui.requestRender()` on every model token still produces visible
+	// flicker on Windows Terminal and blocks scroll-back (the terminal can't
+	// process scroll input while a redraw is queued). Single-flight a 60ms
+	// timer instead: the first token of a burst schedules a paint, subsequent
+	// tokens just update the in-memory Markdown text (the `setText` call), and
+	// the paint that fires renders the latest text. Override the cadence with
+	// `BRIGADE_STREAM_RENDER_MS` if 60ms is wrong for some terminal.
+	const streamRenderMs = Math.max(
+		16,
+		Number(process.env.BRIGADE_STREAM_RENDER_MS) || 60,
+	);
+	let streamRenderTimer: NodeJS.Timeout | null = null;
+	const scheduleStreamingRender = (): void => {
+		if (streamRenderTimer) return;
+		streamRenderTimer = setTimeout(() => {
+			streamRenderTimer = null;
+			tui.requestRender();
+		}, streamRenderMs);
+		if (typeof streamRenderTimer.unref === "function") streamRenderTimer.unref();
+	};
+	const flushStreamingRender = (): void => {
+		if (streamRenderTimer) {
+			clearTimeout(streamRenderTimer);
+			streamRenderTimer = null;
+		}
+		tui.requestRender();
+	};
 	// Elapsed-time tracker for the running agent. Started on `agent_start`,
 	// cleared on `agent_end`. Read by the 1s ticker below to refresh the
 	// header so the user can see "thinking… 12s" / "thinking… 1m 4s" instead
@@ -872,7 +900,16 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 					insertBeforeEditor(fresh);
 				} else {
 					existing.setText(renderedText);
-					tui.requestRender();
+					// message_end carries the FINAL text — paint immediately so
+					// the user never has to wait the debounce window for the
+					// last chunk. message_update batches through the debouncer
+					// so a 200-token reply paints ~12 times instead of ~200,
+					// killing the flicker that blocked terminal scroll-back.
+					if (event.type === "message_end") {
+						flushStreamingRender();
+					} else {
+						scheduleStreamingRender();
+					}
 				}
 				break;
 			}
@@ -890,6 +927,11 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				// We clear ONLY this depth's buffer so a sub-agent's tool start
 				// doesn't close the parent's open assistant block (separate streams).
 				activeAssistants.delete(depth);
+				// A tool starting is a turn-boundary for the open assistant
+				// stream — flush any pending debounced paint so the assistant
+				// block above renders its full text BEFORE the tool indicator
+				// lands underneath.
+				flushStreamingRender();
 				const indicator = new Text(
 					`${subIndent}  ${brand.tool("⚡")} ${brand.tool(event.toolName)}`,
 					0,
@@ -1002,6 +1044,10 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				agentStartedAt = null;
 				editor.disableSubmit = false;
 				activeAssistants.clear();
+				// Turn-end is the definitive flush point — even if every other
+				// path missed flushing, this guarantees the last paint of the
+				// turn lands before the editor re-enables for the operator.
+				flushStreamingRender();
 				if (activeLoader) {
 					removeChild(activeLoader);
 					activeLoader = null;

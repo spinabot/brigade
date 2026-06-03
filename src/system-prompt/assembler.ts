@@ -107,6 +107,22 @@ export interface AssembleArgs {
   // the cached prefix — the skill list is stable within a session.
   skillsPromptBlock?: string;
   /**
+   * Peer agents the operator has configured (excluding the caller itself).
+   * Resolved upstream in agent-loop from `cfg.agents` so the assembler
+   * stays config-agnostic. Renders as a `## Agents` section listing each
+   * peer by id + one-line role so the model can delegate via
+   * `sessions_send({agentId, message})` without first calling `agents_list`.
+   *
+   * Empty array / undefined → no `## Agents` section emitted. Skipped in
+   * sub-agent / cron mode regardless (those get a scoped tool surface).
+   */
+  peerAgents?: ReadonlyArray<{
+    id: string;
+    /** One-line role from the peer's `cfg.agents.<id>.identity.theme` or
+     *  IDENTITY.md `Theme:` field, or undefined when no role is set. */
+    role?: string;
+  }>;
+  /**
    * Active channel surface for this turn. When the gateway has started
    * channel adapters (WhatsApp, Slack, Telegram, …), the agent needs to
    * SEE that list in the system prompt — otherwise asked "send a WhatsApp
@@ -601,6 +617,87 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     lines.push("");
   }
 
+  // 7b''. ## Agents — list of peer agents the operator has configured.
+  // Mirrors the reference codebase's pattern: the model SEES every
+  // configured peer agent up front (without needing to call `agents_list`)
+  // so it can immediately delegate via `sessions_send({agentId, message})`
+  // when the user asks for something a specialist peer handles better.
+  //
+  // Skipped when:
+  //   - only the bootstrap agent exists (no peers to list — pointless)
+  //   - sub-agent / cron / minimal mode (scoped task, no delegation surface)
+  //   - the agent catalogue itself is unreadable (e.g. mid-init)
+  //
+  // Each peer is one line: `- <id> — <one-line role>`. The role comes from
+  // the agent's `identity.name` / `identity.theme` config; falls back to
+  // the agent id alone.
+  if (!isMinimalMode && args.peerAgents && args.peerAgents.length > 0) {
+    lines.push("## Agents");
+    lines.push(
+      `Other agents you can delegate to via \`sessions_send({ agentId, message })\`. To switch the user to a peer for direct conversation, tell them to type \`/agent <id>\` in the TUI.`,
+    );
+    lines.push("");
+    for (const peer of args.peerAgents) {
+      const role = peer.role ? ` — ${peer.role}` : "";
+      lines.push(`- ${peer.id}${role}`);
+    }
+    lines.push("");
+  }
+
+  // 7b'''. ## Agent & Skill Management (always-on, non-minimal).
+  // This block is the explicit "use the tool, NEVER hand-edit" wedge.
+  // Without it the model knows that `manage_agent` / `manage_skill` exist
+  // (via Pi's tool-schema injection) but doesn't know that the alternative
+  // — raw `write` / `edit` against `brigade.json` or `<install>/skills/` —
+  // is now blocked by the path-write guard. Telling it here saves a
+  // turn-of-tool-failure-and-recovery every time it tries the old path.
+  //
+  // Why ALWAYS render (not gated on peer count): the model still needs
+  // this even with zero peers — that's exactly when it's most likely to
+  // be asked to ADD an agent. Minimal mode (sub-agent / cron) skips it
+  // because those scoped runs shouldn't mutate the agent catalog.
+  if (!isMinimalMode) {
+    lines.push("## Agent & Skill Management");
+    lines.push(
+      "Use the dedicated tools below — Brigade's path-write guard will REFUSE direct `write` / `edit` to protected paths (brigade.json, `~/.brigade/agents/<id>/agent/`, the install tree's `skills/` dir) and tell you to come back here.",
+    );
+    lines.push("");
+    lines.push("**Agents** — `manage_agent` (owner-only). Actions:");
+    lines.push(
+      "- `manage_agent({ action: \"add\", id: \"<name>\" })` — creates the agent with workspace + all 7 persona files seeded; atomic rollback on partial failure. Optional `workspace`, `provider`, `model` params.",
+    );
+    lines.push(
+      "- `manage_agent({ action: \"delete\", id: \"<id>\" })` — soft-delete to `.brigade-trash/<id>-<timestamp>/` (recoverable).",
+    );
+    lines.push(
+      "- `manage_agent({ action: \"set-identity\", id: \"<id>\", name, emoji, theme, avatar })` — update display fields only.",
+    );
+    lines.push(
+      "- The gateway hot-reloads within ~500ms; the new/updated agent shows up in `agents_list` immediately, no restart needed.",
+    );
+    lines.push(
+      "- NEVER `bash mkdir` + `write` + `edit brigade.json` to fake agent state — that produces orphan dirs, missing persona files, and config schema mismatches.",
+    );
+    lines.push("");
+    lines.push("**Skills** — `manage_skill` (owner-only). Two scopes, pick deliberately:");
+    lines.push(
+      "- `manage_skill({ action: \"create\", scope: \"agent\", agentId: \"<id>\", name: \"<skill-name>\", description: \"<one-line>\", body: \"<markdown>\" })` — per-agent skill at `~/.brigade/agents/<id>/workspace/skills/<skill-name>/SKILL.md` (or `~/.brigade/workspace/skills/<skill-name>/` for the default agent `main`). Only that agent sees it. This is the default when the user says \"make a skill FOR agent X\".",
+    );
+    lines.push(
+      "- `manage_skill({ action: \"create\", scope: \"managed\", name: \"<skill-name>\", description: \"<one-line>\", body: \"<markdown>\" })` — shared skill at `~/.brigade/skills/<skill-name>/SKILL.md`. Every agent sees it (subject to each agent's `cfg.agents.<id>.skills` allowlist).",
+    );
+    lines.push(
+      "- `agentId` defaults to the calling agent. `description` is what future-you reads to decide whether the skill applies — make it specific. `body` is the actual skill content.",
+    );
+    lines.push(
+      "- To delete: `manage_skill({ action: \"delete\", scope: \"agent\"|\"managed\", name: \"<skill-name>\", agentId: \"<id>\" })`.",
+    );
+    lines.push(
+      "- NEVER run `scripts/init_skill.py`, NEVER `bash mkdir` + `write SKILL.md`, NEVER target the install tree's `skills/` directory — that path is bundled+read-only and wiped on reinstall.",
+    );
+    lines.push("");
+  }
+
   // 7c. ## Skills (conditional on the skills capability).
   // Primitive #5. Emitted only when at least one eligible skill was discovered
   // (`capabilities.skills`). SKILLS_GUIDANCE is the behavioural wrapper (scan
@@ -699,6 +796,16 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // Sort canonically so cache-hits stay stable across turns even if the
   // loader's order varies.
   if (args.personaFiles.length > 0) {
+    // ## Workspace Files (injected) — heads the persona context block so
+    // the model knows these are USER-EDITABLE files (operator's identity,
+    // tools, heartbeat) and treats edits to them as durable persona
+    // mutation rather than ephemeral scratch. Mirrors the reference
+    // codebase's header at the same boundary.
+    lines.push("## Workspace Files (injected)");
+    lines.push(
+      "The block below contains the operator's editable persona files. Treat them as the source of truth for your identity, allowed tools, and current context. When the operator asks you to update SOUL/IDENTITY/TOOLS/etc., edit the file directly — those changes persist across sessions.",
+    );
+    lines.push("");
     lines.push("# Project Context");
     lines.push("The following project context files have been loaded:");
     const hasSoulFile = args.personaFiles.some(

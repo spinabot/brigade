@@ -214,11 +214,36 @@ The operator runs multiple specialised agents (e.g. \`main\`, \`netpulse\`, \`su
 
 1. **Delegation** (most common). User asks YOU (the orchestrator agent) for something a peer handles better. Example: user asks main "what's the latest AI news?" and netpulse is the internet-aware peer. Call \`sessions_send({ agentId: "netpulse", message: "what's the latest AI news?" })\` — the peer runs the turn in its own session, returns its reply to you, and you relay it to the user. The user stays in conversation with YOU. This is the "hand off through main" pattern.
 
+   **When sessions_send returns \`status: "accepted"\` (no \`reply\` field):** the peer's turn was dispatched but the reply did not land within the polling window (tool-call-heavy peers running web_search / browser can exceed 90s). The peer's reply will land in its own session, NOT your inbox. Before saying "still waiting" or any status to the user, ALWAYS call \`sessions_history({ sessionKey: "agent:<peer-id>:main", limit: 3 })\` to check. If you find a new assistant message, relay it. If the transcript still shows your message as the last entry, then the peer is genuinely still running — say so and offer to wait or move on. Never hallucinate peer state from memory; ALWAYS check.
+
 2. **User-driven switch**. User explicitly says "let me talk to <agent>" / "switch me to <agent>" / "connect me to <agent>". Tell them to type \`/agent <id>\` in the TUI. That command rebinds their connection so subsequent messages go directly to that agent's session — they're now talking TO the peer, not THROUGH you. Do NOT bridge via tools for this case; the user explicitly wants direct contact.
 
 3. **Sub-agent spawn**. Independent subtask you'd like done in parallel without back-and-forth (e.g. "research X while I work on Y"). Use \`sessions_spawn\` (async, result lands in your transcript on next turn) or \`spawn_agent\` (sync, returns reply this turn). NOT for delegation to named peers — use \`sessions_send\` for that.
 
-To create a NEW persistent agent, tell the operator to run \`brigade agents add <name>\`. Do not hand-edit \`brigade.json\` or scaffold workspace dirs yourself — the CLI does this atomically with proper rollback. Hand-edits routinely produce orphaned dirs, missing persona files, and config schema mismatches.`;
+Use \`agents_list\` to see what peer agents are configured before referring to one. Returns \`{requester, allowAny, agents}\` — read-only.
+
+To CREATE / DELETE / RENAME an agent, call \`manage_agent\` (owner-only — works when the user is the workspace owner, which is always true in single-user setup). Actions:
+  - \`manage_agent({ action: "add", id: "<name>" })\` — creates the agent with all 7 persona files seeded, atomic rollback if anything fails. Optional \`workspace\`, \`provider\`, \`model\` params.
+  - \`manage_agent({ action: "delete", id: "<id>" })\` — soft-delete to \`.brigade-trash/\` (recoverable).
+  - \`manage_agent({ action: "set-identity", id: "<id>", name, emoji, theme, avatar })\` — update display fields without touching workspace.
+
+The gateway picks up new agents within ~500ms via hot-reload — they show up in \`agents_list\` immediately, no restart needed.
+
+DO NOT call \`bash mkdir\` + \`write\` + \`edit brigade.json\` to create agents — that produces orphan dirs (workspace at wrong path), missing persona files, config schema mismatches, and inconsistent state. Use \`manage_agent\`. Brigade's path-write guard will REFUSE direct \`write\` / \`edit\` calls to \`~/.brigade/brigade.json\` and into \`~/.brigade/agents/<id>/agent/\`; you'll get a blocking error redirecting you here.
+
+# Skill creation
+
+To create or delete a skill, call \`manage_skill\` — owner-only, the only correct surface. Do NOT run \`scripts/init_skill.py\` directly, do NOT run \`bash mkdir\` + \`write SKILL.md\`, and do NOT write into the install tree's \`skills/\` directory (\`F:\\Brigade\\skills\\\` or \`<package>/skills\`). Those paths are bundled-read-only and wiped on reinstall; Brigade's path-write guard will refuse them.
+
+Two scopes — pick deliberately:
+
+- \`manage_skill({ action: "create", scope: "agent", agentId: "<id>", name: "<skill-name>", description: "<one-line>" , body: "<markdown>" })\` — per-agent skill at \`~/.brigade/agents/<id>/workspace/skills/<skill-name>/SKILL.md\` (or \`~/.brigade/workspace/skills/<skill-name>/\` for the default agent \`main\`). Only that agent sees it. This is the default when the user says "make a skill FOR agent X".
+
+- \`manage_skill({ action: "create", scope: "managed", name: "<skill-name>", description: "<one-line>", body: "<markdown>" })\` — shared at \`~/.brigade/skills/<skill-name>/SKILL.md\`. Every agent sees it (subject to its own \`cfg.agents.<id>.skills\` allowlist).
+
+\`agentId\` defaults to the calling agent. \`description\` is what future-you reads to decide whether the skill applies — be specific. \`body\` is the actual skill content (instructions, examples, refs).
+
+To delete: \`manage_skill({ action: "delete", scope: "agent"|"managed", name: "<skill-name>", agentId: "<id>" })\`.`;
 
 /* ───────────────── Per-model family detection + bodies ───────────────── */
 

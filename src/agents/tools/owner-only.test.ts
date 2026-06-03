@@ -198,7 +198,7 @@ describe("assembleBrigadeToolset — senderIsOwner gating", () => {
 			// would be (the wrapper short-circuits in owner mode).
 			assert.equal(typeof tool.execute, "function");
 		}
-		assert.equal(ts.customTools.length, 3); // recall + read + write
+		assert.equal(ts.customTools.length, 6); // recall + read + write + agents_list + manage_agent + manage_skill
 	});
 
 	it("senderIsOwner: false wraps any ownerOnly tool so it refuses execute", async () => {
@@ -217,10 +217,17 @@ describe("assembleBrigadeToolset — senderIsOwner gating", () => {
 			cwd: workspace,
 			senderIsOwner: false,
 		});
-		assert.equal(ts.customTools.length, 3);
+		assert.equal(ts.customTools.length, 6);
 		// brigadeToolNames mirror customTools.name — wrapping must NOT change
 		// the visible name surface.
-		assert.deepEqual(ts.brigadeToolNames.sort(), ["read_memory", "recall_memory", "write_memory"]);
+		assert.deepEqual(ts.brigadeToolNames.sort(), [
+			"agents_list",
+			"manage_agent",
+			"manage_skill",
+			"read_memory",
+			"recall_memory",
+			"write_memory",
+		]);
 	});
 
 	it("senderIsOwner: true is identical to the default", async () => {

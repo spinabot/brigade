@@ -22,16 +22,23 @@ after(() => {
 	}
 });
 
-describe("createBrigadeTools — Primitive #4 (memory)", () => {
-	it("returns the three memory tools (recall_memory + read_memory + write_memory)", () => {
+describe("createBrigadeTools — Primitive #4 (memory) + agents_list + manage_agent + manage_skill", () => {
+	it("returns the three memory tools + agents_list + manage_agent + manage_skill", () => {
 		const tools = createBrigadeTools({
 			workspaceDir: tmpWorkspace,
 			agentId: "main",
 			cwd: tmpWorkspace,
 		});
-		assert.equal(tools.length, 3);
+		assert.equal(tools.length, 6);
 		const names = tools.map((t) => t.name).sort();
-		assert.deepEqual(names, ["read_memory", "recall_memory", "write_memory"]);
+		assert.deepEqual(names, [
+			"agents_list",
+			"manage_agent",
+			"manage_skill",
+			"read_memory",
+			"recall_memory",
+			"write_memory",
+		]);
 	});
 
 	it("each tool has the required AgentTool shape", () => {
