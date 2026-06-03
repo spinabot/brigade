@@ -25,8 +25,10 @@ import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
 	abortLiveSession,
+	hasLiveSession,
 	onSessionStateChange,
 } from "./session-registry.js";
+import { markPendingDispatchAbort } from "./subagent-spawn-abort-marker.js";
 import { listActiveSubagentRunsForController } from "./subagent-registry.js";
 
 const log = createSubsystemLogger("agents/subagent-abort-cascade");
@@ -77,9 +79,21 @@ export function installSubagentAbortCascade(): () => void {
 			const childKey = childEntry.childSessionKey;
 			if (!childKey) continue;
 			try {
+				// Wave O0.8 GAP 9 — close the registration→dispatch race
+				// window. If the child has no live entry yet (the spawn
+				// engine has called `registerSubagentRun` but the gateway
+				// `agent` handler has not yet hit `registerLiveSession`),
+				// leave a pending-abort marker. `dispatchAgentRun` consults
+				// the marker BEFORE registering and short-circuits to an
+				// abort outcome instead of running the adapter.
+				if (!hasLiveSession(childKey)) {
+					markPendingDispatchAbort(childKey, "parent-aborted");
+				}
 				// Abort the child's live session, if any. Returns false when
 				// the child has no live entry yet (gateway handoff race) or
-				// has already terminated - both are fine.
+				// has already terminated - both are fine. When the live
+				// session lands after we leave the marker, dispatchAgentRun
+				// consumes the marker and short-circuits — no double-abort.
 				abortLiveSession(childKey, "parent-aborted");
 			} catch (err) {
 				log.warn("child abort threw", {

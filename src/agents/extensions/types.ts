@@ -859,6 +859,15 @@ export interface HttpRoute {
 	 * the handler hasn't finished by then. Defaults to 30s.
 	 */
 	timeoutMs?: number;
+	/**
+	 * Wave O0.8 — opt out of the dispatcher's default-pass session guard.
+	 * The dispatcher inspects the request body for `sessionKey` / `agentId`
+	 * fields and refuses cross-agent access by default; routes that take
+	 * those fields BUT genuinely do not target per-session state (e.g. an
+	 * incoming webhook whose `agentId` is the receiver, not the actor) can
+	 * set this to opt out and perform their own auth instead.
+	 */
+	skipSessionGuard?: boolean;
 }
 
 /**
@@ -893,6 +902,15 @@ export interface GatewayMethodHandler {
 	 * (read-equivalent). Use `"operator.admin"` for state-changing methods.
 	 */
 	scope?: "operator.read" | "operator.write" | "operator.admin";
+	/**
+	 * Wave O0.8 — opt out of the dispatcher's default-pass session guard.
+	 * The dispatcher inspects params for `sessionKey` / `agentId` fields
+	 * (one level deep) and refuses cross-agent access by default; methods
+	 * that take those fields BUT genuinely do not target per-session state
+	 * (e.g. health pings keyed by agentId for filtering) can set this to
+	 * opt out and perform their own auth instead.
+	 */
+	skipSessionGuard?: boolean;
 }
 
 /* ─────────────────────────── the module context ─────────────────────────── */

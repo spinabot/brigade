@@ -32,6 +32,11 @@
  *     duplicates.
  */
 
+import fs from "node:fs";
+import path from "node:path";
+
+import { resolveAgentDir } from "../config/paths.js";
+import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
 	normalizeOptionalLowercaseString,
@@ -39,6 +44,9 @@ import {
 } from "../shared/string-coerce.js";
 import { mergeDeliveryContext, normalizeDeliveryContext } from "../utils/delivery-context.js";
 import type { DeliveryContext } from "../utils/delivery-context.js";
+import { resolveAgentIdFromSessionKey } from "./routing/session-key.js";
+
+const log = createSubsystemLogger("agents/session-inbox");
 
 export type SystemEvent = {
 	text: string;
@@ -106,6 +114,151 @@ function cloneSystemEvent(event: SystemEvent): SystemEvent {
 	};
 }
 
+/* ─── Wave O0.8 GAP 11 — JSONL persistence helpers ───────────────────────
+ *
+ * Persists each enqueued system event to `<agentDir>/inbox/<sessionKey>.jsonl`
+ * so a gateway restart between child completion and parent next turn does
+ * not lose the announce. Append on enqueue, delete on drain, capped at the
+ * same 20-entry soft cap as the in-memory queue.
+ *
+ * Enabled when BRIGADE_ENABLE_INBOX_PERSIST is set. The gateway boot path
+ * flips this on for production runs; existing tests (which already write
+ * to the singleton in-memory Map) inherit a no-op disk path so they don't
+ * pollute `~/.brigade`. New tests that need persistence opt in by setting
+ * the env var alongside a tempdir-scoped BRIGADE_STATE_DIR.
+ */
+
+const INBOX_FILE_EXT = ".jsonl";
+
+function isPersistDisabled(): boolean {
+	// Operator opt-out always wins so production deployments can disable
+	// the disk write surface entirely.
+	if (process.env.BRIGADE_DISABLE_INBOX_PERSIST === "1") return true;
+	// Default-off so existing tests that don't tempdir-isolate keep
+	// passing. The gateway entry point flips ENABLE on for production.
+	return process.env.BRIGADE_ENABLE_INBOX_PERSIST !== "1";
+}
+
+/** Replace any character outside `[A-Za-z0-9._-]` with `_` for cross-platform-safe filenames. */
+function sanitizeSessionKeyForFile(sessionKey: string): string {
+	return sessionKey.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function resolveInboxFilePath(sessionKey: string): string {
+	const agentId = resolveAgentIdFromSessionKey(sessionKey);
+	const safeName = sanitizeSessionKeyForFile(sessionKey);
+	return path.join(resolveAgentDir(agentId), "inbox", `${safeName}${INBOX_FILE_EXT}`);
+}
+
+function ensureInboxDir(filePath: string): void {
+	try {
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	} catch (err) {
+		log.warn("inbox dir create failed", {
+			dir: path.dirname(filePath),
+			error: (err as Error)?.message,
+		});
+	}
+}
+
+function appendEventToDisk(sessionKey: string, event: SystemEvent): void {
+	if (isPersistDisabled()) return;
+	try {
+		const filePath = resolveInboxFilePath(sessionKey);
+		ensureInboxDir(filePath);
+		fs.appendFileSync(filePath, `${JSON.stringify(event)}\n`, "utf8");
+	} catch (err) {
+		log.warn("inbox JSONL append failed", {
+			sessionKey,
+			error: (err as Error)?.message,
+		});
+	}
+}
+
+function truncateInboxFile(sessionKey: string): void {
+	if (isPersistDisabled()) return;
+	try {
+		const filePath = resolveInboxFilePath(sessionKey);
+		if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+	} catch (err) {
+		log.warn("inbox JSONL truncate failed", {
+			sessionKey,
+			error: (err as Error)?.message,
+		});
+	}
+}
+
+function rewriteInboxFile(sessionKey: string, events: readonly SystemEvent[]): void {
+	if (isPersistDisabled()) return;
+	try {
+		const filePath = resolveInboxFilePath(sessionKey);
+		if (events.length === 0) {
+			if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+			return;
+		}
+		ensureInboxDir(filePath);
+		const body = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+		fs.writeFileSync(filePath, body, "utf8");
+	} catch (err) {
+		log.warn("inbox JSONL rewrite failed", {
+			sessionKey,
+			error: (err as Error)?.message,
+		});
+	}
+}
+
+function readInboxFromDisk(sessionKey: string): SystemEvent[] {
+	if (isPersistDisabled()) return [];
+	try {
+		const filePath = resolveInboxFilePath(sessionKey);
+		if (!fs.existsSync(filePath)) return [];
+		const raw = fs.readFileSync(filePath, "utf8");
+		const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+		const out: SystemEvent[] = [];
+		for (const line of lines) {
+			try {
+				const parsed = JSON.parse(line) as SystemEvent;
+				if (parsed && typeof parsed.text === "string" && typeof parsed.ts === "number") {
+					out.push(parsed);
+				}
+			} catch {
+				// Skip a corrupt line — the rest of the file is still useful.
+			}
+		}
+		// Honour the cap so a runaway producer's persisted file can't blow
+		// the in-memory queue on restore.
+		if (out.length > MAX_EVENTS) return out.slice(out.length - MAX_EVENTS);
+		return out;
+	} catch (err) {
+		log.warn("inbox JSONL read failed", {
+			sessionKey,
+			error: (err as Error)?.message,
+		});
+		return [];
+	}
+}
+
+/**
+ * Hydrate the in-memory queue for `sessionKey` from any unconsumed JSONL
+ * entries on disk. Called lazily on first access so we only pay the read
+ * cost when the session is actually used. Idempotent — repeat calls after
+ * the first hydration are no-ops because the queue is already in-memory.
+ */
+function hydrateFromDiskIfNeeded(sessionKey: string): void {
+	if (isPersistDisabled()) return;
+	const existing = queues.get(sessionKey);
+	if (existing) return;
+	const persisted = readInboxFromDisk(sessionKey);
+	if (persisted.length === 0) return;
+	const tail = persisted[persisted.length - 1];
+	const created: SessionQueue = {
+		queue: persisted.map(cloneSystemEvent),
+		lastText: tail?.text ?? null,
+		lastContextKey: tail?.contextKey ?? null,
+	};
+	queues.set(sessionKey, created);
+}
+
 /**
  * `true` iff `contextKey` differs from the most-recently-enqueued event's
  * key for this session. Used by producers that want to suppress a follow-up
@@ -117,6 +270,7 @@ export function isSystemEventContextChanged(
 	sessionKey: string,
 	contextKey?: string | null,
 ): boolean {
+	hydrateFromDiskIfNeeded(requireSessionKey(sessionKey));
 	const existing = getSessionQueue(sessionKey);
 	const normalized = normalizeContextKey(contextKey);
 	return normalized !== (existing?.lastContextKey ?? null);
@@ -134,6 +288,10 @@ export function isSystemEventContextChanged(
  */
 export function enqueueSystemEvent(text: string, options: SystemEventOptions): boolean {
 	const key = requireSessionKey(options?.sessionKey);
+	// Wave O0.8 GAP 11 — restore any disk-persisted events before mutating
+	// the in-memory queue so a post-restart enqueue doesn't strand the
+	// pre-restart events.
+	hydrateFromDiskIfNeeded(key);
 	const entry = getOrCreateSessionQueue(key);
 	const cleaned = text.trim();
 	if (!cleaned) return false;
@@ -142,15 +300,20 @@ export function enqueueSystemEvent(text: string, options: SystemEventOptions): b
 	entry.lastContextKey = normalizedContextKey;
 	if (entry.lastText === cleaned) return false;
 	entry.lastText = cleaned;
-	entry.queue.push({
+	const event: SystemEvent = {
 		text: cleaned,
 		ts: Date.now(),
 		contextKey: normalizedContextKey,
 		deliveryContext: normalizedDeliveryContext,
 		trusted: options.trusted !== false,
-	});
+	};
+	entry.queue.push(event);
 	if (entry.queue.length > MAX_EVENTS) {
 		entry.queue.shift();
+		// Persisted file's tail-N rewrite keeps disk + memory in sync.
+		rewriteInboxFile(key, entry.queue);
+	} else {
+		appendEventToDisk(key, event);
 	}
 	return true;
 }
@@ -165,6 +328,8 @@ export function enqueueSystemEvent(text: string, options: SystemEventOptions): b
  */
 export function drainSystemEventEntries(sessionKey: string): SystemEvent[] {
 	const key = requireSessionKey(sessionKey);
+	// Hydrate first so post-restart drains see the pre-restart events.
+	hydrateFromDiskIfNeeded(key);
 	const entry = getSessionQueue(key);
 	if (!entry || entry.queue.length === 0) return [];
 	const out = entry.queue.map(cloneSystemEvent);
@@ -172,6 +337,9 @@ export function drainSystemEventEntries(sessionKey: string): SystemEvent[] {
 	entry.lastText = null;
 	entry.lastContextKey = null;
 	queues.delete(key);
+	// Wave O0.8 GAP 11 — clear persisted file once memory is drained so a
+	// later restart-then-drain does not re-emit the same entries.
+	truncateInboxFile(key);
 	return out;
 }
 
@@ -211,6 +379,7 @@ export function consumeSystemEventEntries(
 	consumedEntries: readonly SystemEvent[],
 ): SystemEvent[] {
 	const key = requireSessionKey(sessionKey);
+	hydrateFromDiskIfNeeded(key);
 	const entry = getSessionQueue(key);
 	if (!entry || entry.queue.length === 0 || consumedEntries.length === 0) return [];
 	if (
@@ -227,12 +396,16 @@ export function consumeSystemEventEntries(
 		entry.lastText = null;
 		entry.lastContextKey = null;
 		queues.delete(key);
+		// Wave O0.8 GAP 11 — partial-drain that empties memory also clears disk.
+		truncateInboxFile(key);
 	} else {
 		const newest = entry.queue[entry.queue.length - 1];
 		if (newest) {
 			entry.lastText = newest.text;
 			entry.lastContextKey = newest.contextKey ?? null;
 		}
+		// Wave O0.8 GAP 11 — keep persisted file in sync with the trimmed memory queue.
+		rewriteInboxFile(key, entry.queue);
 	}
 	return removed;
 }
@@ -244,6 +417,7 @@ export function drainSystemEvents(sessionKey: string): string[] {
 
 /** Read-only peek at the queued events for a session. */
 export function peekSystemEventEntries(sessionKey: string): SystemEvent[] {
+	hydrateFromDiskIfNeeded(requireSessionKey(sessionKey));
 	return getSessionQueue(sessionKey)?.queue.map(cloneSystemEvent) ?? [];
 }
 
@@ -254,6 +428,7 @@ export function peekSystemEvents(sessionKey: string): string[] {
 
 /** `true` iff the session has at least one queued event. */
 export function hasSystemEvents(sessionKey: string): boolean {
+	hydrateFromDiskIfNeeded(requireSessionKey(sessionKey));
 	return (getSessionQueue(sessionKey)?.queue.length ?? 0) > 0;
 }
 
@@ -275,4 +450,15 @@ export function resolveSystemEventDeliveryContext(
 /** Test-only — clear every queued event across every session. */
 export function resetSessionInboxForTest(): void {
 	queues.clear();
+}
+
+/**
+ * Wave O0.8 GAP 11 — explicit "force re-hydrate from disk" for the
+ * post-restart replay path. Production callers don't need this (hydration
+ * is lazy on first access of every public read/write entry), but tests
+ * that simulate a gateway restart by clearing the in-memory Map need to
+ * trigger hydration without touching one of the public APIs first.
+ */
+export function forceHydrateFromDiskForTests(sessionKey: string): void {
+	hydrateFromDiskIfNeeded(requireSessionKey(sessionKey));
 }

@@ -35,6 +35,7 @@
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { onAgentEvent } from "./agent-events.js";
+import { requestHeartbeatNow } from "./heartbeat-wake.js";
 import {
 	deliverSubagentCompletionAnnounce,
 	pickReplyTextFromRegistryEntry,
@@ -56,14 +57,99 @@ const log = createSubsystemLogger("agents/subagent-completion-bridge");
 
 type BridgeState = {
 	disposeListener: (() => void) | null;
+	/**
+	 * Wave O0.8 GAP 12 — per-parent serialization chain. Each parent
+	 * sessionKey gets a Promise chain that completion announces append to;
+	 * two siblings finishing in the same microtask land in the inbox in
+	 * the order their lifecycle events arrived, not in microtask-scheduler
+	 * order.
+	 */
+	chainsByParent: Map<string, Promise<void>>;
+	/** Wave O0.8 GAP 12 — monotonic sequence counter for announce ordering. */
+	completionSeq: number;
+	/**
+	 * Wave O0.8 GAP 10 — debounced wake state per parent. A burst of
+	 * sibling completions only fires ONE synthetic heartbeat per window.
+	 */
+	pendingWakes: Map<string, NodeJS.Timeout>;
 };
 
 const BRIDGE_STATE_KEY = Symbol.for("brigade.subagentCompletionBridge.state");
+const WAKE_DEBOUNCE_MS = 25;
 
 function getState(): BridgeState {
 	return resolveGlobalSingleton<BridgeState>(BRIDGE_STATE_KEY, () => ({
 		disposeListener: null,
+		chainsByParent: new Map(),
+		completionSeq: 0,
+		pendingWakes: new Map(),
 	}));
+}
+
+/**
+ * Wave O0.8 GAP 10 — schedule a synthetic heartbeat wake for the parent
+ * session, debounced so a burst of sibling completions collapses to one
+ * wake. The wake is scoped per-parent so unrelated parents don't see
+ * spurious turns. Each scheduled timer is unref'd so it never blocks
+ * process exit.
+ */
+function scheduleParentWake(parentSessionKey: string): void {
+	const state = getState();
+	const existing = state.pendingWakes.get(parentSessionKey);
+	if (existing) {
+		// Within the debounce window — keep the existing timer; it will
+		// pick up this completion's inbox entry on fire.
+		return;
+	}
+	const timer = setTimeout(() => {
+		state.pendingWakes.delete(parentSessionKey);
+		try {
+			requestHeartbeatNow({
+				reason: "subagent-completion",
+				sessionKey: parentSessionKey,
+			});
+		} catch (err) {
+			log.warn("scheduleParentWake requestHeartbeatNow threw", {
+				parentSessionKey,
+				error: (err as Error)?.message,
+			});
+		}
+	}, WAKE_DEBOUNCE_MS);
+	if (typeof timer.unref === "function") timer.unref();
+	state.pendingWakes.set(parentSessionKey, timer);
+}
+
+/**
+ * Wave O0.8 GAP 12 — append `task` to the per-parent serialization chain.
+ * Returns a promise that resolves when the task completes; failures are
+ * logged but never propagate (the chain MUST stay alive for siblings).
+ */
+function enqueueOnParentChain(
+	parentSessionKey: string,
+	task: () => Promise<void>,
+): Promise<void> {
+	const state = getState();
+	const previous = state.chainsByParent.get(parentSessionKey) ?? Promise.resolve();
+	const next = previous
+		.catch(() => undefined)
+		.then(() => task())
+		.catch((err) => {
+			log.warn("per-parent completion chain task threw", {
+				parentSessionKey,
+				error: (err as Error)?.message,
+			});
+		})
+		.finally(() => {
+			// Garbage-collect the chain entry once it settles AND no
+			// follow-up enqueue has replaced it. Without this the Map
+			// grows linearly with the number of distinct parents over the
+			// process lifetime.
+			if (state.chainsByParent.get(parentSessionKey) === next) {
+				state.chainsByParent.delete(parentSessionKey);
+			}
+		});
+	state.chainsByParent.set(parentSessionKey, next);
+	return next;
 }
 
 function deriveOutcomes(data: Record<string, unknown>): {
@@ -175,7 +261,19 @@ export function installSubagentCompletionBridge(): () => void {
 			data as Record<string, unknown>,
 		);
 
-		void (async () => {
+		// Wave O0.8 GAP 12 — tag this completion with a monotonic sequence
+		// number at the moment the lifecycle event was OBSERVED, not when
+		// the async delivery runs. Two siblings finishing in the same
+		// microtask thereby preserve their event-arrival order regardless
+		// of microtask scheduler quirks.
+		const bridgeState = getState();
+		bridgeState.completionSeq += 1;
+		const completionSeqAtEmit = bridgeState.completionSeq;
+
+		const parentSessionKey =
+			entry.requesterSessionKey?.trim() || entry.controllerSessionKey?.trim();
+
+		const deliveryTask = async () => {
 			try {
 				await markSubagentRunCompleted({
 					runId,
@@ -196,8 +294,6 @@ export function installSubagentCompletionBridge(): () => void {
 			// reply". The dedicated module formats the rich message body
 			// (status + duration + truncated reply) and gates the enqueue
 			// idempotently on `subagent:ended:<runId>`.
-			const parentSessionKey =
-				entry.requesterSessionKey?.trim() || entry.controllerSessionKey?.trim();
 			if (!parentSessionKey || parentSessionKey === "main") {
 				// Parent is the operator's main session or unknown - the TUI
 				// sees lifecycle events directly via Step 18's agent-events
@@ -217,6 +313,7 @@ export function installSubagentCompletionBridge(): () => void {
 					childSessionKey: entry.childSessionKey,
 					runId,
 					outcome: lifecycleOutcome,
+					completionSeq: completionSeqAtEmit,
 					...(entry.label ? { label: entry.label } : {}),
 					...(error ? { error } : {}),
 					...(fallbackReply ? { replyText: fallbackReply } : {}),
@@ -237,6 +334,13 @@ export function installSubagentCompletionBridge(): () => void {
 						text,
 					});
 				}
+
+				// Wave O0.8 GAP 10 — fire a synthetic heartbeat wake for the
+				// parent IF the registry entry opted in. Debounced per-parent
+				// so a burst of sibling completions collapses to one wake.
+				if (entry.wakeOnDescendantSettle && enqueued) {
+					scheduleParentWake(parentSessionKey);
+				}
 			} catch (err) {
 				log.warn("subagent completion announce enqueue failed", {
 					runId,
@@ -244,7 +348,19 @@ export function installSubagentCompletionBridge(): () => void {
 					error: (err as Error)?.message,
 				});
 			}
-		})();
+		};
+
+		// Wave O0.8 GAP 12 — route through the per-parent serialization
+		// chain when a parentSessionKey is present. Two siblings finishing
+		// in the same tick thereby land in the inbox in the order their
+		// lifecycle events arrived. When parent is "main" / undefined, we
+		// fall back to a plain `void` wrapper (the inbox path is skipped
+		// inside `deliveryTask` anyway).
+		if (parentSessionKey && parentSessionKey !== "main") {
+			void enqueueOnParentChain(parentSessionKey, deliveryTask);
+		} else {
+			void deliveryTask();
+		}
 	});
 
 	state.disposeListener = dispose;
@@ -266,4 +382,13 @@ export function resetSubagentCompletionBridgeForTests(): void {
 		state.disposeListener();
 		state.disposeListener = null;
 	}
+	// Wave O0.8 GAP 12 — clear per-parent serialization chains + seq counter
+	// + pending wake timers so a test's bridge wiring is independent of any
+	// prior test's leftover state.
+	state.chainsByParent.clear();
+	state.completionSeq = 0;
+	for (const timer of state.pendingWakes.values()) {
+		clearTimeout(timer);
+	}
+	state.pendingWakes.clear();
 }

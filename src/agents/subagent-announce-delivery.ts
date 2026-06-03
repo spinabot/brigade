@@ -139,6 +139,14 @@ export interface DeliverSubagentCompletionParams {
 	error?: string;
 	replyText?: string | null;
 	durationMs?: number;
+	/**
+	 * Wave O0.8 GAP 12 — monotonic sequence number assigned at lifecycle-
+	 * event emission time. Consumers that re-sort announces (e.g. a fresh
+	 * inbox replay) can use this to recover the original order regardless
+	 * of microtask scheduling. Optional — when absent the inbox order is
+	 * the queue insertion order.
+	 */
+	completionSeq?: number;
 }
 
 /**

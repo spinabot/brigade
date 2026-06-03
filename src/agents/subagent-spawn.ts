@@ -133,6 +133,30 @@ function resolveSpawnMode(params: {
 }
 
 /**
+ * Wave O0.8 GAP 10 — decide whether a spawn's parent is the operator main
+ * session (eligible for synthetic-wake on child completion) or a sub-of-sub
+ * / cron parent (not eligible — wakes would cascade).
+ *
+ * The operator's main session keys are:
+ *   - `agent:<id>:main`
+ *   - `main`            (legacy default identifier)
+ *   - undefined         (no parent — root operator turn)
+ *
+ * Sub-agent children carry `agent:<id>:subagent:<uuid>`; cron runs land on
+ * `cron:<jobId>:...` keys. Anything else (channel-routed peer sessions,
+ * thread-bound sessions) is treated as non-operator so we don't wake the
+ * wrong inbox.
+ */
+function isOperatorMainSession(sessionKey: string | undefined | null): boolean {
+	if (!sessionKey) return true;
+	const trimmed = sessionKey.trim();
+	if (!trimmed || trimmed === "main") return true;
+	// `agent:<id>:main` — the standard per-agent operator main session.
+	if (/^agent:[^:]+:main$/i.test(trimmed)) return true;
+	return false;
+}
+
+/**
  * Build a `DeliveryContext` from the loose channel/account/to/thread
  * params the caller has at hand. Returns `undefined` when every field is
  * empty (matches upstream's `normalizeDeliveryContext` for the empty-
@@ -252,6 +276,13 @@ export async function spawnSubagentDirect(
 
 	const runId = crypto.randomUUID();
 
+	// Wave O0.8 GAP 10 — operator-initiated spawns (parent is the operator
+	// main session) get `wakeOnDescendantSettle: true` so when the child
+	// completes, the bridge fires a synthetic heartbeat that drains the
+	// parent's inbox. Cron-initiated or sub-of-sub spawns get false to
+	// avoid wake storms (the cron service / outer parent already polls).
+	const wakeOnDescendantSettle = isOperatorMainSession(ctx.agentSessionKey);
+
 	// Register the run BEFORE the gateway handoff so a fast completion
 	// can stamp the entry as ended without racing the registration.
 	registerSubagentRun({
@@ -269,6 +300,7 @@ export async function spawnSubagentDirect(
 		runTimeoutSeconds: effectiveRunTimeoutSeconds,
 		expectsCompletionMessage: params.expectsCompletionMessage !== false,
 		spawnMode,
+		wakeOnDescendantSettle,
 		createdAt: Date.now(),
 	});
 

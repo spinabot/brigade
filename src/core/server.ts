@@ -2359,61 +2359,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// `customMethods.get(method)` first, so a registered handler
 			// always wins. The case was dead code maintenance-wise AND a
 			// foot-gun if someone unregistered the handler.
-			/* ─── Cron methods (Wave N6) ─────────────────────── */
-			case "cron.status": {
-				const ctx: CronHandlerContext = { state: getActiveCronService() };
-				return (await handleCronStatus(
-					params as Parameters<typeof handleCronStatus>[0],
-					ctx,
-				)) as ResponseFor[M];
-			}
-			case "cron.list": {
-				const ctx: CronHandlerContext = { state: getActiveCronService() };
-				return (await handleCronList(
-					params as Parameters<typeof handleCronList>[0],
-					ctx,
-				)) as ResponseFor[M];
-			}
-			case "cron.add": {
-				const ctx: CronHandlerContext = { state: getActiveCronService() };
-				return (await handleCronAdd(
-					params as Parameters<typeof handleCronAdd>[0],
-					ctx,
-				)) as ResponseFor[M];
-			}
-			case "cron.update": {
-				const ctx: CronHandlerContext = { state: getActiveCronService() };
-				return (await handleCronUpdate(
-					params as Parameters<typeof handleCronUpdate>[0],
-					ctx,
-				)) as ResponseFor[M];
-			}
-			case "cron.remove": {
-				const ctx: CronHandlerContext = { state: getActiveCronService() };
-				return (await handleCronRemove(
-					params as Parameters<typeof handleCronRemove>[0],
-					ctx,
-				)) as ResponseFor[M];
-			}
-			case "cron.run": {
-				const ctx: CronHandlerContext = { state: getActiveCronService() };
-				return (await handleCronRun(
-					params as Parameters<typeof handleCronRun>[0],
-					ctx,
-				)) as ResponseFor[M];
-			}
-			case "cron.runs": {
-				const ctx: CronHandlerContext = { state: getActiveCronService() };
-				return (await handleCronRuns(
-					params as Parameters<typeof handleCronRuns>[0],
-					ctx,
-				)) as ResponseFor[M];
-			}
-			case "wake": {
-				const ctx: CronHandlerContext = { state: getActiveCronService() };
-				handleWake(params as Parameters<typeof handleWake>[0], ctx);
-				return undefined as ResponseFor[M];
-			}
+			//
+			// Wave O0.8 — the cron.* and wake switch cases were also deleted
+			// for the same reason: the registered handlers below carry the
+			// `sessionsAccessCheck` access guard, while the in-switch
+			// dispatch path bypassed it. All cron + wake traffic now flows
+			// through `registerGatewayHandler(...)` exclusively, which is
+			// the single source of truth for guard wiring.
 			case "shutdown": {
 				// Graceful shutdown — ack the request synchronously, then schedule
 				// the actual stop on the next tick so the response frame has time
@@ -2450,6 +2402,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						const err = new Error(`scope insufficient: method "${method}" requires "${custom.scope}"`);
 						(err as Error & { code?: string }).code = "scope-insufficient";
 						throw err;
+					}
+					// Wave O0.8 — default-pass session guard. If the call
+					// names a `sessionKey` / `agentId` and the resolved
+					// target is unreachable under current policy, refuse
+					// before invoking the plugin handler. Plugins whose
+					// methods take those fields but legitimately do not
+					// touch session state opt out via
+					// `skipSessionGuard: true` in their registration.
+					if (!custom.skipSessionGuard) {
+						const guardErr = defaultPassSessionGuard(rawParams, "send");
+						if (guardErr) throw guardErr;
 					}
 					return (await custom.handler(rawParams, caller)) as ResponseFor[M];
 				}
@@ -2770,6 +2733,73 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	void scheduleLiveConfigRefresh();
 	const sessionsAccessCheck = buildSessionsAccessCheck();
 
+	/**
+	 * Wave O0.8 — extract a session-target from an arbitrary params/body
+	 * shape so the default-pass guard for extension handlers (customMethods
+	 * + HTTP routes) can check access without each plugin opting in
+	 * manually.
+	 *
+	 * Strategy (one level deep, intentionally narrow):
+	 *   • If `sessionKey` is a non-empty string, use it verbatim.
+	 *   • Else if `agentId` is a non-empty string, derive `defaultSessionKey`.
+	 *   • Else inspect nested objects (one level) for the same fields —
+	 *     covers `{ params: { agentId: "..." } }` and similar wrappers.
+	 *   • Else return `null` meaning "no targeting hint; nothing to guard".
+	 *
+	 * Returning `null` skips the guard entirely — handlers that DO want a
+	 * guard against the boot agent should call `sessionsAccessCheck`
+	 * directly. The deep-walk is capped at depth 1 to avoid pathological
+	 * shapes (cyclic objects, deeply nested user payloads).
+	 */
+	const extractSessionTargetFromParams = (raw: unknown): string | null => {
+		if (raw === null || raw === undefined || typeof raw !== "object") return null;
+		const root = raw as Record<string, unknown>;
+		const direct = (() => {
+			const sk = root.sessionKey;
+			if (typeof sk === "string" && sk.trim().length > 0) return sk.trim();
+			const aid = root.agentId;
+			if (typeof aid === "string" && aid.trim().length > 0)
+				return defaultSessionKey(aid.trim());
+			return null;
+		})();
+		if (direct !== null) return direct;
+		for (const key of Object.keys(root)) {
+			const v = root[key];
+			if (v && typeof v === "object" && !Array.isArray(v)) {
+				const inner = v as Record<string, unknown>;
+				const sk = inner.sessionKey;
+				if (typeof sk === "string" && sk.trim().length > 0) return sk.trim();
+				const aid = inner.agentId;
+				if (typeof aid === "string" && aid.trim().length > 0)
+					return defaultSessionKey(aid.trim());
+			}
+		}
+		return null;
+	};
+
+	/**
+	 * Wave O0.8 — default-pass session guard for extension surfaces. Returns
+	 * `null` when the call should proceed (no target detected, or guard
+	 * passed), or an `Error` with `code: "forbidden"` when the resolved
+	 * target is unreachable for the caller. Callers throw the returned
+	 * Error themselves so the call site keeps its own response shape (WS
+	 * frames vs HTTP responses differ).
+	 */
+	const defaultPassSessionGuard = (
+		raw: unknown,
+		action: "list" | "history" | "send",
+	): (Error & { code?: string }) | null => {
+		const target = extractSessionTargetFromParams(raw);
+		if (target === null) return null;
+		const verdict = sessionsAccessCheck({ action, targetSessionKey: target });
+		if (verdict.allowed) return null;
+		const err = new Error(verdict.reason ?? "forbidden") as Error & {
+			code?: string;
+		};
+		err.code = "forbidden";
+		return err;
+	};
+
 	disposeHandlers.push(
 		registerGatewayHandler("health", (params: unknown) =>
 			handleHealthMethod(params as { probe?: boolean } | undefined, {
@@ -2822,15 +2852,29 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 							const result = await runGatewayTurn({
 								text: turn.message,
 								sessionKey: turn.sessionKey,
+								...(turn.signal ? { signal: turn.signal } : {}),
 							});
 							return {
 								ok: true,
 								...(typeof result?.reply === "string" ? { reply: result.reply } : {}),
 							};
 						} catch (err) {
+							// Wave O0.8 GAP 8 — surface abort/timeout outcomes so the
+							// dispatcher's lifecycle `phase:end` classifies them
+							// correctly instead of folding into a generic error.
+							const isAbortErr =
+								err instanceof Error &&
+								(err.name === "AbortError" ||
+									(err as { code?: unknown }).code === "ABORT_ERR" ||
+									(err as { code?: unknown }).code === 20);
+							const aborted = isAbortErr || (turn.signal?.aborted ?? false);
+							const message = err instanceof Error ? err.message : String(err);
+							const timedOut = /timed?[- ]?out|timeout/i.test(message);
 							return {
 								ok: false,
-								error: err instanceof Error ? err.message : String(err),
+								error: message,
+								...(aborted ? { aborted: true } : {}),
+								...(timedOut && !aborted ? { timedOut: true } : {}),
 							};
 						}
 					},
@@ -2930,15 +2974,29 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 								text: turn.message,
 								sessionKey: turn.sessionKey,
 								...(turn.agentId ? { agentId: turn.agentId } : {}),
+								...(turn.signal ? { signal: turn.signal } : {}),
 							});
 							return {
 								ok: true,
 								...(typeof result?.reply === "string" ? { reply: result.reply } : {}),
 							};
 						} catch (err) {
+							// Wave O0.8 GAP 8 — surface abort/timeout outcomes so the
+							// completion bridge classifies them as ABORT/TIMEOUT
+							// rather than ERROR. Mirrors the sessions.send adapter.
+							const isAbortErr =
+								err instanceof Error &&
+								(err.name === "AbortError" ||
+									(err as { code?: unknown }).code === "ABORT_ERR" ||
+									(err as { code?: unknown }).code === 20);
+							const aborted = isAbortErr || (turn.signal?.aborted ?? false);
+							const message = err instanceof Error ? err.message : String(err);
+							const timedOut = /timed?[- ]?out|timeout/i.test(message);
 							return {
 								ok: false,
-								error: err instanceof Error ? err.message : String(err),
+								error: message,
+								...(aborted ? { aborted: true } : {}),
+								...(timedOut && !aborted ? { timedOut: true } : {}),
 							};
 						}
 					},
@@ -3075,12 +3133,60 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		}),
 	);
 	disposeHandlers.push(
-		registerGatewayHandler("cron.remove", async (params: unknown) =>
-			handleCronRemove(
+		registerGatewayHandler("cron.remove", async (params: unknown) => {
+			// Wave O0.8 — access guard. Removing a job belonging to another
+			// agent is a destructive cross-agent mutation: it suppresses
+			// scheduled fires that would have driven that agent's next turn.
+			// Look up the persisted job and evaluate the guard against its
+			// actual target before delete.
+			const p = (params ?? {}) as Record<string, unknown>;
+			const idRaw =
+				typeof p.id === "string"
+					? p.id
+					: typeof p.jobId === "string"
+						? p.jobId
+						: undefined;
+			let existingAgentId: string | undefined;
+			let existingSessionTarget: string | undefined;
+			let existingSessionKey: string | undefined;
+			try {
+				const state = cronCtx().state;
+				if (state && idRaw && typeof idRaw === "string" && idRaw.trim().length > 0) {
+					const { getJob } = await import("../cron/service/ops.js");
+					try {
+						const existing = await getJob(state, idRaw.trim());
+						if (typeof existing.agentId === "string") existingAgentId = existing.agentId;
+						if (typeof existing.sessionTarget === "string")
+							existingSessionTarget = existing.sessionTarget;
+						if (typeof existing.sessionKey === "string")
+							existingSessionKey = existing.sessionKey;
+					} catch {
+						// Job not found — let the handler surface the error.
+					}
+				}
+			} catch {
+				/* best-effort */
+			}
+			const cronRemoveVerdict = sessionsAccessCheck({
+				action: "send",
+				targetSessionKey: resolveCronTargetSessionKey({
+					agentId: existingAgentId,
+					sessionTarget: existingSessionTarget,
+					sessionKey: existingSessionKey,
+				}),
+			});
+			if (!cronRemoveVerdict.allowed) {
+				const err = new Error(
+					cronRemoveVerdict.reason ?? "cron.remove forbidden",
+				);
+				(err as Error & { code?: string }).code = "forbidden";
+				throw err;
+			}
+			return handleCronRemove(
 				params as Parameters<typeof handleCronRemove>[0],
 				cronCtx(),
-			),
-		),
+			);
+		}),
 	);
 	disposeHandlers.push(
 		registerGatewayHandler("cron.run", async (params: unknown) => {
@@ -3135,15 +3241,139 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		}),
 	);
 	disposeHandlers.push(
-		registerGatewayHandler("cron.runs", async (params: unknown) =>
-			handleCronRuns(
+		registerGatewayHandler("cron.runs", async (params: unknown) => {
+			// Wave O0.8 — access guard. A run log discloses fire history for a
+			// job (timestamps, outcomes), which in cross-agent mode is a
+			// list-class read against the owning agent's session.
+			//   • scope=job: resolve the single owning job, guard its target.
+			//   • scope=all: enumerate the result and drop entries whose
+			//     owning job the caller cannot reach. We re-resolve the job
+			//     for every distinct jobId so the filter stays correct when
+			//     policy says "self only".
+			const p = (params ?? {}) as Record<string, unknown>;
+			const jobIdRaw =
+				typeof p.id === "string"
+					? p.id
+					: typeof p.jobId === "string"
+						? p.jobId
+						: undefined;
+			const explicitScope =
+				typeof p.scope === "string" ? (p.scope as "job" | "all") : undefined;
+			const scope: "job" | "all" =
+				explicitScope ?? (jobIdRaw && jobIdRaw.trim().length > 0 ? "job" : "all");
+
+			const { getJob } = await import("../cron/service/ops.js");
+
+			if (scope === "job") {
+				let existingAgentId: string | undefined;
+				let existingSessionTarget: string | undefined;
+				let existingSessionKey: string | undefined;
+				try {
+					const state = cronCtx().state;
+					if (state && jobIdRaw && jobIdRaw.trim().length > 0) {
+						try {
+							const existing = await getJob(state, jobIdRaw.trim());
+							if (typeof existing.agentId === "string") existingAgentId = existing.agentId;
+							if (typeof existing.sessionTarget === "string")
+								existingSessionTarget = existing.sessionTarget;
+							if (typeof existing.sessionKey === "string")
+								existingSessionKey = existing.sessionKey;
+						} catch {
+							// Job not found — let the handler surface the error.
+						}
+					}
+				} catch {
+					/* best-effort */
+				}
+				const cronRunsVerdict = sessionsAccessCheck({
+					action: "list",
+					targetSessionKey: resolveCronTargetSessionKey({
+						agentId: existingAgentId,
+						sessionTarget: existingSessionTarget,
+						sessionKey: existingSessionKey,
+					}),
+				});
+				if (!cronRunsVerdict.allowed) {
+					const err = new Error(
+						cronRunsVerdict.reason ?? "cron.runs forbidden",
+					);
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
+				return handleCronRuns(
+					params as Parameters<typeof handleCronRuns>[0],
+					cronCtx(),
+				);
+			}
+
+			// scope = all — run the handler, then strip entries whose job
+			// target the caller cannot reach. Caching the per-job verdict
+			// avoids re-hitting `sessionsAccessCheck` for every row.
+			const raw = await handleCronRuns(
 				params as Parameters<typeof handleCronRuns>[0],
 				cronCtx(),
-			),
-		),
+			);
+			const allowedByJob = new Map<string, boolean>();
+			const state = cronCtx().state;
+			const filtered: Array<(typeof raw.entries)[number]> = [];
+			for (const entry of raw.entries) {
+				const jobId =
+					typeof (entry as { jobId?: unknown }).jobId === "string"
+						? ((entry as { jobId: string }).jobId)
+						: undefined;
+				if (!jobId) {
+					// No jobId on the row — exclude defensively; the row
+					// can't be access-checked.
+					continue;
+				}
+				if (!allowedByJob.has(jobId)) {
+					let aId: string | undefined;
+					let sT: string | undefined;
+					let sK: string | undefined;
+					if (state) {
+						try {
+							const existing = await getJob(state, jobId);
+							if (typeof existing.agentId === "string") aId = existing.agentId;
+							if (typeof existing.sessionTarget === "string") sT = existing.sessionTarget;
+							if (typeof existing.sessionKey === "string") sK = existing.sessionKey;
+						} catch {
+							/* missing job — exclude */
+						}
+					}
+					const verdict = sessionsAccessCheck({
+						action: "list",
+						targetSessionKey: resolveCronTargetSessionKey({
+							agentId: aId,
+							sessionTarget: sT,
+							sessionKey: sK,
+						}),
+					});
+					allowedByJob.set(jobId, verdict.allowed);
+				}
+				if (allowedByJob.get(jobId) === true) filtered.push(entry);
+			}
+			return { ...raw, entries: filtered };
+		}),
 	);
 	disposeHandlers.push(
 		registerGatewayHandler("wake", async (params: unknown) => {
+			// Wave O0.8 — access guard. `wake` injects a synthetic prompt into
+			// a target agent's next-heartbeat (or immediate) turn. That is a
+			// cross-agent send by every meaningful definition; refuse when
+			// policy disallows reaching the resolved target.
+			const p = (params ?? {}) as Record<string, unknown>;
+			const wakeVerdict = sessionsAccessCheck({
+				action: "send",
+				targetSessionKey: resolveCronTargetSessionKey({
+					agentId: p.agentId,
+					sessionKey: p.sessionKey,
+				}),
+			});
+			if (!wakeVerdict.allowed) {
+				const err = new Error(wakeVerdict.reason ?? "wake forbidden");
+				(err as Error & { code?: string }).code = "forbidden";
+				throw err;
+			}
 			handleWake(params as Parameters<typeof handleWake>[0], cronCtx());
 			return undefined;
 		}),
@@ -3220,6 +3450,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			return { ok: true, name, entry };
 		}),
 	);
+
+	// Wave O0.8 GAP 11 — opt the session inbox into JSONL persistence at
+	// gateway boot. The disk write surface defaults off so the existing
+	// unit-test fleet (which doesn't tempdir-isolate ~/.brigade) keeps
+	// passing; the gateway flips it on so a restart between child
+	// completion and parent next turn does not lose the announce.
+	// Operators can opt out via BRIGADE_DISABLE_INBOX_PERSIST=1.
+	if (process.env.BRIGADE_DISABLE_INBOX_PERSIST !== "1") {
+		process.env.BRIGADE_ENABLE_INBOX_PERSIST = "1";
+	}
 
 	// Wire the agent-events bridge. Subagent-ended hooks (Step 10) +
 	// heartbeat-fired hooks (Step 14) + session-state listeners (Step 11)
@@ -3460,6 +3700,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// Buffer) but it's a tiny perf win to skip.
 				const method = (req.method ?? "GET").toUpperCase();
 				const hasBody = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+				let parsedBodyForGuard: unknown = undefined;
 				if (hasBody) {
 					const body = await readBodyWithLimit(req, res, {
 						maxBytes: route.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
@@ -3471,6 +3712,52 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					// — its events have already fired — so the buffer lives
 					// on a side channel the plugin reads from.
 					(req as IncomingMessage & { body?: Buffer }).body = body;
+					// Wave O0.8 — best-effort JSON parse for the default-pass
+					// session guard. Non-JSON bodies (signed webhooks,
+					// multipart) leave `parsedBodyForGuard` undefined; the
+					// guard treats undefined params as "no targeting hint"
+					// and lets the handler run (loopback-auth + plugin auth
+					// remain the primary gates).
+					const ctHeader = req.headers["content-type"];
+					const contentType = (
+						Array.isArray(ctHeader) ? ctHeader[0] : ctHeader ?? ""
+					).toLowerCase();
+					if (
+						contentType.startsWith("application/json") &&
+						body.length > 0 &&
+						body.length <= 64 * 1024
+					) {
+						try {
+							parsedBodyForGuard = JSON.parse(body.toString("utf8"));
+						} catch {
+							/* malformed — skip guard, let handler decide */
+						}
+					}
+				}
+
+				// Wave O0.8 — default-pass session guard for extension HTTP
+				// routes. When the parsed body names a `sessionKey` /
+				// `agentId` and the resolved target is unreachable, refuse
+				// before invoking the plugin. Routes that take those fields
+				// but legitimately do not touch session state (e.g. webhook
+				// dispatches whose `agentId` is the receiver) opt out via
+				// `skipSessionGuard: true` on the route registration.
+				if (!route.skipSessionGuard && parsedBodyForGuard !== undefined) {
+					const guardErr = defaultPassSessionGuard(
+						parsedBodyForGuard,
+						"send",
+					);
+					if (guardErr) {
+						res.statusCode = 403;
+						res.setHeader("Content-Type", "application/json; charset=utf-8");
+						res.end(
+							JSON.stringify({
+								error: guardErr.message,
+								code: guardErr.code ?? "forbidden",
+							}),
+						);
+						return;
+					}
 				}
 
 				// Total handler budget. We race the handler against a timer
@@ -3634,6 +3921,24 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						opts.consoleStream?.info?.(
 							`config-reload error: ${err instanceof Error ? err.message : String(err)}`,
 						);
+					}
+					// Wave O0.8 — close the access-guard TOCTOU window. Without
+					// this, `system.reload` returned `ok:true` while
+					// `liveConfigSnapshot` still pointed at the pre-reload
+					// shape until the next 250ms-throttled refresh — meaning a
+					// caller could tighten visibility, see ok, and immediately
+					// observe the old policy on the very next RPC. Push the
+					// fresh config into the snapshot synchronously and bump
+					// the throttle timestamp so the access check sees the new
+					// state on the very next call.
+					if (cfgAfterReload) {
+						liveConfigSnapshot = cfgAfterReload as unknown as Config;
+						liveConfigLastRefreshMs = Date.now();
+					} else {
+						// Disk read failed — drop the cache so the next access
+						// check falls through to the boot snapshot rather than
+						// returning a stale (post-mutate, pre-reload) shape.
+						liveConfigSnapshot = undefined;
 					}
 					try {
 						if (cfgAfterReload) applyGatewayLaneConcurrency(cfgAfterReload as never);
