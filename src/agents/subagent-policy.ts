@@ -42,7 +42,15 @@ import type { BrigadeConfig } from "../config/io.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import type { AnyBrigadeTool } from "./tools/types.js";
 
-export const DEFAULT_SUBAGENT_MAX_DEPTH = 1;
+/**
+ * Default max sub-agent depth. depth 0 = top-level operator turn; depth 1 = first
+ * sub-agent layer; depth 2 = grandchild; etc. Worst-case parallelism is bounded
+ * by `maxChildrenPerParent ^ maxDepth` — at default `(5, 3)` that's 125 leaf
+ * agents which is plenty for "dispatcher → coordinator → worker" patterns
+ * without recursion runaway. Operators can lift via
+ * `cfg.agents.defaults.subagents.maxDepth` or the boot env `BRIGADE_SUBAGENT_MAX_DEPTH`.
+ */
+export const DEFAULT_SUBAGENT_MAX_DEPTH = 3;
 export const DEFAULT_SUBAGENT_MAX_CHILDREN_PER_PARENT = 5;
 export const DEFAULT_SUBAGENT_TIMEOUT_SECONDS = 300;
 
@@ -94,7 +102,14 @@ export function resolveSubagentLimits(config: BrigadeConfig | undefined): Subage
 	// to zero. Floor to 1 so a misconfigured value degrades to "single level"
 	// rather than "broken". `maxChildrenPerParent: 0` and `defaultTimeoutSeconds:
 	// 0` are similarly forbidden — both make spawn impossible in practice.
-	const maxDepth = Math.max(1, readNonNegInt(block?.maxDepth) ?? DEFAULT_SUBAGENT_MAX_DEPTH);
+	// Resolution precedence: per-config block → BRIGADE_SUBAGENT_MAX_DEPTH env
+	// → hardcoded default. The env override lets an operator A/B-test depth
+	// changes without editing brigade.json.
+	const envMaxDepth = readNonNegInt(Number(process.env.BRIGADE_SUBAGENT_MAX_DEPTH));
+	const maxDepth = Math.max(
+		1,
+		readNonNegInt(block?.maxDepth) ?? envMaxDepth ?? DEFAULT_SUBAGENT_MAX_DEPTH,
+	);
 	const maxChildrenPerParent = Math.max(
 		1,
 		readNonNegInt(block?.maxChildrenPerParent) ?? DEFAULT_SUBAGENT_MAX_CHILDREN_PER_PARENT,
@@ -378,13 +393,16 @@ export function listRecentlyEndedChildren(): ChildRunRecord[] {
  */
 export function filterToolsForSubagentDepth(args: {
 	tools: AnyBrigadeTool[];
-	/** Depth of the session that would CALL `spawn_agent`. */
+	/** Depth of the session that would CALL `spawn_agent` / `spawn_agents`. */
 	callerDepth: number;
 	maxDepth: number;
 }): AnyBrigadeTool[] {
 	const wouldRefuse = args.callerDepth >= args.maxDepth;
 	if (!wouldRefuse) return args.tools;
-	return args.tools.filter((t) => t.name !== "spawn_agent");
+	// Both spawn tools share the same depth gate — when the cap forbids one
+	// child, it forbids five. Filtering by-name keeps the rule legible.
+	const DEPTH_GATED = new Set(["spawn_agent", "spawn_agents"]);
+	return args.tools.filter((t) => !DEPTH_GATED.has(t.name));
 }
 
 /** Test-only hook: clear the active-children registry + recent history between cases. */

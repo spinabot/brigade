@@ -397,7 +397,7 @@ describe("assembleSystemPrompt — subagent mode (Primitive #6)", () => {
 		assert.match(out.text, /Complete the task/);
 		assert.match(out.text, /Don't initiate/);
 		assert.match(out.text, /Be ephemeral/);
-		assert.match(out.text, /No further sub-agents/);
+		assert.match(out.text, /Sub-agents below you/);
 		assert.match(out.text, /Recover from truncated tool output/);
 		assert.match(out.text, /Don't poll/);
 	});

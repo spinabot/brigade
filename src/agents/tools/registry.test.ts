@@ -100,9 +100,10 @@ describe("createBrigadeTools — Primitive #6 (sub-agents)", () => {
 		});
 		const names = tools.map((t) => t.name);
 		assert.ok(names.includes("spawn_agent"), "spawn_agent present for top-level turn");
+		assert.ok(names.includes("spawn_agents"), "spawn_agents present for top-level turn");
 	});
 
-	it("drops spawn_agent at leaf depth (callerDepth === maxDepth)", () => {
+	it("drops BOTH spawn_agent + spawn_agents at leaf depth (callerDepth === maxDepth)", () => {
 		const tools = createBrigadeTools({
 			workspaceDir: tmpWorkspace,
 			agentId: "main",
@@ -115,9 +116,10 @@ describe("createBrigadeTools — Primitive #6 (sub-agents)", () => {
 		});
 		const names = tools.map((t) => t.name);
 		assert.ok(!names.includes("spawn_agent"), "spawn_agent dropped at leaf");
+		assert.ok(!names.includes("spawn_agents"), "spawn_agents dropped at leaf");
 	});
 
-	it("registers spawn_agent at depth 1 when subagentMaxDepth allows depth 2", () => {
+	it("registers spawn_agent + spawn_agents at depth 1 when subagentMaxDepth allows depth 2", () => {
 		const tools = createBrigadeTools({
 			workspaceDir: tmpWorkspace,
 			agentId: "main",
@@ -133,6 +135,47 @@ describe("createBrigadeTools — Primitive #6 (sub-agents)", () => {
 			names.includes("spawn_agent"),
 			"spawn_agent present when child wouldn't be leaf",
 		);
+		assert.ok(
+			names.includes("spawn_agents"),
+			"spawn_agents present when child wouldn't be leaf",
+		);
+	});
+});
+
+describe("Wave P1 — cron-triggered runs can spawn sub-agents", () => {
+	it("a cron-style turn (subagentContext + non-leaf depth) gets both spawn tools", () => {
+		// Cron's isolated executor calls runSingleTurn which always threads
+		// subagentContext through. As long as the depth is below the cap,
+		// the model running inside the cron job has BOTH spawn tools.
+		const tools = createBrigadeTools({
+			workspaceDir: tmpWorkspace,
+			agentId: "main",
+			cwd: tmpWorkspace,
+			subagentContext: {
+				parentSessionKey: "cron:nightly-research:run:abc-123",
+				callerDepth: 0,
+			},
+			// Default subagentMaxDepth (3) — cron at depth 0 is well below.
+		});
+		const names = tools.map((t) => t.name);
+		assert.ok(names.includes("spawn_agent"), "cron run can call spawn_agent");
+		assert.ok(names.includes("spawn_agents"), "cron run can call spawn_agents (parallel fan-out)");
+	});
+
+	it("a cron-style turn at the depth cap drops both spawn tools (no infinite delegation)", () => {
+		const tools = createBrigadeTools({
+			workspaceDir: tmpWorkspace,
+			agentId: "main",
+			cwd: tmpWorkspace,
+			subagentContext: {
+				parentSessionKey: "cron:nightly:run:abc:subagent:x:subagent:y:subagent:z",
+				callerDepth: 3,
+			},
+			subagentMaxDepth: 3,
+		});
+		const names = tools.map((t) => t.name);
+		assert.ok(!names.includes("spawn_agent"));
+		assert.ok(!names.includes("spawn_agents"));
 	});
 });
 

@@ -38,6 +38,7 @@ import { makeManageSkillTool } from "./manage-skill-tool.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
 import { makeSendMessageTool } from "./send-message-tool.js";
 import { makeSpawnAgentTool } from "./spawn-agent-tool.js";
+import { makeSpawnAgentsTool } from "./spawn-agents-tool.js";
 import { createSessionsBrigadeTools } from "./sessions/index.js";
 import type { AnyBrigadeTool } from "./types.js";
 
@@ -96,7 +97,7 @@ export interface CreateBrigadeToolsOptions {
 		parentProvider?: string;
 		parentModelId?: string;
 	};
-	/** Max sub-agent depth — defaults to `DEFAULT_SUBAGENT_MAX_DEPTH` (1). */
+	/** Max sub-agent depth — defaults to `DEFAULT_SUBAGENT_MAX_DEPTH` (3). */
 	subagentMaxDepth?: number;
 	/**
 	 * Active channel context for this turn — set when the inbound came from a
@@ -195,10 +196,13 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// `~/.brigade/skills/` managed) for the user.
 		makeManageSkillTool(opts.agentId !== undefined ? { requesterAgentId: opts.agentId } : {}),
 	];
-	// Primitive #6 — register `spawn_agent` only when the caller supplied a
+	// Primitive #6 — register `spawn_agent` (sync, single child) AND
+	// `spawn_agents` (sync, parallel fan-out) only when the caller supplied a
 	// parent context AND the child wouldn't be a leaf. `filterToolsForSubagentDepth`
-	// owns the leaf check so the rule lives in one place; the registry just
-	// passes the candidate tool array through it.
+	// owns the depth check so the rule lives in one place; the registry just
+	// passes the candidate tool array through it. The two spawn tools share
+	// the same depth gate — if the model can't spawn one child, it can't
+	// spawn five either.
 	if (opts.subagentContext) {
 		const spawnAgentTool = makeSpawnAgentTool({
 			parentSessionKey: opts.subagentContext.parentSessionKey,
@@ -228,8 +232,33 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 				? { spawnedKeys: opts.sessionToolAccess.spawnedKeys }
 				: {}),
 		});
+		const spawnAgentsTool = makeSpawnAgentsTool({
+			parentSessionKey: opts.subagentContext.parentSessionKey,
+			parentAgentId: opts.agentId,
+			...(opts.subagentContext.parentRunId !== undefined
+				? { parentRunId: opts.subagentContext.parentRunId }
+				: {}),
+			...(opts.subagentContext.parentSignal !== undefined
+				? { parentSignal: opts.subagentContext.parentSignal }
+				: {}),
+			...(opts.subagentContext.parentProvider !== undefined
+				? { parentProvider: opts.subagentContext.parentProvider }
+				: {}),
+			...(opts.subagentContext.parentModelId !== undefined
+				? { parentModelId: opts.subagentContext.parentModelId }
+				: {}),
+			...(opts.sessionToolAccess?.visibility !== undefined
+				? { visibility: opts.sessionToolAccess.visibility }
+				: {}),
+			...(opts.sessionToolAccess?.a2aPolicy !== undefined
+				? { a2aPolicy: opts.sessionToolAccess.a2aPolicy }
+				: {}),
+			...(opts.sessionToolAccess?.spawnedKeys !== undefined
+				? { spawnedKeys: opts.sessionToolAccess.spawnedKeys }
+				: {}),
+		});
 		const filtered = filterToolsForSubagentDepth({
-			tools: [spawnAgentTool],
+			tools: [spawnAgentTool, spawnAgentsTool],
 			callerDepth: opts.subagentContext.callerDepth,
 			maxDepth: opts.subagentMaxDepth ?? DEFAULT_SUBAGENT_MAX_DEPTH,
 		});

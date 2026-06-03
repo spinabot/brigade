@@ -507,3 +507,118 @@ describe("filterToolsForSubagentDepth", () => {
 		);
 	});
 });
+
+/* ───────────── depth > 1 — Wave P1 (nested sub-agents) ──────────── */
+
+describe("nested sub-agents — depth > 1", () => {
+	const DEEP_LIMITS = {
+		maxDepth: 3,
+		maxChildrenPerParent: 5,
+		defaultTimeoutSeconds: 300,
+		defaultCleanup: "keep" as const,
+	};
+
+	it("DEFAULT_SUBAGENT_MAX_DEPTH lifted to 3 (Wave P1 — nested sub-agents allowed)", () => {
+		assert.equal(DEFAULT_SUBAGENT_MAX_DEPTH, 3);
+	});
+
+	it("depth-1 sub-agent can reserve a depth-2 grandchild slot", () => {
+		const record = reserveSubagentSlot({
+			parentSessionKey: "agent:main:main:subagent:abc",
+			childSessionKey: "agent:main:main:subagent:abc:subagent:xyz",
+			label: "grandchild",
+			callerDepth: 1,
+			limits: DEEP_LIMITS,
+			cleanup: "keep",
+		});
+		assert.equal(record.callerDepth, 1);
+		assert.equal(record.state, "reserved");
+	});
+
+	it("depth-2 sub-agent can reserve a depth-3 great-grandchild slot", () => {
+		const record = reserveSubagentSlot({
+			parentSessionKey: "agent:main:main:subagent:abc:subagent:xyz",
+			childSessionKey:
+				"agent:main:main:subagent:abc:subagent:xyz:subagent:q1",
+			label: "great-grandchild",
+			callerDepth: 2,
+			limits: DEEP_LIMITS,
+			cleanup: "keep",
+		});
+		assert.equal(record.callerDepth, 2);
+	});
+
+	it("depth-3 sub-agent CANNOT reserve a depth-4 slot (caller AT maxDepth)", () => {
+		try {
+			reserveSubagentSlot({
+				parentSessionKey:
+					"agent:main:main:subagent:a:subagent:b:subagent:c",
+				childSessionKey:
+					"agent:main:main:subagent:a:subagent:b:subagent:c:subagent:d",
+				label: "too-deep",
+				callerDepth: 3,
+				limits: DEEP_LIMITS,
+				cleanup: "keep",
+			});
+			assert.fail("expected depth limit error at depth=3");
+		} catch (err) {
+			assert.ok(err instanceof SubagentLimitError);
+			assert.equal(err.kind, "depth");
+			assert.match(err.message, /depth 3/);
+			assert.match(err.message, /max 3/);
+		}
+	});
+
+	it("concurrency cap is PER PARENT — each level's children counted independently", () => {
+		// Top-level parent fills its 5 children.
+		for (let i = 0; i < DEEP_LIMITS.maxChildrenPerParent; i++) {
+			reserveSubagentSlot({
+				parentSessionKey: "agent:main:main",
+				childSessionKey: `agent:main:main:subagent:t${i}`,
+				label: `top-${i}`,
+				callerDepth: 0,
+				limits: DEEP_LIMITS,
+				cleanup: "keep",
+			});
+		}
+		// A grandchild reservation under one of those children must succeed
+		// — concurrency is per-parent, not global.
+		const grandchild = reserveSubagentSlot({
+			parentSessionKey: "agent:main:main:subagent:t0",
+			childSessionKey: "agent:main:main:subagent:t0:subagent:g1",
+			label: "grand-on-t0",
+			callerDepth: 1,
+			limits: DEEP_LIMITS,
+			cleanup: "keep",
+		});
+		assert.equal(grandchild.state, "reserved");
+		assert.equal(countActiveChildren("agent:main:main"), 5);
+		assert.equal(countActiveChildren("agent:main:main:subagent:t0"), 1);
+	});
+
+	it("BRIGADE_SUBAGENT_MAX_DEPTH env override is read when config is silent", () => {
+		const prev = process.env.BRIGADE_SUBAGENT_MAX_DEPTH;
+		process.env.BRIGADE_SUBAGENT_MAX_DEPTH = "5";
+		try {
+			const limits = resolveSubagentLimits({} as never);
+			assert.equal(limits.maxDepth, 5);
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_SUBAGENT_MAX_DEPTH;
+			else process.env.BRIGADE_SUBAGENT_MAX_DEPTH = prev;
+		}
+	});
+
+	it("config maxDepth overrides BRIGADE_SUBAGENT_MAX_DEPTH env when both set", () => {
+		const prev = process.env.BRIGADE_SUBAGENT_MAX_DEPTH;
+		process.env.BRIGADE_SUBAGENT_MAX_DEPTH = "10";
+		try {
+			const limits = resolveSubagentLimits({
+				agents: { defaults: { subagents: { maxDepth: 2 } } },
+			} as never);
+			assert.equal(limits.maxDepth, 2);
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_SUBAGENT_MAX_DEPTH;
+			else process.env.BRIGADE_SUBAGENT_MAX_DEPTH = prev;
+		}
+	});
+});

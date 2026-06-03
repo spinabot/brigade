@@ -254,8 +254,10 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
       "don't promise actions you can't finish in this turn.",
     );
     lines.push(
-      "5. **No further sub-agents** — even if `spawn_agent` is available, your depth has already " +
-      "reached the cap. Finish the work yourself.",
+      "5. **Sub-agents below you** — the `spawn_agent` and `spawn_agents` tools may be available if " +
+      "your depth is still below the cap. Use them sparingly: nest only when the work decomposes " +
+      "into INDEPENDENT sub-tasks. If `spawn_agent`/`spawn_agents` are missing from your tool list, " +
+      "you've reached the cap — finish the work yourself.",
     );
     lines.push(
       "6. **Recover from truncated tool output** — if you see a notice like `[... N more " +
