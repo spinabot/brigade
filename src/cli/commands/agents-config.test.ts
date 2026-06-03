@@ -157,6 +157,37 @@ describe("agents-config: pruneAgentConfig", () => {
 			(result.config.session?.agentToAgent as { allow?: unknown[] } | undefined)?.allow ?? [];
 		assert.equal(allow.length, 1);
 	});
+
+	it("preserves wildcard allow pairs on delete", async () => {
+		// `{ from: "*", to: "*" }` is the canonical wide-open seed written by
+		// `applyAutoEnableA2AOnAgentCreate`. Deleting any agent must NOT remove
+		// it — wildcards stay regardless of which id is being deleted.
+		const { pruneAgentConfig } = await import("./agents-config.js");
+		const cfg: BrigadeConfig = {
+			agents: {
+				main: { name: "Main" },
+				scout: { name: "Scout" },
+			} as BrigadeConfig["agents"],
+			session: {
+				agentToAgent: {
+					allow: [
+						{ from: "*", to: "*" },
+						{ from: "main", to: "scout" },
+						{ from: "scout", to: "*" },
+						{ from: "*", to: "scout" },
+					],
+				},
+			},
+		};
+		const result = pruneAgentConfig(cfg, "scout");
+		const allow =
+			((result.config.session?.agentToAgent as { allow?: Array<{ from: string; to: string }> } | undefined)
+				?.allow) ?? [];
+		// The two pairs naming "scout" on the non-wildcard side are gone; the
+		// pure-wildcard pair survives.
+		assert.deepEqual(allow, [{ from: "*", to: "*" }]);
+		assert.equal(result.removedAllow, 3);
+	});
 });
 
 describe("agents-config: buildAgentSummaries", () => {

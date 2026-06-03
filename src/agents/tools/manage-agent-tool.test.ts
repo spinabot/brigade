@@ -30,6 +30,11 @@ function readCfg(): {
 		defaults?: { subagents?: { allowAgents?: unknown; autoAllowOnCreate?: unknown } };
 		[k: string]: unknown;
 	};
+	session?: {
+		agentToAgent?: unknown;
+		autoEnableA2AOnAgentCreate?: unknown;
+		[k: string]: unknown;
+	};
 	[k: string]: unknown;
 } {
 	return JSON.parse(readFileSync(join(stateDir, "brigade.json"), "utf8"));
@@ -41,10 +46,20 @@ function readAllowAgents(): string[] {
 	return Array.isArray(list) ? (list as string[]) : [];
 }
 
+function readAgentToAgent(): unknown {
+	return readCfg().session?.agentToAgent;
+}
+
 async function runListTool(requesterAgentId: string): Promise<{
 	requester: string;
-	allowAny: boolean;
-	agents: Array<{ id: string; name?: string; configured: boolean }>;
+	agents: Array<{
+		id: string;
+		name?: string;
+		configured: boolean;
+		self?: boolean;
+		canSpawn: boolean;
+		canSend: boolean;
+	}>;
 }> {
 	const tool = makeAgentsListTool({ requesterAgentId });
 	const result = await tool.execute("test-call-id", {});
@@ -142,17 +157,20 @@ describe("manage_agent — concurrent-call safety", () => {
  *
  * Without this UX bridge, a fresh `manage_agent` call writes the new agent
  * into `cfg.agents.<id>` but never updates `cfg.agents.defaults.subagents.
- * allowAgents` — so the allowlist-scoped `agents_list` tool keeps returning
- * only the requester, and the model has no way to learn the catalog.
+ * allowAgents` — so the new agent would surface in `agents_list` with
+ * `canSpawn: false`, and the model would have no way to spawn it as a
+ * sub-agent without an extra config edit. (The catalog itself is unfiltered
+ * under the enumerate-every-agent contract; the seed governs reachability,
+ * not visibility.)
  *
  * These tests pin the contract:
- *   (a) add seeds `defaults.subagents.allowAgents` and the new id surfaces
- *       in `agents_list`
+ *   (a) add seeds `defaults.subagents.allowAgents` and the new id is
+ *       spawn-reachable from `agents_list`
  *   (b) wildcard `"*"` short-circuits the seed (already covers everything)
  *   (c) duplicate-id seed is idempotent (no double-write)
  *   (d) delete strips the id back out of the allowlist
  *   (e) `autoAllowOnCreate: false` opts the operator out for strict-
- *       allowlist mode
+ *       allowlist mode (new agent still listed, but `canSpawn: false`)
  *   (f) per-agent `subagents.allowAgents` override is left untouched (the
  *       seed only touches `defaults.subagents.allowAgents`)
  */
@@ -261,13 +279,23 @@ describe("manage_agent — auto-allowlist seed on add", () => {
 		const tool = makeManageAgentTool();
 		await tool.execute("call-add", { action: "add", id: "stealth" });
 
-		// Operator-driven allowlist stays empty — model must not see the new agent.
+		// Operator-driven allowlist stays empty — the new agent must not become
+		// spawn-reachable under strict mode.
 		const allow = readAllowAgents();
 		assert.deepEqual(allow, [], "autoAllowOnCreate=false must suppress the seed");
 
+		// Under the enumerate-every-agent contract `stealth` still surfaces in
+		// the catalog, but its `canSpawn` flag is false because the allowlist
+		// wasn't extended. The strict-mode intent is preserved at the flag
+		// layer rather than via visibility filtering.
 		const listed = await runListTool("main");
-		const ids = listed.agents.map((a) => a.id);
-		assert.ok(!ids.includes("stealth"), "stealth must NOT surface in agents_list under strict mode");
+		const stealth = listed.agents.find((a) => a.id === "stealth");
+		assert.ok(stealth, "stealth surfaces in the catalog (no allowlist visibility filter)");
+		assert.equal(
+			stealth?.canSpawn,
+			false,
+			"stealth.canSpawn must be false under strict allowlist mode",
+		);
 	});
 
 	it("(f) per-agent subagents.allowAgents override is left untouched", async () => {
@@ -302,10 +330,172 @@ describe("manage_agent — auto-allowlist seed on add", () => {
 			"per-agent override must NOT be modified by the seed",
 		);
 
-		// agents_list called by captain still only sees `specific-peer` — the
-		// per-agent override beats defaults, so `recruit` is hidden from captain.
+		// Under the enumerate-every-agent contract `recruit` surfaces for
+		// captain too (the catalog is unfiltered), but captain's `canSpawn`
+		// flag is false for it because the per-agent override beats defaults
+		// and `recruit` is not in captain's allowlist.
 		const captainView = await runListTool("captain");
-		const captainSees = captainView.agents.map((a) => a.id);
-		assert.ok(!captainSees.includes("recruit"), "captain must not see recruit (per-agent override wins)");
+		const recruitForCaptain = captainView.agents.find((a) => a.id === "recruit");
+		assert.ok(recruitForCaptain, "recruit surfaces in the catalog for captain");
+		assert.equal(
+			recruitForCaptain?.canSpawn,
+			false,
+			"captain.canSpawn(recruit) must be false (per-agent override wins)",
+		);
+		const specificPeerForCaptain = captainView.agents.find((a) => a.id === "specific-peer");
+		// `specific-peer` is on captain's allowlist but not in cfg.agents — it
+		// won't be present because we only enumerate configured agents.
+		assert.equal(
+			specificPeerForCaptain,
+			undefined,
+			"specific-peer is not configured, so it does not surface",
+		);
+	});
+});
+
+/**
+ * Auto-A2A-policy seed on `manage_agent({action:"add"})`:
+ *
+ * Sibling of the allowlist seed (`applyAutoAllowOnCreate`). Without it, the
+ * model can SEE + spawn the freshly added agent but the `sessions_send` A2A
+ * flow still refuses because `cfg.session.agentToAgent` is absent / disabled.
+ * The seed writes a canonical wide-open policy when no usable one exists.
+ *
+ * These tests pin the contract:
+ *   (a) add on no-A2A config seeds the canonical object
+ *   (b) add on the broken legacy boolean-true shape coerces to canonical
+ *   (b2) add on enabled=false object flips enabled while preserving allow
+ *   (c) `autoEnableA2AOnAgentCreate: false` opts the operator out
+ *   (d) the seed is idempotent on a second add
+ */
+describe("manage_agent — auto-A2A-policy seed on add", () => {
+	it("(a) add on no-A2A config seeds canonical { enabled:true, allow:[{from:*,to:*}] }", async () => {
+		writeCfg({
+			agents: {
+				defaults: {
+					provider: "openrouter",
+					model: { primary: "anthropic/claude-sonnet-4.6" },
+				},
+				main: {},
+			},
+		});
+
+		const tool = makeManageAgentTool();
+		const res = await tool.execute("call-add", { action: "add", id: "netpulse" });
+		assert.ok(res.content);
+
+		const a2a = readAgentToAgent();
+		assert.deepEqual(
+			a2a,
+			{ enabled: true, allow: [{ from: "*", to: "*" }] },
+			"missing agentToAgent must be seeded with the canonical wide-open default",
+		);
+	});
+
+	it("(b) add on boolean-true (broken legacy shape) coerces to canonical object", async () => {
+		writeCfg({
+			agents: {
+				defaults: {
+					provider: "openrouter",
+					model: { primary: "anthropic/claude-sonnet-4.6" },
+				},
+				main: {},
+			},
+			// Broken legacy shape — a literal boolean instead of the policy object.
+			session: { agentToAgent: true },
+		});
+
+		const tool = makeManageAgentTool();
+		await tool.execute("call-add", { action: "add", id: "scout" });
+
+		const a2a = readAgentToAgent();
+		assert.deepEqual(
+			a2a,
+			{ enabled: true, allow: [{ from: "*", to: "*" }] },
+			"boolean-true must be coerced to the canonical object shape",
+		);
+	});
+
+	it("(b2) add on enabled=false object flips enabled while preserving operator-authored allow", async () => {
+		writeCfg({
+			agents: {
+				defaults: {
+					provider: "openrouter",
+					model: { primary: "anthropic/claude-sonnet-4.6" },
+				},
+				main: {},
+			},
+			session: {
+				agentToAgent: {
+					enabled: false,
+					allow: [{ from: "main", to: "captain" }],
+					maxPingPongTurns: 7,
+				},
+			},
+		});
+
+		const tool = makeManageAgentTool();
+		await tool.execute("call-add", { action: "add", id: "recruit" });
+
+		const a2a = readAgentToAgent() as {
+			enabled?: boolean;
+			allow?: Array<{ from: string; to: string }>;
+			maxPingPongTurns?: number;
+		};
+		assert.equal(a2a?.enabled, true, "enabled must flip to true");
+		assert.deepEqual(
+			a2a?.allow,
+			[{ from: "main", to: "captain" }],
+			"operator-authored allow must be preserved",
+		);
+		assert.equal(a2a?.maxPingPongTurns, 7, "other operator-authored fields must be preserved");
+	});
+
+	it("(c) autoEnableA2AOnAgentCreate=false suppresses the seed", async () => {
+		writeCfg({
+			agents: {
+				defaults: {
+					provider: "openrouter",
+					model: { primary: "anthropic/claude-sonnet-4.6" },
+				},
+				main: {},
+			},
+			session: { autoEnableA2AOnAgentCreate: false },
+		});
+
+		const tool = makeManageAgentTool();
+		await tool.execute("call-add", { action: "add", id: "stealth" });
+
+		const a2a = readAgentToAgent();
+		assert.equal(a2a, undefined, "opt-out must leave agentToAgent absent");
+	});
+
+	it("(d) seed is idempotent on a second add", async () => {
+		writeCfg({
+			agents: {
+				defaults: {
+					provider: "openrouter",
+					model: { primary: "anthropic/claude-sonnet-4.6" },
+				},
+				main: {},
+			},
+		});
+
+		const tool = makeManageAgentTool();
+		await tool.execute("call-add-1", { action: "add", id: "first" });
+		const afterFirst = readAgentToAgent();
+		assert.deepEqual(
+			afterFirst,
+			{ enabled: true, allow: [{ from: "*", to: "*" }] },
+			"first add seeds canonical default",
+		);
+
+		await tool.execute("call-add-2", { action: "add", id: "second" });
+		const afterSecond = readAgentToAgent();
+		assert.deepEqual(
+			afterSecond,
+			{ enabled: true, allow: [{ from: "*", to: "*" }] },
+			"second add must NOT mutate the already-seeded canonical default",
+		);
 	});
 });

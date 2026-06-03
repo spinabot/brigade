@@ -130,3 +130,224 @@ describe("path-write guard — protected roots", () => {
 		assert.ok(result?.block);
 	});
 });
+
+describe("path-write guard — bash command inspection", () => {
+	function refusalReasonHas(result: BeforeToolCallResult | undefined, fragment: string): void {
+		assert.ok(result?.block, `expected a block, got ${JSON.stringify(result)}`);
+		assert.match(
+			result?.reason ?? "",
+			new RegExp("refusing to mutate"),
+			`expected canonical refusal phrasing, got: ${result?.reason}`,
+		);
+		assert.ok(
+			(result?.reason ?? "").includes(fragment),
+			`expected reason to mention "${fragment}", got: ${result?.reason}`,
+		);
+	}
+
+	it("(a) refuses `echo {} > brigade.json` (redirect into config)", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `echo {} > ${target}` });
+		refusalReasonHas(result, target);
+		assert.match(result?.reason ?? "", /brigade structural guard/i);
+		assert.match(result?.reason ?? "", /manage_agent/);
+	});
+
+	it("(a2) refuses `>>` append redirect into brigade.json", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `printf '{}' >> ${target}` });
+		refusalReasonHas(result, target);
+	});
+
+	it("(a3) refuses `| tee` into brigade.json", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `echo {} | tee ${target}` });
+		refusalReasonHas(result, target);
+	});
+
+	it("(a4) refuses `| tee -a` append into brigade.json", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `echo {} | tee -a ${target}` });
+		refusalReasonHas(result, target);
+	});
+
+	it("(b) refuses `node -e fs.writeFileSync(...)` against brigade.json", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const command = `node -e "require('fs').writeFileSync('${target.replace(/\\/g, "\\\\")}', '{}')"`;
+		const result = await runGuard("bash", { command });
+		refusalReasonHas(result, target);
+		assert.match(result?.reason ?? "", /node -e write/);
+	});
+
+	it("(b2) refuses `python -c open(..., 'w')` against brigade.json", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const command = `python -c "open('${target.replace(/\\/g, "\\\\")}', 'w').write('{}')"`;
+		const result = await runGuard("bash", { command });
+		refusalReasonHas(result, target);
+		assert.match(result?.reason ?? "", /python -c write/);
+	});
+
+	it("(c) ALLOWS `cat brigade.json` (read-only)", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `cat ${target}` });
+		assert.equal(result, undefined);
+	});
+
+	it("(c2) ALLOWS `grep / head / tail / less / more / ls / stat / wc` over brigade.json", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		for (const tool of ["grep '.'", "head -n 5", "tail -n 5", "less", "more", "ls -la", "stat", "wc -l"]) {
+			const result = await runGuard("bash", { command: `${tool} ${target}` });
+			assert.equal(result, undefined, `expected '${tool}' to be allowed, got: ${JSON.stringify(result)}`);
+		}
+	});
+
+	it("(c3) ALLOWS `python -m json.tool brigade.json` with no redirect", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `python -m json.tool ${target}` });
+		assert.equal(result, undefined);
+	});
+
+	it("(d) refuses `sed -i` against brigade.json", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `sed -i 's/a/b/' ${target}` });
+		refusalReasonHas(result, target);
+		assert.match(result?.reason ?? "", /sed -i/);
+	});
+
+	it("(d2) refuses `sed -i.bak` against brigade.json", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `sed -i.bak 's/a/b/' ${target}` });
+		refusalReasonHas(result, target);
+	});
+
+	it("(d3) refuses `rm` against brigade.json", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `rm -f ${target}` });
+		refusalReasonHas(result, target);
+		assert.match(result?.reason ?? "", /rm of/);
+	});
+
+	it("(d4) refuses `unlink` against brigade.json", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `unlink ${target}` });
+		refusalReasonHas(result, target);
+	});
+
+	it("(d5) refuses `mv X brigade.json` (path as destination)", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `mv /tmp/source.json ${target}` });
+		refusalReasonHas(result, target);
+		assert.match(result?.reason ?? "", /mv destination/);
+	});
+
+	it("(d6) refuses `cp X brigade.json`", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `cp /tmp/source.json ${target}` });
+		refusalReasonHas(result, target);
+	});
+
+	it("(e) ALLOWS write to an unrelated path", async () => {
+		const elsewhere = path.join(tmpRoot, "unrelated", "file.txt");
+		const cmds = [
+			`echo hi > ${elsewhere}`,
+			`echo hi >> ${elsewhere}`,
+			`sed -i 's/a/b/' ${elsewhere}`,
+			`mv /tmp/x ${elsewhere}`,
+			`rm -f ${elsewhere}`,
+		];
+		for (const command of cmds) {
+			const result = await runGuard("bash", { command });
+			assert.equal(result, undefined, `expected '${command}' to be allowed, got: ${JSON.stringify(result)}`);
+		}
+	});
+
+	it("(f) refuses write into install-tree skills/", async () => {
+		const target = path.join(tmpRoot, "install", "skills", "mathematician", "SKILL.md");
+		const result = await runGuard("bash", { command: `echo hi > ${target}` });
+		refusalReasonHas(result, target);
+		assert.match(result?.reason ?? "", /install-skills/);
+	});
+
+	it("(f2) refuses `node -e fs.appendFileSync` into install-tree skills/", async () => {
+		const target = path.join(tmpRoot, "install", "skills", "mathematician", "SKILL.md");
+		const command = `node -e "require('fs').appendFileSync('${target.replace(/\\/g, "\\\\")}', 'extra')"`;
+		const result = await runGuard("bash", { command });
+		refusalReasonHas(result, target);
+	});
+
+	it("(g) ALLOWS write into ~/.brigade/workspace/ (default-agent persona dir)", async () => {
+		const target = path.join(tmpRoot, "workspace", "skills", "hello", "SKILL.md");
+		const cmds = [
+			`echo body > ${target}`,
+			`echo body >> ${target}`,
+			`echo body | tee ${target}`,
+			`sed -i 's/a/b/' ${target}`,
+			`rm -f ${target}`,
+			`mv /tmp/skill.md ${target}`,
+		];
+		for (const command of cmds) {
+			const result = await runGuard("bash", { command });
+			assert.equal(result, undefined, `expected '${command}' to be allowed, got: ${JSON.stringify(result)}`);
+		}
+	});
+
+	it("(g2) ALLOWS write into ~/.brigade/agents/<id>/workspace/ (per-agent persona dir)", async () => {
+		const target = path.join(
+			tmpRoot,
+			"agents",
+			"mathematician",
+			"workspace",
+			"skills",
+			"hello",
+			"SKILL.md",
+		);
+		const result = await runGuard("bash", { command: `echo body > ${target}` });
+		assert.equal(result, undefined);
+	});
+
+	it("(g3) refuses write into ~/.brigade/agents/<id>/agent/ internals via bash", async () => {
+		const target = path.join(tmpRoot, "agents", "mathematician", "agent", "profile-state.json");
+		const result = await runGuard("bash", { command: `echo {} > ${target}` });
+		refusalReasonHas(result, target);
+		assert.match(result?.reason ?? "", /agent-internals/);
+	});
+
+	it("ignores bash calls with no command arg", async () => {
+		const result = await runGuard("bash", {});
+		assert.equal(result, undefined);
+	});
+
+	it("ignores bash calls with a non-string command (exec-gate handles those)", async () => {
+		const result = await runGuard("bash", { command: ["ls", "-la"] as unknown as string });
+		assert.equal(result, undefined);
+	});
+
+	it("ignores bash calls with whitespace-only command", async () => {
+		const result = await runGuard("bash", { command: "   " });
+		assert.equal(result, undefined);
+	});
+
+	it("recognises `exec` / `shell` / `sh` aliases identically", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		for (const name of ["exec", "shell", "sh", "EXEC", "Shell", "SH"]) {
+			const result = await runGuard(name, { command: `echo {} > ${target}` });
+			refusalReasonHas(result, target);
+		}
+	});
+
+	it("does not refuse when the protected path appears only inside a single-quoted comment", async () => {
+		// Single-quoted strings still tokenise as words, but with no
+		// write-intent operator nearby. `echo 'brigade.json is cool'`
+		// should not match.
+		const result = await runGuard("bash", { command: `echo 'brigade.json is cool'` });
+		assert.equal(result, undefined);
+	});
+
+	it("refusal message tells the model to use manage_agent / manage_skill", async () => {
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("bash", { command: `echo {} > ${target}` });
+		assert.ok(result?.block);
+		assert.match(result?.reason ?? "", /manage_agent/);
+		assert.match(result?.reason ?? "", /manage_skill/);
+	});
+});

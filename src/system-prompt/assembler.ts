@@ -4,6 +4,7 @@ import { applyBudget, DEFAULT_BUDGET, type BudgetResult } from "./bootstrap-budg
 import { sanitizeForPromptLiteral } from "./sanitize.js";
 import { formatRuntimeLine, type RuntimeParams } from "./runtime-params.js";
 import {
+  DELEGATION_CASCADE_GUIDANCE,
   MEMORY_GUIDANCE,
   pickModelFamilyGuidance,
   REASONING_FORMAT_GUIDANCE,
@@ -615,6 +616,21 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   if (args.capabilities?.subAgents && !isMinimalMode) {
     lines.push(SUB_AGENTS_GUIDANCE);
     lines.push("");
+  }
+
+  // 7b''''. ## Delegating to peer agents (conditional on the actual tool surface).
+  //
+  // Fires when BOTH `sessions_send` AND `sessions_spawn` are visible to the
+  // model THIS turn — keyed on the tool surface, not a capability flag, so
+  // the cascade only renders when the model actually has both rungs to climb.
+  // Skipped in minimal mode (sub-agent / cron) — those scoped runs don't
+  // delegate to peers; the parent already framed the task.
+  if (!isMinimalMode) {
+    const toolNames = new Set(args.toolDescriptions.map((t) => t.name));
+    if (toolNames.has("sessions_send") && toolNames.has("sessions_spawn")) {
+      lines.push(DELEGATION_CASCADE_GUIDANCE);
+      lines.push("");
+    }
   }
 
   // 7b'''. ## Agent & Skill Management (always-on, non-minimal).

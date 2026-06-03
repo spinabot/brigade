@@ -157,6 +157,12 @@ export interface BrigadeSessionConfig {
   identityLinks?: Record<string, string[]>;
   /** Agent-to-agent messaging policy (used by `sessions_send` A2A flow). */
   agentToAgent?: AgentToAgentPolicy;
+  /** When `true` (default), creating a new agent (via `brigade agents add` or
+   *  the `manage_agent` tool) seeds `cfg.session.agentToAgent` so A2A is
+   *  available immediately. Set `false` for strict-allowlist mode where the
+   *  operator authors every A2A pair by hand. Mirrors the
+   *  `agents.defaults.subagents.autoAllowOnCreate` toggle. */
+  autoEnableA2AOnAgentCreate?: boolean;
   /** Visibility gate for the `sessions_list` / `sessions_history` tools. */
   sessionTools?: { visibility?: SessionToolsVisibility };
   [key: string]: unknown;

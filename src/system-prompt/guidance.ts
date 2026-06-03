@@ -222,7 +222,7 @@ The operator runs multiple specialised agents (e.g. \`main\`, \`netpulse\`, \`su
 
 3. **Sub-agent spawn**. Independent subtask you'd like done in parallel without back-and-forth (e.g. "research X while I work on Y"). Use \`sessions_spawn\` (async, result lands in your transcript on next turn) or \`spawn_agent\` (sync, returns reply this turn). NOT for delegation to named peers — use \`sessions_send\` for that.
 
-Use \`agents_list\` to see what peer agents are configured before referring to one. Returns \`{requester, allowAny, agents:[{id, name?, configured}]}\` — read-only, scoped to the subagent allowlist. The requester is always first; peers appear only when they are listed in \`subagents.allowAgents\` (or when \`allowAny\` is true via the \`*\` wildcard). An agent that exists in the catalog but is not in the allowlist will not appear here.
+Use \`agents_list\` to see what peer agents are configured before referring to one. Returns \`{requester, agents:[{id, name?, configured, self?, canSpawn, canSend}]}\` — read-only, enumerates EVERY configured agent (no allowlist visibility filter). The caller row is marked \`self: true\` and placed first. Use \`canSpawn\` (id is in \`subagents.allowAgents\` or covered by \`*\`) and \`canSend\` (A2A policy permits caller→target) to decide what's actually reachable. Always call this tool for any who/which/how-many agents question — never enumerate from memory.
 
 To CREATE / DELETE / RENAME an agent, call \`manage_agent\` (owner-only — works when the user is the workspace owner, which is always true in single-user setup). Actions:
   - \`manage_agent({ action: "add", id: "<name>" })\` — creates the agent with all 7 persona files seeded, atomic rollback if anything fails. Optional \`workspace\`, \`provider\`, \`model\` params. Auto-extends \`cfg.agents.defaults.subagents.allowAgents\` with the new id so the agent immediately appears in \`agents_list\` and is spawn-targetable (skipped when the allowlist contains \`"*"\`, the id is already present, or the operator set \`cfg.agents.defaults.subagents.autoAllowOnCreate = false\`).
@@ -246,6 +246,34 @@ Two scopes — pick deliberately:
 \`agentId\` defaults to the calling agent. \`description\` is what future-you reads to decide whether the skill applies — be specific. \`body\` is the actual skill content (instructions, examples, refs).
 
 To delete: \`manage_skill({ action: "delete", scope: "agent"|"managed", name: "<skill-name>", agentId: "<id>" })\`.`;
+
+/* ───────────────── Delegation cascade (conditional on sessions_send + sessions_spawn) ───────────────── */
+
+/**
+ * Injected when BOTH `sessions_send` AND `sessions_spawn` are present in the
+ * tool surface. Teaches the model the strict ORDER to attempt cross-agent
+ * delegation: try A2A first, then fall back to a fire-and-forget spawn, then
+ * surface the failure with a concrete remediation (`manage_agent` /
+ * `cfg.session.agentToAgent`). Closes the regression where the model would
+ * silently give up after one refusal — or worse, hand-edit `brigade.json` to
+ * widen the spawn allowlist itself.
+ *
+ * Wired unconditionally in `assembler.ts` when both tools are visible; skipped
+ * in minimal mode (sub-agent / cron), which don't reach for peers anyway.
+ *
+ * The "spawn_agent" clarifier at the end keeps the model from confusing
+ * peer-delegation (cross-agentId) with self-fan-out (same-agentId isolation).
+ */
+export const DELEGATION_CASCADE_GUIDANCE = `## Delegating to peer agents
+
+To delegate to a PEER agent (different agentId — e.g. give task to inventory, ask procurement to ...), use this cascade IN ORDER:
+
+1. First try sessions_send({ agentId, message }). Peer replies. Requires cfg.session.agentToAgent enabled.
+2. If sessions_send refuses with A2A-disabled, try sessions_spawn({ agentId, task, runtime: subagent }) — fire-and-forget child session. Requires the peer id to be in subagents.allowAgents.
+3. If BOTH refuse, surface the failure to the operator: I cannot delegate to <peer> — A2A is disabled and they are not in my spawn allowlist. Run manage_agent({action:add}) to add them if missing, otherwise ask the operator to enable A2A.
+4. NEVER hand-edit brigade.json to fix delegation policy. The path-write guard will refuse it. Agent config mutations go through manage_agent / manage_skill / brigade onboard.
+
+For spawning a sub-agent of MYSELF (same agentId, isolated), use spawn_agent — not sessions_send or sessions_spawn.`;
 
 /* ───────────────── Per-model family detection + bodies ───────────────── */
 

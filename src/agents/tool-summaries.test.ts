@@ -9,11 +9,12 @@ describe("BRIGADE_TOOL_SUMMARIES — wake-word coverage", () => {
 	// behaviour (no inline catalog → must call the tool) does the steering
 	// work; the catalog is just the menu.
 
-	it("agents_list mirrors the reference one-liner (sessions_spawn / subagent runtime)", () => {
+	it("agents_list summary steers the model to ALWAYS call (enumerate-every-agent contract)", () => {
 		const s = resolveToolSummary("agents_list");
 		assert.ok(s, "agents_list must have a summary");
-		assert.match(s!, /sessions_spawn/);
-		assert.match(s!, /runtime="subagent"/);
+		assert.match(s!, /EVERY configured Brigade agent/);
+		assert.match(s!, /canSpawn\/canSend/);
+		assert.match(s!, /don't enumerate agents from memory/);
 	});
 
 	it("manage_agent + manage_skill are advertised (mutation surface)", () => {

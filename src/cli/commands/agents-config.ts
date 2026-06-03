@@ -302,13 +302,25 @@ export function pruneAgentConfig(
 
 	// Strip every agentToAgent.allow pair that names the removed agent.
 	// Brigade's allow matrix is { from, to }[] (vs. the reference's flat
-	// string[]); we drop the pair when either side matches.
+	// string[]); we drop the pair when either side matches the deleted id.
+	//
+	// Wildcards (`"*"`) are deliberately preserved — `normalizeAgentId("*")`
+	// collapses to the default-agent id (because `*` is not a valid id
+	// character), which would otherwise silently delete the canonical
+	// wide-open default pair seeded by `applyAutoEnableA2AOnAgentCreate`.
+	// Compare against the raw string for wildcard detection BEFORE the
+	// normalisation step.
 	const session = (cfg.session as { agentToAgent?: { allow?: Array<{ from?: unknown; to?: unknown }> } } | undefined);
 	const allow = Array.isArray(session?.agentToAgent?.allow) ? session.agentToAgent.allow : [];
 	const filteredAllow = allow.filter((pair) => {
-		const from = typeof pair?.from === "string" ? normalizeAgentId(pair.from) : "";
-		const to = typeof pair?.to === "string" ? normalizeAgentId(pair.to) : "";
-		return from !== id && to !== id;
+		const fromRaw = typeof pair?.from === "string" ? pair.from.trim() : "";
+		const toRaw = typeof pair?.to === "string" ? pair.to.trim() : "";
+		// Wildcards stay untouched on either side.
+		const fromIsWildcard = fromRaw === "*";
+		const toIsWildcard = toRaw === "*";
+		const fromMatches = !fromIsWildcard && fromRaw !== "" && normalizeAgentId(fromRaw) === id;
+		const toMatches = !toIsWildcard && toRaw !== "" && normalizeAgentId(toRaw) === id;
+		return !fromMatches && !toMatches;
 	});
 	const removedAllow = allow.length - filteredAllow.length;
 

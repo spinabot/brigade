@@ -332,6 +332,80 @@ describe("assembleSystemPrompt — capability-gated sections", () => {
 	});
 });
 
+describe("assembleSystemPrompt — Delegation Cascade (sessions_send + sessions_spawn)", () => {
+	// The Delegation Cascade rule fires when BOTH `sessions_send` AND
+	// `sessions_spawn` are present in the tool surface. Teaches the model the
+	// strict ORDER to attempt cross-agent delegation (A2A first, spawn fallback,
+	// then surface the failure with a concrete remediation), and that
+	// `brigade.json` is OFF-LIMITS for self-service policy fixes.
+
+	it("emits the cascade when BOTH sessions_send AND sessions_spawn are in the tool surface", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [
+				{ name: "sessions_send", summary: "send to peer" },
+				{ name: "sessions_spawn", summary: "spawn a child session" },
+			],
+		});
+		assert.match(out.text, /## Delegating to peer agents/);
+		assert.match(out.text, /First try sessions_send/);
+		assert.match(out.text, /try sessions_spawn/);
+		assert.match(out.text, /surface the failure to the operator/);
+		assert.match(out.text, /NEVER hand-edit brigade\.json/);
+		// Self vs peer-fan-out clarifier — model must not confuse the two.
+		assert.match(out.text, /spawn_agent — not sessions_send or sessions_spawn/);
+	});
+
+	it("does NOT emit the cascade when only sessions_send is present", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [
+				{ name: "sessions_send", summary: "send to peer" },
+			],
+		});
+		assert.doesNotMatch(out.text, /## Delegating to peer agents/);
+	});
+
+	it("does NOT emit the cascade when only sessions_spawn is present", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [
+				{ name: "sessions_spawn", summary: "spawn a child session" },
+			],
+		});
+		assert.doesNotMatch(out.text, /## Delegating to peer agents/);
+	});
+
+	it("does NOT emit the cascade in subagent mode (minimal) even with both tools", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" }],
+			toolDescriptions: [
+				{ name: "sessions_send", summary: "send to peer" },
+				{ name: "sessions_spawn", summary: "spawn a child session" },
+			],
+			capabilities: { subagentMode: true },
+		});
+		assert.doesNotMatch(out.text, /## Delegating to peer agents/);
+	});
+
+	it("does NOT emit the cascade in cron mode (minimal) even with both tools", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" }],
+			toolDescriptions: [
+				{ name: "sessions_send", summary: "send to peer" },
+				{ name: "sessions_spawn", summary: "spawn a child session" },
+			],
+			capabilities: { cronMode: true },
+		});
+		assert.doesNotMatch(out.text, /## Delegating to peer agents/);
+	});
+});
+
 describe("assembleSystemPrompt — no ## Agents block (OC mirror)", () => {
 	// The assembler deliberately does NOT enumerate peer agents in the
 	// system prompt. The model learns the agent catalog exclusively via

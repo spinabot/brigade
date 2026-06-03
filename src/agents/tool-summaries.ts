@@ -35,7 +35,8 @@ export const BRIGADE_TOOL_SUMMARIES: Record<string, string> = {
   // implementation's terse one-liners — the structured behaviour (no
   // inline catalog → must call the tool) does the steering work; the
   // catalog is just the menu.
-  agents_list: 'List Brigade agent ids allowed for sessions_spawn when runtime="subagent"',
+  agents_list:
+    "List EVERY configured Brigade agent with canSpawn/canSend reachability flags. Call this — don't enumerate agents from memory.",
   manage_agent: "Owner-only: create, delete, or update an agent's identity. Use this for any agent-catalog mutation — never hand-edit brigade.json.",
   manage_skill: "Owner-only: create or delete a skill (agent-scoped or shared). Never write SKILL.md by hand; this tool handles the catalog atomically.",
   // Session / sub-agent surface — terse summaries mirroring the
