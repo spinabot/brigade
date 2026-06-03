@@ -60,8 +60,18 @@ export interface CronPayloadAgentTurn {
 
 export type CronPayload = CronPayloadSystemEvent | CronPayloadAgentTurn;
 
-/** Where the resulting work lands. */
-export type CronSessionTarget = "main" | "isolated" | `session:${string}`;
+/**
+ * Where the resulting work lands.
+ *
+ * `"current"` is a CREATE-TIME alias: when supplied by the caller, the
+ * normalizer rewrites it to `session:<currentSessionKey>` using the active
+ * session context (or falls back to `"isolated"` when no session is active —
+ * CLI / headless paths). Persisted `CronJob.sessionTarget` values are
+ * therefore always one of `"main" | "isolated" | "session:<id>"`. The literal
+ * `"current"` only appears on the input surface so the agent tool and RPC
+ * can accept it; downstream timer + executor never see it after normalize.
+ */
+export type CronSessionTarget = "main" | "isolated" | "current" | `session:${string}`;
 
 /** "now" forces a heartbeat; "next-heartbeat" waits for the natural cycle. */
 export type CronWakeMode = "now" | "next-heartbeat";

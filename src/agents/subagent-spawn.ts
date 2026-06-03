@@ -58,6 +58,27 @@ const log = createSubsystemLogger("agents/subagent-spawn");
 
 const DEFAULT_MAX_SPAWN_DEPTH = 3;
 const DEFAULT_MAX_CHILDREN_PER_AGENT = 5;
+/**
+ * Wave N4 — default per-call wall-clock cap for a gateway-routed sub-agent
+ * run when the caller (typically the `sessions_spawn` tool) does NOT
+ * supply `runTimeoutSeconds`. Pre-Wave-N4 the engine forwarded
+ * `runTimeoutSeconds: undefined` straight to the gateway `agent` handler,
+ * which then ran the child with NO enforced cap — three of five parallel
+ * children were observed timing out at 60s elsewhere in the stack while
+ * the harness sat idle waiting on the missing reply, masking the real
+ * timeout. 180s is generous (above the slow-path tail of any realistic
+ * tool-using turn but well below "model is hung forever") and matches the
+ * documented `agents.defaults.subagents.defaultTimeoutSeconds` knob's
+ * intent of "model can take its time but never pins a slot indefinitely".
+ *
+ * Operators override per-call by passing `runTimeoutSeconds` on the
+ * `sessions_spawn` call; the `cfg.agents.defaults.subagents.defaultTimeoutSeconds`
+ * knob in `brigade.json` is honoured by the in-process `spawn_agent`
+ * path through `resolveSubagentLimits`. The two paths read different
+ * surfaces today; an operator who genuinely wants longer-running children
+ * sets BOTH.
+ */
+export const DEFAULT_SUBAGENT_RUN_TIMEOUT_SECONDS = 180;
 
 export interface SpawnSubagentParams {
 	task: string;
@@ -189,6 +210,16 @@ export async function spawnSubagentDirect(
 	const maxSpawnDepth = ctx.maxSpawnDepth ?? DEFAULT_MAX_SPAWN_DEPTH;
 	const maxChildren = ctx.maxChildrenPerAgent ?? DEFAULT_MAX_CHILDREN_PER_AGENT;
 	const callerDepth = ctx.callerDepth ?? 0;
+	// Wave N4 — apply a sane default per-call run timeout when the caller
+	// omits one. Without this, the engine forwards `undefined` to the gateway
+	// `agent` handler and the child runs uncapped (parent waits forever on a
+	// hung tool call). 180s is the documented default — override per-call via
+	// `runTimeoutSeconds`, or by setting `agents.defaults.subagents.defaultTimeoutSeconds`
+	// in `brigade.json` (the in-process `spawn_agent` path reads that knob).
+	const effectiveRunTimeoutSeconds =
+		typeof params.runTimeoutSeconds === "number" && params.runTimeoutSeconds > 0
+			? params.runTimeoutSeconds
+			: DEFAULT_SUBAGENT_RUN_TIMEOUT_SECONDS;
 
 	const requesterAgentId = ctx.requesterAgentIdOverride
 		? normalizeAgentId(ctx.requesterAgentIdOverride)
@@ -235,7 +266,7 @@ export async function spawnSubagentDirect(
 		label: label || undefined,
 		model: params.model,
 		workspaceDir: ctx.workspaceDir,
-		runTimeoutSeconds: params.runTimeoutSeconds,
+		runTimeoutSeconds: effectiveRunTimeoutSeconds,
 		expectsCompletionMessage: params.expectsCompletionMessage !== false,
 		spawnMode,
 		createdAt: Date.now(),
@@ -321,7 +352,7 @@ export async function spawnSubagentDirect(
 				// total in-flight spawns process-wide.
 				lane: subagentLane(ctx.agentSessionKey),
 				thinking: params.thinking,
-				timeout: params.runTimeoutSeconds,
+				timeout: effectiveRunTimeoutSeconds,
 				label: label || undefined,
 				spawnedBy: ctx.agentSessionKey ?? "main",
 				...(params.model ? { model: params.model } : {}),

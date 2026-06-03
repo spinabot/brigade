@@ -27,6 +27,10 @@ import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 
 import { getActiveCronService } from "../../cron/active-service.js";
 import {
+	maybeAttachReminderContext,
+	REMINDER_CONTEXT_MESSAGES_MAX,
+} from "../../cron/reminder-context.js";
+import {
 	add as cronAdd,
 	enqueueRun as cronEnqueueRun,
 	listPage as cronListPage,
@@ -52,6 +56,43 @@ import {
 import type { BrigadeTool } from "./types.js";
 
 /**
+ * Top-level keys the cron tool will accept on the flat surface and pull
+ * back into a synthetic `job` (or `patch`) object when the model emits
+ * them at the call's top level instead of nesting under `job` / `patch`.
+ *
+ * Non-frontier models (Grok, smaller local models) sometimes flatten
+ * structured params into the tool's outer object — we recover defensively
+ * so a clearly-intended cron-add doesn't fail with "job required".
+ */
+const CRON_FLAT_PAYLOAD_KEYS = [
+	"message",
+	"text",
+	"model",
+	"fallbacks",
+	"toolsAllow",
+	"thinking",
+	"timeoutSeconds",
+	"lightContext",
+	"allowUnsafeExternalContent",
+] as const;
+
+const CRON_RECOVERABLE_OBJECT_KEYS: ReadonlySet<string> = new Set([
+	"name",
+	"schedule",
+	"sessionTarget",
+	"wakeMode",
+	"payload",
+	"delivery",
+	"enabled",
+	"description",
+	"deleteAfterRun",
+	"agentId",
+	"sessionKey",
+	"failureAlert",
+	...CRON_FLAT_PAYLOAD_KEYS,
+]);
+
+/**
  * Per-turn context the cron tool reads during `add` to auto-fill delivery
  * targets. When the operator schedules a cron from a channel-routed turn
  * (e.g. WhatsApp DM), the active channel + conversation + thread are
@@ -69,6 +110,14 @@ export interface MakeCronToolOptions {
 	/** Active agent id — defaulted onto `job.agentId` when the caller omits it,
 	 *  so cron fires routes back to the agent that scheduled them. */
 	agentId?: string;
+	/**
+	 * Caller's session key — used to resolve `sessionTarget: "current"`
+	 * into the persisted `session:<sessionKey>` form, and to fetch the
+	 * caller's recent messages when `contextMessages` > 0. Omit in TUI /
+	 * standalone CLI paths (the "current" alias then falls back to
+	 * `"isolated"` and `contextMessages` becomes a no-op).
+	 */
+	agentSessionKey?: string;
 }
 
 /**
@@ -157,6 +206,19 @@ const CronToolParams = Type.Object({
 			description: "Wake-action system-event text payload.",
 		}),
 	),
+	contextMessages: Type.Optional(
+		Type.Number({
+			minimum: 0,
+			maximum: REMINDER_CONTEXT_MESSAGES_MAX,
+			description:
+				"For `action: \"add\"` with a `systemEvent` payload — number of " +
+				"recent operator messages (0-10) to append as `Recent context:` " +
+				"after the reminder text. Lets the fire-time consumer see what " +
+				"the operator was just talking about. No-op for `agentTurn` " +
+				"payloads (their `message` is the model's prompt; mixing in " +
+				"random recent chat would pollute the isolated run). Default 0.",
+		}),
+	),
 });
 
 type CronToolDetails =
@@ -184,6 +246,7 @@ export function makeCronTool(
 ): BrigadeTool<typeof CronToolParams, CronToolDetails> {
 	const channelContext = opts.channelContext;
 	const callerAgentId = opts.agentId;
+	const agentSessionKey = opts.agentSessionKey;
 	return {
 		name: "cron",
 		label: "cron",
@@ -222,14 +285,27 @@ export function makeCronTool(
 			"  • \"daily at 9am\" / \"every Monday at 8am\" / \"first of the month\"\n" +
 			"  • Anything where the user names a specific clock time or weekday\n" +
 			"Shape: `{kind: \"cron\", expr: \"<5-field cron>\", tz: \"<IANA tz>\"}`\n" +
-			"5-field syntax: `minute hour day-of-month month day-of-week` (`* * * * *`).\n" +
-			"ALWAYS set `tz` (e.g. `\"America/Los_Angeles\"`, `\"Asia/Kolkata\"`) — without\n" +
-			"it the expression resolves in the gateway host's timezone which may not\n" +
-			"match the operator's.\n" +
-			"Examples:\n" +
-			"  • Daily 9am LA:        `{kind: \"cron\", expr: \"0 9 * * *\", tz: \"America/Los_Angeles\"}`\n" +
-			"  • Weekdays 8am IST:    `{kind: \"cron\", expr: \"0 8 * * 1-5\", tz: \"Asia/Kolkata\"}`\n" +
-			"  • Every 15 min:        `{kind: \"cron\", expr: \"*/15 * * * *\"}`\n\n" +
+			"5-field syntax: `minute hour day-of-month month day-of-week` (`* * * * *`).\n\n" +
+			"TIMEZONE RULE — CRITICAL:\n" +
+			"  - ALWAYS set `tz` to a full IANA zone name (e.g. `\"Asia/Kolkata\"` for IST,\n" +
+			"    `\"America/Los_Angeles\"` for PT, `\"Europe/London\"` for UK).\n" +
+			"  - WRITE `expr` IN THE OPERATOR'S LOCAL TIME — `tz` does the conversion.\n" +
+			"  - DO NOT manually convert to UTC, EVER. Writing `\"30 3 * * *\"` because\n" +
+			"    \"9am IST is 03:30 UTC\" is WRONG — DST shifts, ambiguous winter slots,\n" +
+			"    and operator-config drift all break manual conversion. If they say\n" +
+			"    \"9am IST\", write `{expr: \"0 9 * * *\", tz: \"Asia/Kolkata\"}`.\n" +
+			"  - Abbreviations like `\"IST\"`, `\"EST\"`, `\"PT\"`, `\"GMT\"` are NOT IANA\n" +
+			"    zone names and will be rejected — use the full `Region/City` form.\n\n" +
+			"Examples (always pair operator's local time + their IANA zone):\n" +
+			"  • 9am daily IST:       `{kind: \"cron\", expr: \"0 9 * * *\", tz: \"Asia/Kolkata\"}`\n" +
+			"  • 8am weekdays IST:    `{kind: \"cron\", expr: \"0 8 * * 1-5\", tz: \"Asia/Kolkata\"}`\n" +
+			"  • 6:30pm Mon IST:      `{kind: \"cron\", expr: \"30 18 * * 1\", tz: \"Asia/Kolkata\"}`\n" +
+			"  • 9am daily LA:        `{kind: \"cron\", expr: \"0 9 * * *\", tz: \"America/Los_Angeles\"}`\n" +
+			"  • 7am daily NY:        `{kind: \"cron\", expr: \"0 7 * * *\", tz: \"America/New_York\"}`\n" +
+			"  • 8am daily London:    `{kind: \"cron\", expr: \"0 8 * * *\", tz: \"Europe/London\"}`\n" +
+			"  • 10am Tokyo:          `{kind: \"cron\", expr: \"0 10 * * *\", tz: \"Asia/Tokyo\"}`\n" +
+			"  • First-of-month 9am:  `{kind: \"cron\", expr: \"0 9 1 * *\", tz: \"Asia/Kolkata\"}`\n" +
+			"  • Every 15 min (any tz): `{kind: \"cron\", expr: \"*/15 * * * *\"}`\n\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"PAYLOAD — `payload.kind`:\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
@@ -256,11 +332,70 @@ export function makeCronTool(
 			"a system event in the operator's main session — they'll see `[cron \"X\"]\n" +
 			"<reply>` in the chat surface they're connected to.\n\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+			"DELIVERY ROUTING — DO NOT call messaging tools inside the cron run:\n" +
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+			"  If the scheduled job should send its reply to a specific chat or\n" +
+			"  recipient, set `delivery.channel` and `delivery.to` on the JOB at\n" +
+			"  schedule time. The cron service's delivery dispatcher routes the\n" +
+			"  reply once when the run finishes. Do NOT call `send_message` /\n" +
+			"  channel tools INSIDE the agentTurn run — doing so burns extra\n" +
+			"  tokens, may double-send (delivery THEN the inline send), and\n" +
+			"  defeats the cron's announce-once semantics.\n\n" +
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+			"SESSION TARGETS — `sessionTarget` (resolved at CREATE time):\n" +
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+			"  - `\"main\"`            — Run in the operator's primary session.\n" +
+			"                          REQUIRES `payload.kind: \"systemEvent\"`.\n" +
+			"                          Main-session crons enqueue system events\n" +
+			"                          for the next heartbeat to consume.\n" +
+			"  - `\"isolated\"`        — Run in a fresh ephemeral session per fire.\n" +
+			"                          REQUIRES `payload.kind: \"agentTurn\"`.\n" +
+			"                          Isolated/current crons create background\n" +
+			"                          task runs that produce their own assistant\n" +
+			"                          turns; the delivery block decides where\n" +
+			"                          the result lands.\n" +
+			"  - `\"current\"`         — Bind to the caller's current session\n" +
+			"                          (resolved at CREATE time to\n" +
+			"                          `session:<currentSessionKey>`; falls back\n" +
+			"                          to `\"isolated\"` when no session is active).\n" +
+			"                          REQUIRES `payload.kind: \"agentTurn\"`.\n" +
+			"                          Use this when the cron should pick up\n" +
+			"                          context from THIS conversation.\n" +
+			"  - `\"session:<id>\"`    — Run in a persistent named session.\n" +
+			"                          REQUIRES `payload.kind: \"agentTurn\"`.\n\n" +
+			"  Defaults (kept stable for back-compat):\n" +
+			"    - `payload.kind: \"systemEvent\"` → `sessionTarget: \"main\"`\n" +
+			"    - `payload.kind: \"agentTurn\"`   → `sessionTarget: \"isolated\"`\n" +
+			"  Explicitly set `\"current\"` or `\"session:<id>\"` only when the\n" +
+			"  operator's intent is custom session binding.\n\n" +
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+			"CONTEXT MESSAGES — `contextMessages` (systemEvent reminders only):\n" +
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+			"  For `action: \"add\"` with a `systemEvent` payload, set\n" +
+			"  `contextMessages: <N>` (0-10) to append the operator's last N\n" +
+			"  messages as a `Recent context:` block after the reminder text.\n" +
+			"  Lets the fire-time heartbeat consumer see what the operator was\n" +
+			"  just discussing. Capped at 700 total chars across all lines; each\n" +
+			"  line is at most 220 chars (truncated with `...`). No-op for\n" +
+			"  agentTurn payloads — their `message` is the prompt for the\n" +
+			"  isolated run, and mixing in random recent chat would pollute it.\n\n" +
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+			"WAKE MODES — `wakeMode` (for `action: \"wake\"` and on the job):\n" +
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+			"  - `\"next-heartbeat\"` (DEFAULT) — Queue the event and let the\n" +
+			"      natural heartbeat cycle deliver it. Less disruptive; use for\n" +
+			"      passive reminders / non-urgent context drops where the\n" +
+			"      operator can afford to wait for the next tick (≤30s).\n" +
+			"  - `\"now\"`                       — Force a heartbeat tick to fire\n" +
+			"      immediately so the system event is consumed without waiting.\n" +
+			"      Use for urgent reminders where latency matters (operator is\n" +
+			"      actively engaged and the cron should interrupt promptly).\n\n" +
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"CONSTRAINTS:\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"  - `sessionTarget: \"main\"` MUST pair with `payload.kind: \"systemEvent\"`\n" +
-			"  - `sessionTarget: \"isolated\"` or `\"session:<id>\"` MUST pair with\n" +
-			"    `payload.kind: \"agentTurn\"`\n\n" +
+			"  - `sessionTarget: \"isolated\"` / `\"current\"` / `\"session:<id>\"` MUST\n" +
+			"    pair with `payload.kind: \"agentTurn\"`\n\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"WORKED EXAMPLES:\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
@@ -316,7 +451,43 @@ export function makeCronTool(
 					return payloadTextResult({ action, result });
 				}
 				case "add": {
-					const jobInput = (params as { job?: unknown }).job;
+					// Flat-params recovery: non-frontier models (e.g. Grok, smaller
+					// local models) sometimes flatten job fields to the top level
+					// alongside `action` instead of nesting them under `job`. When
+					// `params.job` is missing or an empty `{}`, recover by pulling
+					// recognised top-level keys into a synthetic job — but only
+					// promote it when at least one MEANINGFUL signal is present
+					// (schedule, payload, message, or text). Without that
+					// minimum-signal gate, a malformed call that happens to
+					// include only `name` or `enabled` would be silently hijacked
+					// into a bogus job.
+					const recParams = params as Record<string, unknown>;
+					const existingJob = recParams.job;
+					const jobIsEmptyObject =
+						typeof existingJob === "object" &&
+						existingJob !== null &&
+						!Array.isArray(existingJob) &&
+						Object.keys(existingJob as Record<string, unknown>).length === 0;
+					if (existingJob === undefined || existingJob === null || jobIsEmptyObject) {
+						const synthetic: Record<string, unknown> = {};
+						let found = false;
+						for (const key of Object.keys(recParams)) {
+							if (CRON_RECOVERABLE_OBJECT_KEYS.has(key) && recParams[key] !== undefined) {
+								synthetic[key] = recParams[key];
+								found = true;
+							}
+						}
+						if (
+							found &&
+							(synthetic.schedule !== undefined ||
+								synthetic.payload !== undefined ||
+								synthetic.message !== undefined ||
+								synthetic.text !== undefined)
+						) {
+							recParams.job = synthetic;
+						}
+					}
+					const jobInput = recParams.job;
 					if (!jobInput || typeof jobInput !== "object") {
 						return failedTextResult(
 							"`job` parameter required for cron add",
@@ -342,12 +513,60 @@ export function makeCronTool(
 						callerAgentId && typeof jobWithDelivery.agentId !== "string"
 							? { ...jobWithDelivery, agentId: callerAgentId }
 							: jobWithDelivery;
-					const created = await cronAdd(state, jobWithAgent as unknown as CronJobCreate);
+					// `contextMessages` is a top-level cron-tool param (NOT a job
+					// field). For systemEvent reminders, append the caller's last
+					// N messages to payload.text. Silent no-op for agentTurn,
+					// empty text, or 0/missing contextMessages.
+					const contextMessages =
+						typeof (params as { contextMessages?: unknown }).contextMessages === "number" &&
+						Number.isFinite((params as { contextMessages: number }).contextMessages)
+							? (params as { contextMessages: number }).contextMessages
+							: 0;
+					const finalJob = await maybeAttachReminderContext({
+						job: jobWithAgent,
+						contextMessages,
+						...(agentSessionKey !== undefined ? { agentSessionKey } : {}),
+					});
+					// Thread `sessionContext` so `defaultCronJobCreate` can resolve
+					// `sessionTarget: "current"` to `session:<sessionKey>` (or fall
+					// back to `"isolated"` when the caller has no session key).
+					const created = await cronAdd(
+						state,
+						finalJob as unknown as CronJobCreate,
+						agentSessionKey !== undefined
+							? { sessionContext: { sessionKey: agentSessionKey } }
+							: undefined,
+					);
 					return payloadTextResult({ action, job: created });
 				}
 				case "update": {
 					const jobId = readStringParam(params, "jobId", { required: true });
-					const patch = (params as { patch?: unknown }).patch;
+					// Flat-params recovery for `patch` — same shape as the `add`
+					// branch, but WITHOUT the minimum-signal gate. Patches can
+					// legitimately be tiny (`{enabled: false}` is a one-key
+					// patch), so any recoverable key found at top level is a
+					// valid synthetic patch.
+					const recParams = params as Record<string, unknown>;
+					const existingPatch = recParams.patch;
+					const patchIsEmptyObject =
+						typeof existingPatch === "object" &&
+						existingPatch !== null &&
+						!Array.isArray(existingPatch) &&
+						Object.keys(existingPatch as Record<string, unknown>).length === 0;
+					if (existingPatch === undefined || existingPatch === null || patchIsEmptyObject) {
+						const synthetic: Record<string, unknown> = {};
+						let found = false;
+						for (const key of Object.keys(recParams)) {
+							if (CRON_RECOVERABLE_OBJECT_KEYS.has(key) && recParams[key] !== undefined) {
+								synthetic[key] = recParams[key];
+								found = true;
+							}
+						}
+						if (found) {
+							recParams.patch = synthetic;
+						}
+					}
+					const patch = recParams.patch;
 					if (!patch || typeof patch !== "object") {
 						return failedTextResult(
 							"`patch` parameter required for cron update",

@@ -56,8 +56,20 @@ import type {
 	CronServiceState,
 } from "./state.js";
 
-/** Anti-drift clamp on the timer delay. */
-export const MAX_TIMER_DELAY_MS = 60_000;
+/**
+ * Anti-drift clamp on the timer delay. This is ALSO the cron's own
+ * always-on heartbeat cadence: the scheduler wakes up at least every
+ * 30 seconds regardless of whether any agent has `heartbeat.intervalMs`
+ * configured. Cron MUST NOT depend on the agent heartbeat scheduler — if
+ * an operator runs Brigade with no heartbeat interval set, `wakeMode:
+ * "next-heartbeat"` system events would otherwise wait forever.
+ *
+ * Why 30 s (not 60 s): a 60-second worst-case for `wakeMode: "now"`
+ * crons feels laggy when the operator says "ping me in a minute".
+ * 30 s halves that perceived latency while keeping the timer cost
+ * negligible (one `setTimeout` per 30 s, no I/O on a quiet tick).
+ */
+export const MAX_TIMER_DELAY_MS = 30_000;
 /** Spin-loop safety net — if the calculated delay rounds to 0, fall back to this. */
 export const MIN_REFIRE_GAP_MS = 2_000;
 /** How long to wait between watchdog-driven rearms during execution. */
@@ -98,8 +110,14 @@ export function stopTimer(state: CronServiceState): void {
 /**
  * Schedule the next `onTimer` call. Idempotent — cancels any previous timer
  * before scheduling the new one so multiple `armTimer` calls don't pile up.
- * The 60 s clamp ensures we wake up at least every minute even when no
- * jobs are pending; that lets the maintenance pass + watchdog do their work.
+ *
+ * Cron owns its OWN tick — `setTimeout` driven, capped at
+ * `MAX_TIMER_DELAY_MS` (30 s). It is COMPLETELY INDEPENDENT of the agent
+ * heartbeat scheduler. Even if no agent has `heartbeat.intervalMs` set,
+ * the cron tick still fires every 30 s, drains pending wake intents, and
+ * picks up `wakeMode: "next-heartbeat"` system-event crons. Without this
+ * decoupling, an install with zero agent-heartbeat config would leave
+ * `next-heartbeat` crons stuck in the enqueue queue forever.
  */
 export function armTimer(state: CronServiceState): void {
 	stopTimer(state);
@@ -108,15 +126,14 @@ export function armTimer(state: CronServiceState): void {
 	const next = nextWakeAtMs(state);
 	let delay = next === undefined ? MAX_TIMER_DELAY_MS : Math.max(0, next - now);
 	delay = Math.min(delay, MAX_TIMER_DELAY_MS);
-	if (delay < MIN_REFIRE_GAP_MS && next !== undefined && next <= now) {
-		// We're past-due on something — fire immediately rather than wait
-		// the MIN_REFIRE_GAP_MS, but use a microtask-ish 0ms timeout so the
-		// stack still unwinds before re-entering.
-		delay = 0;
-	} else if (delay === 0 && next === undefined) {
-		// No work + zero delay would spin — use MAX_TIMER_DELAY_MS instead.
-		delay = MAX_TIMER_DELAY_MS;
-	}
+	// Floor delay==0 to MIN_REFIRE_GAP_MS so a stuck `runningAtMs` + past-due
+	// `nextRunAtMs` pair cannot cause a setTimeout(0) hot-loop. The tick that
+	// just ran couldn't collect the past-due job (runningAtMs blocks it), so
+	// rearming with delay=0 would re-enter onTimer immediately, do nothing,
+	// rearm with delay=0 again, ad infinitum — pinning a CPU core until the
+	// 2-hour STUCK_RUN_MS sweep clears the marker. MIN_REFIRE_GAP_MS=2s gives
+	// the watchdog room to act without saturating the loop.
+	if (delay === 0) delay = MIN_REFIRE_GAP_MS;
 	state.timer = setTimeout(() => {
 		void onTimer(state);
 	}, delay);
@@ -151,6 +168,14 @@ export async function onTimer(state: CronServiceState): Promise<void> {
 	state.running = true;
 	armRunningRecheckTimer(state);
 	try {
+		// Drain pending `next-heartbeat` wake intents BEFORE collecting due
+		// jobs. Every entry came from a previous tick's main-target cron
+		// whose `wakeMode === "next-heartbeat"`; this drain is the "next
+		// tick" semantic, max-30s-from-fire, that decouples cron from the
+		// per-agent heartbeat scheduler. We swap the queue array out first
+		// so wakes enqueued during this very tick (by jobs we run below)
+		// don't get drained immediately — they wait for the NEXT tick.
+		drainPendingHeartbeatWakes(state);
 		const now = state.deps.nowMs!();
 		// Phase A — under the lock: ensureLoaded + maintenance + collect
 		// runnables + mark-running + persist. SHORT and CPU-bound — does NOT
@@ -192,15 +217,26 @@ export async function onTimer(state: CronServiceState): Promise<void> {
 			}
 			await persist(state);
 		});
-		// Phase B — OUTSIDE the lock: spawn the runs in parallel. Each
-		// `runDueJob` re-acquires its own per-instance lock for the brief
-		// result-apply persist after the run finishes — the SHORT critical
-		// section that needs serialisation. The 30-second-to-15-minute model
-		// call in between is NOT under the lock, so a `cron add` arriving
-		// mid-fire completes within milliseconds instead of blocking until
-		// the run finishes.
+		// Phase B — OUTSIDE the lock: dispatch via a bounded worker pool so
+		// over-concurrent fires stay SEQUENCED (oldest-due first) within the
+		// same tick instead of dropping. Each `runDueJob` re-acquires its own
+		// per-instance lock for the brief result-apply persist after the run
+		// finishes — the SHORT critical section that needs serialisation. The
+		// 30-second-to-15-minute model call in between is NOT under the lock,
+		// so a `cron add` arriving mid-fire completes within milliseconds
+		// instead of blocking until the run finishes.
 		if (runnable.length > 0) {
-			await Promise.all(runnable.map((job) => runDueJob(state, job, now)));
+			const concurrency = Math.min(resolveRunConcurrency(state), runnable.length);
+			let cursor = 0;
+			const workers = Array.from({ length: concurrency }, async () => {
+				for (;;) {
+					const index = cursor++;
+					if (index >= runnable.length) return;
+					const job = runnable[index]!;
+					await runDueJob(state, job, state.deps.nowMs!());
+				}
+			});
+			await Promise.all(workers);
 		}
 	} finally {
 		// Session-reaper sweep — throttled to once per MIN_SWEEP_INTERVAL_MS
@@ -246,13 +282,31 @@ export async function onTimer(state: CronServiceState): Promise<void> {
 	}
 }
 
-/** Find jobs whose next-fire has arrived and we can dispatch right now. */
-function collectRunnableJobs(state: CronServiceState, nowMs: number): CronJob[] {
-	const maxConcurrent = Math.max(1, state.config.maxConcurrentRuns ?? 1);
-	let alreadyRunning = 0;
+/**
+ * Resolve the effective max-concurrent-runs setting. Defaults to 4 so a
+ * burst of same-instant fires (a reminder + a "check status" cron sharing
+ * a 09:00 slot) all dispatch in parallel — the prior default of 1 caused
+ * losers to silently get pushed past their slot. Operators can still set
+ * `maxConcurrentRuns: 1` in `brigade.json` to opt back into single-file
+ * dispatch when their downstream provider can't handle parallel turns.
+ */
+export function resolveRunConcurrency(state: CronServiceState): number {
+	const raw = state.config.maxConcurrentRuns;
+	if (typeof raw !== "number" || !Number.isFinite(raw)) return 4;
+	return Math.max(1, Math.floor(raw));
+}
+
+/**
+ * Find every job whose next-fire has arrived. Does NOT cap by the
+ * concurrency limit — the caller (`onTimer`) spawns a worker pool keyed by
+ * the concurrency limit so losers stay sequenced inside the SAME tick
+ * (oldest-due-first) instead of being dropped past their slot. Capping
+ * here used to silently advance the loser's `nextRunAtMs` on the very
+ * next maintenance pass (Bug #2).
+ */
+export function collectRunnableJobs(state: CronServiceState, nowMs: number): CronJob[] {
 	const candidates: CronJob[] = [];
 	for (const job of state.store.jobs) {
-		if (job.state.runningAtMs !== undefined) alreadyRunning++;
 		if (!job.enabled) continue;
 		if (job.state.runningAtMs !== undefined) continue;
 		const next = job.state.nextRunAtMs;
@@ -262,8 +316,7 @@ function collectRunnableJobs(state: CronServiceState, nowMs: number): CronJob[] 
 	}
 	// Sort oldest-due-first so stale jobs run before fresh ones.
 	candidates.sort((a, b) => (a.state.nextRunAtMs ?? 0) - (b.state.nextRunAtMs ?? 0));
-	const slots = Math.max(0, maxConcurrent - alreadyRunning);
-	return candidates.slice(0, slots);
+	return candidates;
 }
 
 /**
@@ -282,7 +335,7 @@ function collectRunnableJobs(state: CronServiceState, nowMs: number): CronJob[] 
  *   - maybe send failure-alert
  *   - maybe delete one-shot
  */
-async function runDueJob(
+export async function runDueJob(
 	state: CronServiceState,
 	job: CronJob,
 	runAtMs: number,
@@ -503,54 +556,68 @@ async function maybeDeliverAnnounce(
 			}
 		}
 	}
+	// ALWAYS surface a TUI-visible awareness event so the operator's main
+	// session sees the cron fire, regardless of whether the channel-side
+	// delivery (WhatsApp / Slack / etc.) succeeded. Bug #4 — previously the
+	// `delivered=true` branch early-returned here and the operator's TUI
+	// silently missed the announce text whenever the channel dispatcher did
+	// its job. The TUI is THE operator console; cron firings must always be
+	// visible there, with a small `delivered`/`not-delivered` hint so the
+	// operator can tell whether the phone got the reminder too.
+	const enqueue = state.deps.enqueueSystemEvent;
+	if (enqueue) {
+		try {
+			enqueue({
+				text,
+				jobId: job.id,
+				jobName: job.name,
+				source: "cron",
+				delivered,
+				...(job.agentId !== undefined ? { agentId: job.agentId } : {}),
+				...(job.sessionKey !== undefined ? { sessionKey: job.sessionKey } : {}),
+			});
+		} catch (err) {
+			const enqueueErr = err instanceof Error ? err.message : String(err);
+			if (!bestEffort) {
+				state.deps.log.warn("cron announce awareness enqueueSystemEvent threw", {
+					jobId: job.id,
+					error: enqueueErr,
+				});
+			}
+			// When channel-side ALSO failed, surface the enqueue error in the
+			// run-log so the operator can `cron list` and see "both surfaces
+			// fell through" rather than a misleading "delivered" tag.
+			if (!delivered) {
+				return {
+					status: "not-delivered",
+					delivered: false,
+					error: lastError ?? enqueueErr,
+				};
+			}
+		}
+	} else if (!delivered && !bestEffort) {
+		state.deps.log.warn(
+			"cron announce had no usable delivery target (no channel + no enqueueSystemEvent dep)",
+			{ jobId: job.id, mode: delivery.mode, channel, to },
+		);
+	}
+
 	if (delivered) {
 		return { status: "delivered", delivered: true };
 	}
-	// Channel dispatch didn't land — fall back to the operator's main
-	// session so the reply STILL lands somewhere visible. Skipped when no
-	// `enqueueSystemEvent` dep is wired (at which point we've genuinely
-	// run out of surfaces and log).
-	const enqueue = state.deps.enqueueSystemEvent;
-	if (!enqueue) {
-		if (!bestEffort) {
-			state.deps.log.warn(
-				"cron announce had no usable delivery target (no channel + no enqueueSystemEvent dep)",
-				{ jobId: job.id, mode: delivery.mode, channel, to },
-			);
-		}
-		return {
-			status: "not-delivered",
-			delivered: false,
-			error: lastError ?? "no delivery surface available",
-		};
-	}
-	try {
-		enqueue({
-			text,
-			jobId: job.id,
-			jobName: job.name,
-			...(job.agentId !== undefined ? { agentId: job.agentId } : {}),
-			...(job.sessionKey !== undefined ? { sessionKey: job.sessionKey } : {}),
-		});
-		// Fallback IS still a delivery — the operator's TUI / connect client
-		// will see the system event. Mark delivered so the operator's
-		// `cron list` doesn't flash "not-delivered" red on what actually
-		// reached them.
+	// Channel dispatch didn't land and the awareness fallback either was
+	// missing or threw. The system event itself counts as a successful
+	// delivery surface when it was enqueued — match the original semantics
+	// so `cron list` doesn't flash "not-delivered" red on what reached the
+	// operator's TUI.
+	if (enqueue) {
 		return { status: "delivered", delivered: true };
-	} catch (err) {
-		const enqueueErr = err instanceof Error ? err.message : String(err);
-		if (!bestEffort) {
-			state.deps.log.warn("cron announce fallback enqueueSystemEvent threw", {
-				jobId: job.id,
-				error: enqueueErr,
-			});
-		}
-		return {
-			status: "not-delivered",
-			delivered: false,
-			error: lastError ?? enqueueErr,
-		};
 	}
+	return {
+		status: "not-delivered",
+		delivered: false,
+		error: lastError ?? "no delivery surface available",
+	};
 }
 
 /**
@@ -616,11 +683,32 @@ async function executeJobCore(
 		try {
 			enqueue({
 				text: job.payload.text,
+				source: "cron",
+				jobId: job.id,
+				jobName: job.name,
 				...(job.agentId !== undefined ? { agentId: job.agentId } : {}),
 				...(job.sessionKey !== undefined ? { sessionKey: job.sessionKey } : {}),
 			});
-			if (job.wakeMode === "now" && state.deps.requestHeartbeatNow) {
-				state.deps.requestHeartbeatNow({
+			if (job.wakeMode === "now") {
+				// Inline wake — bypass the heartbeat-wake-interval dependency
+				// entirely. The cron decided this is urgent; consume the system
+				// event right now via `requestHeartbeatNow`.
+				if (state.deps.requestHeartbeatNow) {
+					state.deps.requestHeartbeatNow({
+						reason: "cron-wake",
+						...(job.agentId !== undefined ? { agentId: job.agentId } : {}),
+						...(job.sessionKey !== undefined ? { sessionKey: job.sessionKey } : {}),
+					});
+				}
+			} else {
+				// `next-heartbeat` — DO NOT depend on the agent heartbeat
+				// scheduler (which may not be configured at all). Queue a
+				// pending wake; the next cron tick (≤30 s) drains it via
+				// `requestHeartbeatNow` so the system event actually
+				// reaches a turn. Without this, a job with no
+				// `heartbeat.intervalMs` set would leave the system event
+				// stuck in `enqueueSystemEvent`'s queue indefinitely.
+				state.pendingHeartbeatWakes.push({
 					reason: "cron-wake",
 					...(job.agentId !== undefined ? { agentId: job.agentId } : {}),
 					...(job.sessionKey !== undefined ? { sessionKey: job.sessionKey } : {}),
@@ -657,6 +745,43 @@ function resolveJobTimeoutMs(job: CronJob): number {
 function summariseSystemEventPayload(text: string): string {
 	const flat = text.replace(/\s+/g, " ").trim();
 	return flat.length <= 120 ? flat : `${flat.slice(0, 117)}…`;
+}
+
+/**
+ * Drain `state.pendingHeartbeatWakes` by invoking `requestHeartbeatNow`
+ * for each queued intent. Called at the START of every `onTimer` tick so
+ * `wakeMode: "next-heartbeat"` system events queued by main-target crons
+ * during the PREVIOUS tick get consumed within ≤30 s — independent of any
+ * per-agent `heartbeat.intervalMs` setting. Errors per-entry are caught
+ * + logged so one bad wake can't poison the rest of the drain.
+ */
+function drainPendingHeartbeatWakes(state: CronServiceState): void {
+	if (state.pendingHeartbeatWakes.length === 0) return;
+	const intents = state.pendingHeartbeatWakes;
+	state.pendingHeartbeatWakes = [];
+	const requestWake = state.deps.requestHeartbeatNow;
+	if (!requestWake) {
+		// No wake dispatcher wired (tests / CLI). Drop the intents — the
+		// system events themselves were already enqueued via
+		// `enqueueSystemEvent`; the operator's next turn or external
+		// consumer is responsible for picking them up.
+		return;
+	}
+	for (const intent of intents) {
+		try {
+			requestWake({
+				reason: intent.reason ?? "cron-wake",
+				...(intent.agentId !== undefined ? { agentId: intent.agentId } : {}),
+				...(intent.sessionKey !== undefined ? { sessionKey: intent.sessionKey } : {}),
+			});
+		} catch (err) {
+			state.deps.log.warn("cron pending-wake drain entry threw", {
+				agentId: intent.agentId,
+				sessionKey: intent.sessionKey,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
 }
 
 /** Emit a lifecycle event, swallowing listener errors. */
@@ -824,8 +949,12 @@ export async function planStartupCatchup(state: CronServiceState): Promise<void>
 		}
 
 		// Stagger missed-job replays so a hundred catchups don't all fire on
-		// the same tick. Capped at maxMissed; the others stay deferred to
-		// their NEXT regular slot.
+		// the same tick. The first `maxMissed` jobs fire immediately (with a
+		// small offset between them); ALL further deferred jobs ALSO get a
+		// `nextRunAtMs` that's still past-due (now + offset) so they fire on
+		// later ticks rather than being silently dropped past their slot
+		// (Bug #2). The prior implementation jumped over-cap deferred jobs
+		// to their NEXT regular slot, which dropped the missed fire entirely.
 		const slice = missed.slice(0, maxMissed);
 		for (let i = 0; i < slice.length; i++) {
 			const job = slice[i]!;
@@ -838,25 +967,25 @@ export async function planStartupCatchup(state: CronServiceState): Promise<void>
 			};
 			mutated = true;
 		}
-		// Jobs past their slot beyond the cap: jump to their next NEW slot to
-		// avoid them piling up on tick 1.
+		// Over-cap deferred missed jobs: keep them scheduled past-due with a
+		// continuing stagger offset so subsequent ticks pick them up in order
+		// without piling onto tick 1. Deferred-offset pattern: they STILL
+		// fire, just spaced beyond the initial maxMissed slice — each
+		// subsequent tick picks the next past-due one off the front.
+		let offset = maxMissed * stagger;
 		for (let i = maxMissed; i < missed.length; i++) {
 			const job = missed[i]!;
 			const idx = state.store.jobs.findIndex((j) => j.id === job.id);
 			if (idx < 0) continue;
-			try {
-				const skipAhead = computeJobNextRunAtMs(state.store.jobs[idx]!, now);
-				state.store.jobs[idx] = {
-					...state.store.jobs[idx]!,
-					state: { ...state.store.jobs[idx]!.state, nextRunAtMs: skipAhead },
-				};
-				mutated = true;
-			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
-				state.store.jobs[idx] = recordScheduleComputeError(state.store.jobs[idx]!, message);
-				mutated = true;
-			}
+			state.store.jobs[idx] = {
+				...state.store.jobs[idx]!,
+				state: { ...state.store.jobs[idx]!.state, nextRunAtMs: now + offset },
+			};
+			offset += stagger;
+			mutated = true;
 		}
+		// `computeJobNextRunAtMs` import retained for downstream callers.
+		void computeJobNextRunAtMs;
 		if (mutated) await persist(state);
 	});
 	// Use errorBackoffMs so the import doesn't go unused (some tests import it indirectly).

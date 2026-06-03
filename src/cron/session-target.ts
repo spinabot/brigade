@@ -32,6 +32,21 @@ export class InvalidCronSessionTargetIdError extends Error {
 	}
 }
 
+/**
+ * Discriminator for the cron RPC layer's soft-OK degrade path
+ * (`cron.run` returns `{ok:true, ran:false, reason:"invalid-spec"}` when
+ * a persisted sessionTarget id is malformed). Instance-of catches the
+ * structured throw; the name-fallback covers cross-realm cases (workers,
+ * vm contexts) where the prototype chain doesn't survive.
+ */
+export function isInvalidCronSessionTargetIdError(err: unknown): boolean {
+	if (err instanceof InvalidCronSessionTargetIdError) return true;
+	if (err && typeof err === "object" && (err as { name?: unknown }).name === "InvalidCronSessionTargetIdError") {
+		return true;
+	}
+	return false;
+}
+
 /** Narrowing type-guard: is this string a `"session:<id>"` form? */
 export function isSessionTargetWithId(value: string): value is `session:${string}` {
 	return value.startsWith(SESSION_PREFIX);
@@ -75,6 +90,12 @@ export function assertSafeCronSessionTargetId(id: string): void {
  * version that throws.
  */
 export function isValidCronSessionTarget(value: string): value is CronSessionTarget {
-	if (value === "main" || value === "isolated") return true;
+	// `current` is a create-time alias — the input layer must accept it so
+	// callers (agent tool / RPC) can pass the literal, and the normalizer
+	// later resolves it to `session:<id>` or `"isolated"`. After resolution
+	// the persisted value will never be `"current"` again, but defensive
+	// downstream callers (assertSupportedJobSpec, delivery-plan) still
+	// recognise it for safety against hand-edited cron.json.
+	if (value === "main" || value === "isolated" || value === "current") return true;
 	return isSessionTargetWithId(value);
 }

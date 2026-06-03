@@ -276,12 +276,17 @@ export function assertSupportedJobSpec(args: {
 	if (sessionTarget === "main" && payload.kind !== "systemEvent") {
 		throw new Error('cron sessionTarget "main" requires payload.kind "systemEvent"');
 	}
-	if (
-		(sessionTarget === "isolated" || isSessionTargetWithId(sessionTarget)) &&
-		payload.kind !== "agentTurn"
-	) {
+	// `"current"` is normally resolved to `"session:<id>"` or `"isolated"`
+	// by `defaultCronJobCreate`, but assertSupportedJobSpec is also called
+	// from `createJob` / `applyJobPatch` and any external paths that
+	// bypass normalize. Defensive: still require agentTurn pairing.
+	const isIsolatedLike =
+		sessionTarget === "isolated" ||
+		sessionTarget === "current" ||
+		isSessionTargetWithId(sessionTarget);
+	if (isIsolatedLike && payload.kind !== "agentTurn") {
 		throw new Error(
-			'cron sessionTarget "isolated"/"session:*" requires payload.kind "agentTurn"',
+			'cron sessionTarget "isolated"/"current"/"session:*" requires payload.kind "agentTurn"',
 		);
 	}
 }

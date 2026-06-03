@@ -20,6 +20,23 @@
  */
 
 import type { Model } from "@mariozechner/pi-ai";
+import type {
+	CronAddParamsV2,
+	CronAddResultV2,
+	CronListParamsV2,
+	CronListResultV2,
+	CronRemoveParamsV2,
+	CronRemoveResultV2,
+	CronRunParamsV2,
+	CronRunResultV2,
+	CronRunsParamsV2,
+	CronRunsResultV2,
+	CronStatusParamsV2,
+	CronStatusResultV2,
+	CronUpdateParamsV2,
+	CronUpdateResultV2,
+	CronWakeParams,
+} from "./core/server-methods/cron.js";
 
 /* ─────────────────────────── frame types ─────────────────────────── */
 
@@ -109,7 +126,38 @@ export type RequestMethod =
 	 */
 	| "subscribe"
 	/** Drop a previously-recorded subscribe entry. */
-	| "unsubscribe";
+	| "unsubscribe"
+	/**
+	 * Wave N5 (bug #9) — list every agent the gateway knows about (boot
+	 * default + every entry under `cfg.agents.<id>`). Used by the connect
+	 * TUI's `/agents` slash command so the operator can see what they can
+	 * `/agent <id>`-bind to without grovelling through the config file.
+	 */
+	| "agents.list"
+	/**
+	 * Wave N5 (bug #9) — list live sessions (one per in-flight Pi session
+	 * keyed by sessionKey) on the gateway. Filtered to the supplied
+	 * `agentId` by default; `all: true` returns every agent's live
+	 * sessions. Used by the connect TUI's `/sessions` slash command.
+	 */
+	| "sessions.list"
+	/* ─── Cron methods (Wave N6 — full reference parity) ────────── */
+	/** Service-level snapshot — job count, next wake, running. */
+	| "cron.status"
+	/** Paginated job list. */
+	| "cron.list"
+	/** Create a new job. */
+	| "cron.add"
+	/** Patch one job by id (accepts `id` or `jobId`). */
+	| "cron.update"
+	/** Delete one job by id. */
+	| "cron.remove"
+	/** Fire a job NOW (force or due-only; enqueued). */
+	| "cron.run"
+	/** Read run-log history (scope: per-job or all). */
+	| "cron.runs"
+	/** Inject a system event into a session (heartbeat-driven). */
+	| "wake";
 
 /* ─────────────────────────── event names ─────────────────────────── */
 
@@ -224,6 +272,22 @@ export interface RequestParams {
 		/** Drop a prior sessionId subscription. */
 		sessionId?: string;
 	};
+	"agents.list": void;
+	"sessions.list": {
+		/** Filter to this agent's live sessions. Defaults to caller's bound agent. */
+		agentId?: string;
+		/** When true, ignore `agentId` and return every agent's live sessions. */
+		all?: boolean;
+	} | void;
+	/* ─── Cron methods (Wave N6) — wire shapes owned by the handler module. */
+	"cron.status": CronStatusParamsV2 | void;
+	"cron.list": CronListParamsV2 | void;
+	"cron.add": CronAddParamsV2;
+	"cron.update": CronUpdateParamsV2;
+	"cron.remove": CronRemoveParamsV2;
+	"cron.run": CronRunParamsV2;
+	"cron.runs": CronRunsParamsV2 | void;
+	wake: CronWakeParams;
 }
 
 /** Payload for each request method's response. `void` = no payload. */
@@ -242,6 +306,17 @@ export interface ResponseFor {
 	shutdown: void;
 	subscribe: void;
 	unsubscribe: void;
+	"agents.list": AgentSummary[];
+	"sessions.list": SessionSummary[];
+	/* ─── Cron methods (Wave N6) ─────────────────────────────── */
+	"cron.status": CronStatusResultV2;
+	"cron.list": CronListResultV2;
+	"cron.add": CronAddResultV2;
+	"cron.update": CronUpdateResultV2;
+	"cron.remove": CronRemoveResultV2;
+	"cron.run": CronRunResultV2;
+	"cron.runs": CronRunsResultV2;
+	wake: void;
 }
 
 /** Payload shape for each event. */
@@ -285,6 +360,15 @@ export interface EventPayload {
 		jobId?: string;
 		/** Optional human-readable name of the cron job that fired. */
 		jobName?: string;
+		/**
+		 * True when the cron's channel-side delivery (WhatsApp/Slack/etc.)
+		 * landed; false when the channel dispatcher refused or no channel
+		 * target was wired. The TUI shows a small `· delivered` / `· not
+		 * delivered (TUI only)` suffix so the operator can tell whether
+		 * their phone got the reminder too. Undefined for system-events that
+		 * aren't cron deliveries (e.g. main-target wakes).
+		 */
+		delivered?: boolean;
 		/** P1#3 (Wave H) — agent the system event targets, when known. */
 		agentId?: string;
 		/** P1#3 (Wave H) — session the system event targets, when known. */
@@ -388,6 +472,34 @@ export interface ModelSummary {
 	contextWindow: number;
 	costInputPerMtok: number;
 	hasVision: boolean;
+}
+
+/**
+ * Wave N5 (bug #9) — wire-safe agent descriptor for the `/agents` slash
+ * command. Lists configured agents with their resolved provider + model
+ * so the operator can `/agent <id>`-bind without grovelling through
+ * `~/.brigade/brigade.json`. `isBoot` flags the gateway's default agent
+ * (the one the TUI auto-binds to on first connect).
+ */
+export interface AgentSummary {
+	id: string;
+	provider: string;
+	modelId: string;
+	isBoot: boolean;
+	/** Display-only persona name (from IDENTITY.md), when set. */
+	personaName?: string;
+}
+
+/**
+ * Wave N5 (bug #9) — wire-safe live-session descriptor for the
+ * `/sessions` slash command. One entry per in-flight Pi session keyed
+ * by `sessionKey`. `agentId` is the agent that owns the session; the
+ * raw key carries the channel/peer / cron / subagent details the TUI
+ * label formatter turns into a chip.
+ */
+export interface SessionSummary {
+	sessionKey: string;
+	agentId: string;
 }
 
 export function modelToSummary(model: Model<any>): ModelSummary {

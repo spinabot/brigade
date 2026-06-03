@@ -35,7 +35,11 @@ describe("detectDmScopeCollapseRisk — no warning paths", () => {
 		assert.deepEqual(detectDmScopeCollapseRisk(cfg), []);
 	});
 
-	it("returns [] when only one peer is bound on the channel", () => {
+	it("still warns when only one peer is bound on the channel (Wave N3 — bug #5)", () => {
+		// Wave N3 widened the heuristic: any wired channel + unset dmScope
+		// is risky because the moment a second peer messages the channel,
+		// both transcripts merge silently into `main`. We surface the
+		// remediation now, not after the merge happens.
 		const cfg = {
 			bindings: {
 				entries: [
@@ -43,10 +47,14 @@ describe("detectDmScopeCollapseRisk — no warning paths", () => {
 				],
 			},
 		} as unknown as BrigadeConfig;
-		assert.deepEqual(detectDmScopeCollapseRisk(cfg), []);
+		const got = detectDmScopeCollapseRisk(cfg);
+		assert.equal(got.length, 1);
+		assert.equal(got[0]!.kind, "unset-with-channel-bindings");
 	});
 
-	it("ignores '*' wildcards when counting peers", () => {
+	it("warns on '*' wildcard channel bindings too (channel is wired)", () => {
+		// Wildcards prove the channel is wired even though there's no
+		// distinct second peer to count. Same remediation, different kind.
 		const cfg = {
 			bindings: {
 				entries: [
@@ -55,7 +63,9 @@ describe("detectDmScopeCollapseRisk — no warning paths", () => {
 				],
 			},
 		} as unknown as BrigadeConfig;
-		assert.deepEqual(detectDmScopeCollapseRisk(cfg), []);
+		const got = detectDmScopeCollapseRisk(cfg);
+		assert.equal(got.length, 1);
+		assert.equal(got[0]!.kind, "unset-with-channel-bindings");
 	});
 });
 
@@ -73,6 +83,34 @@ describe("detectDmScopeCollapseRisk — warning paths", () => {
 		assert.equal(got.length, 1);
 		assert.equal(got[0]!.channel, "whatsapp");
 		assert.equal(got[0]!.peerCount, 2);
+		assert.equal(got[0]!.kind, "unset-multi-peer");
+	});
+
+	it("warns when dmScope is explicitly \"main\" and any channel is wired (Wave N3)", () => {
+		const cfg = {
+			session: { dmScope: "main" },
+			bindings: {
+				entries: [
+					{ agentId: "alice", match: { channel: "whatsapp", peer: { kind: "direct", id: "+1" } } },
+				],
+			},
+		} as unknown as BrigadeConfig;
+		const got = detectDmScopeCollapseRisk(cfg);
+		assert.equal(got.length, 1);
+		assert.equal(got[0]!.kind, "explicit-main-with-channel-bindings");
+	});
+
+	it("stays silent when dmScope is per-channel-peer regardless of bindings", () => {
+		const cfg = {
+			session: { dmScope: "per-channel-peer" },
+			bindings: {
+				entries: [
+					{ agentId: "alice", match: { channel: "whatsapp", peer: { kind: "direct", id: "+1" } } },
+					{ agentId: "bob", match: { channel: "whatsapp", peer: { kind: "direct", id: "+2" } } },
+				],
+			},
+		} as unknown as BrigadeConfig;
+		assert.deepEqual(detectDmScopeCollapseRisk(cfg), []);
 	});
 
 	it("emits one warning per affected channel", () => {
@@ -126,9 +164,34 @@ describe("formatDmScopeWarning", () => {
 			channel: "whatsapp",
 			peerCount: 2,
 			samplePeers: ["+1", "+2"],
+			kind: "unset-multi-peer",
 		});
 		assert.match(msg, /whatsapp/);
 		assert.match(msg, /per-peer/);
 		assert.match(msg, /brigade\.json/);
+	});
+
+	it("calls out single-peer wired-channel risk with the configured-channel kind", () => {
+		const msg = formatDmScopeWarning({
+			channel: "whatsapp",
+			peerCount: 1,
+			samplePeers: ["+1"],
+			kind: "unset-with-channel-bindings",
+		});
+		assert.match(msg, /whatsapp/);
+		assert.match(msg, /configured/);
+		assert.match(msg, /per-channel-peer/);
+	});
+
+	it("calls out explicit-main configs", () => {
+		const msg = formatDmScopeWarning({
+			channel: "whatsapp",
+			peerCount: 1,
+			samplePeers: ["+1"],
+			kind: "explicit-main-with-channel-bindings",
+		});
+		assert.match(msg, /session\.dmScope/);
+		assert.match(msg, /main/);
+		assert.match(msg, /per-channel-peer/);
 	});
 });

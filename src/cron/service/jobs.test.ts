@@ -95,6 +95,26 @@ describe("assertSupportedJobSpec — session-id safety", () => {
 			}),
 		);
 	});
+
+	it("accepts 'current' paired with agentTurn (defensive — normally resolved earlier)", () => {
+		assert.doesNotThrow(() =>
+			assertSupportedJobSpec({
+				sessionTarget: "current",
+				payload: { kind: "agentTurn", message: "x" },
+			}),
+		);
+	});
+
+	it("rejects 'current' paired with systemEvent (isolated-like family)", () => {
+		assert.throws(
+			() =>
+				assertSupportedJobSpec({
+					sessionTarget: "current",
+					payload: { kind: "systemEvent", text: "x" },
+				}),
+			/"current"|agentTurn/,
+		);
+	});
 });
 
 describe("computeJobNextRunAtMs — kind: every", () => {

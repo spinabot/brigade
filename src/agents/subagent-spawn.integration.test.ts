@@ -40,7 +40,8 @@ import {
 	SUBAGENT_ENDED_OUTCOME_OK,
 	type SubagentLifecycleEndedReason,
 } from "./subagent-lifecycle-events.js";
-import { spawnSubagentDirect } from "./subagent-spawn.js";
+import { DEFAULT_SUBAGENT_RUN_TIMEOUT_SECONDS, spawnSubagentDirect } from "./subagent-spawn.js";
+import { DEFAULT_SUBAGENT_MAX_CONCURRENT } from "../config/agent-limits.js";
 
 const PARENT_KEY = "agent:test:integration-parent";
 
@@ -219,6 +220,46 @@ describe("subagent-spawn integration (Steps 10, 18, 20)", () => {
 			disposeListener();
 			disposeBridge();
 		}
+	});
+
+	it("Wave N4 — applies DEFAULT_SUBAGENT_RUN_TIMEOUT_SECONDS (180s) when caller omits runTimeoutSeconds", async () => {
+		const { caller, calls } = makeStubCaller();
+		setGlobalGatewayCaller(caller);
+
+		const result = await spawnSubagentDirect(
+			{ task: "no timeout supplied" },
+			{ agentSessionKey: PARENT_KEY, callerDepth: 0 },
+		);
+		assert.equal(result.status, "accepted");
+
+		// Verify the engine forwarded the documented default (180s) to the
+		// gateway `agent` handler, NOT `undefined`. Pre-Wave-N4 this was
+		// undefined and children ran uncapped.
+		const agentCall = calls.find((c) => c.method === "agent");
+		const params = agentCall?.params as Record<string, unknown>;
+		assert.equal(params.timeout, DEFAULT_SUBAGENT_RUN_TIMEOUT_SECONDS, "default 180s applied");
+		assert.equal(DEFAULT_SUBAGENT_RUN_TIMEOUT_SECONDS, 180, "Wave N4 documented default");
+	});
+
+	it("Wave N4 — caller-supplied runTimeoutSeconds wins over the default", async () => {
+		const { caller, calls } = makeStubCaller();
+		setGlobalGatewayCaller(caller);
+
+		const result = await spawnSubagentDirect(
+			{ task: "explicit cap", runTimeoutSeconds: 30 },
+			{ agentSessionKey: PARENT_KEY, callerDepth: 0 },
+		);
+		assert.equal(result.status, "accepted");
+		const agentCall = calls.find((c) => c.method === "agent");
+		const params = agentCall?.params as Record<string, unknown>;
+		assert.equal(params.timeout, 30, "operator override wins");
+	});
+
+	it("Wave N4 — DEFAULT_SUBAGENT_MAX_CONCURRENT is 8 (parallel-spawn budget)", () => {
+		// Smoke test the locked default. Bumping this needs a corresponding
+		// review of `subagent-budget.ts` semaphore behaviour and the
+		// operator-facing `agents.defaults.maxSubagentConcurrent` docs.
+		assert.equal(DEFAULT_SUBAGENT_MAX_CONCURRENT, 8);
 	});
 
 	it("snapshot contains the registered entries (test-only helper)", async () => {

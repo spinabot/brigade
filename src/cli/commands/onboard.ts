@@ -31,6 +31,7 @@ import { BRIGADE_DIR, loadConfig, saveConfig } from "../../core/config.js";
 import { EXIT_CONFIG_ERROR } from "../../protocol.js";
 import { runOnboarding } from "../../ui/onboarding.js";
 import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
+import { applyOnboardingSessionDefaults, ONBOARDING_DEFAULT_DM_SCOPE } from "./onboard-config.js";
 
 export interface OnboardCommandOptions {
 	/**
@@ -253,7 +254,21 @@ async function bridgeOnboardingResultToBrigadeNative(args: {
 		defaults.model = model;
 		agents.defaults = defaults;
 		cfg.agents = agents;
-		saveConfig(cfg as never);
+		// Wave N3 (bug #5) — seed the secure DM-scope default. Without
+		// this, a fresh onboard leaves `session.dmScope` undefined and the
+		// runtime fallback in session-key.ts collapses every DM into the
+		// agent's single `agent:<id>:main` lane (shared transcript +
+		// memory across peers). Operator-explicit values are preserved.
+		const seeded = applyOnboardingSessionDefaults(cfg as never);
+		saveConfig(seeded as never);
+		const finalScope = (seeded as { session?: { dmScope?: string } }).session?.dmScope;
+		if (finalScope === ONBOARDING_DEFAULT_DM_SCOPE) {
+			process.stderr.write(
+				chalk.dim(
+					`Set session.dmScope to "${ONBOARDING_DEFAULT_DM_SCOPE}" — every DM gets its own session/transcript/memory.\n`,
+				),
+			);
+		}
 	} catch (err) {
 		process.stderr.write(
 			chalk.yellow(

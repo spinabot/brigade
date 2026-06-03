@@ -136,17 +136,42 @@ export type GatewayMethodSignatures = {
 		params: { sessionKey: string; limit?: number };
 		result: { messages: Array<{ role: string; text: string; ts: number }> };
 	};
+	// Cron methods — full reference parity. Params + results live in
+	// `core/server-methods/cron.ts` as the source of truth; we widen to
+	// `unknown` here to avoid a circular import between gateway-call (low-
+	// level dispatch) and the handler module (high-level). Tool callers
+	// cast through the typed handler module directly when needed.
 	"cron.add": {
-		params: { schedule: string; sessionKey: string; payload: string };
-		result: { scheduleId: string };
+		params: Record<string, unknown>;
+		result: Record<string, unknown>;
 	};
 	"cron.list": {
-		params: Record<string, never>;
-		result: { schedules: Array<{ id: string; schedule: string; sessionKey: string }> };
+		params: Record<string, unknown>;
+		result: Record<string, unknown>;
+	};
+	"cron.status": {
+		params: Record<string, unknown>;
+		result: Record<string, unknown>;
+	};
+	"cron.update": {
+		params: Record<string, unknown>;
+		result: Record<string, unknown>;
 	};
 	"cron.remove": {
-		params: { scheduleId: string };
-		result: { ok: boolean };
+		params: Record<string, unknown>;
+		result: { removed: boolean };
+	};
+	"cron.run": {
+		params: Record<string, unknown>;
+		result: Record<string, unknown>;
+	};
+	"cron.runs": {
+		params: Record<string, unknown>;
+		result: Record<string, unknown>;
+	};
+	wake: {
+		params: { text: string; mode?: "now" | "next-heartbeat"; agentId?: string; sessionKey?: string };
+		result: void;
 	};
 	"approvals.respond": {
 		params: { approvalId: string; decision: "allow-once" | "allow-always" | "allow-pattern" | "deny" };

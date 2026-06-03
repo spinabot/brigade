@@ -25,7 +25,7 @@ import {
 	computeJobNextRunAtMs,
 } from "./jobs.js";
 import { defaultCronJobCreate } from "../normalize.js";
-import { armTimer, onTimer, planStartupCatchup, stopTimer } from "./timer.js";
+import { armTimer, planStartupCatchup, runDueJob, stopTimer } from "./timer.js";
 import { readCronRunLogEntries, type ReadCronRunLogOpts } from "../run-log.js";
 import type {
 	CronEvent,
@@ -182,12 +182,26 @@ export async function getJob(state: CronServiceState, jobId: string): Promise<Cr
 	});
 }
 
+/**
+ * Optional context the caller can thread into `add` so the normalizer can
+ * resolve `sessionTarget: "current"` into a concrete `session:<sessionKey>`
+ * value. Agent tool / RPC callers supply it; CLI / tests omit it (and the
+ * "current" alias falls back to `"isolated"` per the normalizer).
+ */
+export interface CronAddOpts {
+	sessionContext?: { sessionKey?: string };
+}
+
 /** Create + persist + rearm timer. Returns the created job (with id). */
 export async function add(
 	state: CronServiceState,
 	input: CronJobCreate,
+	opts?: CronAddOpts,
 ): Promise<CronJob> {
-	const defaulted = defaultCronJobCreate(input);
+	const defaulted = defaultCronJobCreate(
+		input,
+		opts?.sessionContext ? { sessionContext: opts.sessionContext } : undefined,
+	);
 	// Channel-target validation. When the operator (or the model on their
 	// behalf) sets `delivery.channel`, refuse the add if that channel id
 	// doesn't match a started adapter — typos like "whatapp" / "slak" would
@@ -291,31 +305,55 @@ export async function run(
 	mode: "due" | "force" = "force",
 ): Promise<void> {
 	const now = state.deps.nowMs!();
-	const targetJob = await withPerInstanceLock(state.op, async () => {
+	// Phase A — under the lock: validate, due-check, reserve `runningAtMs`,
+	// persist the running marker so concurrent timer ticks force-reloading
+	// from disk cannot start the same job. Critically: do NOT trample
+	// `nextRunAtMs` — the canonical schedule anchor must survive a manual
+	// force-run untouched (Bug #1). Reserve-then-run pattern: stamp
+	// runningAtMs under lock, persist, then dispatch via the SAME runDueJob
+	// path the tick uses so observability + delivery + run-log fire once
+	// per execution.
+	const reservation = await withPerInstanceLock(state.op, async () => {
 		await ensureLoaded(state);
-		const job = state.store.jobs.find((j) => j.id === jobId);
-		if (!job) throw new Error(`cron job not found: ${jobId}`);
+		const idx = state.store.jobs.findIndex((j) => j.id === jobId);
+		if (idx < 0) throw new Error(`cron job not found: ${jobId}`);
+		const job = state.store.jobs[idx]!;
 		if (mode === "due") {
 			const next = job.state.nextRunAtMs;
 			if (next === undefined || next > now) {
 				throw new Error(`cron job not due: ${jobId}`);
 			}
 		}
-		// Mark the run as starting so concurrent ticks don't double-fire.
-		const idx = state.store.jobs.findIndex((j) => j.id === jobId);
-		if (idx < 0) throw new Error(`cron job not found: ${jobId}`);
+		if (typeof job.state.runningAtMs === "number") {
+			return { ran: false as const };
+		}
 		state.store.jobs[idx] = {
 			...job,
-			state: { ...job.state, runningAtMs: now, nextRunAtMs: now },
+			state: { ...job.state, runningAtMs: now },
 		};
 		await persist(state);
-		return state.store.jobs[idx]!;
+		// Hand the worker a defensive clone so concurrent ops mutations
+		// can't race the in-flight execution view.
+		const executionJob = JSON.parse(JSON.stringify(state.store.jobs[idx]!)) as CronJob;
+		return { ran: true as const, executionJob };
 	});
-	// Outside the per-instance lock: the timer loop's runDueJob path will
-	// handle the rest if armTimer fires soon. To make `run` return AFTER
-	// the run completes, we drive the tick ourselves.
-	void targetJob; // referenced for clarity; the tick loop reloads from disk
-	await onTimer(state);
+	if (!reservation.ran) {
+		// Job is already running — caller's force-run becomes a no-op so the
+		// existing run finishes first. The "already-running" reason simply
+		// returns without re-dispatching — the in-flight execution will
+		// emit `finished` on its own and recompute the schedule from there.
+		return;
+	}
+	// Phase B — OUTSIDE the lock: execute via the SAME runDueJob path the
+	// tick loop uses. runDueJob handles emit(started)/emit(finished),
+	// applyJobResult, run-log append, announce delivery, and failure
+	// alerting — every observability surface the tick path supports.
+	// applyJobResult recomputes `nextRunAtMs` from `endedAtMs` on success,
+	// preserving the recurring anchor without the prior broken
+	// `nextRunAtMs: now` write.
+	await runDueJob(state, reservation.executionJob, now);
+	// Re-arm so the canonical post-run `nextRunAtMs` drives the next tick.
+	armTimer(state);
 }
 
 /**
@@ -329,6 +367,8 @@ export async function enqueueRun(
 	mode: "due" | "force" = "force",
 ): Promise<void> {
 	const now = state.deps.nowMs!();
+	// Validate under the lock so the caller gets a clean refusal for
+	// not-found / not-due before we kick off the background run.
 	await withPerInstanceLock(state.op, async () => {
 		await ensureLoaded(state);
 		const idx = state.store.jobs.findIndex((j) => j.id === jobId);
@@ -340,13 +380,25 @@ export async function enqueueRun(
 				throw new Error(`cron job not due: ${jobId}`);
 			}
 		}
-		state.store.jobs[idx] = {
-			...job,
-			state: { ...job.state, nextRunAtMs: now },
-		};
-		await persist(state);
+		// Crucially: do NOT mutate `nextRunAtMs` here. The prior implementation
+		// stamped `nextRunAtMs: now` so the next tick would pick it up, but
+		// that corrupted the recurring "every" anchor (the tick's
+		// applyJobResult would compute the next slot relative to the trampled
+		// anchor) AND raced with concurrent ticks (Bug #1). The non-blocking
+		// trigger now schedules a microtask that runs the manual-run pipeline
+		// off the caller's promise chain — the canonical nextRunAtMs stays
+		// untouched until applyJobResult recomputes it after the run finishes.
 	});
-	armTimer(state);
+	// Fire-and-forget background run. Errors are swallowed (the run-log +
+	// failure-alert path inside `runDueJob` already records them) so the
+	// caller's enqueue-return contract stays clean.
+	void run(state, jobId, mode).catch((err) => {
+		state.deps.log.warn("cron enqueueRun background run threw", {
+			jobId,
+			mode,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
 }
 
 /**

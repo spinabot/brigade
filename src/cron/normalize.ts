@@ -23,6 +23,8 @@
  * file only fills defaults + light coercion.
  */
 
+import { parseAbsoluteTimeMs } from "./parse.js";
+import { assertSafeCronSessionTargetId } from "./session-target.js";
 import { defaultStaggerMsForCronExpression } from "./stagger.js";
 import type {
 	CronDelivery,
@@ -82,19 +84,37 @@ export function coerceScheduleInput(raw: unknown): CronSchedule {
 				: undefined;
 	const expr = rawExpr?.trim() || undefined;
 	const everyMs = typeof rec.everyMs === "number" ? rec.everyMs : undefined;
-	// Accept `at` OR `atMs` as the absolute timestamp field. Some models (and
-	// the older Brigade schema) used `atMs`; the canonical field is `at`. We
-	// quietly merge so a model writing either shape lands the same job.
-	const at =
-		typeof rec.at === "number"
-			? rec.at
-			: typeof rec.atMs === "number"
-				? rec.atMs
-				: undefined;
+	// Accept `at` OR `atMs` as the absolute timestamp field. Per reference
+	// implementation parse.ts, BOTH channels accept (a) numeric epoch ms,
+	// (b) digit-string epoch ms, and (c) ISO-8601 string with UTC fallback
+	// (bare date → midnight Z; naive date-time → append Z; tz-suffixed
+	// preserved). Failure to parse a string → undefined (caller error
+	// surfaces below in the kind-"at" branch).
+	const atMsRaw = rec.atMs;
+	const atRaw = rec.at;
+	const atString = typeof atRaw === "string" ? atRaw.trim() : "";
+	const atMsString = typeof atMsRaw === "string" ? atMsRaw.trim() : "";
+	const at: number | undefined =
+		typeof atMsRaw === "number" && Number.isFinite(atMsRaw)
+			? Math.floor(atMsRaw)
+			: atMsString
+				? (parseAbsoluteTimeMs(atMsString) ?? undefined)
+				: typeof atRaw === "number" && Number.isFinite(atRaw)
+					? Math.floor(atRaw)
+					: atString
+						? (parseAbsoluteTimeMs(atString) ?? undefined)
+						: undefined;
+	// A bare ISO string on `at` or `atMs` is enough to infer kind "at" — the
+	// reference normalizer auto-detects this even when `kind` is omitted.
+	const hasAtSignal =
+		at !== undefined ||
+		atString.length > 0 ||
+		atMsString.length > 0 ||
+		typeof atMsRaw === "number";
 	// Infer kind from whichever discriminator field is present.
 	const inferredKind =
 		kind ??
-		(at !== undefined
+		(hasAtSignal
 			? "at"
 			: everyMs !== undefined
 				? "every"
@@ -109,7 +129,10 @@ export function coerceScheduleInput(raw: unknown): CronSchedule {
 	switch (inferredKind) {
 		case "at": {
 			if (at === undefined) {
-				throw new Error('cron schedule kind "at" requires a numeric `at` (ms since epoch)');
+				throw new Error(
+					'cron schedule kind "at" requires `at` as ISO-8601 string ' +
+						"OR epoch ms (number, or numeric/atMs string)",
+				);
 			}
 			return { kind: "at", at };
 		}
@@ -198,19 +221,68 @@ export function resolveDeleteAfterRun(
 }
 
 /**
+ * Optional context the caller can thread into `defaultCronJobCreate` so the
+ * normalizer can resolve `sessionTarget: "current"` into a concrete
+ * `session:<sessionKey>` value. CLI / headless callers omit it; the agent
+ * tool (which knows its calling session) supplies it.
+ */
+export interface CronJobCreateNormalizeOpts {
+	sessionContext?: {
+		/** Caller's session key — used to resolve `sessionTarget: "current"`. */
+		sessionKey?: string;
+	};
+}
+
+/**
+ * Resolve a possibly-aliased `sessionTarget` into the persisted form.
+ *
+ *   - `"current"` + session context → `session:<sessionKey>` (safe-id guarded).
+ *   - `"current"` without context  → `"isolated"` (headless / CLI fallback).
+ *   - any other value              → returned unchanged.
+ *
+ * Mirrors the reference normalizer's create-time resolver — persisted
+ * `CronJob.sessionTarget` values are always one of
+ * `"main" | "isolated" | "session:<id>"` after this runs.
+ */
+function resolveSessionTargetAlias(
+	target: CronSessionTarget,
+	opts: CronJobCreateNormalizeOpts | undefined,
+): CronSessionTarget {
+	if (target !== "current") return target;
+	const key = opts?.sessionContext?.sessionKey?.trim();
+	if (key) {
+		// `assertSafeCronSessionTargetId` throws on path-special / control
+		// characters; we re-throw with the original error to surface the
+		// invalid-spec to the caller (matches reference behaviour).
+		assertSafeCronSessionTargetId(key);
+		return `session:${key}`;
+	}
+	return "isolated";
+}
+
+/**
  * Produce a fully-defaulted create input — every optional field decided.
  * Doesn't validate; that's `assertSupportedJobSpec`'s job. Doesn't write to
  * disk; the caller (ops.add) does that.
+ *
+ * Pass `opts.sessionContext.sessionKey` to resolve `sessionTarget: "current"`
+ * into the caller's session. Existing callers that omit `opts` keep the
+ * pre-existing single-agent behaviour (no "current" → no rewrite).
  */
-export function defaultCronJobCreate(input: CronJobCreate): Required<
-	Pick<CronJobCreate, "enabled" | "sessionTarget" | "wakeMode">
-> & CronJobCreate {
+export function defaultCronJobCreate(
+	input: CronJobCreate,
+	opts?: CronJobCreateNormalizeOpts,
+): Required<Pick<CronJobCreate, "enabled" | "sessionTarget" | "wakeMode">> & CronJobCreate {
 	// Coerce permissive caller input (bare string / object-without-kind) into
 	// the canonical CronSchedule shape BEFORE we touch staggerMs etc. — see
 	// `coerceScheduleInput` for the supported shapes.
 	const coerced = coerceScheduleInput(input.schedule);
 	const schedule = normalizeSchedule(coerced);
-	const sessionTarget = input.sessionTarget ?? defaultSessionTargetForPayload(input.payload);
+	const sessionTargetRaw =
+		input.sessionTarget ?? defaultSessionTargetForPayload(input.payload);
+	// Resolve `"current"` → `session:<id>` (or `"isolated"` when no session
+	// context is available). Persisted value is never `"current"`.
+	const sessionTarget = resolveSessionTargetAlias(sessionTargetRaw, opts);
 	const wakeMode = input.wakeMode ?? defaultWakeMode();
 	const delivery = normalizeDelivery(input.delivery, input.payload);
 	const deleteAfterRun = resolveDeleteAfterRun(input.deleteAfterRun, schedule);

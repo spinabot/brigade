@@ -86,6 +86,7 @@ import {
   composeBrigadeBeforeToolCall,
   type GuardContextRef,
 } from "./session-wiring.js";
+import { buildSessionContext } from "./session-context.js";
 import { getSubagentDepthFromSessionKey } from "./subagent-policy.js";
 import { emitAgentEvent } from "./agent-event-bus.js";
 import { randomUUID } from "node:crypto";
@@ -550,6 +551,20 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     ...(args.channelApprovalRoute !== undefined
       ? { channelContext: args.channelApprovalRoute }
       : {}),
+    // Per-turn session context — bind the cron tool (and sessions tools)
+    // to THIS session's key so `sessionTarget: "current"` resolves to
+    // `session:<resolved.sessionKey>` instead of falling back to
+    // `"isolated"`. Built from the RESOLVED key (not args.sessionKey)
+    // because the agent loop may have minted a default key when the
+    // caller omitted one — the cron must bind to the live session, not
+    // the missing-input alias.
+    ...(() => {
+      const ctx = buildSessionContext({
+        sessionKey: resolved.sessionKey,
+        agentId,
+      });
+      return ctx ? { sessionContext: ctx } : {};
+    })(),
   });
   const brigadeCustomTools = toolset.customTools;
   const enabledToolNames = toolset.enabledToolNames;

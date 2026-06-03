@@ -29,35 +29,51 @@ const CURRENT_STORE_VERSION = 1;
 /**
  * Read the on-disk store. Returns an empty store when the file is missing,
  * malformed, or unreadable. Never throws — callers can rely on getting a
- * usable struct back.
+ * usable struct back. Sets `repaired = true` on the result when any job's
+ * schedule needed coercion so callers (`ensureLoaded`) can persist the
+ * canonical form ONCE — avoiding the "repaired job schedule on load" log
+ * line being emitted on every single tick (Bug #10).
  */
+export interface LoadCronStoreResult {
+	store: CronStoreFile;
+	repaired: boolean;
+}
+
 export function loadCronStore(storePath: string): CronStoreFile {
+	return loadCronStoreWithRepairFlag(storePath).store;
+}
+
+export function loadCronStoreWithRepairFlag(storePath: string): LoadCronStoreResult {
 	if (!fs.existsSync(storePath)) {
-		return { version: CURRENT_STORE_VERSION, jobs: [] };
+		return { store: { version: CURRENT_STORE_VERSION, jobs: [] }, repaired: false };
 	}
 	let raw: string;
 	try {
 		raw = fs.readFileSync(storePath, "utf8");
 	} catch {
-		return { version: CURRENT_STORE_VERSION, jobs: [] };
+		return { store: { version: CURRENT_STORE_VERSION, jobs: [] }, repaired: false };
 	}
 	if (!raw.trim()) {
-		return { version: CURRENT_STORE_VERSION, jobs: [] };
+		return { store: { version: CURRENT_STORE_VERSION, jobs: [] }, repaired: false };
 	}
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
-		return { version: CURRENT_STORE_VERSION, jobs: [] };
+		return { store: { version: CURRENT_STORE_VERSION, jobs: [] }, repaired: false };
 	}
 	if (!parsed || typeof parsed !== "object") {
-		return { version: CURRENT_STORE_VERSION, jobs: [] };
+		return { store: { version: CURRENT_STORE_VERSION, jobs: [] }, repaired: false };
 	}
 	const candidate = parsed as Partial<CronStoreFile>;
 	const rawJobs = Array.isArray(candidate.jobs) ? candidate.jobs : [];
 	const jobs: CronJob[] = [];
+	let repaired = false;
 	for (const raw of rawJobs) {
-		if (!isMinimalJobShape(raw)) continue;
+		if (!isMinimalJobShape(raw)) {
+			repaired = true; // drop = a change vs disk
+			continue;
+		}
 		// Repair on read: an older Brigade build (or an agent that called
 		// the tool with the wrong shape) may have persisted `schedule` as a
 		// bare string ("0 9 * * *") or an object missing `kind`. In that
@@ -66,13 +82,18 @@ export function loadCronStore(storePath: string): CronStoreFile {
 		// the shape becomes canonical on the next save — and if the schedule
 		// truly can't be coerced (genuine corruption), drop the job with a
 		// log rather than poison the whole store.
-		const repaired = repairLoadedJob(raw as unknown as CronJob);
-		if (repaired) jobs.push(repaired);
+		const result = repairLoadedJobWithFlag(raw as unknown as CronJob);
+		if (!result) {
+			repaired = true; // drop
+			continue;
+		}
+		if (result.changed) repaired = true;
+		jobs.push(result.job);
 	}
 	// Version is normalized to CURRENT — unknown future fields on each job
 	// pass through (CronJob is `[key: string]: unknown`-friendly via the
 	// state field) so we don't blow away operator data on read.
-	return { version: CURRENT_STORE_VERSION, jobs };
+	return { store: { version: CURRENT_STORE_VERSION, jobs }, repaired };
 }
 
 /**
@@ -82,6 +103,22 @@ export function loadCronStore(storePath: string): CronStoreFile {
  * Returns `null` if the schedule is genuinely uncoercible.
  */
 function repairLoadedJob(job: CronJob): CronJob | null {
+	const result = repairLoadedJobWithFlag(job);
+	return result ? result.job : null;
+}
+
+interface RepairResult {
+	job: CronJob;
+	changed: boolean;
+}
+
+/**
+ * Repair variant that also reports whether the job changed shape vs disk —
+ * lets `loadCronStoreWithRepairFlag` decide to persist the canonical form
+ * ONCE so subsequent loads see no change and don't re-emit the "repaired"
+ * log line on every tick (Bug #10).
+ */
+function repairLoadedJobWithFlag(job: CronJob): RepairResult | null {
 	let canonical: CronJob["schedule"];
 	try {
 		canonical = normalizeSchedule(coerceScheduleInput(job.schedule));
@@ -99,7 +136,7 @@ function repairLoadedJob(job: CronJob): CronJob | null {
 	// schedule shape (a new canonical may have a different fire-time).
 	const needsRecompute =
 		(job.enabled && job.state?.nextRunAtMs === undefined) || scheduleChanged;
-	if (!scheduleChanged && !needsRecompute) return job;
+	if (!scheduleChanged && !needsRecompute) return { job, changed: false };
 	const now = Date.now();
 	let nextRunAtMs: number | undefined;
 	try {
@@ -108,19 +145,26 @@ function repairLoadedJob(job: CronJob): CronJob | null {
 		nextRunAtMs = undefined;
 	}
 	if (scheduleChanged) {
-		log.info("repaired job schedule on load (string/legacy → canonical object)", {
+		// Logged at debug — the canonical form is persisted by the caller on
+		// first repair, so subsequent loads observe a no-op repair. If the
+		// log ever returns on every tick, the persist-on-repair path
+		// downstream is broken.
+		log.debug("repaired job schedule on load (string/legacy → canonical object)", {
 			id: job.id,
 			name: job.name,
 			nextRunAtMs,
 		});
 	}
 	return {
-		...job,
-		schedule: canonical,
-		state: {
-			...(job.state ?? {}),
-			...(nextRunAtMs !== undefined ? { nextRunAtMs } : {}),
+		job: {
+			...job,
+			schedule: canonical,
+			state: {
+				...(job.state ?? {}),
+				...(nextRunAtMs !== undefined ? { nextRunAtMs } : {}),
+			},
 		},
+		changed: true,
 	};
 }
 
@@ -190,9 +234,34 @@ export async function persist(state: CronServiceState): Promise<void> {
  * sequence so concurrent edits made by ANOTHER process (e.g., the operator
  * running `brigade cron edit` while the daemon is also writing) don't get
  * silently overwritten. Last-write-wins WITH a fresh read is the safety net.
+ *
+ * Persists the canonical form back to disk on the FIRST load that needs
+ * schedule repair (Bug #10). Without this, every subsequent tick reloaded
+ * the still-uncanonical disk file, re-emitted the "repaired job schedule
+ * on load" log line, and noise-saturated the operator's diagnostic
+ * stream. After the persist, the on-disk shape is canonical and future
+ * loads observe a no-op repair.
  */
 export async function ensureLoaded(state: CronServiceState): Promise<void> {
-	state.store = loadCronStore(state.storePath);
+	const result = loadCronStoreWithRepairFlag(state.storePath);
+	state.store = result.store;
+	if (result.repaired) {
+		try {
+			saveCronStore(state.storePath, state.store);
+			log.info("cron store canonicalised on load — subsequent loads will be silent", {
+				path: state.storePath,
+				jobCount: state.store.jobs.length,
+			});
+		} catch (err) {
+			// A persist failure isn't fatal — the next persist on a normal
+			// mutation will eventually canonicalise. We just keep paying the
+			// repair cost on each load until it succeeds.
+			log.warn("cron store canonicalisation persist failed", {
+				path: state.storePath,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
 }
 
 /**

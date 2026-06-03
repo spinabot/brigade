@@ -38,6 +38,7 @@ import {
 import { WebSocketServer, type WebSocket } from "ws";
 
 import {
+	type AgentSummary,
 	DEFAULT_PORT,
 	type EventName,
 	type EventPayload,
@@ -49,6 +50,7 @@ import {
 	type RequestParams,
 	type ResponseFor,
 	type SessionStateSnapshot,
+	type SessionSummary,
 	TICK_INTERVAL_MS,
 } from "../protocol.js";
 // Per-turn execution path (the single canonical runtime). The gateway no
@@ -82,7 +84,7 @@ import {
 	InMemoryApprovalBridge,
 	setActiveApprovalBridge,
 } from "../agents/approval-bridge.js";
-import { setActiveCronService } from "../cron/active-service.js";
+import { getActiveCronService, setActiveCronService } from "../cron/active-service.js";
 import { runCronIsolatedAgentJob } from "../cron/isolated-agent/run.js";
 import { createCronServiceState } from "../cron/service/state.js";
 import { start as cronStart, stop as cronStop } from "../cron/service/ops.js";
@@ -94,7 +96,6 @@ import {
 	abortAllSessions,
 	countActiveLiveSessions,
 	countActiveLiveSessionsForAgent,
-	hasLiveSession,
 	registerLiveSession,
 	unregisterLiveSession,
 } from "../agents/session-registry.js";
@@ -109,6 +110,17 @@ import {
 	registerGatewayHandler,
 } from "./gateway-caller-impl.js";
 import { dispatchAgentRun } from "./agent-dispatcher.js";
+import {
+	handleCronAdd,
+	handleCronList,
+	handleCronRemove,
+	handleCronRun,
+	handleCronRuns,
+	handleCronStatus,
+	handleCronUpdate,
+	handleWake,
+	type CronHandlerContext,
+} from "./server-methods/cron.js";
 import { handleHealthMethod } from "./server-methods/health.js";
 import {
 	handleSessionsHistory,
@@ -1025,9 +1037,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				broadcast("system-event", {
 					text: args.text,
 					at,
-					source: "cron",
+					source: args.source ?? "cron",
 					...(args.jobId !== undefined ? { jobId: args.jobId } : {}),
 					...(args.jobName !== undefined ? { jobName: args.jobName } : {}),
+					...(args.delivered !== undefined ? { delivered: args.delivered } : {}),
 					agentId: cronTargetAgentId,
 					sessionId: cronTargetSessionKey,
 				});
@@ -1707,15 +1720,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const targetSessionKey =
 					p.sessionKey?.trim() ||
 					(targetAgentId === agentId ? sessionKey : defaultSessionKey(targetAgentId));
-				// Fast-reject if THIS session is already streaming so the
-				// interactive client gets immediate feedback rather than a
-				// silently-queued duplicate. Correctness (no overlap on the same
-				// session) is guaranteed by `runGatewayTurn`'s per-lane queue
-				// regardless — this check is just UX. Concurrent peer turns on
-				// different sessionKeys are fine and explicitly allowed.
-				if (hasLiveSession(targetSessionKey)) {
-					throw new Error("a turn is already in progress");
-				}
+				// Wave N4 — no hasLiveSession pre-flight. The session-lane FIFO
+				// inside `runGatewayTurn` (sessionLane(turn.sessionKey)) already
+				// serialises every prompt on the same session: a second client's
+				// prompt for an in-flight session enqueues and runs after the
+				// first settles, instead of being rejected with "a turn is
+				// already in progress". Different sessionKeys still run
+				// concurrently. The legacy reject was UX-only and broke same-
+				// session multi-client (e.g. TUI + chat both attached to
+				// `agent:main:main`).
 				await runGatewayTurn({
 					text: p.text,
 					sessionKey: targetSessionKey,
@@ -1943,6 +1956,108 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			case "get-state": {
 				return buildSnapshot() as ResponseFor[M];
+			}
+			case "agents.list": {
+				// Wave N5 (bug #9) — emit every agent the gateway has runtime
+				// state for. `perAgentRuntime` is the authoritative seed (boot
+				// default + every `cfg.agents.<id>` that resolved on boot), so
+				// the list never advertises an agent the gateway couldn't load.
+				const entries: AgentSummary[] = [];
+				for (const [id, rt] of perAgentRuntime.entries()) {
+					entries.push({
+						id,
+						provider: rt.provider,
+						modelId: rt.modelId,
+						isBoot: id === agentId,
+						...(computeAgentName(id) !== undefined
+							? { personaName: computeAgentName(id) as string }
+							: {}),
+					});
+				}
+				// Stable order: boot agent first, then the rest alphabetically
+				// so two consecutive `/agents` calls render identically.
+				entries.sort((a, b) => {
+					if (a.isBoot && !b.isBoot) return -1;
+					if (!a.isBoot && b.isBoot) return 1;
+					return a.id.localeCompare(b.id);
+				});
+				return entries as ResponseFor[M];
+			}
+			case "sessions.list": {
+				// Wave N5 (bug #9) — surface live sessions (one per in-flight
+				// Pi session keyed by sessionKey). When `all` is true, return
+				// every agent's sessions; otherwise filter to the supplied
+				// agentId (or fall through to the boot agent for legacy
+				// single-agent callers).
+				const p = (params ?? {}) as RequestParams["sessions.list"];
+				const wantsAll = p && typeof p === "object" && p.all === true;
+				const filterAgentId = (p && typeof p === "object" && typeof p.agentId === "string"
+					? p.agentId.trim()
+					: agentId) || agentId;
+				const entries: SessionSummary[] = [];
+				for (const liveKey of liveSessionsByKey.keys()) {
+					const parsed = parseAgentSessionKey(liveKey);
+					const ownerAgentId = parsed?.agentId ?? agentId;
+					if (!wantsAll && ownerAgentId !== filterAgentId) continue;
+					entries.push({ sessionKey: liveKey, agentId: ownerAgentId });
+				}
+				entries.sort((a, b) => a.sessionKey.localeCompare(b.sessionKey));
+				return entries as ResponseFor[M];
+			}
+			/* ─── Cron methods (Wave N6) ─────────────────────── */
+			case "cron.status": {
+				const ctx: CronHandlerContext = { state: getActiveCronService() };
+				return (await handleCronStatus(
+					params as Parameters<typeof handleCronStatus>[0],
+					ctx,
+				)) as ResponseFor[M];
+			}
+			case "cron.list": {
+				const ctx: CronHandlerContext = { state: getActiveCronService() };
+				return (await handleCronList(
+					params as Parameters<typeof handleCronList>[0],
+					ctx,
+				)) as ResponseFor[M];
+			}
+			case "cron.add": {
+				const ctx: CronHandlerContext = { state: getActiveCronService() };
+				return (await handleCronAdd(
+					params as Parameters<typeof handleCronAdd>[0],
+					ctx,
+				)) as ResponseFor[M];
+			}
+			case "cron.update": {
+				const ctx: CronHandlerContext = { state: getActiveCronService() };
+				return (await handleCronUpdate(
+					params as Parameters<typeof handleCronUpdate>[0],
+					ctx,
+				)) as ResponseFor[M];
+			}
+			case "cron.remove": {
+				const ctx: CronHandlerContext = { state: getActiveCronService() };
+				return (await handleCronRemove(
+					params as Parameters<typeof handleCronRemove>[0],
+					ctx,
+				)) as ResponseFor[M];
+			}
+			case "cron.run": {
+				const ctx: CronHandlerContext = { state: getActiveCronService() };
+				return (await handleCronRun(
+					params as Parameters<typeof handleCronRun>[0],
+					ctx,
+				)) as ResponseFor[M];
+			}
+			case "cron.runs": {
+				const ctx: CronHandlerContext = { state: getActiveCronService() };
+				return (await handleCronRuns(
+					params as Parameters<typeof handleCronRuns>[0],
+					ctx,
+				)) as ResponseFor[M];
+			}
+			case "wake": {
+				const ctx: CronHandlerContext = { state: getActiveCronService() };
+				handleWake(params as Parameters<typeof handleWake>[0], ctx);
+				return undefined as ResponseFor[M];
 			}
 			case "shutdown": {
 				// Graceful shutdown — ack the request synchronously, then schedule
@@ -2328,6 +2443,75 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// let the lifecycle stream surface the settled outcome.
 			void run.settled.catch(() => undefined);
 			return { ok: true, runId: run.runId };
+		}),
+	);
+
+	/* ─── Cron methods (Wave N6) — full reference parity. ───── */
+	// Service context snapshot per-call so a delayed re-register honours
+	// service stop/start. `getActiveCronService()` is the canonical
+	// runtime accessor; the handler returns null-state errors when the
+	// daemon hasn't started yet.
+	const cronCtx = (): CronHandlerContext => ({ state: getActiveCronService() });
+	disposeHandlers.push(
+		registerGatewayHandler("cron.status", async (params: unknown) =>
+			handleCronStatus(
+				params as Parameters<typeof handleCronStatus>[0],
+				cronCtx(),
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("cron.list", async (params: unknown) =>
+			handleCronList(
+				params as Parameters<typeof handleCronList>[0],
+				cronCtx(),
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("cron.add", async (params: unknown) =>
+			handleCronAdd(
+				params as Parameters<typeof handleCronAdd>[0],
+				cronCtx(),
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("cron.update", async (params: unknown) =>
+			handleCronUpdate(
+				params as Parameters<typeof handleCronUpdate>[0],
+				cronCtx(),
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("cron.remove", async (params: unknown) =>
+			handleCronRemove(
+				params as Parameters<typeof handleCronRemove>[0],
+				cronCtx(),
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("cron.run", async (params: unknown) =>
+			handleCronRun(
+				params as Parameters<typeof handleCronRun>[0],
+				cronCtx(),
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("cron.runs", async (params: unknown) =>
+			handleCronRuns(
+				params as Parameters<typeof handleCronRuns>[0],
+				cronCtx(),
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("wake", async (params: unknown) => {
+			handleWake(params as Parameters<typeof handleWake>[0], cronCtx());
+			return undefined;
 		}),
 	);
 

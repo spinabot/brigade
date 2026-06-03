@@ -201,10 +201,21 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// Pass channel context so `cron add` from a channel-routed turn can
 		// auto-fill `delivery.channel/to/threadId` and the eventual announce
 		// lands back in the SAME chat the operator created the job from.
+		// Caller's session key threads in so the tool can resolve
+		// `sessionTarget: "current"` to `session:<sessionKey>` and (when
+		// `contextMessages` is set on a systemEvent add) fetch the operator's
+		// recent messages via `sessions.history`. TUI / unit-test paths that
+		// don't supply `sessionContext.key` keep the existing fallback
+		// behaviour (current → isolated, contextMessages → no-op).
+		const agentSessionKey =
+			typeof opts.sessionContext?.key === "string" && opts.sessionContext.key.trim().length > 0
+				? opts.sessionContext.key
+				: undefined;
 		tools.push(
 			makeCronTool({
 				...(opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {}),
 				...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+				...(agentSessionKey !== undefined ? { agentSessionKey } : {}),
 			}),
 		);
 	}

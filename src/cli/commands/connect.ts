@@ -47,7 +47,7 @@ import { brand, editorTheme, markdownTheme } from "../../ui/theme.js";
 import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
 import { ApprovalPrompt, type ApprovalResolution } from "../../tui/approval-prompt.js";
-import type { ModelSummary, SessionStateSnapshot } from "../../protocol.js";
+import type { AgentSummary, ModelSummary, SessionStateSnapshot, SessionSummary } from "../../protocol.js";
 
 // Commander wrapper — `brigade connect` is the thin TUI client that
 // connects to a running gateway. Same single-touch pattern the TUI /
@@ -218,6 +218,16 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// entries widens what the operator sees).
 	let lastSubscribedAgentId: string | undefined = undefined;
 	let lastSubscribedSessionKey: string | undefined = undefined;
+	// Wave N3 (bug #3) — track whether the very first `state` snapshot has
+	// already seeded the connection bindings AND fired an initial `subscribe`.
+	// Without this, the snapshot handler stamped boundAgentId/boundSessionKey
+	// but never called applySubscription(), so the gateway's per-connection
+	// filter at server.ts:903 fell through to its back-compat "deliver
+	// everything" branch — every operator on a multi-agent gateway saw every
+	// other agent's pi/log/approval frames until they manually issued /agent
+	// or /session. We now fire applySubscription() exactly once on the first
+	// non-trivial seed; subsequent snapshots are no-ops on this code path.
+	let seededSubscription = false;
 	const applySubscription = async (): Promise<void> => {
 		try {
 			const priorParams: Record<string, string> = {};
@@ -240,6 +250,25 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			// Best-effort. Server falls back to the back-compat branch on
 			// failure (deliver everything), which matches the pre-fix surface.
 		}
+	};
+	// Wave N3 (bug #3) — defence-in-depth lane filter. Even with the
+	// server-side `subscribe` RPC engaged, a stale frame can leak during the
+	// gap between /agent or /session being typed and the gateway processing
+	// the new subscription set, or against a legacy gateway that doesn't
+	// honour subscribe at all. Drop any frame whose stamped agentId/sessionId
+	// disagrees with the operator's currently bound lane. Mirrors the
+	// upstream client-side gate pattern but adapted for Brigade's
+	// server-side subscribe (so we only drop frames that explicitly stamp a
+	// DIFFERENT lane — frames with no stamp at all fall through, preserving
+	// back-compat with older gateway builds that don't tag broadcasts yet).
+	const isOffLane = (frameAgentId?: string, frameSessionId?: string): boolean => {
+		if (boundAgentId !== undefined && typeof frameAgentId === "string" && frameAgentId.length > 0) {
+			if (frameAgentId !== boundAgentId) return true;
+		}
+		if (boundSessionKey !== undefined && typeof frameSessionId === "string" && frameSessionId.length > 0) {
+			if (frameSessionId !== boundSessionKey) return true;
+		}
+		return false;
 	};
 	// Build the standard `{ agentId?, sessionKey?, ...rest }` payload shape
 	// every RPC uses. Keeps the call sites compact and ensures sessionKey
@@ -429,6 +458,20 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			description: "show/bind the connection's active session key",
 			argumentHint: "[<session-key>]",
 		},
+		{
+			name: "agents",
+			description: "list every agent the gateway knows about",
+		},
+		{
+			name: "sessions",
+			description: "list live sessions for the bound agent (or all)",
+			argumentHint: "[--all]",
+		},
+		{
+			name: "mute",
+			description: "unsubscribe from an agent id or session key",
+			argumentHint: "<agent-id|session-key>",
+		},
 	];
 	editor.setAutocompleteProvider(new CombinedAutocompleteProvider(SLASH_COMMANDS, process.cwd()));
 
@@ -610,6 +653,17 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		if (boundSessionKey === undefined && typeof snap.sessionKey === "string" && snap.sessionKey.length > 0) {
 			boundSessionKey = snap.sessionKey;
 		}
+		// Wave N3 (bug #3) — fire the initial subscription as soon as we
+		// have a non-trivial binding from the gateway. Without this, the
+		// server-side broadcast filter falls through to "deliver
+		// everything" until the operator types /agent or /session, leaking
+		// other agents' frames into this TUI. Fires AT MOST ONCE per
+		// connection; subsequent /agent and /session bindings each fire
+		// their own applySubscription() from their handlers below.
+		if (!seededSubscription && (boundAgentId !== undefined || boundSessionKey !== undefined)) {
+			seededSubscription = true;
+			void applySubscription();
+		}
 		updateHeader();
 	});
 
@@ -622,6 +676,15 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// atomically with 0o600 perms.
 	let activePrompt: ApprovalPrompt | null = null;
 	client.on("approval-request", (req) => {
+		// Wave N3 (bug #3) — defence-in-depth: drop approval prompts that
+		// don't belong to the lane this TUI is bound to. Without this, two
+		// operators each running /agent X and /agent Y would both render
+		// every approval card. Server-side subscribe should already filter
+		// this, but a race between /agent rebind + the next gated-tool
+		// frame can still leak a stale one here.
+		if (isOffLane((req as { agentId?: string }).agentId, (req as { sessionId?: string }).sessionId)) {
+			return;
+		}
 		// If another prompt is somehow already showing (shouldn't happen
 		// because exec-gate is serial per-turn), tear it down first so we
 		// don't stack prompts on the screen.
@@ -688,6 +751,10 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// gateway emits these via the wrapper-chain callbacks. Mirror to the TUI
 	// so the user sees the same context they would in `brigade chat`.
 	client.on("log", (entry) => {
+		// Wave N3 (bug #3) — defensive lane drop. Stamped log entries from
+		// off-lane agents get silently dropped here, matching the same
+		// filter the server's subscribe applies.
+		if (isOffLane(entry.agentId, entry.sessionId)) return;
 		const tone =
 			entry.level === "error"
 				? brand.error(`✗ ${entry.message}`)
@@ -701,10 +768,29 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// only emitted by the cron service's announce path). Rendered as a
 	// visible Brigade-side chat line, NOT in the dim log lane, so a cron
 	// reminder firing while the operator is connected actually surfaces.
+	// Bug #4 — when `payload.source === "cron"` we always render the cron
+	// prefix `[cron "<name>"] <summary>` and append a small delivered/not-
+	// delivered hint so the operator can tell whether the channel-side
+	// send also landed or only this TUI awareness fired.
 	client.on("system-event", (event) => {
-		const label = event.jobName ? `cron "${event.jobName}"` : "cron";
-		const heading = brand.amber(`🦁 [${label}]`);
-		insertBeforeEditor(new Text(`${heading} ${event.text}`, 0, 0));
+		// Wave N3 (bug #3) — defensive lane drop. Cron-fired events stamped
+		// for another agent shouldn't surface on this operator's connect TUI.
+		if (isOffLane(event.agentId, event.sessionId)) return;
+		const isCron = event.source === "cron" || event.jobName !== undefined;
+		if (isCron) {
+			const name = event.jobName ?? "cron";
+			const heading = brand.amber(`🦁 [cron "${name}"]`);
+			let suffix = "";
+			if (event.delivered === true) {
+				suffix = ` ${brand.dim("· delivered")}`;
+			} else if (event.delivered === false) {
+				suffix = ` ${brand.dim("· not delivered (TUI only)")}`;
+			}
+			insertBeforeEditor(new Text(`${heading} ${event.text}${suffix}`, 0, 0));
+		} else {
+			const heading = brand.amber("🦁");
+			insertBeforeEditor(new Text(`${heading} ${event.text}`, 0, 0));
+		}
 		tui.requestRender();
 	});
 
@@ -713,7 +799,13 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// mutations. Primitive #6: when `subagentDepth > 0`, indent child events
 	// by `2 * depth` spaces so nested sub-agent activity is visually distinct
 	// from the parent's stream.
-	client.on("pi", ({ event, subagentDepth }: { event: any; subagentDepth?: number }) => {
+	client.on("pi", (payload: { event: any; subagentDepth?: number; agentId?: string; sessionId?: string }) => {
+		const { event, subagentDepth } = payload;
+		// Wave N3 (bug #3) — defensive lane drop. The gateway already
+		// filters via subscribe; this catches the gap between an /agent or
+		// /session rebind and the gateway's next-frame view of the new
+		// binding (or a legacy gateway that doesn't filter at all).
+		if (isOffLane(payload.agentId, payload.sessionId)) return;
 		const depth = typeof subagentDepth === "number" ? subagentDepth : 0;
 		const subIndent = depth > 0 ? "  ".repeat(depth) : "";
 		switch (event?.type) {
@@ -757,6 +849,24 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				// the parent's buffer).
 				const existing = activeAssistants.get(depth);
 				if (!existing) {
+					// Wave N5 (bug #6) — origin attribution. When this turn is
+					// running on a non-`main` session (e.g. a channel-routed
+					// `agent:<id>:whatsapp:direct:<peer>` lane), drop a small
+					// `↳ via <label>` chip ABOVE the assistant block so the
+					// operator can tell at a glance that the reply is the
+					// agent's answer to an inbound WhatsApp / Slack / cron
+					// message — not something they typed locally. We surface
+					// it only ONCE per (turn, depth), keyed off the first
+					// message_update arriving at this depth (when `existing`
+					// is undefined). The home session returns `undefined` from
+					// `formatSessionLabel` so the chip is silently omitted on
+					// the common path.
+					const originLabel = formatSessionLabel(payload.sessionId);
+					if (originLabel) {
+						insertBeforeEditor(
+							new Text(`${subIndent}${brand.dim(`↳ via ${originLabel}`)}`, 0, 0),
+						);
+					}
 					const fresh = new Markdown(renderedText, 1, 0, markdownTheme);
 					activeAssistants.set(depth, fresh);
 					insertBeforeEditor(fresh);
@@ -977,6 +1087,11 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 						`- ${chalk.bold("/abort")} — stop the in-flight turn\n` +
 						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
 						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's thinking blocks before replies (default: off)\n` +
+						`- ${chalk.bold("/agent [<id>]")} — show/bind the connection's active agent\n` +
+						`- ${chalk.bold("/session [<key>]")} — show/bind the connection's active session\n` +
+						`- ${chalk.bold("/agents")} — list every agent the gateway knows about\n` +
+						`- ${chalk.bold("/sessions [--all]")} — list live sessions (bound agent or all)\n` +
+						`- ${chalk.bold("/mute <id|key>")} — unsubscribe from an agent id or session key\n` +
 						`- ${chalk.bold("Ctrl+C")} — abort the current turn (same as /abort)\n` +
 						`- ${chalk.bold("Ctrl+D")} — quit\n\n` +
 						brand.dim("To add a new provider, run `brigade onboard` on the gateway machine."),
@@ -1013,6 +1128,149 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			);
 			updateHeader();
 			void applySubscription();
+			return;
+		}
+
+		// /agents — list every agent the gateway has runtime state for.
+		// Wave N5 (bug #9). Pulls from the gateway via `agents.list` so the
+		// list is always source-of-truth (no client-side mirror to fall out
+		// of sync with set-model writes). The currently-bound agent is
+		// flagged with a `←` so the operator can tell at a glance which
+		// agent their typing currently targets.
+		if (trimmed === "/agents") {
+			editor.setText("");
+			let agents: AgentSummary[];
+			try {
+				agents = await client.request("agents.list");
+			} catch (err) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
+			if (agents.length === 0) {
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("no agents configured on the gateway")}`, 0, 0),
+				);
+				return;
+			}
+			const bound = boundAgentId ?? lastSnapshot?.agentId;
+			const lines = agents.map((a) => {
+				const here = a.id === bound ? " " + brand.amber("← bound") : "";
+				const bootTag = a.isBoot ? " " + brand.dim("(boot)") : "";
+				const persona = a.personaName ? " " + brand.dim(`· ${a.personaName}`) : "";
+				return `  ${brand.white(a.id)}${persona}  ${brand.dim(`${a.provider} · ${a.modelId}`)}${bootTag}${here}`;
+			});
+			insertBeforeEditor(
+				new Markdown(
+					`${brand.dim("agents on the gateway:")}\n${lines.join("\n")}\n\n${brand.dim("usage: /agent <id> to bind")}`,
+					1,
+					0,
+					markdownTheme,
+				),
+			);
+			return;
+		}
+
+		// /sessions [--all] — list live (in-flight Pi) sessions. Defaults to
+		// the bound agent's sessions; `--all` returns every agent's. Wave N5
+		// (bug #9). Combine with /session <key> to bind to one of them.
+		if (trimmed === "/sessions" || trimmed.startsWith("/sessions ")) {
+			editor.setText("");
+			const arg = trimmed === "/sessions" ? "" : trimmed.slice("/sessions ".length).trim();
+			const wantsAll = /\b--?all\b/i.test(arg);
+			let sessions: SessionSummary[];
+			try {
+				const params: { agentId?: string; all?: boolean } = wantsAll
+					? { all: true }
+					: boundAgentId !== undefined
+						? { agentId: boundAgentId }
+						: {};
+				sessions = await client.request("sessions.list", params);
+			} catch (err) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
+			if (sessions.length === 0) {
+				const scope = wantsAll
+					? "no live sessions on the gateway"
+					: `no live sessions for agent ${boundAgentId ?? lastSnapshot?.agentId ?? "main"}`;
+				insertBeforeEditor(
+					new Text(`  ${brand.dim(scope)} ${brand.dim("(turns run between requests — try again during one)")}`, 0, 0),
+				);
+				return;
+			}
+			const boundKey = boundSessionKey ?? lastSnapshot?.sessionKey;
+			const lines = sessions.map((s) => {
+				const friendly = formatSessionLabel(s.sessionKey) ?? brand.dim("(home)");
+				const here = s.sessionKey === boundKey ? " " + brand.amber("← bound") : "";
+				return `  ${brand.white(s.agentId)}  ${friendly}  ${brand.dim(s.sessionKey)}${here}`;
+			});
+			const scopeLine = wantsAll
+				? "live sessions (all agents):"
+				: `live sessions for agent ${boundAgentId ?? lastSnapshot?.agentId ?? "main"}:`;
+			insertBeforeEditor(
+				new Markdown(
+					`${brand.dim(scopeLine)}\n${lines.join("\n")}\n\n${brand.dim("usage: /session <key> to bind · /mute <id|key> to unsubscribe")}`,
+					1,
+					0,
+					markdownTheme,
+				),
+			);
+			return;
+		}
+
+		// /mute <id> — drop a subscription on the gateway. Accepts EITHER
+		// an agentId (e.g. `ops`) or a full sessionKey (e.g.
+		// `agent:main:whatsapp:direct:+91…`). Heuristic: anything starting
+		// with `agent:` is treated as a sessionKey; everything else is an
+		// agentId. Wave N5 (bug #9). Wires to the existing `unsubscribe`
+		// RPC so the per-conn filter (server.ts:861-882) stops delivering
+		// frames tagged with that lane to this connection.
+		if (trimmed === "/mute" || trimmed.startsWith("/mute ")) {
+			editor.setText("");
+			const arg = trimmed === "/mute" ? "" : trimmed.slice("/mute ".length).trim();
+			if (!arg) {
+				insertBeforeEditor(new Text(`  ${brand.dim("usage: /mute <agent-id|session-key>")}`, 0, 0));
+				return;
+			}
+			const isSessionKey = arg.toLowerCase().startsWith("agent:");
+			const params: { agentId?: string; sessionId?: string } = isSessionKey
+				? { sessionId: arg }
+				: { agentId: arg };
+			try {
+				await client.request("unsubscribe", params);
+				// Keep our local lastSubscribed* mirror honest so a later
+				// applySubscription() doesn't try to undo a subscribe we just
+				// muted — only clear the mirror entry that matches the muted lane.
+				if (isSessionKey && lastSubscribedSessionKey === arg) {
+					lastSubscribedSessionKey = undefined;
+				}
+				if (!isSessionKey && lastSubscribedAgentId === arg) {
+					lastSubscribedAgentId = undefined;
+				}
+				const kind = isSessionKey ? "session" : "agent";
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.amber("✓")} ${brand.dim(`muted ${kind}`)} ${brand.amber(arg)}`,
+						0,
+						0,
+					),
+				);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
+			}
 			return;
 		}
 

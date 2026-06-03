@@ -14,6 +14,23 @@
  */
 
 import type { SpawnSubagentMode, SpawnSubagentSandboxMode } from "../agents/subagent-registry.types.js";
+import type {
+	CronAddParamsV2,
+	CronAddResultV2,
+	CronListParamsV2,
+	CronListResultV2,
+	CronRemoveParamsV2,
+	CronRemoveResultV2,
+	CronRunParamsV2,
+	CronRunResultV2,
+	CronRunsParamsV2,
+	CronRunsResultV2,
+	CronStatusParamsV2,
+	CronStatusResultV2,
+	CronUpdateParamsV2,
+	CronUpdateResultV2,
+	CronWakeParams,
+} from "../core/server-methods/cron.js";
 
 /* ─── Sessions methods ──────────────────────────────────────────── */
 
@@ -175,30 +192,29 @@ export interface AgentResult {
 }
 
 /* ─── Cron methods ──────────────────────────────────────────────── */
-
-export interface CronAddParams {
-	schedule: string;
-	sessionKey: string;
-	payload: string;
-}
-
-export interface CronAddResult {
-	scheduleId: string;
-}
-
-export type CronListParams = Record<string, never>;
-
-export interface CronListResult {
-	schedules: ReadonlyArray<{ id: string; schedule: string; sessionKey: string }>;
-}
-
-export interface CronRemoveParams {
-	scheduleId: string;
-}
-
-export interface CronRemoveResult {
-	ok: boolean;
-}
+/**
+ * Cron RPC parameters + results are owned by the handler module
+ * (`core/server-methods/cron.ts`) so the wire shapes stay in lockstep
+ * with the dispatch path. We re-export them here under the canonical
+ * `Cron*Params` / `Cron*Result` names so existing imports from
+ * `protocol/methods.ts` keep working.
+ */
+export type CronAddParams = CronAddParamsV2;
+export type CronAddResult = CronAddResultV2;
+export type CronListParams = CronListParamsV2;
+export type CronListResult = CronListResultV2;
+export type CronStatusParams = CronStatusParamsV2;
+export type CronStatusResult = CronStatusResultV2;
+export type CronUpdateParams = CronUpdateParamsV2;
+export type CronUpdateResult = CronUpdateResultV2;
+export type CronRemoveParams = CronRemoveParamsV2;
+export type CronRemoveResult = CronRemoveResultV2;
+export type CronRunParams = CronRunParamsV2;
+export type CronRunResult = CronRunResultV2;
+export type CronRunsParams = CronRunsParamsV2;
+export type CronRunsResult = CronRunsResultV2;
+export type WakeParams = CronWakeParams;
+export type WakeResult = void;
 
 /* ─── Approvals methods ─────────────────────────────────────────── */
 
@@ -234,7 +250,12 @@ export interface GatewayMethodSignatures {
 	agent: { params: AgentParams; result: AgentResult };
 	"cron.add": { params: CronAddParams; result: CronAddResult };
 	"cron.list": { params: CronListParams; result: CronListResult };
+	"cron.status": { params: CronStatusParams; result: CronStatusResult };
+	"cron.update": { params: CronUpdateParams; result: CronUpdateResult };
 	"cron.remove": { params: CronRemoveParams; result: CronRemoveResult };
+	"cron.run": { params: CronRunParams; result: CronRunResult };
+	"cron.runs": { params: CronRunsParams; result: CronRunsResult };
+	wake: { params: WakeParams; result: WakeResult };
 	"approvals.respond": { params: ApprovalsRespondParams; result: ApprovalsRespondResult };
 	health: { params: HealthParams; result: HealthResult };
 }

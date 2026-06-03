@@ -23,6 +23,7 @@
 import type { ChannelApprovalRoute } from "./channels/approval-router.js";
 import type { MemoryCapability } from "./extensions/types.js";
 import { makeExecGate } from "./exec-gate.js";
+import type { SessionContext } from "./session-context.js";
 import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-guard.js";
 import { makeToolLoopDetector } from "./tool-loop-detector.js";
 import { wrapOwnerOnlyToolExecution, wrapToolExecutionTimeout } from "./tools/common.js";
@@ -109,6 +110,21 @@ export function assembleBrigadeToolset(opts: {
 	 * to the operator's main session via `enqueueSystemEvent`).
 	 */
 	channelContext?: ChannelApprovalRoute;
+	/**
+	 * Per-turn session metadata. When provided, the cron tool resolves
+	 * `sessionTarget: "current"` to `session:<sessionKey>` (otherwise it
+	 * falls back to `"isolated"`); the sessions tools surface here too.
+	 * The agent loop builds this from the resolved per-turn session key
+	 * + agent id so a TUI operator's "remind me here in 30 mins" cron
+	 * binds to THIS conversation, not a fresh isolated run.
+	 */
+	sessionContext?: SessionContext;
+	/**
+	 * Sandbox flag for the sessions tools — when true, `sessions_list`
+	 * clamps visibility to the spawned-tree only. Forwarded to the tool
+	 * registry; ignored when `sessionContext` is unset.
+	 */
+	sandboxedSessionTools?: boolean;
 }): BrigadeToolset {
 	const rawCustomTools = createBrigadeTools({
 		workspaceDir: opts.workspaceDir,
@@ -117,6 +133,10 @@ export function assembleBrigadeToolset(opts: {
 		...(opts.memoryCapability ? { memoryCapability: opts.memoryCapability } : {}),
 		...(opts.subagentContext ? { subagentContext: opts.subagentContext } : {}),
 		...(opts.channelContext ? { channelContext: opts.channelContext } : {}),
+		...(opts.sessionContext ? { sessionContext: opts.sessionContext } : {}),
+		...(opts.sandboxedSessionTools !== undefined
+			? { sandboxedSessionTools: opts.sandboxedSessionTools }
+			: {}),
 	});
 	const senderIsOwner = opts.senderIsOwner ?? true;
 	// Wrap every tool — `wrapOwnerOnlyToolExecution` is a no-op for the owner

@@ -66,6 +66,20 @@ export interface CronSystemEventArgs {
 	jobId?: string;
 	/** Cron job name whose announce text this carries (display only). */
 	jobName?: string;
+	/**
+	 * Origin marker so the gateway broadcast + TUI renderer can distinguish a
+	 * cron-fired event from future system-event producers. Defaults to "cron"
+	 * at the broadcast layer when omitted.
+	 */
+	source?: "cron";
+	/**
+	 * True when the channel-side delivery (WhatsApp / Slack / etc.) actually
+	 * landed; false when the channel dispatcher refused or no channel target
+	 * was wired. The TUI renders a small status hint so the operator knows
+	 * whether their phone got the reminder or just this in-TUI awareness.
+	 * Undefined for system-events that aren't cron deliveries.
+	 */
+	delivered?: boolean;
 }
 
 /** Args the cron service hands to its failure-alert sender. */
@@ -157,7 +171,10 @@ export interface CronServiceDeps {
 /** Tunable knobs the operator can set in `brigade.json`. */
 export interface CronServiceConfig {
 	enabled?: boolean;
-	/** Max in-flight cron runs across all jobs. Default 1. */
+	/** Max in-flight cron runs across all jobs. Default 4 — same-instant
+	 *  fires (a reminder + a check-in cron sharing 09:00) all dispatch in
+	 *  parallel; over-cap losers stay sequenced via the worker pool rather
+	 *  than dropping their slot. Set to 1 for strict single-file dispatch. */
 	maxConcurrentRuns?: number;
 	/** Max overdue jobs replayed at start(). Default 5. */
 	maxMissedJobsPerRestart?: number;
@@ -195,6 +212,19 @@ export interface CronServiceState {
 	/** Wake reasons in flight — drains as heartbeats consume them. */
 	pendingSystemEvents: Array<{ text: string; mode: CronWakeMode }>;
 	/**
+	 * `next-heartbeat` wake intents that landed during the previous tick and
+	 * still need consumption. Cron drains this on each `onTimer` call by
+	 * invoking `requestHeartbeatNow` for every entry — so a `wakeMode:
+	 * "next-heartbeat"` cron fires within one cron tick (≤30 s) even when
+	 * no agent has its own `heartbeat.intervalMs` configured. Without this
+	 * the system event would sit in `enqueueSystemEvent`'s queue forever.
+	 */
+	pendingHeartbeatWakes: Array<{
+		agentId?: string;
+		sessionKey?: string;
+		reason?: string;
+	}>;
+	/**
 	 * Last time the session-reaper ran for this store. Throttled via
 	 * `shouldRunSweep` to MIN_SWEEP_INTERVAL_MS so the reaper doesn't
 	 * hammer the filesystem on every tick — it only fires every ~5 min.
@@ -229,5 +259,6 @@ export function createCronServiceState(args: {
 		timer: null,
 		running: false,
 		pendingSystemEvents: [],
+		pendingHeartbeatWakes: [],
 	};
 }
