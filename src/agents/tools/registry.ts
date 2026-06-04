@@ -43,6 +43,7 @@ import { makeManageSkillTool } from "./manage-skill-tool.js";
 import { makeOrgTool } from "./org-tool.js";
 import { loadConfig as _loadConfigForOrgGate } from "../../core/config.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
+import { makeSendMediaTool } from "./send-media-tool.js";
 import { makeSendMessageTool } from "./send-message-tool.js";
 import { makeSpawnAgentTool } from "./spawn-agent-tool.js";
 import { makeSpawnAgentsTool } from "./spawn-agents-tool.js";
@@ -120,6 +121,14 @@ export interface CreateBrigadeToolsOptions {
 	 * `enqueueSystemEvent` fallback (see `cron/service/timer.ts`).
 	 */
 	channelContext?: ChannelApprovalRoute;
+	/**
+	 * When false, `send_media` (and other context-aware tools) refuse
+	 * cross-conversation sends — only the inbound's own chat is
+	 * reachable. Defaults to true (treat as owner-routed). Channel
+	 * turns from approved-non-owner peers set this to false so the
+	 * narrow per-call gate kicks in.
+	 */
+	senderIsOwner?: boolean;
 	/**
 	 * Per-turn session metadata (Step 11's `SessionContext`). When supplied,
 	 * `createBrigadeTools` includes the four sessions tools
@@ -224,6 +233,20 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 						: {}),
 					...(opts.sessionContext?.key !== undefined
 						? { agentSessionKey: opts.sessionContext.key }
+						: {}),
+					...(opts.channelContext !== undefined
+						? {
+								channelContext: {
+									channelId: opts.channelContext.channelId,
+									conversationId: opts.channelContext.conversationId,
+									...(opts.channelContext.threadId !== undefined
+										? { threadId: opts.channelContext.threadId }
+										: {}),
+									...(opts.channelContext.accountId !== undefined
+										? { accountId: opts.channelContext.accountId }
+										: {}),
+								},
+							}
 						: {}),
 				}),
 			);
@@ -351,6 +374,20 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 			makeSendMessageTool(
 				opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {},
 			),
+		);
+		// `send_media` — same gating as send_message. The tool itself
+		// refuses cleanly when the chosen channel adapter happens to be
+		// text-only (no sendMedia capability), so it can safely surface
+		// to the model whenever ANY channel is started.
+		tools.push(
+			makeSendMediaTool({
+				...(opts.channelContext !== undefined
+					? { channelContext: opts.channelContext }
+					: {}),
+				...(opts.senderIsOwner !== undefined
+					? { senderIsOwner: opts.senderIsOwner }
+					: {}),
+			}),
 		);
 	}
 	// Sessions tools (Steps 19-23) — register only when the caller passed

@@ -333,7 +333,10 @@ export interface ChannelAdapter {
 	/**
 	 * Optional: send a media attachment (image / video / audio / voice / doc /
 	 * sticker) to a conversation. Channels that don't support media omit this
-	 * slot; the runtime falls back to a `sendText` describing the path.
+	 * slot. The `send_media` tool REFUSES with a clear operator-facing error
+	 * pointing at the file path; it does NOT auto-fallback to `sendText`. If
+	 * you want a text fallback, the LLM calls `send_message` itself after the
+	 * refusal. See `send-media-tool.ts` for the refusal branch.
 	 */
 	sendMedia?(conversationId: string, media: OutboundMedia): Promise<void>;
 	/**

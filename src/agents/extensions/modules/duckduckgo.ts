@@ -242,13 +242,13 @@ function createDuckDuckGoProvider(): WebSearchProvider {
 					});
 					if (response.status !== 200) {
 						throw new Error(
-							`duckduckgo: HTTP ${response.status} from ${finalUrl} (likely anti-bot or temporary block)`,
+							`duckduckgo: HTTP ${response.status} from ${finalUrl} (likely anti-bot or temporary block). DO NOT retry web_search with a different query — DDG's keyless endpoint blocks at the source IP, not the query. Instead: (a) call the \`browser\` tool to navigate to a known URL for the content you need (e.g. unsplash.com, picsum.photos, wikipedia.org, the user's named site), OR (b) tell the operator to set BRAVE_SEARCH_API_KEY / TAVILY_API_KEY / EXA_API_KEY in the gateway env to switch to a JSON-API provider.`,
 						);
 					}
 					const { text: html } = await readResponseText(response.body, 2_000_000);
 					if (looksLikeBotChallenge(html)) {
 						throw new Error(
-							"duckduckgo: anti-bot challenge page returned. Try again later or configure a JSON-API provider (Brave / Tavily).",
+							"duckduckgo: anti-bot challenge page returned. DO NOT retry web_search with a different query — DDG's anti-bot is IP-based, not query-based, and will block the same way. Instead: (a) call the `browser` tool to navigate to a known URL for the content you need, OR (b) tell the operator to set BRAVE_SEARCH_API_KEY / TAVILY_API_KEY / EXA_API_KEY in the gateway env.",
 						);
 					}
 					const htmlResults = parseDdgResults(html, instantHit ? count - 1 : count);

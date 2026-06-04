@@ -138,10 +138,15 @@ export function assembleBrigadeToolset(opts: {
 		spawnedKeys?: ReadonlySet<string>;
 	};
 }): BrigadeToolset {
+	const senderIsOwner = opts.senderIsOwner ?? true;
 	const rawCustomTools = createBrigadeTools({
 		workspaceDir: opts.workspaceDir,
 		agentId: opts.agentId,
 		cwd: opts.cwd,
+		// Pass senderIsOwner so tools like send_media that need a
+		// narrower-than-blanket gate (allow same-chat replies for
+		// non-owners, refuse cross-conversation sends) can self-check.
+		senderIsOwner,
 		...(opts.memoryCapability ? { memoryCapability: opts.memoryCapability } : {}),
 		...(opts.subagentContext ? { subagentContext: opts.subagentContext } : {}),
 		...(opts.channelContext ? { channelContext: opts.channelContext } : {}),
@@ -153,7 +158,6 @@ export function assembleBrigadeToolset(opts: {
 			? { sessionToolAccess: opts.sessionToolAccess }
 			: {}),
 	});
-	const senderIsOwner = opts.senderIsOwner ?? true;
 	// Wrap every tool — `wrapOwnerOnlyToolExecution` is a no-op for the owner
 	// AND for non-ownerOnly tools, so the cost is one identity-check per tool.
 	// Then ALSO wrap with `wrapToolExecutionTimeout` so a tool whose promise

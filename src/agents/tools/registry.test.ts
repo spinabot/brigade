@@ -24,11 +24,23 @@ after(() => {
 
 describe("createBrigadeTools — Primitive #4 (memory) + agents_list + manage_agent + manage_skill", () => {
 	it("returns the three memory tools + agents_list + manage_agent + manage_skill", () => {
-		const tools = createBrigadeTools({
-			workspaceDir: tmpWorkspace,
-			agentId: "main",
-			cwd: tmpWorkspace,
-		});
+		// Isolate from the user's real brigade.json so the `org` tool gate
+		// can't surface when the dev has bootstrapped a cfg.org elsewhere.
+		const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-registry-noorg-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = stateDir;
+		let tools;
+		try {
+			tools = createBrigadeTools({
+				workspaceDir: tmpWorkspace,
+				agentId: "main",
+				cwd: tmpWorkspace,
+			});
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			fs.rmSync(stateDir, { recursive: true, force: true });
+		}
 		assert.equal(tools.length, 6);
 		const names = tools.map((t) => t.name).sort();
 		assert.deepEqual(names, [
@@ -200,14 +212,24 @@ describe("createBrigadeTools — consolidated `org` tool gating", () => {
 	}
 
 	it("ADDITIVE PROOF: when cfg.org is absent, the `org` tool is NOT registered (legacy install unchanged)", () => {
-		// No BRIGADE_STATE_DIR override — readConfigOrInit falls back to
-		// the user's real config, but createBrigadeTools wraps the load
-		// in a try/catch that defaults to legacy when org is missing.
-		const tools = createBrigadeTools({
-			workspaceDir: tmpWorkspace,
-			agentId: "main",
-			cwd: tmpWorkspace,
-		});
+		// Isolate via BRIGADE_STATE_DIR so the test can't be poisoned by
+		// a real ~/.brigade/brigade.json that happens to contain cfg.org
+		// (which a dev may have bootstrapped for chart-rendering work).
+		const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-registry-additive-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = stateDir;
+		let tools;
+		try {
+			tools = createBrigadeTools({
+				workspaceDir: tmpWorkspace,
+				agentId: "main",
+				cwd: tmpWorkspace,
+			});
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			fs.rmSync(stateDir, { recursive: true, force: true });
+		}
 		const names = tools.map((t) => t.name);
 		assert.ok(!names.includes("org"), "legacy install must not surface the org tool");
 		// Defensive: the old two-tool surface MUST also be gone (no shim).

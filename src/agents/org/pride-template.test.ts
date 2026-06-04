@@ -88,6 +88,88 @@ describe("flattenToThreeTiers", () => {
     assert.equal(flat.topOrder.id, "main");
     assert.equal(flat.topOrder.role, "Chief of Staff");
     assert.deepEqual(flat.departments, []);
+    // higherOffice exists, contains [topOrder] as a back-compat alias
+    assert.equal(flat.higherOffice.length, 1);
+    assert.equal(flat.higherOffice[0]?.id, "main");
+    assert.equal(flat.higherOffice[0], flat.topOrder);
+  });
+
+  it("(c-suite) Chief X Officer roles AND executive dept members are promoted to Higher Office, NOT shown as dept leads", () => {
+    const graph = makeGraph({
+      topOrder: "ceo",
+      members: {
+        ceo: { department: "executive", reportsTo: null, role: "Chief Executive Officer" },
+        cfo: { department: "finance", reportsTo: "ceo", role: "Chief Financial Officer" },
+        coo: { department: "operations", reportsTo: "ceo", role: "Chief Operating Officer" },
+        cos: { department: "executive", reportsTo: "ceo", role: "Chief of Staff" },
+        finance_lead: { department: "finance", reportsTo: "cfo", role: "Finance Lead" },
+        eng_lead: { department: "engineering", reportsTo: "coo", role: "Engineering Lead" },
+        ic: { department: "engineering", reportsTo: "eng_lead", role: "Engineer" },
+      },
+    });
+    const flat = flattenToThreeTiers(graph);
+    // Higher Office must contain ALL 4: topOrder (ceo), the 2 chief
+    // officers reporting to ceo (cfo + coo), AND the executive-dept
+    // member (cos). topOrder always at index 0.
+    const ids = flat.higherOffice.map((m) => m.id).sort();
+    assert.deepEqual(ids, ["ceo", "cfo", "coo", "cos"]);
+    assert.equal(flat.higherOffice[0]?.id, "ceo");
+    // Dept leads must NOT be the promoted c-suite members — finance
+    // lead is finance_lead (not cfo); engineering lead is eng_lead
+    // (not coo); executive dept is OMITTED from Tier 2 entirely.
+    const deptsBySlug: Record<string, { lead: string; team: string[] }> = {};
+    for (const d of flat.departments) {
+      deptsBySlug[d.slug] = {
+        lead: d.lead.id,
+        team: d.team.map((m) => m.id),
+      };
+    }
+    assert.equal(deptsBySlug["finance"]?.lead, "finance_lead");
+    assert.equal(deptsBySlug["engineering"]?.lead, "eng_lead");
+    assert.equal(
+      deptsBySlug["executive"],
+      undefined,
+      "executive dept must be suppressed from Tier 2",
+    );
+    // Promoted members must NOT also appear in any dept team.
+    for (const d of flat.departments) {
+      for (const m of d.team) {
+        assert.ok(
+          !["ceo", "cfo", "coo", "cos"].includes(m.id),
+          `${m.id} should not appear in ${d.slug} team`,
+        );
+      }
+      assert.ok(
+        !["ceo", "cfo", "coo", "cos"].includes(d.lead.id),
+        `${d.lead.id} should not appear as ${d.slug} lead`,
+      );
+    }
+  });
+
+  it("(c-suite back-compat) higherOffice[0] === topOrder for ALL configs (single + multi-c-suite)", () => {
+    // Single c-suite
+    const single = flattenToThreeTiers(
+      makeGraph({
+        topOrder: "main",
+        members: {
+          main: { department: "office", reportsTo: null, role: "CEO" },
+          a: { department: "x", reportsTo: "main", role: "Worker" },
+        },
+      }),
+    );
+    assert.equal(single.higherOffice[0]?.id, single.topOrder.id);
+    // Multi c-suite
+    const multi = flattenToThreeTiers(
+      makeGraph({
+        topOrder: "ceo",
+        members: {
+          ceo: { department: "executive", reportsTo: null, role: "CEO" },
+          cto: { department: "engineering", reportsTo: "ceo", role: "CTO" },
+        },
+      }),
+    );
+    assert.equal(multi.higherOffice[0]?.id, multi.topOrder.id);
+    assert.equal(multi.higherOffice[0]?.id, "ceo");
   });
 
   it("(2) top-order + 2 depts + 3 members each → 1 topOrder, 2 leads, 6 team", () => {

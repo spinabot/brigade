@@ -154,10 +154,37 @@ export function makeManageAgentTool(): BrigadeTool<typeof ManageAgentParams, Man
 							role?: string;
 							bio?: string;
 						} = {};
-						if (args.department !== undefined) orgFields.department = args.department;
-						if (args.reportsTo !== undefined) orgFields.reportsTo = args.reportsTo;
-						if (args.role !== undefined) orgFields.role = args.role;
-						if (args.bio !== undefined) orgFields.bio = args.bio;
+						// Normalise the LLM's freeform inputs:
+						//   - department/role/bio: trim, treat "" as omitted
+						//   - reportsTo: special-case — TypeBox accepts the
+						//     union (string | null) and LLMs sometimes pass
+						//     ""  meaning "no parent" instead of `null`. Coerce
+						//     empty/whitespace strings → null so the agent
+						//     becomes the top-of-org (matching the LLM's
+						//     intent) rather than producing a corrupt
+						//     `agents.<id>.org.reportsTo: ""` block that
+						//     fails validation and bricks every subsequent
+						//     turn.
+						if (args.department !== undefined) {
+							const d = args.department.trim();
+							if (d.length > 0) orgFields.department = d;
+						}
+						if (args.reportsTo !== undefined) {
+							if (args.reportsTo === null) {
+								orgFields.reportsTo = null;
+							} else if (typeof args.reportsTo === "string") {
+								const rt = args.reportsTo.trim();
+								orgFields.reportsTo = rt.length > 0 ? rt : null;
+							}
+						}
+						if (args.role !== undefined) {
+							const r = args.role.trim();
+							if (r.length > 0) orgFields.role = r;
+						}
+						if (args.bio !== undefined) {
+							const b = args.bio.trim();
+							if (b.length > 0) orgFields.bio = b;
+						}
 						exitCode = await runAgentsAdd({
 							name: id,
 							nonInteractive: true,

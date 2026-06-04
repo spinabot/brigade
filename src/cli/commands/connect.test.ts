@@ -261,11 +261,21 @@ describe("connect /org slash command (TUI flow)", () => {
 	it("(2) /org with cfg.org present prints the chart with the Brigade footer rule", async () => {
 		const cfg = makePopulatedCfg();
 		const out = await renderTuiOrg("", cfg);
-		assert.match(out, /Higher Office/);
-		assert.match(out, /Departments/);
-		// Taunt + footer rotate from the 145-taunt / 48-footer bank now;
-		// assert that AT LEAST ONE entry from each bank is present rather
-		// than pinning the legacy single-string constants.
+		// The TUI /org chart is now the FANCY columnar render
+		// (box-drawing connectors + Higher Office box centered + lead
+		// boxes in a row + team bullets). It no longer prints the
+		// legacy "Higher Office" / "Departments" section-bar headings
+		// because the columnar layout makes the tier implicit
+		// (visually).
+		assert.match(out, /🦁 The Pride/);
+		// Top-of-org agent name present.
+		assert.match(out, /main/);
+		// Dept slugs present in the column headers.
+		assert.match(out, /engineering/);
+		assert.match(out, /ops/);
+		// Box-drawing connectors (the visual hierarchy).
+		assert.match(out, /[┌┐└┘├┤┬┴┼─│]/);
+		// Taunt + footer rotate from the bank.
 		assert.ok(
 			BRIGADE_TAUNTS.some((t) => out.includes(t)),
 			"chart must contain a taunt from the bank",

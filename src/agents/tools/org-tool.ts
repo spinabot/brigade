@@ -48,9 +48,11 @@
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import crypto from "node:crypto";
+import path from "node:path";
 import { Type } from "typebox";
 
 import { loadConfig } from "../../core/config.js";
+import type { ChannelApprovalRoute } from "../channels/approval-router.js";
 import {
   getOrgTemplate,
   listOrgTemplateIds,
@@ -71,7 +73,7 @@ import {
   renderPrideColumnsWithPins,
   renderPrideTreeWithPins,
 } from "../org/pride-template.js";
-import { saveOrgChartImage } from "../org/pride-image.js";
+import { markTransientImage, saveOrgChartImage } from "../org/pride-image.js";
 import type { OrgGraph } from "../org/types.js";
 import { callGateway } from "../gateway-call.js";
 import { nestedLane } from "../../process/lanes.js";
@@ -261,6 +263,14 @@ export interface OrgShowResult {
   imageWidth?: number;
   /** (image mode) Pixel height of the rendered image. */
   imageHeight?: number;
+  /**
+   * Channel-turn-only nudge for the model — present when the tool was
+   * called on a channel-routed turn. Tells the LLM to dispatch via
+   * `send_media` (success) or `send_message` (image-render failure).
+   * Numbered-list format so smaller models follow the steps in order.
+   * Empty / undefined for TUI / CLI / sub-agent turns.
+   */
+  instructions?: string;
 }
 
 export interface OrgDelegateResult {
@@ -326,6 +336,14 @@ export interface MakeOrgToolOptions {
    * the inbox event without a session-key prefix.
    */
   agentSessionKey?: string;
+  /**
+   * Channel-routed turn context. When present, the `show` action
+   * auto-defaults `format` to `"image"` and emits a strong "now call
+   * send_media" instruction in the tool result so a chat user gets a
+   * picture instead of an ASCII code block. Pass-through TUI / CLI
+   * turns leave this undefined and keep the default `format:"list"`.
+   */
+  channelContext?: ChannelApprovalRoute;
 }
 
 interface OrgToolParams {
@@ -379,7 +397,7 @@ export function makeOrgTool(
         case "describe":
           return executeDescribe(requesterAgentId);
         case "show":
-          return executeShow(params);
+          return executeShow(params, opts.channelContext);
         case "delegate":
           return executeDelegate(params, requesterAgentId, opts.agentSessionKey);
         case "init":
@@ -545,6 +563,7 @@ function mapReason(
  */
 async function executeShow(
   params: OrgToolParams,
+  channelContext?: MakeOrgToolOptions["channelContext"],
 ): Promise<AgentToolResult<OrgToolResult>> {
   const cfg = loadConfig() as {
     org?: { departmentHeads?: Record<string, string> };
@@ -558,7 +577,13 @@ async function executeShow(
     }) as AgentToolResult<OrgToolResult>;
   }
   const pins = cfg.org?.departmentHeads;
-  const format = params.format ?? "list";
+  // Channel auto-default: when the turn was routed in via a chat
+  // channel (WhatsApp / Slack / Telegram / Discord) AND the caller
+  // didn't pin a format explicitly, pick "image" — chat users want a
+  // picture, not an ASCII code block. TUI / CLI turns leave
+  // channelContext undefined and keep the default "list".
+  const format =
+    params.format ?? (channelContext ? "image" : "list");
   const baseOpts = { emoji: true, ansi: false } as const;
 
   if (format === "tree") {
@@ -584,15 +609,76 @@ async function executeShow(
   }
 
   if (format === "image") {
-    // ASCII columns chart in the response so the model retains a
-    // textual snapshot of the org without re-calling the tool. The
-    // image-save uses its own internal rng for taunt/footer/story —
-    // operator's TUI render and the saved image will pick INDEPENDENT
-    // taunts on the same turn (by design: the image is a stand-alone
-    // artefact that may be sent days later).
     const chart = renderPrideColumnsWithPins(graph, pins, baseOpts);
     try {
-      const saved = await saveOrgChartImage(graph, pins, {});
+      // Force-fresh render on channel turns so the user gets a new
+      // random theme + new taunt + new footer rule every time —
+      // cached PNGs from earlier turns are bypassed. Also marks the
+      // file as transient so `send_media` unlinks it after dispatch
+      // (the chart is delivered ONCE; after that we don't want stale
+      // copies cluttering the cache or being served to a future
+      // channel turn where the org may have changed).
+      // TUI / CLI / sub-agent turns keep the content-hash cache —
+      // they re-render the same chart many times in a session and
+      // benefit from reuse.
+      const saved = await saveOrgChartImage(graph, pins, {
+        force: channelContext !== undefined,
+      });
+      if (channelContext) {
+        markTransientImage(saved.filePath);
+      }
+      // On a channel turn we want the LLM to dispatch the image via
+      // `send_media` without leaving a paste-able ASCII chart in its
+      // context. Two reinforcing mechanisms:
+      //   1. STUB the `chart` field — a populated ASCII block in the
+      //      same result is too tempting for mid-tier models to paste
+      //      either alongside send_media OR in the post-send
+      //      confirmation turn (the original ASCII would still be in
+      //      context). We replace it with a short marker.
+      //   2. Numbered `instructions` field — line-broken steps follow
+      //      Anthropic's prompting guidance for instruction-following.
+      // TUI / CLI turns still get the full ASCII for direct read.
+      if (channelContext) {
+        // Posix-form the path so it round-trips through the LLM
+        // unchanged. The LLM sees this string twice (in the
+        // `imagePath` field and inside the `instructions` text); on
+        // Windows, native backslashes get mangled when the model
+        // copies them out of a string that LOOKS like a function-call
+        // template. Forward slashes survive any stringification and
+        // Node's fs accepts them on Windows.
+        const posixPath = saved.filePath.split(path.sep).join("/");
+        // CRITICAL: do NOT embed the path inside a JSON-shape template
+        // (like `Call send_media({path: "..."})`). Mid-tier models
+        // copy the template character-for-character and mangle
+        // backslashes. Instead instruct the model to use the
+        // `imagePath` field VERBATIM — that field is JSON-stringified
+        // by `jsonResult` so its escapes are model-safe.
+        const instructions = [
+          `1. You are on channel "${channelContext.channelId}", conversation "${channelContext.conversationId}".`,
+          `2. Call send_media now. For the "path" argument, copy the value of the imagePath field in this tool result VERBATIM (do not retype it, do not modify slashes or escapes).`,
+          `3. Pass deleteAfterSend:true to send_media so the temp PNG is cleaned up after dispatch — the chart is transient (re-rendered fresh on every request), this file should not linger.`,
+          `4. Pick a caption that answers the user's specific question; do not use a generic "Here's the org chart" if the user asked something specific.`,
+          `5. Do NOT include the org structure in any text reply — the image IS the reply.`,
+          `6. If send_media fails, call send_message with a short acknowledgement and tell the user to view the image directly.`,
+        ].join("\n");
+        return jsonResult({
+          ok: true,
+          status: "ok",
+          chart:
+            "[delivered as image via send_media — do not paste this field; the image is the deliverable]",
+          format: "image",
+          graph,
+          imagePath: posixPath,
+          mimeType: saved.mimeType,
+          rasterized: saved.rasterized,
+          imageWidth: saved.width,
+          imageHeight: saved.height,
+          instructions,
+        } satisfies OrgShowResult) as AgentToolResult<OrgToolResult>;
+      }
+      // Non-channel image render (TUI explicit format:"image", sub-agent,
+      // etc.) — keep the ASCII alongside since the LLM may need it for
+      // direct text rendering and there's no send_media auto-route.
       return jsonResult({
         ok: true,
         status: "ok",
@@ -604,20 +690,38 @@ async function executeShow(
         rasterized: saved.rasterized,
         imageWidth: saved.width,
         imageHeight: saved.height,
-      }) as AgentToolResult<OrgToolResult>;
+      } satisfies OrgShowResult) as AgentToolResult<OrgToolResult>;
     } catch (err) {
-      // Image save failed (rare — disk full, permissions). Fall back to
-      // the ASCII columns chart so the caller still gets a usable
-      // response. mimeType/imagePath omitted to signal the failure.
+      // Image render failed (disk full, missing playwright-core,
+      // browser launch failure, etc.). On a channel turn we still must
+      // not let the LLM paste the ASCII inline — instruct it to call
+      // send_message with the chart text as the message body so the
+      // chat user gets a deliverable. Off-channel, the model can render
+      // the ASCII inline as usual.
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (channelContext) {
+        const instructions = [
+          `1. Image render FAILED ("${errMsg}"). You are still on channel "${channelContext.channelId}".`,
+          `2. Call send_message({text: <the chart field, verbatim, wrapped in a triple-backtick code block>}) so the user gets the ASCII fallback in their chat.`,
+          `3. Do NOT include the chart in any other text — send_message is the ONLY deliverable.`,
+          `4. After send_message succeeds, optionally apologise once for the missing image; do not retry the image render this turn.`,
+        ].join("\n");
+        return jsonResult({
+          ok: true,
+          status: "ok",
+          chart,
+          format: "columns",
+          graph,
+          instructions,
+        } satisfies OrgShowResult) as AgentToolResult<OrgToolResult>;
+      }
       return jsonResult({
         ok: true,
         status: "ok",
-        chart: `${chart}\n\n[image render failed: ${
-          err instanceof Error ? err.message : String(err)
-        }]`,
+        chart: `${chart}\n\n[image render failed: ${errMsg}]`,
         format: "columns",
         graph,
-      }) as AgentToolResult<OrgToolResult>;
+      } satisfies OrgShowResult) as AgentToolResult<OrgToolResult>;
     }
   }
 
@@ -915,6 +1019,32 @@ async function executeSet(
     } satisfies OrgSetResult) as AgentToolResult<OrgToolResult>;
   }
 
+  // Normalise the LLM's freeform inputs BEFORE we write them. The
+  // schema's `Type.Union([Type.String(), Type.Null()])` on reportsTo
+  // accepts ANY string including `""`, but an empty string is never
+  // a valid agent id and writing it produces an org config that fails
+  // `validate.ts` for every subsequent turn (the gateway then bricks
+  // until the file is hand-repaired). Treating `""` as "no parent"
+  // (i.e. null) matches the LLM's intent and prevents the regression.
+  // Same hardening for department/role/bio: empty string → undefined.
+  const normDept =
+    params.department !== undefined
+      ? params.department.trim() || undefined
+      : undefined;
+  let normReportsTo: string | null | undefined;
+  if (params.reportsTo === null) {
+    normReportsTo = null;
+  } else if (typeof params.reportsTo === "string") {
+    const t = params.reportsTo.trim();
+    normReportsTo = t.length > 0 ? t : null;
+  } else {
+    normReportsTo = undefined;
+  }
+  const normRole =
+    params.role !== undefined ? params.role.trim() || undefined : undefined;
+  const normBio =
+    params.bio !== undefined ? params.bio.trim() || undefined : undefined;
+
   try {
     const next = await mutateConfigAtomic((current: BrigadeConfig) => {
       const merged: BrigadeConfig = { ...current };
@@ -923,11 +1053,10 @@ async function executeSet(
       const prevOrg =
         (target.org as Record<string, unknown> | undefined) ?? {};
       const nextOrg: Record<string, unknown> = { ...prevOrg };
-      if (params.department !== undefined)
-        nextOrg.department = params.department;
-      if (params.reportsTo !== undefined) nextOrg.reportsTo = params.reportsTo;
-      if (params.role !== undefined) nextOrg.role = params.role;
-      if (params.bio !== undefined) nextOrg.bio = params.bio;
+      if (normDept !== undefined) nextOrg.department = normDept;
+      if (normReportsTo !== undefined) nextOrg.reportsTo = normReportsTo;
+      if (normRole !== undefined) nextOrg.role = normRole;
+      if (normBio !== undefined) nextOrg.bio = normBio;
       target.org = nextOrg;
       agents[agentId] = target;
       merged.agents = agents as never;

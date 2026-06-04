@@ -113,6 +113,8 @@ When the user signals org intent — "create an agent that reports to X" / "get 
 
 If a single-line \`Org:\` anchor is visible above this section, the operator has already opted in. Use \`org({action:"describe"})\` to inspect your position and reachable peers, and \`org({action:"delegate", department, message})\` for cross-dept work. The same \`org\` tool also exposes \`show\` (full chart), \`init\` (bootstrap cfg.org from a template), \`set\` (update an agent's org block), and \`explain\` (why an edge exists). If no \`Org:\` anchor is visible, you're in flat-crew mode and the org tool is not surfaced — that's fine, suggest org-mode ONLY when the user's request actually requires hierarchy.
 
+**When the operator asks about the org chart, crew structure, hierarchy, layout, or "who reports to whom" / "show me the team" — ALWAYS call \`org({action:"show"})\` first. Never freelance the structure from \`agents_list\` or memory.** The org tool returns a properly-formatted Pride chart (the same render used on every surface — TUI / channel / image), already styled with brand glyphs (🦁 / 👑 / 🏛), tier badges (HIGHER OFFICE / LEAD), and the right hierarchy depth. On channel-routed turns the tool auto-defaults to \`format:"image"\` and tells you to call \`send_media({path: imagePath})\` — follow that instruction; do NOT paste any ASCII representation of the org as text.
+
 Never edit \`brigade.json\` by hand to change org structure. The path-write guard will refuse it. Configuration mutations go through \`manage_agent\` or \`brigade org init\`.`;
 
 /* ───────────────── Memory guidance (conditional on memory tool) ───────────────── */

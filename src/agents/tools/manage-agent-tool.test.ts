@@ -658,4 +658,59 @@ describe("manage_agent — implicit Pride-org init on hierarchical add", () => {
 			role: "Strict Lead",
 		});
 	});
+
+	it("(f) reportsTo:'' (empty string) is coerced to null — bricked-gateway regression", async () => {
+		// REGRESSION: the LLM sometimes passes `reportsTo: ""` meaning
+		// "no parent". TypeBox's Union<String, Null> accepts that; the
+		// auto-init then wrote `agents.<id>.org.reportsTo = ""` which
+		// fails `validate.ts` (`"" is not a member`) and bricks the
+		// gateway — every subsequent prompt throws during boot
+		// validation. The tool must NORMALISE empty / whitespace
+		// reportsTo strings to null (== "new agent IS topOrder").
+		writeCfg({
+			agents: {
+				defaults: { provider: "openrouter", model: { primary: "anthropic/claude-sonnet-4.6" } },
+				main: {},
+			},
+		});
+		const tool = makeManageAgentTool();
+		await tool.execute("call-ceo-empty", {
+			action: "add",
+			id: "ceo_x",
+			department: "executive",
+			reportsTo: "", // ← THE BUG
+			role: "CEO",
+		});
+		const org = readCfgOrg() as { topOrder?: string } | undefined;
+		assert.equal(org?.topOrder, "ceo_x", "empty-string reportsTo treated as null → ceo is topOrder");
+		assert.deepEqual(readAgentOrg("ceo_x"), {
+			department: "executive",
+			reportsTo: null,
+			role: "CEO",
+		});
+	});
+
+	it("(g) empty department/role/bio strings are dropped (not written as '')", async () => {
+		writeCfg({
+			agents: {
+				defaults: { provider: "openrouter", model: { primary: "anthropic/claude-sonnet-4.6" } },
+				main: {},
+			},
+			org: { topOrder: "main", a2a: { mode: "derived" } },
+		});
+		const tool = makeManageAgentTool();
+		await tool.execute("call-blanks", {
+			action: "add",
+			id: "blanks",
+			department: "  ", // whitespace-only
+			reportsTo: "main",
+			role: "",
+			bio: "",
+		});
+		const block = readAgentOrg("blanks") as Record<string, unknown> | undefined;
+		assert.equal(block?.reportsTo, "main");
+		assert.ok(!("department" in (block ?? {})), "blank department dropped");
+		assert.ok(!("role" in (block ?? {})), "blank role dropped");
+		assert.ok(!("bio" in (block ?? {})), "blank bio dropped");
+	});
 });

@@ -34,6 +34,8 @@ import { deriveOrgGraph } from "../../agents/org/derive-graph.js";
 import {
   PRIDE_CHART_FLAT_CREW_NOTE,
   renderPrideChartWithPins,
+  renderPrideColumnsWithPins,
+  renderPrideTreeWithPins,
 } from "../../agents/org/pride-template.js";
 import type { OrgGraph } from "../../agents/org/types.js";
 
@@ -52,8 +54,25 @@ export interface OrgSnapshotDeps {
 
 /** Per-format chart bundle returned when cfg.org is present. */
 export interface OrgSnapshotCharts {
-  /** ANSI + emoji — for the TUI. */
+  /**
+   * ANSI + emoji — for the TUI. NEW default since the "fancy" body
+   * shipped: a horizontal columnar org-chart with box-drawing
+   * connectors (┌─┐│└─┘├┬┴), one Higher Office box at top, lead
+   * boxes in a row with a branching spine, team bullets per
+   * column. The `/org` slash command renders this verbatim.
+   */
   tui: string;
+  /**
+   * Legacy compact list (Higher Office / Departments tier headings,
+   * leads + team bullets). Kept available so the few internal sites
+   * that depend on the old shape can opt in.
+   */
+  list: string;
+  /**
+   * Vertical indent tree (├── / └── connectors) — good for narrow
+   * terminals (<60 cols) where the columnar variant wraps.
+   */
+  tree: string;
   /** Emoji + plain text wrapped in a triple-backtick code block. */
   channel: string;
   /** Plain ASCII (no emoji, no ANSI). */
@@ -101,7 +120,23 @@ export function handleOrgSnapshot(
     };
   }
   const pins = cfg.org?.departmentHeads;
-  const tui = renderPrideChartWithPins(graph, pins, {
+  // TUI form: fancy columnar org-chart with box-drawing connectors +
+  // emoji + ANSI colour. This is what `/org` shows in the connect
+  // TUI — the "Higher Office box on top, lead boxes in a horizontal
+  // row with branching spine, team bullets under each column" look
+  // the operator asked for after seeing the legacy compact list.
+  const tui = renderPrideColumnsWithPins(graph, pins, {
+    emoji: true,
+    ansi: true,
+  });
+  // Vertical indent tree alternative for narrow terminals.
+  const tree = renderPrideTreeWithPins(graph, pins, {
+    emoji: true,
+    ansi: true,
+  });
+  // Legacy compact list — kept for back-compat (a handful of internal
+  // sites still pin the original section-bar layout).
+  const list = renderPrideChartWithPins(graph, pins, {
     emoji: true,
     ansi: true,
   });
@@ -109,10 +144,10 @@ export function handleOrgSnapshot(
     emoji: false,
     ansi: false,
   });
-  // Channel form: emoji on, ANSI off, wrapped in a triple-backtick block so
-  // WhatsApp / Slack / Discord render it as monospace. Pins are honoured so
-  // the chart format matches the TUI one byte-for-byte aside from the
-  // ANSI escapes.
+  // Channel form: emoji on, ANSI off, wrapped in a triple-backtick
+  // block so WhatsApp / Slack / Discord render it as monospace. Uses
+  // the LIST shape (not columnar) because chat clients on mobile are
+  // often <40 cols wide and the columnar variant wraps badly.
   const channelInner = renderPrideChartWithPins(graph, pins, {
     emoji: true,
     ansi: false,
@@ -123,6 +158,8 @@ export function handleOrgSnapshot(
     graph,
     charts: {
       tui,
+      list,
+      tree,
       channel,
       ascii,
       json: graph,

@@ -761,6 +761,22 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
           extensionRegistry.lookupWebSearchProviderById(id, turnConfig as never),
       })
     : null;
+  // Diagnostic toggle — when BRIGADE_DEBUG_WEB=1 the gateway log gets one
+  // line per turn telling you WHICH web-search provider got resolved, whether
+  // it supports filters, and whether the tool was actually built. Hard to
+  // debug a "3ms ✗ web_search" failure without this — the model could be
+  // hitting any of 5 distinct early-refusal branches (unknown tool, schema
+  // rejection, unsupported filter, provider key gate, DDG anti-bot). Off by
+  // default so it doesn't bloat the log for everyone.
+  if (process.env.BRIGADE_DEBUG_WEB === "1") {
+    const dbg = {
+      activeSearchProviderId: activeSearchProvider?.id ?? null,
+      supportsFilters: activeSearchProvider?.supportsFilters ?? null,
+      webSearchToolBuilt: webSearchTool !== null,
+    };
+    // eslint-disable-next-line no-console
+    console.error("[brigade.web]", JSON.stringify(dbg));
+  }
   // Browser tool — ALWAYS registered (matches the upstream reference's
   // behaviour). `playwright-core` is a hard dependency that ships the
   // runtime engine WITHOUT a bundled Chromium binary (~30 MB). When the

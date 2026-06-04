@@ -111,6 +111,7 @@ import { enqueuePendingSystemEvent } from "../agents/pending-system-events.js";
 // runner + wake flag, lane drain helpers. All exported but never called
 // pre-wiring; the boot path below installs them once.
 import {
+	createInProcessGatewayCaller,
 	installInProcessGatewayCaller,
 	registerGatewayHandler,
 } from "./gateway-caller-impl.js";
@@ -2447,7 +2448,35 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					}
 					return (await custom.handler(rawParams, caller)) as ResponseFor[M];
 				}
-				throw new Error(`unknown method: ${method}`);
+				// Bridge to the in-process registry. `registerGatewayHandler`
+				// (from `gateway-caller-impl.ts`) populates a SEPARATE
+				// singleton registry used by in-process tool callers
+				// (`callGateway(...)`). Without this fallback, methods like
+				// `org.snapshot`, `sessions.list`, `cron.*`, and `health` —
+				// all registered there — are reachable from tools but
+				// throw "unknown method" over the WebSocket, even though
+				// the dispatcher COMMENT above claims registered handlers
+				// "always win" at the default branch. They don't; they
+				// live in a different Map. We forward here so the WS
+				// surface matches the in-process one.
+				try {
+					return (await inProcessCaller.call({
+						method: method as string,
+						params: rawParams,
+					})) as ResponseFor[M];
+				} catch (err) {
+					// Distinguish "method not registered" from "method
+					// threw an actual error" so the WS client sees the
+					// same `unknown method` shape as before for missing
+					// methods, and the genuine handler errors propagate.
+					if (
+						err instanceof Error &&
+						err.message.startsWith("gateway method not registered:")
+					) {
+						throw new Error(`unknown method: ${method}`);
+					}
+					throw err;
+				}
 			}
 		}
 	};
@@ -2646,6 +2675,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// also dispatch through the same registry once the connection handler
 	// routes their request frame here (in `handleRequest`).
 	const disposeGatewayCaller = installInProcessGatewayCaller();
+	// In-process caller instance used by handleRequest's default branch
+	// to bridge to the singleton-registry path. See the comment block
+	// in the default branch for why this fallback is needed (TL;DR:
+	// `registerGatewayHandler` populates a separate registry that the
+	// WS dispatcher otherwise can't see).
+	const inProcessCaller = createInProcessGatewayCaller();
 
 	// Register the five sessions handlers + health. Bound `agentId` is the
 	// boot-time default; the dispatcher's per-turn route resolver overrides

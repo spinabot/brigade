@@ -178,6 +178,31 @@ export function makeWebSearchTool(opts: MakeWebSearchToolOptions): AnyBrigadeToo
 			const count = args.count ?? DEFAULT_COUNT;
 			const startedAt = Date.now();
 
+			// Guard whitespace-only / effectively-empty queries with a typed
+			// envelope. TypeBox's `minLength: 1` on the schema lets through
+			// `"   "` and the upstream providers each throw their own opaque
+			// "missing query" error — same observable shape as a 3ms ✗ that's
+			// hard to diagnose. The typed envelope is self-describing and
+			// short-circuits before any HTTP work.
+			if (!query) {
+				const errorPayload: WebSearchDetails = {
+					query,
+					provider: opts.provider.id,
+					count,
+					tookMs: Date.now() - startedAt,
+					results: [],
+					error: "invalid_query",
+					message:
+						"web_search: `query` must be a non-empty, non-whitespace string.",
+					externalContent: buildExternalContentMeta({
+						source: "web_search",
+						provider: opts.provider.id,
+						wrapped: true,
+					}),
+				};
+				return jsonResult(errorPayload);
+			}
+
 			// Per-call provider override. The model can request a specific
 			// backend for one query (e.g. "use brave for this");
 			// resolution uses the registry-side lookup so the override

@@ -84,6 +84,10 @@ export async function saveOrgChartImage(
 ): Promise<OrgChartImageResult> {
   const outDir = opts.outDir ?? path.join(resolveCacheDir(), "org-charts");
   await fs.mkdir(outDir, { recursive: true });
+  // Opportunistic cache GC — every render reaps stale + over-cap
+  // files. Best-effort, swallowed errors. Don't await: keep the
+  // happy path latency identical for the caller.
+  void gcOrgChartsCache({ cacheDir: outDir });
 
   const { html, width, height, themeId, themeName } = renderPrideHtmlWithPins(
     graph,
@@ -198,5 +202,88 @@ async function pathExists(p: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/* ─── transient-image registry + cache GC ────────────────────────── */
+/**
+ * Module-level Set of image paths the producer (org-tool) considers
+ * transient — they exist only to be dispatched once, then unlinked.
+ * `send_media` consumes the entry on successful dispatch and unlinks
+ * the file even if the LLM forgot to pass `deleteAfterSend:true`.
+ * Belt + suspenders for the channel-served chart freshness contract.
+ */
+const transientImagePaths = new Set<string>();
+
+function normaliseTransientKey(p: string): string {
+  return path.resolve(p);
+}
+
+/**
+ * Mark a generated PNG/SVG as transient. Org-tool calls this on
+ * every channel-routed `format:"image"` render so the file is reaped
+ * after delivery. Idempotent.
+ */
+export function markTransientImage(filePath: string): void {
+  transientImagePaths.add(normaliseTransientKey(filePath));
+}
+
+/**
+ * Check + clear a transient-marker for `filePath`. Returns true if
+ * the path was registered (and was therefore consumed). `send_media`
+ * uses this to decide whether to unlink even when the caller didn't
+ * pass `deleteAfterSend:true` explicitly.
+ */
+export function consumeTransientImage(filePath: string): boolean {
+  const key = normaliseTransientKey(filePath);
+  return transientImagePaths.delete(key);
+}
+
+/**
+ * Opportunistic cache GC for `~/.brigade/cache/org-charts/`. Reaps
+ * (a) files older than `maxAgeMs` (default 6h), then (b) trims the
+ * remaining set down to `maxFiles` (default 50) keeping the newest.
+ *
+ * Called lazily from `saveOrgChartImage` BEFORE writing a new file
+ * so each render does its own cleanup — no separate timer to plumb
+ * through the gateway lifecycle. Best-effort: every error is
+ * swallowed; chart rendering must never fail because GC didn't.
+ */
+export async function gcOrgChartsCache(opts: {
+  cacheDir?: string;
+  maxAgeMs?: number;
+  maxFiles?: number;
+} = {}): Promise<void> {
+  const cacheDir =
+    opts.cacheDir ?? path.join(resolveCacheDir(), "org-charts");
+  const maxAgeMs = opts.maxAgeMs ?? 6 * 60 * 60 * 1000;
+  const maxFiles = opts.maxFiles ?? 50;
+  try {
+    const names = await fs.readdir(cacheDir);
+    const stats = await Promise.allSettled(
+      names.map(async (name) => {
+        const file = path.join(cacheDir, name);
+        const st = await fs.stat(file);
+        return { file, mtimeMs: st.mtimeMs };
+      }),
+    );
+    const entries = stats.flatMap((r) =>
+      r.status === "fulfilled" ? [r.value] : [],
+    );
+    const now = Date.now();
+    const stale = entries.filter((e) => now - e.mtimeMs > maxAgeMs);
+    const staleSet = new Set(stale.map((e) => e.file));
+    await Promise.allSettled(stale.map((e) => fs.unlink(e.file)));
+    const fresh = entries
+      .filter((e) => !staleSet.has(e.file))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    if (fresh.length > maxFiles) {
+      await Promise.allSettled(
+        fresh.slice(maxFiles).map((e) => fs.unlink(e.file)),
+      );
+    }
+  } catch {
+    // GC is best-effort. Missing cache dir, permission errors,
+    // mid-read mutations — all OK to ignore.
   }
 }

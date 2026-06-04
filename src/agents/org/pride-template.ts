@@ -103,10 +103,78 @@ export interface PrideDepartment {
 
 /** Result of `flattenToThreeTiers`. */
 export interface PrideFlatten {
-  /** Tier 1: the top-of-org agent. */
+  /**
+   * Tier 1: the Higher Office band. Length >= 1. Index 0 is always
+   * the resolved top-of-org (kept stable for back-compat); subsequent
+   * entries are c-suite members (Chief X Officer / CEO / CFO / COO /
+   * CTO / CMO / CIO / CSO / CPO / CRO / CHRO / President) plus anyone
+   * whose department slug is in the executive set ("executive",
+   * "exec", "leadership", "higher-office", "office"), sorted by
+   * manager-chain depth then alphabetically. C-suite agents that
+   * were previously appearing as DEPARTMENT LEADS (e.g. CFO over
+   * finance-lead) are now promoted here — which strictly REMOVES
+   * a middle-manager render shape, not adds one (the Pride policy
+   * "no managers, just leads and the team" is reinforced).
+   */
+  higherOffice: PrideMember[];
+  /**
+   * Tier 1 alias — `higherOffice[0]`. Kept so existing callers that
+   * just want the single top-of-org agent (CLI flat-crew note path,
+   * `org({action:"describe"})`, etc.) compile and work unchanged.
+   */
   topOrder: PrideMember;
   /** Tier 2 + Tier 3 grouped by department slug. */
   departments: PrideDepartment[];
+}
+
+/**
+ * Departments slugs that ARE the Higher Office (executive/leadership).
+ * Members in these depts are auto-promoted to the Higher Office band
+ * and their dept is suppressed from Tier 2 (it would otherwise
+ * double-bill — the executive dept IS Higher Office).
+ */
+const HIGHER_OFFICE_DEPT_SLUGS: ReadonlySet<string> = new Set([
+  "executive",
+  "exec",
+  "leadership",
+  "higher-office",
+  "office",
+]);
+
+/**
+ * Role-name regex matching the C-suite. Word-boundary anchored so
+ * "Chief of Staff" matches, "Engineering Lead" does NOT, and
+ * "President of Sales" matches. Case-insensitive.
+ */
+const C_SUITE_ROLE_RE =
+  /^\s*(chief\b|ceo\b|cfo\b|coo\b|cto\b|cio\b|cmo\b|cso\b|cpo\b|cro\b|chro\b|president\b)/i;
+
+/**
+ * Determine whether a member belongs in the Higher Office tier.
+ *
+ * Rules (in evaluation order):
+ *   1. The graph's `topOrder` is ALWAYS in Higher Office (even if its
+ *      dept/role doesn't match the rules below — defensive).
+ *   2. Department slug is in the executive set
+ *      (`HIGHER_OFFICE_DEPT_SLUGS`).
+ *   3. Role matches the C-suite regex
+ *      (`Chief X Officer` / `CEO` / `CFO` / `COO` / `CTO` / `CIO`
+ *      / `CMO` / `CSO` / `CPO` / `CRO` / `CHRO` / `President`).
+ *
+ * Tests pin: changing this rule changes the chart shape, so the rule
+ * is exported for direct unit testing.
+ */
+export function isHigherOfficeMember(
+  id: string,
+  topOrderId: string,
+  member: { department: string; role?: string } | undefined,
+): boolean {
+  if (id === topOrderId) return true;
+  if (!member) return false;
+  const slug = (member.department ?? "").toLowerCase().trim();
+  if (HIGHER_OFFICE_DEPT_SLUGS.has(slug)) return true;
+  if (member.role && C_SUITE_ROLE_RE.test(member.role)) return true;
+  return false;
 }
 
 /** Options for `renderPrideChart`. */
@@ -199,13 +267,39 @@ export function flattenToThreeTiersWithPins(
       }
     : { id: topOrderId };
 
-  // Single-member org → no departments are rendered.
+  // Single-member org → no departments, no co-execs to promote.
   if (memberEntries.length <= 1) {
-    return { topOrder, departments: [] };
+    return { higherOffice: [topOrder], topOrder, departments: [] };
   }
 
-  // ── Tier 2 + Tier 3 — bucket every non-topOrder member into a
-  // department, then resolve the lead.
+  // ── Tier 1 (multi-member) — promote c-suite to Higher Office.
+  // Pre-compute depth-to-topOrder so we can stable-sort co-execs.
+  const depth = computeDepthToTopOrder(graph, topOrderId);
+  const promotedIds = new Set<string>([topOrderId]);
+  for (const [id, m] of memberEntries) {
+    if (id === topOrderId) continue;
+    if (isHigherOfficeMember(id, topOrderId, m)) {
+      promotedIds.add(id);
+    }
+  }
+  const coExecIds = [...promotedIds]
+    .filter((id) => id !== topOrderId)
+    .sort((a, b) => {
+      const da = depth[a] ?? Number.POSITIVE_INFINITY;
+      const db = depth[b] ?? Number.POSITIVE_INFINITY;
+      if (da !== db) return da - db;
+      return a.localeCompare(b);
+    });
+  const higherOffice: PrideMember[] = [
+    topOrder,
+    ...coExecIds.map((id) => toPrideMember(graph, id)),
+  ];
+
+  // ── Tier 2 + Tier 3 — bucket every NON-PROMOTED member into a
+  // department, then resolve the lead. Members already in Higher
+  // Office (CEO + c-suite) are excluded so they don't double-bill as
+  // department leads (which was the structural middle-manager-render
+  // bug that promoted them existed to fix).
   const buckets: Record<string, string[]> = {};
   const ensureBucket = (slug: string): string[] => {
     const existing = buckets[slug];
@@ -215,12 +309,26 @@ export function flattenToThreeTiersWithPins(
     return created;
   };
 
-  // Seed buckets from the inverse index so we keep every dept slug
-  // even if its only member happens to be `topOrder`.
+  // Seed buckets from the inverse index. Skip (a) promoted members
+  // (they're in Higher Office now) and (b) executive-dept slugs
+  // themselves (they ARE Higher Office; rendering as Tier 2 would
+  // double-bill). Stragglers under exec slugs (a rare config — a
+  // non-c-suite member parked in dept=executive) fold into
+  // "unassigned" so they still surface somewhere.
   for (const [slug, ids] of Object.entries(graph.departments)) {
+    const isExecSlug = HIGHER_OFFICE_DEPT_SLUGS.has(slug.toLowerCase().trim());
+    if (isExecSlug) {
+      // Re-bucket non-promoted members of an exec slug to "unassigned"
+      // — they're orphans of the new tier rule.
+      for (const id of ids) {
+        if (promotedIds.has(id)) continue;
+        ensureBucket("unassigned").push(id);
+      }
+      continue;
+    }
     ensureBucket(slug);
     for (const id of ids) {
-      if (id === topOrderId) continue;
+      if (promotedIds.has(id)) continue;
       ensureBucket(slug).push(id);
     }
   }
@@ -228,8 +336,11 @@ export function flattenToThreeTiersWithPins(
   // Members whose own department isn't in the inverse index (shouldn't
   // happen, but defensive) are folded into an "unassigned" bucket.
   for (const [id, m] of memberEntries) {
-    if (id === topOrderId) continue;
-    const slug = m.department || "unassigned";
+    if (promotedIds.has(id)) continue;
+    const rawSlug = m.department || "unassigned";
+    const slug = HIGHER_OFFICE_DEPT_SLUGS.has(rawSlug.toLowerCase().trim())
+      ? "unassigned"
+      : rawSlug;
     const bucket = buckets[slug];
     if (!bucket) {
       ensureBucket(slug).push(id);
@@ -243,12 +354,6 @@ export function flattenToThreeTiersWithPins(
     const b = buckets[slug];
     if (b) b.sort();
   }
-
-  // Pre-compute the manager-chain depth from every member to topOrder.
-  // Members whose chain doesn't terminate at topOrder are given
-  // `Infinity` so seniority resolution still works (they're just the
-  // most junior in any tie).
-  const depth = computeDepthToTopOrder(graph, topOrderId);
 
   // Build the dept records.
   const departments: PrideDepartment[] = [];
@@ -294,7 +399,7 @@ export function flattenToThreeTiersWithPins(
     });
   }
 
-  return { topOrder, departments };
+  return { higherOffice, topOrder, departments };
 }
 
 /**
@@ -343,15 +448,22 @@ export function renderPrideChartWithPins(
   lines.push("");
 
   // ── Higher Office ──────────────────────────────────────────────
+  // Renders every Higher Office member, not just topOrder. Index 0
+  // (topOrder) keeps the 👑 glyph; co-execs get the smaller ✦
+  // marker. The Pride policy still holds (no middle managers) — c-suite
+  // members appear here BECAUSE they're peers of the top, not below.
   lines.push(`  ${paint.bar(SECTION_BAR)}${paint.section("Higher Office")}`);
-  lines.push(
-    `     ${paint.crown(tokens.crown)} ${paint.id(flat.topOrder.id)}${
-      flat.topOrder.role ? ` · ${paint.role(flat.topOrder.role)}` : ""
-    }`,
-  );
-  if (flat.topOrder.bio) {
-    lines.push(`        ${paint.bio(flat.topOrder.bio)}`);
-  }
+  flat.higherOffice.forEach((member, idx) => {
+    const glyph = idx === 0 ? tokens.crown : tokens.coExec;
+    lines.push(
+      `     ${paint.crown(glyph)} ${paint.id(member.id)}${
+        member.role ? ` · ${paint.role(member.role)}` : ""
+      }`,
+    );
+    if (member.bio) {
+      lines.push(`        ${paint.bio(member.bio)}`);
+    }
+  });
   lines.push("");
 
   // ── Departments ─────────────────────────────────────────────────
@@ -473,12 +585,19 @@ export function renderPrideTreeWithPins(
   lines.push(`     ${paint.taunt(pickTaunt(rng))}`);
   lines.push("");
 
-  // ── Top-of-org ──────────────────────────────────────────────────
-  lines.push(
-    `  ${paint.crown(tokens.crown)} ${paint.id(flat.topOrder.id)}${
-      flat.topOrder.role ? ` · ${paint.role(flat.topOrder.role)}` : ""
-    }`,
-  );
+  // ── Higher Office (Tier 1) ──────────────────────────────────────
+  // Top-of-org first with 👑, then any c-suite co-execs (CFO/COO/etc.)
+  // as sibling lines with the ✦ marker. Pride policy is reinforced:
+  // c-suite members are PEERS of the top, not middle managers of a
+  // dept they happened to be tagged with.
+  flat.higherOffice.forEach((member, idx) => {
+    const glyph = idx === 0 ? tokens.crown : tokens.coExec;
+    lines.push(
+      `  ${paint.crown(glyph)} ${paint.id(member.id)}${
+        member.role ? ` · ${paint.role(member.role)}` : ""
+      }`,
+    );
+  });
   // Vertical drop-down to the first department branch, only when
   // there ARE departments below.
   if (flat.departments.length > 0) {
@@ -665,11 +784,20 @@ export function renderPrideColumnsWithPins(
   lines.push(centerInWidth(pickTaunt(rng), totalWidth, paint.taunt));
   lines.push("");
 
-  // Top-of-org box
-  const topInner = [
+  // Top-of-org box. Now houses the entire Higher Office band: CEO
+  // first with 👑, then any c-suite co-execs (CFO/COO/etc.) on
+  // their own line with the ✦ marker. The box grows taller as the
+  // org adds c-suite members; spine drop still anchors to the
+  // bottom-center so dept connections stay aligned.
+  const topInner: string[] = [
     `${tokens.crown} ${flat.topOrder.id}`,
     flat.topOrder.role ?? "",
   ];
+  for (let i = 1; i < flat.higherOffice.length; i++) {
+    const ce = flat.higherOffice[i];
+    if (!ce) continue;
+    topInner.push(`${tokens.coExec} ${ce.id}${ce.role ? ` · ${ce.role}` : ""}`);
+  }
   const topBox = renderBoxLines(topInner, topBoxWidth, bx, paint, {
     bottomCenterChar: N > 0 ? bx.t : undefined,
   });
@@ -921,6 +1049,13 @@ const SECTION_BAR = "▌"; // ▌
 interface DisplayTokens {
   lion: string;
   crown: string;
+  /**
+   * Co-executive marker — used for Higher Office members other than
+   * the resolved topOrder (CFO/COO/CTO/etc. alongside the CEO).
+   * Visually distinguishable from the crown so the top-of-org stays
+   * unambiguous when there are multiple c-suite agents in Tier 1.
+   */
+  coExec: string;
   dept: string;
   bolt: string;
 }
@@ -930,6 +1065,7 @@ function pickTokens(emoji: boolean): DisplayTokens {
     return {
       lion: "\u{1f981}", // 🦁
       crown: "\u{1f451}", // 👑
+      coExec: "✦", // ✦ — four-pointed star, visually below the crown
       dept: "\u{1f3db}", // 🏛
       bolt: "⚡", // ⚡
     };
@@ -937,6 +1073,7 @@ function pickTokens(emoji: boolean): DisplayTokens {
   return {
     lion: "*",
     crown: "[TOP]",
+    coExec: "[CXO]",
     dept: "[DEPT]",
     bolt: "!",
   };

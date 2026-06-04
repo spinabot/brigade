@@ -134,7 +134,13 @@ export function renderPrideHtmlWithPins(
   const colsTotalW =
     colWidths.reduce((a, b) => a + b, 0) +
     Math.max(0, N - 1) * COL_GUTTER_X;
-  const contentW = Math.max(TOP_CARD.w, colsTotalW);
+  // Higher Office band can also push canvas width when there are
+  // multiple c-suite members in a row.
+  const HIGHER_OFFICE_GAP_PEEK = 24;
+  const higherOfficeBandWidth =
+    flat.higherOffice.length * TOP_CARD.w +
+    Math.max(0, flat.higherOffice.length - 1) * HIGHER_OFFICE_GAP_PEEK;
+  const contentW = Math.max(higherOfficeBandWidth, colsTotalW);
   const totalW = contentW + PAD * 2;
 
   const maxBlockH = Math.max(0, ...blocks.map((b) => b.blockH));
@@ -164,8 +170,19 @@ export function renderPrideHtmlWithPins(
   }
   const colCenters = colLefts.map((left, i) => left + colWidths[i]! / 2);
 
-  const topCardX = (totalW - TOP_CARD.w) / 2;
   const topCardY = PAD + HEADER_H;
+  // Higher Office band layout — when there are co-execs (CFO/COO/...)
+  // the band is a HORIZONTAL ROW of cards. CEO sits at the centre slot
+  // so the spine still drops cleanly from its bottom-centre into the
+  // dept row below; co-execs flank alternating right/left for visual
+  // balance. With a single Higher Office member this collapses to the
+  // original single centred card.
+  const HIGHER_OFFICE_GAP = 24;
+  const N_HO = flat.higherOffice.length;
+  const bandWidth = N_HO * TOP_CARD.w + Math.max(0, N_HO - 1) * HIGHER_OFFICE_GAP;
+  const bandStart = (totalW - bandWidth) / 2;
+  const ceoSlot = Math.floor((N_HO - 1) / 2);
+  const topCardX = bandStart + ceoSlot * (TOP_CARD.w + HIGHER_OFFICE_GAP);
   const topCenterX = topCardX + TOP_CARD.w / 2;
   const leadCardY = topCardY + TOP_CARD.h + SPINE_Y_GAP;
   const spineY = topCardY + TOP_CARD.h + SPINE_Y_GAP / 2;
@@ -215,21 +232,49 @@ export function renderPrideHtmlWithPins(
     (a, d) => a + 1 + d.team.length,
     0,
   );
-  body.push(
-    leadCardHtml({
-      x: topCardX,
-      y: topCardY,
-      w: TOP_CARD.w,
-      h: TOP_CARD.h,
-      emoji: "👑",
-      name: flat.topOrder.id,
-      role: flat.topOrder.role ?? "Top of org",
-      platformTag,
-      badgeCount: totalTeamCount > 0 ? totalTeamCount : undefined,
-      tier: "top",
-      tierBadge: "HIGHER OFFICE",
-    }),
-  );
+  // Higher Office band — emit one card per member. CEO goes in
+  // `ceoSlot` (the centre), co-execs alternate right/left around it
+  // for visual balance. Slot layout is deterministic so renders are
+  // order-stable across calls with the same graph.
+  const slotOrder: number[] = new Array(N_HO).fill(0);
+  slotOrder[ceoSlot] = 0;
+  {
+    let leftCursor = ceoSlot - 1;
+    let rightCursor = ceoSlot + 1;
+    for (let i = 1; i < N_HO; i++) {
+      if (i % 2 === 1 && rightCursor < N_HO) {
+        slotOrder[rightCursor] = i;
+        rightCursor += 1;
+      } else if (leftCursor >= 0) {
+        slotOrder[leftCursor] = i;
+        leftCursor -= 1;
+      } else if (rightCursor < N_HO) {
+        slotOrder[rightCursor] = i;
+        rightCursor += 1;
+      }
+    }
+  }
+  for (let slot = 0; slot < N_HO; slot++) {
+    const memberIdx = slotOrder[slot]!;
+    const member = flat.higherOffice[memberIdx]!;
+    const isCeo = memberIdx === 0;
+    const cardX = bandStart + slot * (TOP_CARD.w + HIGHER_OFFICE_GAP);
+    body.push(
+      leadCardHtml({
+        x: cardX,
+        y: topCardY,
+        w: TOP_CARD.w,
+        h: TOP_CARD.h,
+        emoji: isCeo ? "👑" : "✦",
+        name: member.id,
+        role: member.role ?? (isCeo ? "Top of org" : "C-suite"),
+        platformTag,
+        badgeCount: isCeo && totalTeamCount > 0 ? totalTeamCount : undefined,
+        tier: "top",
+        tierBadge: "HIGHER OFFICE",
+      }),
+    );
+  }
 
   if (N > 0) {
     flat.departments.forEach((d, i) => {
