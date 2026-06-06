@@ -30,3 +30,6 @@ coverage/
 
 # Misc
 test.txt
+
+# VSCode workspace files
+*.code-workspace
