@@ -51,6 +51,7 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 					hydrateSessionCaches(ctx.store, cfg as Record<string, unknown>),
 					hydrateApprovalCaches(ctx.store, cfg as Record<string, unknown>),
 					hydrateAccessCaches(ctx.store),
+					hydrateCronCache(ctx.store),
 				]);
 			}
 			setRuntimeContext(ctx);
@@ -148,6 +149,18 @@ async function hydrateAccessCaches(store: BrigadeStore): Promise<void> {
 		console.error(
 			`brigade: channel-access hydration failed — ${(err as Error).message}`,
 		);
+	}
+}
+
+/** Convex mode boot — install the cron jobs into the cron cache so the
+ *  cron service's whole-file load/save choke points serve from memory. */
+async function hydrateCronCache(store: BrigadeStore): Promise<void> {
+	try {
+		const { primeCronCache } = await import("./cron-cache.js");
+		const jobs = await store.cron.listJobs();
+		primeCronCache(jobs as never[]);
+	} catch (err) {
+		console.error(`brigade: cron hydration failed — ${(err as Error).message}`);
 	}
 }
 

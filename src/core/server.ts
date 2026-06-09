@@ -4410,6 +4410,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			} catch {
 				/* best-effort */
 			}
+			try {
+				const { awaitCronFlush } = await import("../storage/cron-cache.js");
+				await awaitCronFlush();
+			} catch {
+				/* best-effort */
+			}
 			// Dispose the agent-events bridge + every registered handler +
 			// the in-process gateway caller. Order: bridge → handlers →
 			// caller so a late `callGateway()` after shutdown gets a clean

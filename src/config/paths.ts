@@ -3,6 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// NOTE: paths ⇄ storage/runtime-context is a benign ESM cycle — both sides
+// only dereference the other inside function bodies (call time), never
+// during module evaluation.
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
+
 // All filesystem paths the brigade runtime touches resolve through this module.
 // Override via BRIGADE_STATE_DIR / BRIGADE_CONFIG_PATH so tests + alt installs
 // can run isolated from ~/.brigade.
@@ -161,7 +166,33 @@ export function resolveCredentialsDir(): string {
 }
 
 export function resolveCacheDir(): string {
+  // Regenerable cache artifacts (org-chart PNGs, twemoji SVGs). In convex
+  // mode NOTHING may live under ~/.brigade, and these are machine-local
+  // scratch by nature — so convex mode uses the OS cache location:
+  //   Windows %LOCALAPPDATA%\Brigade\cache, macOS ~/Library/Caches/brigade,
+  //   Linux $XDG_CACHE_HOME|~/.cache/brigade.
+  // Filesystem mode keeps today's ~/.brigade/cache path unchanged. Pre-boot
+  // callers (no runtime context yet) also get the filesystem path, which is
+  // correct — no context means convex mode isn't active.
+  if (tryGetRuntimeContext()?.mode === "convex") {
+    return resolveOsCacheDir();
+  }
   return path.join(resolveStateDir(), "cache");
+}
+
+/** OS-conventional per-user cache root for Brigade (NOT under ~/.brigade). */
+export function resolveOsCacheDir(): string {
+  const override = process.env.BRIGADE_CACHE_DIR?.trim();
+  if (override) return path.resolve(override);
+  if (process.platform === "win32") {
+    const base = process.env.LOCALAPPDATA?.trim() || path.join(os.homedir(), "AppData", "Local");
+    return path.join(base, "Brigade", "cache");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Caches", "brigade");
+  }
+  const xdg = process.env.XDG_CACHE_HOME?.trim();
+  return path.join(xdg || path.join(os.homedir(), ".cache"), "brigade");
 }
 
 // Per-channel state root, e.g. `~/.brigade/channels/whatsapp`. Channels keep
