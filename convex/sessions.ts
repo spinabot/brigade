@@ -59,16 +59,32 @@ export const upsertEntry = mutation({
 			)
 			.first();
 		const now = Date.now();
-		const payload = {
+		if (existing) {
+			// MERGE, never replace — mirrors the filesystem store's
+			// read-modify-write (src/sessions/session-store.ts): fields the
+			// caller omits keep their stored value, `createdAt` is set once at
+			// creation, and `subagent` is write-once (only applied when the
+			// row doesn't carry one yet — session-store.ts:351-367).
+			const patch: Record<string, unknown> = {
+				sessionId: args.sessionId,
+				lastUsedAt: args.lastUsedAt ?? now,
+			};
+			if (args.provider !== undefined) patch.provider = args.provider;
+			if (args.modelId !== undefined) patch.modelId = args.modelId;
+			if (args.authProfile !== undefined) patch.authProfile = args.authProfile;
+			if (args.thinkingLevel !== undefined) patch.thinkingLevel = args.thinkingLevel;
+			if (args.extra !== undefined) patch.extra = args.extra;
+			if (args.subagent !== undefined && existing.subagent === undefined) {
+				patch.subagent = args.subagent;
+			}
+			await ctx.db.patch(existing._id, patch);
+			return await ctx.db.get(existing._id);
+		}
+		const id = await ctx.db.insert("sessions", {
 			...args,
 			createdAt: args.createdAt ?? now,
 			lastUsedAt: args.lastUsedAt ?? now,
-		};
-		if (existing) {
-			await ctx.db.replace(existing._id, payload);
-			return await ctx.db.get(existing._id);
-		}
-		const id = await ctx.db.insert("sessions", payload);
+		});
 		return await ctx.db.get(id);
 	},
 });
