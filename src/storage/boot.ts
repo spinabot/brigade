@@ -50,6 +50,7 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 				await Promise.all([
 					hydrateSessionCaches(ctx.store, cfg as Record<string, unknown>),
 					hydrateApprovalCaches(ctx.store, cfg as Record<string, unknown>),
+					hydrateAccessCaches(ctx.store),
 				]);
 			}
 			setRuntimeContext(ctx);
@@ -131,6 +132,23 @@ async function hydrateApprovalCaches(
 			}
 		}),
 	);
+}
+
+/** Convex mode boot — install channel access state (allow lists + pending
+ *  pairings) into the access-control module's cache. One query for the
+ *  whole owner; the module groups rows by (channel, account, kind). */
+async function hydrateAccessCaches(store: BrigadeStore): Promise<void> {
+	try {
+		const { primeAccessCacheFromRows } = await import(
+			"../agents/channels/access-control/store.js"
+		);
+		const rows = await store.channels.listAllAccessRows();
+		primeAccessCacheFromRows(rows);
+	} catch (err) {
+		console.error(
+			`brigade: channel-access hydration failed — ${(err as Error).message}`,
+		);
+	}
 }
 
 let _configLiveUnsub: (() => void) | undefined;

@@ -91,6 +91,40 @@ export class LocalChannelStore implements ChannelStore {
 			: removeAllowFrom(args.channelId, args.senderId, acct);
 	}
 
+	/** Local mode never hydrates an access cache — the filesystem functions
+	 *  read their JSON files directly. Empty keeps boot uniform. */
+	async listAllAccessRows(): Promise<
+		Array<{
+			channelId: string;
+			accountId: string;
+			kind: "allow-from" | "group-allow-from" | "pairing";
+			senderId: string;
+			senderName?: string;
+			code?: string;
+			createdAt: string;
+			lastSeenAt: string;
+		}>
+	> {
+		return [];
+	}
+
+	/** No-op locally — the access-control module already wrote the JSON file
+	 *  before the dispatcher would ever consider reconciling. */
+	async reconcileAccessRows(_args: {
+		channelId: string;
+		accountId?: string | null;
+		kind: "allow-from" | "group-allow-from" | "pairing";
+		rows: Array<{
+			senderId: string;
+			senderName?: string;
+			code?: string;
+			createdAt: string;
+			lastSeenAt: string;
+		}>;
+	}): Promise<void> {
+		// Filesystem mode persists via the access-control module itself.
+	}
+
 	// ---------------------------------------------------------------------
 	// Pairing
 	// ---------------------------------------------------------------------

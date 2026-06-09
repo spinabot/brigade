@@ -24,9 +24,150 @@ import {
 	resolveChannelStateDir,
 } from "../../../config/paths.js";
 import { createSubsystemLogger } from "../../../logging/subsystem-logger.js";
+import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
 import type { PairingRequest } from "./types.js";
 
 const log = createSubsystemLogger("channels/access-control");
+
+/* ───────────────────── convex-mode dispatch plumbing ───────────────────── */
+//
+// In convex mode the per-channel JSON files never exist — state lives in the
+// channelAccess table. The policy code below (normalisation, pruning, code
+// generation, caps) is identical in both modes; only the three primitives
+// dispatch: `readJson` serves an in-process cache, `writeJsonAtomic` primes
+// the cache + enqueues a transactional row-set reconcile, and `withFileLock`
+// skips the lockfile (no file to lock; JS single-threading serialises the
+// sync read-modify-write in-process, Convex linearises across processes).
+//
+// Path→semantics registry: the path resolvers are the natural cache keys —
+// each resolved path is registered with its (channelId, accountId, kind) so
+// the write primitive knows which row set to reconcile.
+
+type AccessKindName = "allow-from" | "group-allow-from" | "pairing";
+interface AccessSem {
+	channelId: string;
+	accountId: string;
+	kind: AccessKindName;
+}
+
+const accessCache = new Map<string, unknown>();
+const pathSem = new Map<string, AccessSem>();
+let accessFlushChain: Promise<void> = Promise.resolve();
+
+function inConvexMode(): boolean {
+	return tryGetRuntimeContext()?.mode === "convex";
+}
+
+function allowFromPath(channelId: string, acct: string | null): string {
+	const p = resolveChannelAllowFromPath(channelId, acct);
+	pathSem.set(p, { channelId, accountId: acct ?? "default", kind: "allow-from" });
+	return p;
+}
+function groupAllowFromPath(channelId: string, acct: string | null): string {
+	const p = resolveChannelGroupAllowFromPath(channelId, acct);
+	pathSem.set(p, { channelId, accountId: acct ?? "default", kind: "group-allow-from" });
+	return p;
+}
+function pairingPath(channelId: string, acct: string | null): string {
+	const p = resolveChannelPairingPath(channelId, acct);
+	pathSem.set(p, { channelId, accountId: acct ?? "default", kind: "pairing" });
+	return p;
+}
+
+/** Convex-mode boot hydration — install the full access state (one
+ *  listAllAccessRows query, grouped here) into the in-process cache. */
+export function primeAccessCacheFromRows(
+	rows: Array<{
+		channelId: string;
+		accountId: string;
+		kind: AccessKindName;
+		senderId: string;
+		senderName?: string;
+		code?: string;
+		createdAt: string;
+		lastSeenAt: string;
+	}>,
+): void {
+	const grouped = new Map<string, typeof rows>();
+	for (const row of rows) {
+		const acct = row.accountId === "default" ? null : row.accountId;
+		const p =
+			row.kind === "allow-from"
+				? allowFromPath(row.channelId, acct)
+				: row.kind === "group-allow-from"
+					? groupAllowFromPath(row.channelId, acct)
+					: pairingPath(row.channelId, acct);
+		const bucket = grouped.get(p) ?? [];
+		bucket.push(row);
+		grouped.set(p, bucket);
+	}
+	for (const [p, bucket] of grouped) {
+		const sem = pathSem.get(p) as AccessSem;
+		if (sem.kind === "pairing") {
+			accessCache.set(p, {
+				version: 1,
+				requests: bucket.map((r) => ({
+					senderId: r.senderId,
+					...(r.senderName !== undefined ? { senderName: r.senderName } : {}),
+					code: r.code ?? "",
+					createdAt: r.createdAt,
+					lastSeenAt: r.lastSeenAt,
+				})),
+			});
+		} else {
+			accessCache.set(p, { version: 1, allowFrom: bucket.map((r) => r.senderId) });
+		}
+	}
+}
+
+function enqueueAccessReconcile(filePath: string, value: unknown): void {
+	const sem = pathSem.get(filePath);
+	const rctx = tryGetRuntimeContext();
+	if (!sem || !rctx) return;
+	const nowIso = new Date().toISOString();
+	const rows =
+		sem.kind === "pairing"
+			? ((value as { requests?: PairingRequest[] }).requests ?? []).map((r) => ({
+					senderId: r.senderId,
+					...(r.senderName !== undefined ? { senderName: r.senderName } : {}),
+					code: r.code,
+					createdAt: r.createdAt,
+					lastSeenAt: r.lastSeenAt,
+				}))
+			: ((value as { allowFrom?: string[] }).allowFrom ?? []).map((senderId) => ({
+					senderId,
+					createdAt: nowIso,
+					lastSeenAt: nowIso,
+				}));
+	const store = rctx.store;
+	accessFlushChain = accessFlushChain
+		.then(() =>
+			store.channels.reconcileAccessRows({
+				channelId: sem.channelId,
+				accountId: sem.accountId === "default" ? null : sem.accountId,
+				kind: sem.kind,
+				rows,
+			}),
+		)
+		.catch((err) => {
+			console.error(
+				`brigade: access-control write to convex failed (${sem.channelId}/${sem.kind}) — ${(err as Error).message}`,
+			);
+		});
+}
+
+/** Resolves when every access-control mutation enqueued so far reached the
+ *  backend (convex mode). */
+export function awaitAccessFlush(): Promise<void> {
+	return accessFlushChain;
+}
+
+/** Test-only. */
+export function __resetAccessCacheForTests(): void {
+	accessCache.clear();
+	pathSem.clear();
+	accessFlushChain = Promise.resolve();
+}
 
 // Code alphabet: deliberately drops `0/O/1/I` so an operator reading a code
 // over voice or copying from a screenshot can't fumble it. 32^8 ≈ 1.1×10¹²
@@ -45,6 +186,10 @@ function ensureParentDir(filePath: string): void {
 }
 
 function readJson<T>(filePath: string, fallback: T): T {
+	if (inConvexMode()) {
+		const cached = accessCache.get(filePath);
+		return cached !== undefined ? (structuredClone(cached) as T) : fallback;
+	}
 	if (!existsSync(filePath)) return fallback;
 	let raw: string;
 	try {
@@ -77,6 +222,11 @@ function readJson<T>(filePath: string, fallback: T): T {
 }
 
 function writeJsonAtomic(filePath: string, value: unknown): void {
+	if (inConvexMode()) {
+		accessCache.set(filePath, structuredClone(value));
+		enqueueAccessReconcile(filePath, value);
+		return;
+	}
 	ensureParentDir(filePath);
 	const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
 	writeFileSync(tmp, JSON.stringify(value, null, 2));
@@ -93,6 +243,12 @@ function writeJsonAtomic(filePath: string, value: unknown): void {
  * so we don't propagate async through the CLI surface).
  */
 function withFileLock<T>(filePath: string, fn: () => T): T {
+	if (inConvexMode()) {
+		// No file to lock. The callers' read-modify-write is synchronous, so
+		// JS single-threading already serialises it in-process; cross-process
+		// writes are linearised by the Convex reconcile mutation.
+		return fn();
+	}
 	ensureParentDir(filePath);
 	// proper-lockfile requires the target to exist; create an empty placeholder
 	// if needed — the real content lands when fn() calls writeJsonAtomic.
@@ -145,11 +301,11 @@ interface AllowFromFile {
  */
 export function readAllowFrom(channelId: string, accountId?: string | null): string[] {
 	const acct = (accountId ?? "").trim();
-	const data = readJson<AllowFromFile>(resolveChannelAllowFromPath(channelId, acct || null), { version: 1, allowFrom: [] });
+	const data = readJson<AllowFromFile>(allowFromPath(channelId, acct || null), { version: 1, allowFrom: [] });
 	const entries = (data.allowFrom ?? []).map((x) => normalizeId(x)).filter(Boolean);
 	// Multi-account legacy-merge: pull in the channel-wide legacy file too.
 	if (acct && acct !== "default") {
-		const legacy = readJson<AllowFromFile>(resolveChannelAllowFromPath(channelId, null), { version: 1, allowFrom: [] });
+		const legacy = readJson<AllowFromFile>(allowFromPath(channelId, null), { version: 1, allowFrom: [] });
 		for (const raw of legacy.allowFrom ?? []) {
 			const id = normalizeId(raw);
 			if (id) entries.push(id);
@@ -163,7 +319,7 @@ export function addAllowFrom(channelId: string, senderId: string, accountId?: st
 	const id = normalizeId(senderId);
 	if (!id) return false;
 	const acct = (accountId ?? "").trim();
-	const filePath = resolveChannelAllowFromPath(channelId, acct || null);
+	const filePath = allowFromPath(channelId, acct || null);
 	return withFileLock(filePath, () => {
 		const current = readAllowFrom(channelId, acct || null);
 		if (current.includes(id)) return false;
@@ -177,7 +333,7 @@ export function removeAllowFrom(channelId: string, senderId: string, accountId?:
 	const id = normalizeId(senderId);
 	if (!id) return false;
 	const acct = (accountId ?? "").trim();
-	const filePath = resolveChannelAllowFromPath(channelId, acct || null);
+	const filePath = allowFromPath(channelId, acct || null);
 	return withFileLock(filePath, () => {
 		const current = readAllowFrom(channelId, acct || null);
 		if (!current.includes(id)) return false;
@@ -196,7 +352,7 @@ export function addGroupAllowFrom(
 	const id = normalizeId(groupId);
 	if (!id) return false;
 	const acct = (accountId ?? "").trim();
-	const filePath = resolveChannelGroupAllowFromPath(channelId, acct || null);
+	const filePath = groupAllowFromPath(channelId, acct || null);
 	return withFileLock(filePath, () => {
 		const current = readGroupAllowFrom(channelId, acct || null);
 		if (current.includes(id)) return false;
@@ -218,7 +374,7 @@ export function removeGroupAllowFrom(
 	const id = normalizeId(groupId);
 	if (!id) return false;
 	const acct = (accountId ?? "").trim();
-	const filePath = resolveChannelGroupAllowFromPath(channelId, acct || null);
+	const filePath = groupAllowFromPath(channelId, acct || null);
 	return withFileLock(filePath, () => {
 		const current = readGroupAllowFrom(channelId, acct || null);
 		if (!current.includes(id)) return false;
@@ -233,10 +389,10 @@ export function removeGroupAllowFrom(
 /** Read the deduped, normalized GROUP allow-from list for a channel account. */
 export function readGroupAllowFrom(channelId: string, accountId?: string | null): string[] {
 	const acct = (accountId ?? "").trim();
-	const data = readJson<AllowFromFile>(resolveChannelGroupAllowFromPath(channelId, acct || null), { version: 1, allowFrom: [] });
+	const data = readJson<AllowFromFile>(groupAllowFromPath(channelId, acct || null), { version: 1, allowFrom: [] });
 	const entries = (data.allowFrom ?? []).map((x) => normalizeId(x)).filter(Boolean);
 	if (acct && acct !== "default") {
-		const legacy = readJson<AllowFromFile>(resolveChannelGroupAllowFromPath(channelId, null), { version: 1, allowFrom: [] });
+		const legacy = readJson<AllowFromFile>(groupAllowFromPath(channelId, null), { version: 1, allowFrom: [] });
 		for (const raw of legacy.allowFrom ?? []) {
 			const id = normalizeId(raw);
 			if (id) entries.push(id);
@@ -294,7 +450,7 @@ function pruneRequests(requests: PairingRequest[], now = Date.now()): PairingReq
 /** Read pending pairing requests; prunes expired/over-cap on read (under lock). */
 export function readPendingPairings(channelId: string, accountId?: string | null): PairingRequest[] {
 	const acct = (accountId ?? "").trim();
-	const filePath = resolveChannelPairingPath(channelId, acct || null);
+	const filePath = pairingPath(channelId, acct || null);
 	return withFileLock(filePath, () => {
 		const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
 		const pruned = pruneRequests(data.requests ?? []);
@@ -321,7 +477,7 @@ export function upsertPairingRequest(args: {
 	const senderId = normalizeId(args.senderId);
 	if (!senderId) throw new Error("upsertPairingRequest: senderId required");
 	const acct = (args.accountId ?? "").trim();
-	const filePath = resolveChannelPairingPath(args.channelId, acct || null);
+	const filePath = pairingPath(args.channelId, acct || null);
 	return withFileLock(filePath, () => {
 	const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
 	const now = new Date().toISOString();
@@ -357,7 +513,7 @@ export function upsertPairingRequest(args: {
 export function approvePairingCode(channelId: string, code: string, accountId?: string | null): PairingRequest | null {
 	const wanted = normalizeCode(code);
 	const acct = (accountId ?? "").trim();
-	const filePath = resolveChannelPairingPath(channelId, acct || null);
+	const filePath = pairingPath(channelId, acct || null);
 	const approved = withFileLock(filePath, (): PairingRequest | null => {
 		const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
 		const fresh = pruneRequests(data.requests ?? []);
@@ -376,7 +532,7 @@ export function approvePairingCode(channelId: string, code: string, accountId?: 
 export function revokePairingCode(channelId: string, code: string, accountId?: string | null): boolean {
 	const wanted = normalizeCode(code);
 	const acct = (accountId ?? "").trim();
-	const filePath = resolveChannelPairingPath(channelId, acct || null);
+	const filePath = pairingPath(channelId, acct || null);
 	return withFileLock(filePath, () => {
 		const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
 		const fresh = pruneRequests(data.requests ?? []);

@@ -72,6 +72,60 @@ export class ConvexChannelStore implements ChannelStore {
 		})) as boolean;
 	}
 
+	async listAllAccessRows(): Promise<
+		Array<{
+			channelId: string;
+			accountId: string;
+			kind: "allow-from" | "group-allow-from" | "pairing";
+			senderId: string;
+			senderName?: string;
+			code?: string;
+			createdAt: string;
+			lastSeenAt: string;
+		}>
+	> {
+		const rows = (await this.deps.client.query(api.channels.listAllAccess, {
+			ownerId: this.deps.ownerId,
+		})) as Array<Record<string, unknown>>;
+		return rows.map((r) => ({
+			channelId: r.channelId as string,
+			accountId: r.accountId as string,
+			kind: r.kind as "allow-from" | "group-allow-from" | "pairing",
+			senderId: bytesToString(r.senderId as ArrayBuffer),
+			...(r.senderName !== undefined ? { senderName: r.senderName as string } : {}),
+			...(r.code !== undefined ? { code: bytesToString(r.code as ArrayBuffer) } : {}),
+			createdAt: new Date((r.createdAt as number | undefined) ?? 0).toISOString(),
+			lastSeenAt: new Date((r.lastSeenAt as number | undefined) ?? 0).toISOString(),
+		}));
+	}
+
+	async reconcileAccessRows(args: {
+		channelId: string;
+		accountId?: string | null;
+		kind: "allow-from" | "group-allow-from" | "pairing";
+		rows: Array<{
+			senderId: string;
+			senderName?: string;
+			code?: string;
+			createdAt: string;
+			lastSeenAt: string;
+		}>;
+	}): Promise<void> {
+		await this.deps.client.mutation(api.channels.reconcileAccess, {
+			ownerId: this.deps.ownerId,
+			channelId: args.channelId,
+			accountId: (args.accountId ?? "default") || "default",
+			kind: args.kind,
+			rows: args.rows.map((r) => ({
+				senderId: stringToBytes(r.senderId),
+				...(r.senderName !== undefined ? { senderName: r.senderName } : {}),
+				...(r.code !== undefined ? { code: stringToBytes(r.code) } : {}),
+				createdAt: Date.parse(r.createdAt) || 0,
+				lastSeenAt: Date.parse(r.lastSeenAt) || 0,
+			})),
+		});
+	}
+
 	async listPendingPairings(_args: { channelId: string; accountId?: string | null }): Promise<PairingRequest[]> {
 		// Pairing in convex mode follows a different shape — codes are
 		// served from the channelAccess kind="pairing" rows. Read those.
