@@ -8,7 +8,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { canonicalWhatsAppId, isWaCryptoError, resolveJidToE164 } from "./connection.js";
+import { canonicalWhatsAppId, isWaCryptoError, resolveJidToE164, resolveSenderIdentity } from "./connection.js";
 
 describe("canonicalWhatsAppId", () => {
 	it("returns empty for null/undefined/empty inputs", () => {
@@ -206,6 +206,59 @@ describe("resolveJidToE164", () => {
 		} finally {
 			rmSync(authDir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("resolveSenderIdentity", () => {
+	function makeSock(lidTable: Record<string, string | null>) {
+		return {
+			signalRepository: {
+				lidMapping: {
+					getPNForLID: async (lidJid: string) => lidTable[lidJid] ?? null,
+				},
+			},
+		} as unknown as Parameters<typeof resolveSenderIdentity>[0];
+	}
+
+	it("returns null only for empty / unusable input", async () => {
+		assert.equal(await resolveSenderIdentity(null, null), null);
+		assert.equal(await resolveSenderIdentity(null, undefined), null);
+		assert.equal(await resolveSenderIdentity(null, ""), null);
+	});
+
+	it("resolves a phone jid to E.164 as the primary id", async () => {
+		const sock = makeSock({});
+		assert.deepEqual(await resolveSenderIdentity(sock, "15551234567@s.whatsapp.net"), {
+			id: "15551234567",
+			e164: "15551234567",
+		});
+	});
+
+	it("NEVER drops an unmapped LID — falls back to the canonical LID as the id", async () => {
+		const sock = makeSock({}); // no mapping on record
+		// The whole point: instead of returning null (drop), we keep the LID so
+		// a group message from a privacy-aliased member still reaches the gate.
+		assert.deepEqual(await resolveSenderIdentity(sock, "260451430568126@lid"), {
+			id: "260451430568126@lid",
+			lid: "260451430568126@lid",
+		});
+	});
+
+	it("strips the device suffix from an unmapped LID fallback", async () => {
+		const sock = makeSock({});
+		assert.deepEqual(await resolveSenderIdentity(sock, "260451430568126:7@lid"), {
+			id: "260451430568126@lid",
+			lid: "260451430568126@lid",
+		});
+	});
+
+	it("keeps BOTH e164 and lid when a LID maps to a phone (identity overlap)", async () => {
+		const sock = makeSock({ "260451430568126@lid": "447700900123@s.whatsapp.net" });
+		assert.deepEqual(await resolveSenderIdentity(sock, "260451430568126@lid"), {
+			id: "447700900123",
+			e164: "447700900123",
+			lid: "260451430568126@lid",
+		});
 	});
 });
 

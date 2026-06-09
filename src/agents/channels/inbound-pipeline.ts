@@ -381,6 +381,7 @@ export async function runChannelInboundPipeline(
 			policy: dmPolicy,
 			groupPolicy,
 			senderId: msg.from,
+			...(msg.senderLid !== undefined ? { senderLid: msg.senderLid } : {}),
 			selfId,
 			allowFrom,
 			groupAllowFrom,

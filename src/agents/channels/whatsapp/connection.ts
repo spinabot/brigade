@@ -46,8 +46,20 @@ export interface WaInboundText {
 	 * burst-spam every stranger with codes the moment Brigade reconnects.
 	 */
 	messageTimestampMs?: number;
-	/** Sender JID (canonical digits-only E.164). */
+	/**
+	 * Sender id within the channel. Canonical digits-only E.164 when the sender
+	 * could be resolved to a phone number; otherwise a stable `@lid` privacy
+	 * alias (see {@link resolveSenderIdentity}) so a group message from an
+	 * unmapped sender still reaches the gate. Routing / allow-lists key off this.
+	 */
 	from: string;
+	/**
+	 * The sender's `@lid` privacy alias, set ONLY when the phone number could
+	 * not be resolved and `from` fell back to the LID. Carried separately so the
+	 * access-control gate can recognise an allow-listed / self LID without
+	 * conflating it with an E.164 number. Undefined for resolved phone senders.
+	 */
+	senderLid?: string;
 	/** WhatsApp display name, when present. */
 	fromName?: string;
 	/** Plain message text. May be empty when only media was sent. */
@@ -297,9 +309,53 @@ export async function resolveJidToE164(
 		const m = pnJid.match(WA_PHONE_JID_RE);
 		return m ? (m[1] ?? null) : null;
 	} catch {
-		// Lookup failure (e.g. mapping not cached yet) → drop the inbound.
+		// Lookup failure (e.g. mapping not cached yet) → fall through.
 		return null;
 	}
+}
+
+/** Strip a device-id suffix (`:NN`) from a jid, leaving the bare user jid. */
+export function normalizeDeviceScopedJid(jid: string | null | undefined): string | null {
+	return jid ? jid.replace(/:\d+/, "") : null;
+}
+
+/**
+ * Resolve an inbound sender jid to a STABLE channel identity that NEVER drops a
+ * usable sender. Mirrors the reference codebase's identity model
+ * (`getPrimaryIdentityId`: e164 || jid || lid): try the phone number first, and
+ * when it can't be resolved — e.g. an unmapped `@lid` privacy alias, the common
+ * case for group participants — fall back to the canonical LID jid so the
+ * message still reaches the access-control gate instead of being silently
+ * dropped at the socket layer. The LID is a perfectly stable "same person"
+ * handle: routing, allow-lists, and per-sender sessions all key off the
+ * returned `id` exactly the way they key off a phone number.
+ *
+ * Returns:
+ *   { id: "<e164 digits>", e164: "<e164 digits>" }   — phone resolved
+ *   { id: "<digits>@lid", lid: "<digits>@lid" }       — LID alias, unmapped
+ *   { id: "<normalized jid>" }                         — other jid shape
+ *   null                                               — empty / unusable input
+ */
+export async function resolveSenderIdentity(
+	sock: WASocket | null,
+	jid: string | null | undefined,
+	authDir?: string,
+): Promise<{ id: string; e164?: string; lid?: string } | null> {
+	if (!jid) return null;
+	// Capture the LID alias whenever the sender came in via one — even when it
+	// DID map to a phone number — so the access-control gate can match on either
+	// the number or the LID (mirrors the reference codebase's identity overlap).
+	const lid = WA_LID_JID_RE.test(jid) ? (normalizeDeviceScopedJid(jid) ?? undefined) : undefined;
+	const e164 = await resolveJidToE164(sock, jid, authDir);
+	if (e164) return { id: e164, e164, ...(lid ? { lid } : {}) };
+	const normalized = normalizeDeviceScopedJid(jid) ?? jid;
+	if (!normalized) return null;
+	// Unmapped LID privacy alias — keep it verbatim as the stable identity.
+	if (lid || /@(lid|hosted\.lid)$/i.test(normalized)) {
+		return { id: normalized, lid: lid ?? normalized };
+	}
+	// Some other jid shape we couldn't map — keep it rather than dropping.
+	return { id: normalized };
 }
 
 // Reconnect backoff: 2s → 30s, ×1.8 with ±25% jitter, capped attempts so a
@@ -621,6 +677,27 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 	let sessionAgeTimer: ReturnType<typeof setTimeout> | null = null;
 	const WATCHDOG_CHECK_MS = 60_000;
 	const WATCHDOG_STALE_MS = 10 * 60 * 1_000;
+	// Connect-time liveness probe. As soon as the link opens we want proof that
+	// inbound is actually flowing — not just a socket that *says* "ready" while
+	// the server silently holds the queue (the "turn it on after a week and
+	// nothing arrives" failure). WhatsApp emits `receivedPendingNotifications:
+	// true` on `connection.update` once it has flushed everything that arrived
+	// while the device was away; a real inbound also counts as proof. If NEITHER
+	// happens within COLD_START_HEALTH_MS of connect, the socket is wedged, so we
+	// force ONE immediate clean reconnect to wake it — instead of waiting out the
+	// 10-minute watchdog. Bounded to MAX_COLD_START_KICKS per attempt so a
+	// legitimately slow flush of a huge backlog can't become a reconnect-storm.
+	const COLD_START_HEALTH_MS = 90_000;
+	const MAX_COLD_START_KICKS = 2;
+	let coldStartHealthTimer: ReturnType<typeof setTimeout> | null = null;
+	let pendingNotificationsSeen = false;
+	let coldStartKicks = 0;
+	const clearColdStartHealth = (): void => {
+		if (coldStartHealthTimer) {
+			clearTimeout(coldStartHealthTimer);
+			coldStartHealthTimer = null;
+		}
+	};
 
 	// Signal-protocol crypto errors don't reach `connection.update` — they
 	// surface as unhandled rejections from inside Baileys' async ratchet.
@@ -673,6 +750,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			sessionAgeTimer = null;
 		}
 		clearColdStartNudges();
+		clearColdStartHealth();
 		if (!s) return;
 		// Detach our own listeners explicitly first so we never drop
 		// listeners owned by callers (defense against a future cross-cutting
@@ -794,6 +872,21 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			// otherwise surface as an unhandled rejection and could crash the daemon.
 			try {
 				const { connection, lastDisconnect, qr } = update;
+				// Offline-queue flush signal — WhatsApp sets
+				// `receivedPendingNotifications: true` on `connection.update` once it
+				// has delivered everything that arrived while the device was away.
+				// That's positive proof inbound is flowing (not a connected-but-deaf
+				// socket), so we disarm the connect-time liveness probe and announce
+				// the catch-up — the operator sees "turned it on → immediately caught
+				// up", even after a week away.
+				if ((update as { receivedPendingNotifications?: boolean }).receivedPendingNotifications) {
+					if (!pendingNotificationsSeen) {
+						pendingNotificationsSeen = true;
+						coldStartKicks = 0;
+						clearColdStartHealth();
+						if (!args.linkMode) args.log("WhatsApp caught up — offline message queue flushed");
+					}
+				}
 				// Dedupe QR refreshes — Baileys re-emits the same string on its own
 				// polling cadence; only forward when the QR actually changed so the
 				// operator's terminal doesn't fill with identical QR codes.
@@ -808,6 +901,8 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 					lastInboundAt = now; // coarse "frames flowing" reset on fresh link
 					lastActivityAt = now; // watchdog clock reset on fresh link
 					connectedAtMs = now; // anchor the pairing-grace window
+					pendingNotificationsSeen = false; // re-arm the connect-time liveness probe
+					clearColdStartHealth();
 					// Gateway mode: always log the structured event.
 					// Link mode: the CLI renders the polished success card itself,
 					//   so suppress the duplicate "connected" log here.
@@ -894,6 +989,38 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 							scheduleReconnect();
 						}, sessionAge);
 						sessionAgeTimer.unref?.();
+						// Arm the connect-time liveness probe (one-shot per open). If
+						// the offline-queue flush (`receivedPendingNotifications`)
+						// hasn't arrived AND no real inbound has flowed within
+						// COLD_START_HEALTH_MS, the socket is connected-but-deaf — force
+						// ONE immediate clean reconnect so a wedged link wakes up in
+						// ~90s instead of waiting out the 10-minute watchdog. Bounded by
+						// MAX_COLD_START_KICKS so a legitimately slow flush of a huge
+						// backlog can't become a reconnect-storm; after that we leave it
+						// to the steady-state watchdog.
+						clearColdStartHealth();
+						coldStartHealthTimer = setTimeout(() => {
+							if (closed || !sock) return;
+							if (pendingNotificationsSeen) return; // queue flushed / inbound flowed — healthy
+							if (Date.now() - lastActivityAt < COLD_START_HEALTH_MS) return; // real inbound recently
+							if (coldStartKicks >= MAX_COLD_START_KICKS) {
+								args.log("WhatsApp liveness probe — still no inbound after retries; leaving it to the watchdog", {
+									kicks: coldStartKicks,
+								});
+								return;
+							}
+							coldStartKicks += 1;
+							args.log("WhatsApp liveness probe — no inbound flow after connect, forcing reconnect to wake the link", {
+								waitedMs: COLD_START_HEALTH_MS,
+								kick: coldStartKicks,
+							});
+							const dying = sock;
+							sock = null;
+							teardownSocket(dying);
+							reconnectAttempts = 0; // liveness kick isn't a failure sequence
+							scheduleReconnect({ immediate: true });
+						}, COLD_START_HEALTH_MS);
+						coldStartHealthTimer.unref?.();
 					}
 				}
 				if (connection === "close") {
@@ -980,9 +1107,16 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 		});
 
 		const messagesUpsertHandler = (payload: { messages: WAMessage[]; type: string }): void => {
-			// `notify` = live messages; `append`/history-sync are ignored so we
-			// never replay old chats on reconnect.
-			if (payload.type !== "notify") return;
+			// `notify` = live messages. `append` = the offline/history catch-up
+			// batch WhatsApp delivers on (re)connect — the messages that arrived
+			// while the device was away. We accept BOTH (mirrors the reference
+			// codebase) so a gateway turned on after a long offline window
+			// immediately surfaces what it missed; the per-message handler gates
+			// `append` to RECENT entries (within APPEND_RECENT_GRACE_MS of connect)
+			// so we catch genuinely-missed live messages without replaying the
+			// whole backlog of old chats.
+			if (payload.type !== "notify" && payload.type !== "append") return;
+			const upsertType = payload.type;
 			// Coarse "frames are flowing" clock — bumped on ANY notify, including
 			// status broadcasts and other passthrough traffic. This proves the
 			// transport is alive but says nothing about real inbound delivery,
@@ -1008,6 +1142,28 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						// Cancel any pending cold-start nudges — the queue is open
 						// and flowing, no need to keep nagging the server.
 						if (coldStartNudgeTimers.length > 0) clearColdStartNudges();
+						// Real inbound (live OR offline catch-up) proves delivery is
+						// flowing — disarm the connect-time liveness probe.
+						pendingNotificationsSeen = true;
+						clearColdStartHealth();
+						// History/offline catch-up (`append`) — process only RECENT
+						// entries so a reconnect after a long offline window surfaces
+						// genuinely-missed live messages without replaying the whole
+						// backlog of old chats. Mirrors the reference codebase's
+						// APPEND_RECENT_GRACE_MS gate. `notify` messages are always
+						// live and skip this check.
+						if (upsertType === "append") {
+							const APPEND_RECENT_GRACE_MS = 60_000;
+							const tsRaw = m.messageTimestamp;
+							const tsSec =
+								typeof tsRaw === "number"
+									? tsRaw
+									: tsRaw && typeof (tsRaw as { toNumber?: () => number }).toNumber === "function"
+										? (tsRaw as { toNumber: () => number }).toNumber()
+										: 0;
+							const tsMs = tsSec > 0 ? tsSec * 1000 : 0;
+							if (connectedAtMs !== null && tsMs < connectedAtMs - APPEND_RECENT_GRACE_MS) return;
+						}
 						const isGroup = jid.endsWith("@g.us");
 						const msgId = m.key.id;
 						// `fromMe` handling. WhatsApp surfaces TWO distinct flavours of
@@ -1082,24 +1238,27 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 								: [];
 						// Drop the message entirely only if there's no text AND no media.
 						if (!text && media.length === 0) return;
-						// Sender-jid resolution. For DMs the chat jid itself is the sender;
+						// Sender resolution. For DMs the chat jid itself is the sender;
 						// for groups the per-message `participant` carries the speaker.
-						// LID-aliased jids must be mapped to E.164 through the Baileys LID
-						// table — the leading digits of `@lid` jids are NOT a phone number.
-						// If the mapping isn't available, we DROP the message rather than
-						// inventing a fake sender id from the LID digits (which would key
-						// allow-lists and pairing requests on garbage).
+						// We resolve to a STABLE identity that NEVER drops a usable
+						// sender (mirrors the reference codebase): the phone number when
+						// the LID can be mapped, otherwise the canonical `@lid` alias
+						// itself — so a group message from a privacy-aliased member
+						// still reaches the access-control gate instead of vanishing at
+						// the socket layer. Only a genuinely empty/unusable jid drops.
 						const rawParticipant = m.key.participant?.trim();
 						const senderJid =
 							isGroup && rawParticipant && rawParticipant.length > 0 ? rawParticipant : jid;
-						const fromCanonical = await resolveJidToE164(sock, senderJid, args.authDir);
-						if (!fromCanonical) {
-							args.log("inbound dropped — could not resolve sender jid to phone (LID unmapped)", {
+						const senderIdentity = await resolveSenderIdentity(sock, senderJid, args.authDir);
+						if (!senderIdentity) {
+							args.log("inbound dropped — empty/unusable sender jid", {
 								jid,
 								participant: rawParticipant,
 							});
 							return;
 						}
+						const fromCanonical = senderIdentity.id;
+						const senderLid = senderIdentity.lid;
 						// Mentions + quoted-reply context come from the normalized message;
 						// pulled here so the manager can gate group activation cleanly and
 						// the LLM gets the "user replied to X" context for free. Async
@@ -1125,6 +1284,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 							participantId: isGroup ? rawParticipant : undefined,
 							messageTimestampMs: typeof tsSec === "number" && tsSec > 0 ? tsSec * 1000 : undefined,
 							from: fromCanonical,
+							senderLid,
 							fromName: m.pushName ?? undefined,
 							text,
 							chatType: isGroup ? "group" : "direct",
@@ -1421,6 +1581,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 				clearInterval(watchdogTimer);
 				watchdogTimer = null;
 			}
+			clearColdStartHealth();
 			// Remove the process-level crypto-rejection trap — otherwise a
 			// torn-down connection's handler survives and could touch a `sock`
 			// that's been nulled out (the `closed` guard catches that, but it's

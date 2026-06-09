@@ -153,6 +153,7 @@ export function createWhatsAppAdapter(opts: CreateWhatsAppAdapterOptions = {}): 
 						participantId: msg.participantId,
 						messageTimestampMs: msg.messageTimestampMs,
 						from: msg.from,
+						senderLid: msg.senderLid,
 						fromName: msg.fromName,
 						text: msg.text,
 						chatType: msg.chatType,

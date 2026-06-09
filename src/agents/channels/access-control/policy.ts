@@ -13,6 +13,15 @@ import type { AccessDecision, DmPolicy } from "./types.js";
 export interface EvaluateAccessArgs {
 	policy: DmPolicy;
 	senderId: string;
+	/**
+	 * Secondary sender handle (e.g. a WhatsApp `@lid` privacy alias) for senders
+	 * that can be addressed by more than one stable id. When present, allow-list
+	 * and self checks match if EITHER `senderId` OR `senderLid` matches —
+	 * mirrors the reference codebase's identity overlap so a sender allow-listed
+	 * by phone number is still recognised when they arrive via their LID, and
+	 * vice-versa.
+	 */
+	senderLid?: string;
 	/** The linked-self id, when known (operator messaging themselves → allow). */
 	selfId?: string;
 	/** Approved senders for this channel (from `allow-from.json` + config). */
@@ -44,9 +53,15 @@ function eq(a: string, b: string): boolean {
  * happens BEFORE the per-entry comparison so an empty / partial list with
  * `*` still matches.
  */
-function isOnAllowList(senderId: string, allowFrom: ReadonlyArray<string>): boolean {
+function isOnAllowList(
+	senderId: string,
+	allowFrom: ReadonlyArray<string>,
+	senderLid?: string,
+): boolean {
 	for (const entry of allowFrom) if (entry === "*") return true;
-	return allowFrom.includes(senderId);
+	// Identity overlap — a sender matches if the list carries EITHER of their
+	// stable handles (phone number OR `@lid` privacy alias).
+	return allowFrom.includes(senderId) || (senderLid !== undefined && allowFrom.includes(senderLid));
 }
 
 /**
@@ -55,7 +70,10 @@ function isOnAllowList(senderId: string, allowFrom: ReadonlyArray<string>): bool
  * code on a `challenge` decision (so the evaluator stays pure).
  */
 export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
-	const isSelf = !!(args.selfId && eq(args.selfId, args.senderId));
+	const isSelf = !!(
+		args.selfId &&
+		(eq(args.selfId, args.senderId) || (args.senderLid !== undefined && eq(args.selfId, args.senderLid)))
+	);
 	// Group branch — completely separate gate from DMs. A `pairing` group policy
 	// is intentionally degraded to "allowlist" semantics: spamming pairing codes
 	// at strangers in a group is worse than just being silent.
@@ -83,7 +101,7 @@ export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
 		// allow-listed here — they don't need to add themselves — but they
 		// STILL need to mention the bot to be heard. A `*` in the list is
 		// a wildcard and matches everyone (still mention-gated below).
-		const senderAllowed = isSelf || isOnAllowList(args.senderId, allow);
+		const senderAllowed = isSelf || isOnAllowList(args.senderId, allow, args.senderLid);
 		if (!senderAllowed) return { kind: "block", reason: "group:not-allowlisted" };
 		return args.mentioned
 			? {
@@ -109,11 +127,12 @@ export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
 		case "disabled":
 			return { kind: "block", reason: "policy:disabled" };
 		case "allowlist":
-			return isOnAllowList(args.senderId, args.allowFrom)
+			return isOnAllowList(args.senderId, args.allowFrom, args.senderLid)
 				? { kind: "allow", reason: "allow-from" }
 				: { kind: "block", reason: "not-allowlisted" };
 		case "pairing":
-			if (isOnAllowList(args.senderId, args.allowFrom)) return { kind: "allow", reason: "allow-from" };
+			if (isOnAllowList(args.senderId, args.allowFrom, args.senderLid))
+				return { kind: "allow", reason: "allow-from" };
 			// Caller will mint/refresh the code via the store and send a reply.
 			return { kind: "challenge", code: "", reason: "needs-pairing" };
 	}

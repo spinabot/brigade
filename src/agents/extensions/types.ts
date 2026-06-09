@@ -99,6 +99,15 @@ export interface InboundMessage {
 	messageTimestampMs?: number;
 	/** Sender id within the channel (phone/user id). */
 	from: string;
+	/**
+	 * Secondary sender id for channels (e.g. WhatsApp) where a sender can be
+	 * addressed by more than one stable handle — specifically a privacy alias
+	 * (`@lid`) alongside / instead of a phone number. When present, the
+	 * access-control gate matches the sender if EITHER `from` OR `senderLid`
+	 * appears on an allow-list. Undefined for channels / senders without an
+	 * alias.
+	 */
+	senderLid?: string;
 	/** Plain text of the message (may be empty when media has no caption). */
 	text: string;
 	/** Optional display name of the sender. */
