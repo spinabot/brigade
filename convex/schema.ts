@@ -263,6 +263,10 @@ export default defineSchema({
     aborted: v.optional(v.boolean()),
     willRetry: v.optional(v.boolean()),
     messageCount: v.optional(v.number()),
+    // auto_retry_end carries these — kept so a failed-then-recovered turn is
+    // fully reconstructable from the convex log (disk parity).
+    success: v.optional(v.boolean()),
+    finalError: v.optional(v.string()),
   })
     .index("by_owner_day", ["ownerId", "day"])
     .index("by_owner_session", ["ownerId", "sessionKey", "ts"])

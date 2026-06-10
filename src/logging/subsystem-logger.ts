@@ -227,8 +227,17 @@ export function __resetSubsystemConvexSinkForTests(): void {
 function writeFileLine(line: string): void {
   if (peekStorageMode() === "convex") {
     // Rows are structured JSON already (emit serialises before calling us).
+    // `emit` SPREADS the structured `fields` at the row's top level for the
+    // disk JSONL shape; the convex subsystemLog table instead carries them in
+    // a single `fields` column. Re-nest the non-standard keys here so the
+    // store adapter forwards them — otherwise every extra (jobId, error,
+    // counts, …) is silently dropped and the convex log is far less useful
+    // than the disk one.
     try {
-      const row = JSON.parse(line) as Record<string, unknown>;
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      const { time, level, subsystem, message, ...extras } = parsed;
+      const row: Record<string, unknown> = { time, level, subsystem, message };
+      if (Object.keys(extras).length > 0) row.fields = extras;
       if (convexRowBuffer.length < CONVEX_LOG_BUFFER_CAP) convexRowBuffer.push(row);
       scheduleConvexLogFlush();
     } catch {

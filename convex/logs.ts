@@ -40,6 +40,8 @@ export const appendSessionEvent = mutation({
 		aborted: v.optional(v.boolean()),
 		willRetry: v.optional(v.boolean()),
 		messageCount: v.optional(v.number()),
+		success: v.optional(v.boolean()),
+		finalError: v.optional(v.string()),
 	},
 	handler: async (ctx, args) => {
 		await ctx.db.insert("sessionEvents", args);
@@ -62,12 +64,31 @@ export const readSessionEventTail = query({
 export const findLastError = query({
 	args: { ownerId: v.string(), limit: v.optional(v.number()) },
 	handler: async (ctx, args) => {
-		const row = await ctx.db
+		// Mirror the disk `getLastLoggedError` scan: the most recent error is not
+		// always a tool error (isError) — it can be an auto_retry_start with an
+		// errorMessage or an aborted compaction_end. Scan today's events
+		// newest-first and return the first error-shaped row. Falls back to the
+		// isError index for older days when today has none.
+		const day = new Date().toISOString().slice(0, 10);
+		const scan = args.limit && args.limit > 0 ? args.limit : 400;
+		const recent = await ctx.db
+			.query("sessionEvents")
+			.withIndex("by_owner_day", (q) => q.eq("ownerId", args.ownerId).eq("day", day))
+			.order("desc")
+			.take(scan);
+		for (const row of recent) {
+			if (row.type === "tool_execution_end" && row.isError === true) return row;
+			if (row.type === "auto_retry_start" && typeof row.errorMessage === "string") return row;
+			if (row.type === "compaction_end" && row.aborted === true && typeof row.errorMessage === "string") {
+				return row;
+			}
+		}
+		// Nothing today — fall back to the newest tool error across all days.
+		return ctx.db
 			.query("sessionEvents")
 			.withIndex("by_owner_error", (q) => q.eq("ownerId", args.ownerId).eq("isError", true))
 			.order("desc")
 			.first();
-		return row;
 	},
 });
 
