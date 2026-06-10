@@ -95,7 +95,7 @@ export class LocalInstanceStore implements InstanceStore {
 		// Internal `SuperviseOptions.nowMs` is a CLOCK FN (`() => number`),
 		// not a timestamp. The public interface takes a literal ms timestamp
 		// for ergonomics; wrap it in a constant clock when supplied.
-		const decision = checkGatewayHealth({
+		const decision = await checkGatewayHealth({
 			...(opts?.maxStaleMs !== undefined ? { maxStaleMs: opts.maxStaleMs } : {}),
 			...(opts?.nowMs !== undefined ? { nowMs: () => opts.nowMs as number } : {}),
 		});

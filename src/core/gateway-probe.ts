@@ -98,6 +98,22 @@ export async function writeHeartbeatFile(): Promise<void> {
  * `pathOverride` is for tests; production callers leave it omitted so the
  * canonical `~/.brigade/gateway.heartbeat` is consulted.
  */
+/** Mode-aware heartbeat read — convex consults the gatewayCoord row,
+ *  filesystem reads the file. `pathOverride` (tests) forces the file. */
+export async function readHeartbeat(pathOverride?: string): Promise<GatewayHeartbeat | undefined> {
+  if (pathOverride === undefined) {
+    const rctx = tryGetRuntimeContext();
+    if (rctx?.mode === "convex") {
+      try {
+        return (await rctx.store.instance.readHeartbeat()) as GatewayHeartbeat | undefined;
+      } catch {
+        return undefined;
+      }
+    }
+  }
+  return readHeartbeatFile(pathOverride);
+}
+
 export function readHeartbeatFile(pathOverride?: string): GatewayHeartbeat | undefined {
   try {
     const raw = fs.readFileSync(pathOverride ?? GATEWAY_HEARTBEAT_PATH, "utf8");
@@ -302,6 +318,22 @@ export function readPidFile(pathOverride?: string): number | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** Mode-aware pid read — convex consults the gatewayCoord row, filesystem
+ *  reads the file. `pathOverride` (tests) forces the file. */
+export async function readPid(pathOverride?: string): Promise<number | undefined> {
+  if (pathOverride === undefined) {
+    const rctx = tryGetRuntimeContext();
+    if (rctx?.mode === "convex") {
+      try {
+        return await rctx.store.instance.readPid();
+      } catch {
+        return undefined;
+      }
+    }
+  }
+  return readPidFile(pathOverride);
 }
 
 /**

@@ -24,7 +24,7 @@ import path from "node:path";
 import * as tar from "tar";
 
 import { resolveStateDir } from "../../config/paths.js";
-import { isProcessAlive, readPidFile } from "../../core/gateway-probe.js";
+import { isProcessAlive, readPid } from "../../core/gateway-probe.js";
 
 const MANIFEST_NAME = ".brigade-backup-manifest.json";
 const EXCLUDE_DIRS = ["logs", "cache"];
@@ -43,8 +43,8 @@ interface Manifest {
 	entries: ManifestEntry[];
 }
 
-function gatewayIsRunning(): boolean {
-	const pid = readPidFile();
+async function gatewayIsRunning(): Promise<boolean> {
+	const pid = await readPid();
 	return pid != null && isProcessAlive(pid);
 }
 
@@ -105,7 +105,7 @@ export async function runBackupCreate(
 		else process.stderr.write(`${msg}\n`);
 		return 1;
 	}
-	if (gatewayIsRunning() && !args.force) {
+	if ((await gatewayIsRunning()) && !args.force) {
 		const msg = "The Brigade gateway is running. Stop it first (`brigade gateway stop`) or pass --force to back up live state.";
 		if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, reason: msg })}\n`);
 		else process.stderr.write(`${msg}\n`);
@@ -231,7 +231,7 @@ export async function runBackupRestore(
 		return 1;
 	}
 	const target = path.resolve(args.target ?? resolveStateDir());
-	if (gatewayIsRunning() && !args.force) {
+	if ((await gatewayIsRunning()) && !args.force) {
 		process.stderr.write("The Brigade gateway is running. Stop it first (`brigade gateway stop`) or pass --force.\n");
 		return 1;
 	}
