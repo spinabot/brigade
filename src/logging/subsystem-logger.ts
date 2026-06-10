@@ -23,7 +23,8 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-import { ensureDir, resolveLogsDir } from "../config/paths.js";
+import { ensureDir, resolveLogsDir, resolveStateDir } from "../config/paths.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal";
 
@@ -137,7 +138,105 @@ function emit(
 // silently strand the writer.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Convex-mode batched sink. Pre-context emits (the boot window before
+// bootRuntimeContext resolves) buffer in memory; the mode is peeked from
+// the sentinel/env DIRECTLY so a convex-mode boot never writes the log
+// file even before the context exists. Filesystem mode stays byte-
+// identical (immediate sync appendFileSync — today's behaviour).
+let modePeek: "filesystem" | "convex" | undefined;
+const convexRowBuffer: Array<Record<string, unknown>> = [];
+let convexLogFlushChain: Promise<void> = Promise.resolve();
+let convexLogFlushTimer: ReturnType<typeof setTimeout> | undefined;
+const CONVEX_LOG_FLUSH_MS = 1_000;
+const CONVEX_LOG_BUFFER_CAP = 5_000;
+
+function peekStorageMode(): "filesystem" | "convex" {
+  if (modePeek) return modePeek;
+  try {
+    const explicit = process.env.BRIGADE_MODE?.trim();
+    if (explicit === "convex" || explicit === "filesystem") {
+      modePeek = explicit;
+      return modePeek;
+    }
+    const sentinelPath = path.join(resolveStateDir(), "mode.sentinel");
+    if (fs.existsSync(sentinelPath)) {
+      const parsed = JSON.parse(fs.readFileSync(sentinelPath, "utf8")) as { mode?: string };
+      modePeek = parsed.mode === "convex" ? "convex" : "filesystem";
+      return modePeek;
+    }
+    if (process.env.BRIGADE_CONVEX_URL?.trim()) {
+      modePeek = "convex";
+      return modePeek;
+    }
+  } catch {
+    // Unreadable sentinel etc. — boot will throw a proper error; logs
+    // default to filesystem behaviour meanwhile.
+  }
+  modePeek = "filesystem";
+  return modePeek;
+}
+
+function scheduleConvexLogFlush(): void {
+  if (convexLogFlushTimer) return;
+  convexLogFlushTimer = setTimeout(() => {
+    convexLogFlushTimer = undefined;
+    void flushConvexLogRows();
+  }, CONVEX_LOG_FLUSH_MS);
+  convexLogFlushTimer.unref?.();
+}
+
+function flushConvexLogRows(): Promise<void> {
+  const ctx = tryGetRuntimeContext();
+  if (!ctx) {
+    // Store not ready yet — keep buffering (bounded); drain on next tick.
+    scheduleConvexLogFlush();
+    return convexLogFlushChain;
+  }
+  const rows = convexRowBuffer.splice(0, convexRowBuffer.length);
+  if (rows.length === 0) return convexLogFlushChain;
+  const store = ctx.store;
+  convexLogFlushChain = convexLogFlushChain
+    .then(async () => {
+      for (const row of rows) {
+        await store.logs.appendSubsystemRecord(row as never);
+      }
+    })
+    .catch(() => {
+      /* observability rows — never crash a turn for a log write */
+    });
+  return convexLogFlushChain;
+}
+
+/** Drained by the gateway on shutdown. */
+export async function awaitSubsystemLogFlush(): Promise<void> {
+  await flushConvexLogRows();
+  await convexLogFlushChain;
+}
+
+/** Test-only. */
+export function __resetSubsystemConvexSinkForTests(): void {
+  modePeek = undefined;
+  convexRowBuffer.length = 0;
+  convexLogFlushChain = Promise.resolve();
+  if (convexLogFlushTimer) {
+    clearTimeout(convexLogFlushTimer);
+    convexLogFlushTimer = undefined;
+  }
+}
+
 function writeFileLine(line: string): void {
+  if (peekStorageMode() === "convex") {
+    // Rows are structured JSON already (emit serialises before calling us).
+    try {
+      const row = JSON.parse(line) as Record<string, unknown>;
+      if (convexRowBuffer.length < CONVEX_LOG_BUFFER_CAP) convexRowBuffer.push(row);
+      scheduleConvexLogFlush();
+    } catch {
+      /* non-JSON line — drop; the stderr mirror already carried it */
+    }
+    return;
+  }
+
   if (suppressFileWrites) return;
   try {
     if (!logFilePathInitialised) {

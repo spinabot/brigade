@@ -20,7 +20,62 @@ import * as path from "node:path";
 
 import type { AgentSession, AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
+import type { BrigadeStore } from "../storage/store.js";
 import { BRIGADE_DIR } from "./config.js";
+
+/* ───────────────────── convex-mode batched sink ───────────────────── */
+// Pi fires 4-8 events per tool call — one mutation per event would be far
+// too chatty. Rows buffer here and drain in order; flush every 500 ms or
+// 100 rows, whichever first. Log rows are observability (loss-tolerant on
+// hard kill); the gateway shutdown drains the chain.
+
+const eventRowBuffer: Array<Record<string, unknown>> = [];
+let eventFlushChain: Promise<void> = Promise.resolve();
+let eventFlushTimer: ReturnType<typeof setTimeout> | undefined;
+const EVENT_FLUSH_MS = 500;
+const EVENT_FLUSH_MAX = 100;
+
+function enqueueSessionEventRow(store: BrigadeStore, row: Record<string, unknown>): void {
+	eventRowBuffer.push(row);
+	if (eventRowBuffer.length >= EVENT_FLUSH_MAX) {
+		void flushSessionEventRows(store);
+		return;
+	}
+	if (!eventFlushTimer) {
+		eventFlushTimer = setTimeout(() => {
+			eventFlushTimer = undefined;
+			void flushSessionEventRows(store);
+		}, EVENT_FLUSH_MS);
+		eventFlushTimer.unref?.();
+	}
+}
+
+function flushSessionEventRows(store: BrigadeStore): Promise<void> {
+	if (eventFlushTimer) {
+		clearTimeout(eventFlushTimer);
+		eventFlushTimer = undefined;
+	}
+	const rows = eventRowBuffer.splice(0, eventRowBuffer.length);
+	if (rows.length === 0) return eventFlushChain;
+	eventFlushChain = eventFlushChain
+		.then(async () => {
+			for (const row of rows) {
+				await store.logs.appendSessionEvent(row as never);
+			}
+		})
+		.catch(() => {
+			/* observability rows — drop on backend failure, never crash a turn */
+		});
+	return eventFlushChain;
+}
+
+/** Drained by the gateway on shutdown. */
+export async function awaitEventLogFlush(): Promise<void> {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") await flushSessionEventRows(rctx.store);
+	await eventFlushChain;
+}
 
 /** Directory we append to. Created lazily on first write. */
 const LOGS_DIR = path.join(BRIGADE_DIR, "logs");
@@ -73,11 +128,21 @@ export function attachEventLogger(session: AgentSession): () => void {
 	};
 
 	const writeEvent = (event: AgentSessionEvent): void => {
-		if (!ensureDir()) return;
 		// Build the row. Strip massive fields (full message contents repeated on
 		// every delta) — we want the log to be greppable, not a token-by-token
 		// replay. Tool calls, errors, retries, state changes are kept full.
 		const row = serializeForLog(event);
+
+		// Convex mode — batched write-behind to the sessionEvents table. This
+		// is the hottest log path in Brigade (4-8 events per tool call), so
+		// rows buffer and flush in batches; the chat never blocks on it.
+		const rctx = tryGetRuntimeContext();
+		if (rctx?.mode === "convex") {
+			enqueueSessionEventRow(rctx.store, row as Record<string, unknown>);
+			return;
+		}
+
+		if (!ensureDir()) return;
 		const filePath = todayFile();
 		// Periodically check file size and rotate before write to keep log
 		// files bounded. Cheap stat every N writes — checking on every write

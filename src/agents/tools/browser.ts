@@ -35,6 +35,8 @@ import { Type, type Static } from "typebox";
 import { buildExternalContentMeta, wrapWebContent } from "../../security/external-content.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { BRIGADE_DIR } from "../../core/config.js";
+import { resolveOsCacheDir } from "../../config/paths.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { classifyUrlForSsrf, SsrfBlockedError } from "../../infra/net/fetch-guard.js";
 import { htmlToMarkdown, stripEnvelopeMarkers, stripInvisibleUnicode } from "./web-fetch-utils.js";
 import type { AgentToolResult, AgentToolUpdateCallback, AnyBrigadeTool, BrigadeTool } from "./types.js";
@@ -288,6 +290,16 @@ function profileUserDataDir(name: string): string {
 	// Keep profile names tame — restrict to a portable charset so we
 	// don't generate unwriteable paths on Windows.
 	const safe = name.replace(/[^a-z0-9_.-]/gi, "_");
+	// Convex mode: Chromium owns this directory (SQLite + LevelDB + caches —
+	// hundreds of files only Chromium can coherently write), so it cannot
+	// ride Convex; it lives in the OS cache dir instead of ~/.brigade.
+	// Machine-local by nature: cookies/logins don't roam, which is the
+	// accepted trade-off. BRIGADE_BROWSER_USER_DATA_DIR overrides both modes.
+	const override = process.env.BRIGADE_BROWSER_USER_DATA_DIR?.trim();
+	if (override) return join(override, safe || DEFAULT_PROFILE);
+	if (tryGetRuntimeContext()?.mode === "convex") {
+		return join(resolveOsCacheDir(), "browser", safe || DEFAULT_PROFILE);
+	}
 	return join(BRIGADE_DIR, "browser", safe || DEFAULT_PROFILE);
 }
 
@@ -1678,7 +1690,13 @@ function persistCapture(args: {
 	url: string;
 	outputPath?: string;
 }): { path: string; bytes: number } {
-	const captureDir = join(BRIGADE_DIR, "captures");
+	// Convex mode: captures land in the OS cache dir, never under ~/.brigade.
+	// They're working artifacts the agent forwards (send_media reads the
+	// path) — regenerable, machine-local.
+	const captureDir =
+		tryGetRuntimeContext()?.mode === "convex"
+			? join(resolveOsCacheDir(), "captures")
+			: join(BRIGADE_DIR, "captures");
 	try {
 		mkdirSync(captureDir, { recursive: true });
 	} catch {

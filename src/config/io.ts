@@ -506,8 +506,33 @@ function writeConfigSafeInternal(config: BrigadeConfig): void {
     lastParsedConfig = structuredClone(restoredForStore);
     const store = rctx.store;
     convexConfigFlushChain = convexConfigFlushChain
-      .then(() => store.config.write(restoredForStore))
-      .then(() => {})
+      .then(async () => {
+        await store.config.write(restoredForStore);
+        // Observability parity with the disk path's 4-file commit: the
+        // audit chain + health snapshot land in their tables after the
+        // config row. Best-effort — a failed audit row never blocks the
+        // config write itself.
+        const serialized = JSON.stringify(restoredForStore, null, 2);
+        const sha = createHash("sha256").update(serialized).digest("hex");
+        await store.logs
+          .appendConfigAudit({
+            ts: new Date().toISOString(),
+            sha256: sha,
+            bytes: Buffer.byteLength(serialized, "utf8"),
+            pid: process.pid,
+          } as never)
+          .catch(() => {});
+        await store.logs
+          .writeConfigHealth({
+            ts: new Date().toISOString(),
+            configPath: "convex://brigadeConfig",
+            bytes: Buffer.byteLength(serialized, "utf8"),
+            sha256: sha,
+            mtimeMs: Date.now(),
+            pid: process.pid,
+          } as never)
+          .catch(() => {});
+      })
       .catch((err) => {
         // The cache already serves the new value in-process; surface the
         // persistence failure loudly so the operator knows the backend

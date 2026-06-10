@@ -4472,6 +4472,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			} catch {
 				/* best-effort */
 			}
+			try {
+				const { awaitEventLogFlush } = await import("./event-logger.js");
+				await awaitEventLogFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitSubsystemLogFlush } = await import(
+					"../logging/subsystem-logger.js"
+				);
+				await awaitSubsystemLogFlush();
+			} catch {
+				/* best-effort */
+			}
 			// Dispose the agent-events bridge + every registered handler +
 			// the in-process gateway caller. Order: bridge → handlers →
 			// caller so a late `callGateway()` after shutdown gets a clean
