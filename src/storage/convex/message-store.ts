@@ -156,9 +156,11 @@ export class ConvexMessageStore implements MessageStore {
 		};
 		const text = typeof e.text === "string" ? e.text : "";
 		if (!text) return false;
+		const ts = (e as { ts?: number }).ts;
 		await this.deps.client.mutation(api.messages.inboxEnqueue, {
 			sessionKey,
 			text: jsonToBytes(text),
+			...(typeof ts === "number" ? { ts } : {}),
 			...(e.contextKey !== undefined && e.contextKey !== null ? { contextKey: e.contextKey } : {}),
 			...(e.deliveryContext !== undefined ? { deliveryContext: e.deliveryContext } : {}),
 			trusted: e.trusted !== false,
@@ -186,15 +188,27 @@ export class ConvexMessageStore implements MessageStore {
 		const rows = (await this.deps.client.mutation(api.messages.inboxConsumePrefix, {
 			sessionKey,
 			prefixLength: prefix.length,
-		})) as Array<{ text: ArrayBuffer; ts: number }>;
-		return rows.map((r) => ({ text: bytesToJson<string>(r.text) ?? "", ts: r.ts })) as unknown as SystemEvent[];
+		})) as Array<{ text: ArrayBuffer; ts: number; contextKey?: string; deliveryContext?: unknown; trusted?: boolean }>;
+		return rows.map((r) => ({
+			text: bytesToJson<string>(r.text) ?? "",
+			ts: r.ts,
+			...(r.contextKey !== undefined ? { contextKey: r.contextKey } : {}),
+			...(r.deliveryContext !== undefined ? { deliveryContext: r.deliveryContext } : {}),
+			...(r.trusted !== undefined ? { trusted: r.trusted } : {}),
+		})) as unknown as SystemEvent[];
 	}
 
 	async inboxPeek(sessionKey: string): Promise<SystemEvent[]> {
 		const rows = (await this.deps.client.query(api.messages.inboxPeek, {
 			sessionKey,
-		})) as Array<{ text: ArrayBuffer; ts: number }>;
-		return rows.map((r) => ({ text: bytesToJson<string>(r.text) ?? "", ts: r.ts })) as unknown as SystemEvent[];
+		})) as Array<{ text: ArrayBuffer; ts: number; contextKey?: string; deliveryContext?: unknown; trusted?: boolean }>;
+		return rows.map((r) => ({
+			text: bytesToJson<string>(r.text) ?? "",
+			ts: r.ts,
+			...(r.contextKey !== undefined ? { contextKey: r.contextKey } : {}),
+			...(r.deliveryContext !== undefined ? { deliveryContext: r.deliveryContext } : {}),
+			...(r.trusted !== undefined ? { trusted: r.trusted } : {}),
+		})) as unknown as SystemEvent[];
 	}
 
 	async inboxHasEvents(sessionKey: string): Promise<boolean> {

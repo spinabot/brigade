@@ -102,8 +102,14 @@ function withSyncStoreLock<T>(agentId: string, fn: () => T): T {
   // sync mutex above already serialises in-process callers; the file lock
   // closes the cross-process gap. Best-effort: on lock-acquisition failure
   // we proceed without it (degraded same as before — last writer wins).
+  // Convex mode: no sessions.json on disk to lock — Convex linearises
+  // cross-process writes and the in-process mutex above covers same-process
+  // serialisation. Skip the sidecar so nothing is created under ~/.brigade.
   const filePath = resolveSessionStorePath(agentId);
-  const releaseFileLock = tryAcquireSessionStoreFileLockSync(filePath);
+  const releaseFileLock =
+    tryGetRuntimeContext()?.mode === "convex"
+      ? null
+      : tryAcquireSessionStoreFileLockSync(filePath);
   try {
     return fn();
   } finally {
@@ -402,7 +408,8 @@ export function resolveOrCreateSession(args: {
 
     // Make sure the sessions/ directory exists; the JSONL itself is created
     // lazily by Pi's SessionManager on first write.
-    ensureDir(resolveSessionsDir(agentId));
+    // Convex mode never writes the JSONL here (inMemory + factory) — skip.
+    if (tryGetRuntimeContext()?.mode !== "convex") ensureDir(resolveSessionsDir(agentId));
 
     return {
       sessionKey,
@@ -545,7 +552,8 @@ export function upsertSessionEntry(
       store.sessions[sessionKey] = entry;
     }
     writeSessionStore(agentId, store);
-    ensureDir(resolveSessionsDir(agentId));
+    // Convex mode never writes the JSONL here (inMemory + factory) — skip.
+    if (tryGetRuntimeContext()?.mode !== "convex") ensureDir(resolveSessionsDir(agentId));
     return entry;
   });
 }

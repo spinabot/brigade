@@ -18,6 +18,7 @@
 
 import { createSubsystemLogger } from "../../../logging/subsystem-logger.js";
 import { ensureDir } from "../../../config/paths.js";
+import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
 import type { BrigadeConfig } from "../../../config/types.js";
 import type {
 	ChannelAdapter,
@@ -135,7 +136,9 @@ export function createWhatsAppPlugin(
 			accountRuntimes.delete(accountId);
 		}
 		const account = ctx.account;
-		ensureDir(account.authDir);
+		// Convex mode owns auth in tables (useConvexAuthState) — don't create
+		// the on-disk auth dir under ~/.brigade (strict-zero).
+		if (tryGetRuntimeContext()?.mode !== "convex") ensureDir(account.authDir);
 
 		const factory = deps.adapterFactory ?? createWhatsAppAdapter;
 		const adapter = factory({

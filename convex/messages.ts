@@ -156,6 +156,10 @@ export const inboxEnqueue = mutation({
 	args: {
 		sessionKey: v.string(),
 		text: v.bytes(),
+		// Client-supplied ts — areSystemEventsEqual (session-inbox.ts) does
+		// ts-equality during prefix matching, so we MUST preserve the
+		// producer's timestamp rather than stamping our own.
+		ts: v.optional(v.number()),
 		contextKey: v.optional(v.string()),
 		deliveryContext: v.optional(v.any()),
 		trusted: v.boolean(),
@@ -171,7 +175,7 @@ export const inboxEnqueue = mutation({
 			sessionKey: args.sessionKey,
 			seq,
 			text: args.text,
-			ts: Date.now(),
+			ts: args.ts ?? Date.now(),
 			...(args.contextKey !== undefined ? { contextKey: args.contextKey } : {}),
 			...(args.deliveryContext !== undefined ? { deliveryContext: args.deliveryContext } : {}),
 			trusted: args.trusted,

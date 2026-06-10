@@ -50,6 +50,10 @@ function isAllowlisted(target: string): boolean {
 	// Workspace stays local (incl. .git) — operator decision.
 	if (parts[0] === "workspace") return true;
 	if (parts[0] === "agents" && parts[2] === "workspace") return true;
+	// Agent-deletion trash is local recovery state (workspace is local), so
+	// its trash is too — covers agents/.brigade-trash/**, agents/<id>/
+	// .brigade-trash/**, and a custom in-state workspace's trash.
+	if (parts.includes(".brigade-trash")) return true;
 	return false;
 }
 

@@ -79,6 +79,13 @@ export function resolveSessionStorePath(agentId: string): string {
 }
 
 export function resolveSessionTranscriptPath(agentId: string, sessionId: string): string {
+  // Convex mode: the transcript JSONL is never written (SessionManager.inMemory
+  // + the write-behind factory own it), but Pi's getSessionFile() and the
+  // advisory write-lock sidecar still need a real path — route it to the OS
+  // cache dir, NEVER under ~/.brigade. Filesystem mode unchanged.
+  if (tryGetRuntimeContext()?.mode === "convex") {
+    return path.join(resolveOsCacheDir(), "sessions", agentId, `${sessionId}.jsonl`);
+  }
   return path.join(resolveSessionsDir(agentId), `${sessionId}.jsonl`);
 }
 
