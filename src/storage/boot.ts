@@ -44,6 +44,11 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 				// BRIGADE_STRICT_MODE=off|warn|enforce (default warn).
 				const { installStrictGuard } = await import("./strict-guard.js");
 				installStrictGuard(ctx.stateDir);
+				// Wrong-key tripwire: the first encrypted boot stores the key's
+				// fingerprint; every later boot verifies it. A mismatched
+				// BRIGADE_ENCRYPTION_KEY would otherwise corrupt-on-write and
+				// fail-on-read cryptically deep inside a turn.
+				await verifyEncryptionFingerprint(ctx.store);
 				const { value } = await ctx.store.config.read();
 				// First-boot parity with the disk path: an absent row reads as
 				// `{}`; the disk path's absent-file shape is `{ agents: {} }`.
@@ -358,6 +363,52 @@ async function syncWorkspaceMirrors(
 					}
 				}
 
+				// Skills — same two-way rule, one row per workspace/skills/<name>/SKILL.md.
+				try {
+					const skillsDir = path.join(workspaceDir, "skills");
+					const convexSkills = await store.skills.list({ workspaceDir });
+					const convexByName = new Map(
+						(convexSkills.records as Array<{ name?: string; frontmatter?: string; body?: string }>)
+							.filter((r) => typeof r.name === "string")
+							.map((r) => [r.name as string, r] as const),
+					);
+					const diskNames = new Set<string>();
+					if (existsSync(skillsDir)) {
+						for (const entry of await fsp.readdir(skillsDir, { withFileTypes: true })) {
+							if (!entry.isDirectory()) continue;
+							const skillFile = path.join(skillsDir, entry.name, "SKILL.md");
+							if (!existsSync(skillFile)) continue;
+							diskNames.add(entry.name);
+							const content = await fsp.readFile(skillFile, "utf8");
+							const inConvex = convexByName.get(entry.name);
+							const convexContent = inConvex
+								? `${inConvex.frontmatter ?? ""}${inConvex.body ?? ""}`
+								: undefined;
+							if (!inConvex || convexContent !== content) {
+								await store.skills.write({
+									scope: "workspace",
+									agentId,
+									name: entry.name,
+									content,
+								} as never);
+							}
+						}
+					}
+					for (const [name, record] of convexByName) {
+						if (diskNames.has(name)) continue;
+						const skillFile = path.join(skillsDir, name, "SKILL.md");
+						await fsp.mkdir(path.dirname(skillFile), { recursive: true });
+						await fsp.writeFile(
+							skillFile,
+							`${record.frontmatter ?? ""}${record.body ?? ""}`,
+							"utf8",
+						);
+					}
+				} catch {
+					// Skills mirror is best-effort — discovery still works from
+					// disk; a fresh machine simply re-installs skills.
+				}
+
 				// Lifecycle marker — same two-way rule.
 				const diskState = dirExists
 					? await readWorkspaceState(workspaceDir)
@@ -382,6 +433,62 @@ async function syncWorkspaceMirrors(
 			}
 		}),
 	);
+}
+
+/** Convex mode boot — wrong-key tripwire. The first boot with encryption
+ *  enabled records the key's sha256 fingerprint in systemMeta; later boots
+ *  refuse loudly on mismatch instead of corrupting writes / failing reads
+ *  cryptically mid-turn. Key ROTATION goes through
+ *  BRIGADE_ENCRYPTION_KEY_OLD: when the stored fingerprint matches the OLD
+ *  key, the stored value updates to the new key's fingerprint. */
+async function verifyEncryptionFingerprint(store: BrigadeStore): Promise<void> {
+	const { encryptionStatus } = await import("./encryption.js");
+	const status = encryptionStatus();
+	if (!status.enabled || !status.primaryKeyFingerprint) return; // no key — nothing to pin
+	try {
+		const { getConvexClient } = await import("./convex/client.js");
+		const { api } = await import("../../convex/_generated/api.js");
+		const client = getConvexClient({});
+		const stored = (await client.query(api.health.getMeta, {
+			key: "encryptionFingerprint",
+		})) as string | null;
+		if (stored === null) {
+			await client.mutation(api.health.setMeta, {
+				key: "encryptionFingerprint",
+				value: status.primaryKeyFingerprint,
+			});
+			return;
+		}
+		if (stored === status.primaryKeyFingerprint) return;
+		// Rotation path: stored matches the OLD key → re-pin to the new one.
+		if (status.hasOldKey) {
+			const { createHash } = await import("node:crypto");
+			const oldHex = process.env.BRIGADE_ENCRYPTION_KEY_OLD?.trim();
+			if (oldHex) {
+				const oldFp = createHash("sha256")
+					.update(Buffer.from(oldHex, "hex"))
+					.digest("hex")
+					.slice(0, 8);
+				if (stored === oldFp) {
+					await client.mutation(api.health.setMeta, {
+						key: "encryptionFingerprint",
+						value: status.primaryKeyFingerprint,
+					});
+					return;
+				}
+			}
+		}
+		throw new Error(
+			`BRIGADE_ENCRYPTION_KEY does not match the key this deployment was sealed with ` +
+				`(stored fingerprint ${stored}, current ${status.primaryKeyFingerprint}). ` +
+				`Use the original key, or rotate properly by setting BRIGADE_ENCRYPTION_KEY_OLD ` +
+				`to the previous key alongside the new BRIGADE_ENCRYPTION_KEY.`,
+		);
+	} catch (err) {
+		// Re-throw only the deliberate mismatch error — a transient meta
+		// read failure must not block boot (the healthcheck already passed).
+		if ((err as Error).message?.includes("BRIGADE_ENCRYPTION_KEY does not match")) throw err;
+	}
 }
 
 /** Test-only — exercise the workspace mirror sync against a stub store. */

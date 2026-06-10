@@ -41,20 +41,34 @@ export class ConvexChannelStore implements ChannelStore {
 			.filter((s) => s.length > 0);
 	}
 
+	// NOTE: the legacy upsertAccess/removeAccess mutations compare sealed
+	// senderId BYTES server-side — sealing uses a random nonce per call, so
+	// byte-equality silently never matches once BRIGADE_ENCRYPTION_KEY is
+	// set (duplicates pile up; removals no-op). These methods therefore
+	// read-decrypt-reconcile: equality happens CLIENT-side on plaintext and
+	// the row set is replaced transactionally. The server stays blind.
+
 	async addAllowedSender(args: {
 		channelId: string;
 		accountId?: string | null;
 		senderId: string;
 		group?: boolean;
 	}): Promise<boolean> {
-		const result = (await this.deps.client.mutation(api.channels.upsertAccess, {
-			ownerId: this.deps.ownerId,
+		const kind = args.group ? "group-allow-from" : "allow-from";
+		const current = await this.listAllowedSenders(args);
+		if (current.includes(args.senderId)) return false;
+		const nowIso = new Date().toISOString();
+		await this.reconcileAccessRows({
 			channelId: args.channelId,
-			accountId: (args.accountId ?? "default") || "default",
-			kind: args.group ? "group-allow-from" : "allow-from",
-			senderId: stringToBytes(args.senderId),
-		})) as { changed: boolean };
-		return result.changed;
+			accountId: args.accountId ?? null,
+			kind,
+			rows: [...current, args.senderId].map((senderId) => ({
+				senderId,
+				createdAt: nowIso,
+				lastSeenAt: nowIso,
+			})),
+		});
+		return true;
 	}
 
 	async removeAllowedSender(args: {
@@ -63,13 +77,19 @@ export class ConvexChannelStore implements ChannelStore {
 		senderId: string;
 		group?: boolean;
 	}): Promise<boolean> {
-		return (await this.deps.client.mutation(api.channels.removeAccess, {
-			ownerId: this.deps.ownerId,
+		const kind = args.group ? "group-allow-from" : "allow-from";
+		const current = await this.listAllowedSenders(args);
+		if (!current.includes(args.senderId)) return false;
+		const nowIso = new Date().toISOString();
+		await this.reconcileAccessRows({
 			channelId: args.channelId,
-			accountId: (args.accountId ?? "default") || "default",
-			kind: args.group ? "group-allow-from" : "allow-from",
-			senderId: stringToBytes(args.senderId),
-		})) as boolean;
+			accountId: args.accountId ?? null,
+			kind,
+			rows: current
+				.filter((s) => s !== args.senderId)
+				.map((senderId) => ({ senderId, createdAt: nowIso, lastSeenAt: nowIso })),
+		});
+		return true;
 	}
 
 	async listAllAccessRows(): Promise<

@@ -489,6 +489,14 @@ export default defineSchema({
   // exceed the mutation arg cap) spill to Convex File Storage via
   // `storageId`. keyType is a plain string — Baileys adds types across
   // versions and a locked union would reject them.
+  // Small system-level key/value facts (encryption-key fingerprint, schema
+  // markers). Generic so future singletons don't need their own tables.
+  systemMeta: defineTable({
+    key: v.string(),
+    value: v.string(),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
   whatsappAuthCreds: defineTable({
     ownerId: v.string(),
     accountId: v.string(),

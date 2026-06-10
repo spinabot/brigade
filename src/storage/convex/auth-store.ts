@@ -41,14 +41,25 @@ interface Deps {
 // bytes (no behaviour change). See [encryption.ts](../encryption.ts).
 import { open, openJson, sealJson, sealString } from "../encryption.js";
 
-function plaintextToBytes(value: string | undefined): ArrayBuffer | undefined {
+// AAD binds each secret to its column — a row copied into a different
+// column/table fails to decrypt even with the right key (GCM-native).
+function plaintextToBytes(value: string | undefined, field?: string): ArrayBuffer | undefined {
 	if (value === undefined || value === "") return undefined;
-	return sealString(value);
+	return sealString(value, field ? `authProfiles|${field}` : undefined);
 }
 
-function bytesToPlaintext(value: ArrayBuffer | undefined | null): string | undefined {
+function bytesToPlaintext(
+	value: ArrayBuffer | undefined | null,
+	field?: string,
+): string | undefined {
 	if (!value) return undefined;
-	return open(value).toString("utf8");
+	try {
+		return open(value, field ? `authProfiles|${field}` : undefined).toString("utf8");
+	} catch {
+		// Pre-AAD rows (sealed before this hardening landed) open without
+		// the context — try once more so older data keeps working.
+		return open(value).toString("utf8");
+	}
 }
 
 /** Process-local cache for the sync getCachedCredentialSnapshot path. */
@@ -115,19 +126,19 @@ export class ConvexAuthStore implements AuthStore {
 			provider,
 			...(p.alias !== undefined ? { alias: p.alias } : {}),
 			type: p.type ?? "api_key",
-			...(plaintextToBytes(p.key) !== undefined
-				? { keyEnc: plaintextToBytes(p.key) }
+			...(plaintextToBytes(p.key, "keyEnc") !== undefined
+				? { keyEnc: plaintextToBytes(p.key, "keyEnc") }
 				: {}),
 			...(p.keyRef !== undefined ? { keyRef: p.keyRef } : {}),
-			...(plaintextToBytes(p.token) !== undefined
-				? { tokenEnc: plaintextToBytes(p.token) }
+			...(plaintextToBytes(p.token, "tokenEnc") !== undefined
+				? { tokenEnc: plaintextToBytes(p.token, "tokenEnc") }
 				: {}),
 			...(p.tokenRef !== undefined ? { tokenRef: p.tokenRef } : {}),
-			...(plaintextToBytes(p.access) !== undefined
-				? { accessEnc: plaintextToBytes(p.access) }
+			...(plaintextToBytes(p.access, "accessEnc") !== undefined
+				? { accessEnc: plaintextToBytes(p.access, "accessEnc") }
 				: {}),
-			...(plaintextToBytes(p.refresh) !== undefined
-				? { refreshEnc: plaintextToBytes(p.refresh) }
+			...(plaintextToBytes(p.refresh, "refreshEnc") !== undefined
+				? { refreshEnc: plaintextToBytes(p.refresh, "refreshEnc") }
 				: {}),
 			...(p.expires !== undefined ? { expires: p.expires } : {}),
 			...(p.metadata !== undefined ? { metadata: p.metadata } : {}),
@@ -301,15 +312,15 @@ export class ConvexAuthStore implements AuthStore {
 			type: row.type,
 		};
 		if (row.alias !== undefined) out.alias = row.alias;
-		const keyPlain = bytesToPlaintext(row.keyEnc as ArrayBuffer | undefined);
+		const keyPlain = bytesToPlaintext(row.keyEnc as ArrayBuffer | undefined, "keyEnc");
 		if (keyPlain !== undefined) out.key = keyPlain;
 		if (row.keyRef !== undefined) out.keyRef = row.keyRef;
-		const tokenPlain = bytesToPlaintext(row.tokenEnc as ArrayBuffer | undefined);
+		const tokenPlain = bytesToPlaintext(row.tokenEnc as ArrayBuffer | undefined, "tokenEnc");
 		if (tokenPlain !== undefined) out.token = tokenPlain;
 		if (row.tokenRef !== undefined) out.tokenRef = row.tokenRef;
-		const accessPlain = bytesToPlaintext(row.accessEnc as ArrayBuffer | undefined);
+		const accessPlain = bytesToPlaintext(row.accessEnc as ArrayBuffer | undefined, "accessEnc");
 		if (accessPlain !== undefined) out.access = accessPlain;
-		const refreshPlain = bytesToPlaintext(row.refreshEnc as ArrayBuffer | undefined);
+		const refreshPlain = bytesToPlaintext(row.refreshEnc as ArrayBuffer | undefined, "refreshEnc");
 		if (refreshPlain !== undefined) out.refresh = refreshPlain;
 		if (row.expires !== undefined) out.expires = row.expires;
 		if (row.metadata !== undefined) out.metadata = row.metadata;

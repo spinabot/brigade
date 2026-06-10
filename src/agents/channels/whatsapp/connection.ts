@@ -27,7 +27,7 @@ import type { ConnectionState, WAMessage, WASocket } from "@whiskeysockets/baile
 import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
 import { createDedupeCache } from "../dedupe.js";
 import { chunkText } from "./chunk.js";
-import { useConvexAuthState } from "./convex-auth-state.js";
+import { lookupLidReverseSync, useConvexAuthState } from "./convex-auth-state.js";
 import { markdownToWhatsApp } from "./format.js";
 import { extractMentions, extractReplyContext } from "./inbound-extras.js";
 import { downloadInboundMedia } from "./media.js";
@@ -247,7 +247,13 @@ interface LidLookup {
  * absent, unreadable, or carries a null/empty value.
  */
 function readLidReverseMappingSync(authDir: string | null | undefined, lidDigits: string): string | null {
-	if (!authDir || !lidDigits) return null;
+	if (!lidDigits) return null;
+	// Convex mode — the lid-mapping keys live in the keystore; the
+	// auth-state module mirrors reverse entries for exactly this sync read.
+	if (tryGetRuntimeContext()?.mode === "convex") {
+		return lookupLidReverseSync("default", lidDigits);
+	}
+	if (!authDir) return null;
 	// Best-effort filesystem read — gated by a quick exists check so the
 	// happy-path "no mapping yet" branch doesn't spam the disk.
 	try {

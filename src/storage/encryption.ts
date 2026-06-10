@@ -84,7 +84,10 @@ export function isEncryptionEnabled(): boolean {
 /** Encrypt arbitrary bytes. When no key is configured, returns the bytes
  *  unchanged (so existing data and freshly-onboarded operators without a
  *  key continue to work). */
-export function seal(plaintext: Uint8Array | ArrayBuffer | Buffer | string): ArrayBuffer {
+export function seal(
+	plaintext: Uint8Array | ArrayBuffer | Buffer | string,
+	aad?: string,
+): ArrayBuffer {
 	const key = getKeys().primary;
 	const buf = toBuffer(plaintext);
 	if (!key) {
@@ -94,6 +97,7 @@ export function seal(plaintext: Uint8Array | ArrayBuffer | Buffer | string): Arr
 	}
 	const nonce = randomBytes(NONCE_LEN);
 	const cipher = createCipheriv("aes-256-gcm", key, nonce);
+	if (aad) cipher.setAAD(Buffer.from(aad, "utf8"));
 	const ct = Buffer.concat([cipher.update(buf), cipher.final()]);
 	const tag = cipher.getAuthTag();
 	const out = Buffer.alloc(HEADER_LEN + NONCE_LEN + TAG_LEN + ct.length);
@@ -106,7 +110,10 @@ export function seal(plaintext: Uint8Array | ArrayBuffer | Buffer | string): Arr
 }
 
 /** Decrypt bytes if they carry the magic prefix; otherwise return as-is. */
-export function open(payload: Uint8Array | ArrayBuffer | Buffer | undefined | null): Buffer {
+export function open(
+	payload: Uint8Array | ArrayBuffer | Buffer | undefined | null,
+	aad?: string,
+): Buffer {
 	if (!payload) return Buffer.alloc(0);
 	const buf = toBuffer(payload);
 	if (buf.length < HEADER_LEN || buf[0] !== MAGIC) {
@@ -133,6 +140,7 @@ export function open(payload: Uint8Array | ArrayBuffer | Buffer | undefined | nu
 	const tryDecrypt = (key: Buffer): Buffer | undefined => {
 		try {
 			const dec = createDecipheriv("aes-256-gcm", key, nonce);
+			if (aad) dec.setAAD(Buffer.from(aad, "utf8"));
 			dec.setAuthTag(tag);
 			return Buffer.concat([dec.update(ct), dec.final()]);
 		} catch {
@@ -157,14 +165,17 @@ export function open(payload: Uint8Array | ArrayBuffer | Buffer | undefined | nu
 
 /** Encrypt a UTF-8 string. Returns the sealed ArrayBuffer ready to send
  *  into a Convex `v.bytes()` column. */
-export function sealString(text: string): ArrayBuffer {
-	return seal(Buffer.from(text, "utf8"));
+export function sealString(text: string, aad?: string): ArrayBuffer {
+	return seal(Buffer.from(text, "utf8"), aad);
 }
 
 /** Decrypt a sealed-or-plain ArrayBuffer back into a UTF-8 string. */
-export function openToString(payload: ArrayBuffer | Uint8Array | undefined | null): string {
+export function openToString(
+	payload: ArrayBuffer | Uint8Array | undefined | null,
+	aad?: string,
+): string {
 	if (!payload) return "";
-	return open(payload).toString("utf8");
+	return open(payload, aad).toString("utf8");
 }
 
 /** Encrypt a JSON-serialisable value. */

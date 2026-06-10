@@ -56,6 +56,41 @@ export interface ConvexAuthState {
 const FLUSH_DELAY_MS = 400;
 const FLUSH_MAX_PENDING = 64;
 
+// LID → phone reverse lookup (`lid-mapping` keyType, `<lid>_reverse` ids).
+// Baileys writes these through keys.set like every other key; connection.ts
+// needs a SYNC read for inbound sender resolution, so the auth-state keeps
+// this module-level mirror current (populated at load + on every set).
+const lidReverseMirror = new Map<string, string>(); // `${accountId}|${lid}` -> phone digits
+
+function mirrorLidEntry(accountId: string, keyId: string, value: unknown): void {
+	if (!keyId.endsWith("_reverse")) return;
+	const lid = keyId.slice(0, -"_reverse".length);
+	if (value === null || value === undefined) {
+		lidReverseMirror.delete(`${accountId}|${lid}`);
+		return;
+	}
+	// The reverse-mapping value is the phone digits — historically either a
+	// bare string or an object carrying it; normalise to digits.
+	const raw =
+		typeof value === "string"
+			? value
+			: typeof (value as { phoneNumber?: unknown }).phoneNumber === "string"
+				? ((value as { phoneNumber: string }).phoneNumber as string)
+				: JSON.stringify(value);
+	const digits = raw.replace(/\D/g, "");
+	if (digits.length >= 7) lidReverseMirror.set(`${accountId}|${lid}`, digits);
+}
+
+/** Sync LID → phone lookup for convex mode (connection.ts inbound path). */
+export function lookupLidReverseSync(accountId: string, lidDigits: string): string | null {
+	return lidReverseMirror.get(`${accountId}|${lidDigits}`) ?? null;
+}
+
+/** Test-only. */
+export function __resetLidMirrorForTests(): void {
+	lidReverseMirror.clear();
+}
+
 export async function useConvexAuthState(
 	store: BrigadeStore,
 	accountId: string,
@@ -72,7 +107,9 @@ export async function useConvexAuthState(
 	const cache = new Map<string, unknown>();
 	for (const k of loaded.keys) {
 		try {
-			cache.set(`${k.keyType}:${k.keyId}`, JSON.parse(k.valueJson, BufferJSON.reviver));
+			const value = JSON.parse(k.valueJson, BufferJSON.reviver);
+			cache.set(`${k.keyType}:${k.keyId}`, value);
+			if (k.keyType === "lid-mapping") mirrorLidEntry(accountId, k.keyId, value);
 		} catch {
 			// One undecodable key (rotated-away seal, corrupt row) must not
 			// poison the whole keystore — skip it; Baileys treats a missing
@@ -137,6 +174,7 @@ export async function useConvexAuthState(
 						for (const id in data[category]) {
 							const value = data[category][id];
 							const cacheKey = `${category}:${id}`;
+							if (category === "lid-mapping") mirrorLidEntry(accountId, id, value);
 							if (value === null || value === undefined) {
 								cache.delete(cacheKey);
 								pending.set(cacheKey, { keyType: category, keyId: id, valueJson: null });
