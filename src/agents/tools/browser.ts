@@ -824,7 +824,7 @@ const BrowserSchema = Type.Object({
 			],
 			{
 				description:
-					"For `navigate`: when to consider the nav done. `commit` = first byte (fastest, use for bot-protected pages like Justdial / Cloudflare-fronted that never fire load). `domcontentloaded` = HTML parsed (default). `load` = all resources fetched. `networkidle` = no requests for 500ms (slowest).",
+					"For `navigate`: when to consider the nav done. `commit` = first byte (fastest; use for heavily bot-protected pages that never fire load). `domcontentloaded` = HTML parsed (default). `load` = all resources fetched. `networkidle` = no requests for 500ms (slowest).",
 			},
 		),
 	),
@@ -913,7 +913,7 @@ export function makeBrowserTool(opts: MakeBrowserToolOptions = {}): AnyBrigadeTo
 		description: [
 			"Control the browser via Playwright + your system Chromium (status/start/stop/profiles/attach/tabs/open/focus/close/navigate/snapshot/screenshot/pdf/click/type/press/hover/drag/select/fill/resize/scrollIntoView/evaluate/wait/console/dialog/upload).",
 			"Auto-detects Chrome / Chromium / Edge / Brave (a supported Chromium-based browser must be installed).",
-			"Use only when existing logins/cookies matter, the page is JS-rendered, or you need UI automation / screenshots / PDF render.",
+			'Renders JavaScript and keeps cookies — a "JS-heavy" page (search results, maps, SPAs) is exactly what this tool is for, never a dead end. Use it whenever fetch_url can\'t read a page, whenever web_search is unavailable (navigate to a search-engine results URL, then snapshot the hits), and for UI automation / screenshots / PDF render / pages where existing logins matter.',
 			"The browser keeps a persistent profile under `~/.brigade/browser/default/` — cookies and Cloudflare passes survive across turns.",
 			"Screenshots + PDFs auto-save to `~/.brigade/captures/<timestamp>-<host>.<ext>` and the path is returned in details.path — point users at that path directly. Pass `outputPath` to override.",
 			"When using refs from snapshot (e.g. e12), keep the same tab: prefer passing targetId from the snapshot response into subsequent actions (click/type/wait/etc).",

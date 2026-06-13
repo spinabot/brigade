@@ -53,6 +53,26 @@ mkdirSync(DATA_DIR, { recursive: true });
 mkdirSync(join(DATA_DIR, "storage"), { recursive: true });
 mkdirSync(join(DATA_DIR, "logs"), { recursive: true });
 
+// Preflight: a second `npm run convex:dev` should say so plainly, not die
+// with an unhandled EADDRINUSE stack trace from deep inside node:net.
+import { createServer as createNetServer } from "node:net";
+function portFree(port) {
+  return new Promise((resolve) => {
+    const probe = createNetServer();
+    probe.once("error", () => resolve(false));
+    probe.once("listening", () => probe.close(() => resolve(true)));
+    probe.listen(port, BACKEND_HOST);
+  });
+}
+for (const [port, what] of [[BACKEND_PORT, "backend"], [SITE_PROXY_PORT, "site proxy"], [DASHBOARD_PORT, "dashboard"]]) {
+  if (!(await portFree(port))) {
+    console.error(`✖ Port ${port} (${what}) is already in use.`);
+    console.error(`  Is another \`npm run convex:dev\` already running?`);
+    console.error(`  If so, its dashboard is at http://${BACKEND_HOST}:${DASHBOARD_PORT} — or stop it and re-run.`);
+    process.exit(1);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 2. Stable identity — generate once, persist forever
 // ---------------------------------------------------------------------------
@@ -226,10 +246,11 @@ const dashboardServer = createServer(async (req, res) => {
     // anything replies with {type:"dashboard-credentials", adminKey,
     // deploymentUrl, deploymentName}. The page is top-level here, so
     // window.parent === window and our injected listener can be that
-    // responder. Localhost-only listener; same trust domain as the key
-    // file itself. Respects Log Out: the dashboard records it as
-    // sessionStorage adminKey = JSON '""' — we stay silent then so manual
-    // re-login still works (fresh tabs have no marker and auto-login).
+    // responder. Always answer — "Log Out" is meaningless for a localhost
+    // dashboard whose admin key lives in a file on the same machine, and
+    // any logged-out heuristic is unreliable anyway (the dashboard's own
+    // storage hook writes the same empty marker on first load that Log Out
+    // writes). Localhost-only listener; same trust domain as the key file.
     if (ext === ".html") {
       const creds =
         `{type:"dashboard-credentials",adminKey:${JSON.stringify(adminKey)},` +
@@ -238,10 +259,8 @@ const dashboardServer = createServer(async (req, res) => {
       const html = (await readFile(filePath, "utf8")).replace(
         /<head>/i,
         `<head><script>(function(){try{` +
-          `function loggedOut(){try{var k=sessionStorage.getItem("adminKey");` +
-          `return k!==null&&JSON.parse(k||"null")===""}catch(e){return false}}` +
           `window.addEventListener("message",function(ev){` +
-          `if(ev&&ev.data&&ev.data.type==="dashboard-credentials-request"&&!loggedOut()){` +
+          `if(ev&&ev.data&&ev.data.type==="dashboard-credentials-request"){` +
           `window.postMessage(${creds},"*");}});` +
           `}catch(e){}})();</script>`,
       );
@@ -257,33 +276,25 @@ const dashboardServer = createServer(async (req, res) => {
 
 dashboardServer.listen(DASHBOARD_PORT, BACKEND_HOST, () => {
   const dashboardUrl = `http://${BACKEND_HOST}:${DASHBOARD_PORT}`;
-  console.log(`\x1b[36m▌   dashboard → ${dashboardUrl}\x1b[0m`);
-  console.log(`\x1b[33m▌ Add deployment in dashboard with:\x1b[0m`);
-  console.log(`\x1b[33m▌   URL:        http://${BACKEND_HOST}:${BACKEND_PORT}\x1b[0m`);
-  console.log(`\x1b[33m▌   Admin key:  (paste contents of .convex-data/admin-key.txt)\x1b[0m`);
+  console.log(`\x1b[36m▌   dashboard → ${dashboardUrl} (logs in automatically)\x1b[0m`);
+  console.log(`\x1b[90m▌   admin key in .convex-data/admin-key.txt if you ever need it manually\x1b[0m`);
 
-  // Convenience: open the dashboard in the default browser and put the
-  // admin key on the clipboard so "add deployment" is paste-and-go.
-  // Opt out (CI / headless / "stop opening tabs") with BRIGADE_NO_BROWSER=1.
+  // Convenience: open the dashboard in the default browser — it logs in by
+  // itself via the credential handshake injected above, so there's nothing
+  // to paste. Opt out (CI / headless / "stop opening tabs") with
+  // BRIGADE_NO_BROWSER=1.
   if (process.env.BRIGADE_NO_BROWSER !== "1") {
     try {
       if (process.platform === "win32") {
-        // `start` needs the empty-title arg; clip reads the key from stdin.
+        // `start` needs the empty-title arg.
         spawn("cmd", ["/c", "start", "", dashboardUrl], { stdio: "ignore", detached: true }).unref();
-        const clip = spawn("clip", [], { stdio: ["pipe", "ignore", "ignore"] });
-        clip.stdin.end(adminKey);
-        console.log(`\x1b[32m▌   (dashboard opened · admin key copied to clipboard — just paste it)\x1b[0m`);
       } else if (process.platform === "darwin") {
         spawn("open", [dashboardUrl], { stdio: "ignore", detached: true }).unref();
-        const pb = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-        pb.stdin.end(adminKey);
-        console.log(`\x1b[32m▌   (dashboard opened · admin key copied to clipboard — just paste it)\x1b[0m`);
       } else {
         spawn("xdg-open", [dashboardUrl], { stdio: "ignore", detached: true }).unref();
-        console.log(`\x1b[32m▌   (dashboard opened — admin key is in .convex-data/admin-key.txt)\x1b[0m`);
       }
     } catch {
-      /* best-effort — the printed instructions above always work */
+      /* best-effort — the printed URL above always works */
     }
   }
   console.log(``);

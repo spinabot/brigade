@@ -30,7 +30,11 @@ import {
 } from "./web-shared.js";
 import { buildUnsupportedSearchFilterResponse } from "../extensions/modules/web-search-filters.js";
 import type { AgentToolResult, AgentToolUpdateCallback, AnyBrigadeTool, BrigadeTool } from "./types.js";
-import type { WebProviderContext, WebSearchProvider } from "../extensions/types.js";
+import type {
+	WebProviderContext,
+	WebProviderToolDefinition,
+	WebSearchProvider,
+} from "../extensions/types.js";
 
 const log = createSubsystemLogger("brigade/web");
 
@@ -135,6 +139,25 @@ const DEFAULT_COUNT = 10;
 
 const SEARCH_CACHE = new Map<string, CacheEntry<WebSearchDetails>>();
 
+/* ─────────────────────────── rate-limit cooldown ─────────────────────────── */
+
+// When a provider throws a rate-limit-shaped error it sits out this long
+// before the fallback chain tries it again — a weekly-capped backend would
+// otherwise burn a failed round-trip at the head of EVERY search until its
+// cap resets (the production incident that motivated the chain).
+const RATE_LIMIT_COOLDOWN_MS = 10 * 60_000;
+/** providerId → epoch-ms until which the provider is skipped. Process-local. */
+const RATE_LIMITED_UNTIL = new Map<string, number>();
+
+function isRateLimitError(message: string): boolean {
+	return /\b429\b|rate.?limit|quota|too many requests|weekly usage/i.test(message);
+}
+
+/** Test seam — cooldowns persist module-wide; tests must not leak across cases. */
+export function clearWebSearchRateLimitCooldownsForTests(): void {
+	RATE_LIMITED_UNTIL.clear();
+}
+
 /* ─────────────────────────── public factory ─────────────────────────── */
 
 export interface MakeWebSearchToolOptions {
@@ -148,6 +171,13 @@ export interface MakeWebSearchToolOptions {
 	 * backend for a single query without changing operator config.
 	 */
 	lookupProviderById?: (id: string) => WebSearchProvider | null;
+	/**
+	 * Error-time fallback chain (ordered; the tool dedupes by id, so loops
+	 * are impossible). Walked ONLY when an attempt throws / short-circuits
+	 * AND the model did not explicitly override the provider for this call.
+	 * Empty or absent → single-provider behavior (the pre-chain contract).
+	 */
+	fallbackProviders?: () => WebSearchProvider[];
 }
 
 /**
@@ -164,7 +194,7 @@ export function makeWebSearchTool(opts: MakeWebSearchToolOptions): AnyBrigadeToo
 	const tool: BrigadeTool<typeof WebSearchSchema, WebSearchDetails> = {
 		name: "web_search",
 		label: "web_search",
-		description: `Search the web using ${opts.provider.label}. Returns titles, URLs, and snippets for fast research.`,
+		description: `Search the web using ${opts.provider.label}. Returns titles, URLs, and snippets for fast research. FIRST step whenever you need to find a page, business, person, or fact and don't have a URL. If this tool errors (rate-limited / provider down) or returns nothing useful, do NOT drop the search task — run the search in the browser tool instead (navigate to a search-engine results URL, then snapshot), or retry with provider:"<id>" if another provider is configured.`,
 		parameters: WebSearchSchema,
 		ownerOnly: false,
 		displaySummary: "searching the web",
@@ -210,6 +240,13 @@ export function makeWebSearchTool(opts: MakeWebSearchToolOptions): AnyBrigadeToo
 			// id, not configured, denied), fall back to the default.
 			let activeProvider: WebSearchProvider = opts.provider;
 			let activeProviderTool = defaultProviderTool;
+			// When the model's per-call provider override can't be honoured (unknown
+			// id, or found-but-not-configured because its API key is missing), we keep
+			// the default provider so results still flow — but we MUST say so. Silently
+			// rerouting let the model believe it was on e.g. Brave (with Brave-only
+			// filters) while actually running on keyless DDG, which both hid the missing
+			// key from the operator and produced confusing downstream behaviour.
+			let overrideNote: string | undefined;
 			const requested = args.provider?.trim();
 			if (requested && requested !== opts.provider.id && opts.lookupProviderById) {
 				const found = opts.lookupProviderById(requested);
@@ -218,7 +255,13 @@ export function makeWebSearchTool(opts: MakeWebSearchToolOptions): AnyBrigadeToo
 					if (overrideTool) {
 						activeProvider = found;
 						activeProviderTool = overrideTool;
+					} else {
+						overrideNote = `Requested provider "${requested}" is not configured (missing API key) — used "${opts.provider.id}" instead.`;
+						log.warn("web_search override not configured", { requested, fellBackTo: opts.provider.id });
 					}
+				} else {
+					overrideNote = `Requested provider "${requested}" is unknown or not allowed — used "${opts.provider.id}" instead.`;
+					log.warn("web_search override unknown", { requested, fellBackTo: opts.provider.id });
 				}
 			}
 
@@ -261,68 +304,165 @@ export function makeWebSearchTool(opts: MakeWebSearchToolOptions): AnyBrigadeToo
 				}
 			}
 
-			const cacheKey = buildSearchCacheKey([
-				activeProvider.id,
-				query,
-				count,
-				...Object.entries(filterArgs)
-					.sort(([a], [b]) => a.localeCompare(b))
-					.map(([k, v]) => `${k}=${String(v)}`),
-			]);
-			const cached = readCache(SEARCH_CACHE, cacheKey);
-			if (cached) {
-				log.debug("web_search cache hit", { provider: activeProvider.id, query });
-				return jsonResult({ ...cached, cached: true });
+			// Build the attempt chain ONCE: the resolved provider first, then —
+			// only when the model did NOT explicitly override — the configured
+			// fallback chain (ordered, deduped by id). One provider's rate limit
+			// or outage no longer kills search outright (production incident:
+			// the default provider 429'd on a weekly quota and EVERY search
+			// died; the agent went blind and fell back to directory scraping).
+			const chain: Array<{ provider: WebSearchProvider; tool: WebProviderToolDefinition }> = [
+				{ provider: activeProvider, tool: activeProviderTool },
+			];
+			const explicitOverride = Boolean(requested && requested !== opts.provider.id);
+			if (!explicitOverride && opts.fallbackProviders) {
+				const seen = new Set([activeProvider.id]);
+				for (const candidate of opts.fallbackProviders()) {
+					if (seen.has(candidate.id)) continue;
+					seen.add(candidate.id);
+					// A rung that can't honour the call's filters would short-circuit
+					// with `unsupported_*` — skip it instead of burning an attempt.
+					if (!candidate.supportsFilters && Object.keys(filterArgs).length > 0) continue;
+					const candidateTool = candidate.createTool(opts.providerCtx);
+					if (candidateTool) chain.push({ provider: candidate, tool: candidateTool });
+				}
 			}
 
-			onUpdate?.({
-				content: [{ type: "text", text: `Searching (${activeProvider.label})…` }],
-				details: {} as WebSearchDetails,
-			});
+			const filterEntries = Object.entries(filterArgs)
+				.sort(([a], [b]) => a.localeCompare(b))
+				.map(([k, v]) => `${k}=${String(v)}`);
+			const failures: Array<{ provider: string; message: string }> = [];
 
-			const raw = await activeProviderTool.execute(
-				{ query, count, ...filterArgs },
-				signal,
-			);
+			for (const attempt of chain) {
+				// Recently rate-limited rungs sit out their cooldown so a dead
+				// provider doesn't cost a failed round-trip on every call.
+				const coolUntil = RATE_LIMITED_UNTIL.get(attempt.provider.id);
+				if (coolUntil !== undefined && Date.now() < coolUntil) {
+					failures.push({ provider: attempt.provider.id, message: "in rate-limit cooldown" });
+					continue;
+				}
 
-			// Provider can short-circuit with a typed error response — surface
-			// it 1:1 without trying to normalise it as a result set.
-			if (raw && typeof raw === "object" && typeof (raw as { error?: unknown }).error === "string") {
-				const errorRaw = raw as { error: string; message?: string; docs?: string };
-				const errorPayload: WebSearchDetails = {
+				const cacheKey = buildSearchCacheKey([attempt.provider.id, query, count, ...filterEntries]);
+				const cached = readCache(SEARCH_CACHE, cacheKey);
+				if (cached) {
+					log.debug("web_search cache hit", { provider: attempt.provider.id, query });
+					return jsonResult({ ...cached, cached: true });
+				}
+
+				onUpdate?.({
+					content: [{ type: "text", text: `Searching (${attempt.provider.label})…` }],
+					details: {} as WebSearchDetails,
+				});
+
+				let raw: Awaited<ReturnType<typeof attempt.tool.execute>>;
+				try {
+					raw = await attempt.tool.execute({ query, count, ...filterArgs }, signal);
+				} catch (err) {
+					// A provider throw (anti-bot block, non-200, network) must NOT
+					// escape as an opaque tool ✗ — and it shouldn't end the search
+					// either. Re-raise only a genuine caller abort (the watchdog /
+					// parent cancellation owns that); otherwise record the failure,
+					// start a cooldown for rate limits, and walk to the next rung.
+					if (signal?.aborted) throw err;
+					const message = err instanceof Error ? err.message : String(err);
+					if (isRateLimitError(message)) {
+						RATE_LIMITED_UNTIL.set(attempt.provider.id, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+					}
+					log.warn("web_search provider error", {
+						provider: attempt.provider.id,
+						query,
+						message,
+						remainingFallbacks: chain.length - 1 - chain.indexOf(attempt),
+					});
+					failures.push({ provider: attempt.provider.id, message });
+					continue;
+				}
+
+				// Provider short-circuited with a typed error response. With no
+				// fallback rungs this surfaces 1:1 (the pre-chain contract, also
+				// the per-call-override path); with a chain it counts as a failed
+				// rung and the walk continues.
+				if (raw && typeof raw === "object" && typeof (raw as { error?: unknown }).error === "string") {
+					const errorRaw = raw as { error: string; message?: string; docs?: string };
+					if (chain.length === 1) {
+						const errorPayload: WebSearchDetails = {
+							query,
+							provider: attempt.provider.id,
+							count,
+							tookMs: Date.now() - startedAt,
+							results: [],
+							error: errorRaw.error,
+							message: typeof errorRaw.message === "string" ? errorRaw.message : undefined,
+							docs: typeof errorRaw.docs === "string" ? errorRaw.docs : undefined,
+							externalContent: buildExternalContentMeta({
+								source: "web_search",
+								provider: attempt.provider.id,
+								wrapped: true,
+							}),
+						};
+						return jsonResult(errorPayload);
+					}
+					failures.push({
+						provider: attempt.provider.id,
+						message:
+							typeof errorRaw.message === "string"
+								? `${errorRaw.error}: ${errorRaw.message}`
+								: errorRaw.error,
+					});
+					continue;
+				}
+
+				const payload = normalizeProviderPayload({
+					raw,
+					provider: attempt.provider.id,
 					query,
-					provider: activeProvider.id,
 					count,
-					tookMs: Date.now() - startedAt,
-					results: [],
-					error: errorRaw.error,
-					message: typeof errorRaw.message === "string" ? errorRaw.message : undefined,
-					docs: typeof errorRaw.docs === "string" ? errorRaw.docs : undefined,
-					externalContent: buildExternalContentMeta({
-						source: "web_search",
-						provider: activeProvider.id,
-						wrapped: true,
-					}),
-				};
-				return jsonResult(errorPayload);
+				});
+				payload.tookMs = Date.now() - startedAt;
+				// Cache the clean payload (no notes — notes are call-specific and the
+				// cache key is the provider, which a later note-free call shares).
+				writeCache(SEARCH_CACHE, cacheKey, payload, { ttlMs: cacheTtlMs });
+				log.info("web_search ok", {
+					provider: payload.provider,
+					query,
+					count: payload.count,
+					resultCount: payload.results.length,
+					tookMs: payload.tookMs,
+					...(failures.length > 0 ? { fellBackFrom: failures.map((f) => f.provider).join(",") } : {}),
+				});
+				const fallbackNote =
+					failures.length > 0
+						? `Note: provider${failures.length > 1 ? "s" : ""} ${failures
+								.map((f) => `"${f.provider}"`)
+								.join(", ")} failed — these results are from "${attempt.provider.id}".`
+						: undefined;
+				const notes = [overrideNote, fallbackNote].filter(Boolean).join(" ");
+				return jsonResult(
+					notes
+						? { ...payload, message: payload.message ? `${payload.message} ${notes}` : notes }
+						: payload,
+				);
 			}
 
-			const payload = normalizeProviderPayload({
-				raw,
+			// Every rung failed. Surface ONE typed envelope carrying each rung's
+			// failure plus a recovery playbook the model can act on (browser-SERP
+			// fallback) instead of an opaque ✗ — recovery options that live only
+			// in code comments don't change model behaviour.
+			const summary = failures.map((f) => `${f.provider}: ${f.message}`).join(" | ");
+			const allFailedPayload: WebSearchDetails = {
+				query,
 				provider: activeProvider.id,
-				query,
 				count,
-			});
-			payload.tookMs = Date.now() - startedAt;
-			writeCache(SEARCH_CACHE, cacheKey, payload, { ttlMs: cacheTtlMs });
-			log.info("web_search ok", {
-				provider: payload.provider,
-				query,
-				count: payload.count,
-				resultCount: payload.results.length,
-				tookMs: payload.tookMs,
-			});
-			return jsonResult(payload);
+				tookMs: Date.now() - startedAt,
+				results: [],
+				error: "provider_error",
+				message: `${summary} — all search providers failed. Do NOT drop the search task: run it in the browser tool instead (navigate to a search-engine results URL such as https://www.bing.com/search?q=<query> or https://duckduckgo.com/html/?q=<query>, then snapshot to read the hits). Or tell the operator to set a search API key (e.g. BRAVE_API_KEY or TAVILY_API_KEY).`,
+				externalContent: buildExternalContentMeta({
+					source: "web_search",
+					provider: activeProvider.id,
+					wrapped: true,
+				}),
+			};
+			return jsonResult(allFailedPayload);
 		},
 	};
 	return tool;

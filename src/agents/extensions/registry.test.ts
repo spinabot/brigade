@@ -134,6 +134,61 @@ describe("BrigadeExtensionRegistry.lookupWebSearchProviderById — per-call over
 	});
 });
 
+describe("BrigadeExtensionRegistry.listWebSearchFallbackChain — error-time fallback", () => {
+	// Production incident: the default provider 429'd on a weekly quota and,
+	// with no fallback chain, every search died. The chain is what web_search
+	// walks when an attempt THROWS.
+
+	it("returns configured general-purpose providers sorted by autoDetectOrder", () => {
+		const r = makeRegistryWith([
+			fakeProvider("duckduckgo", 100, true, false),
+			fakeProvider("tavily", 20, true),
+			fakeProvider("brave", 30, true),
+		]);
+		const chain = r.listWebSearchFallbackChain({} as never);
+		assert.deepEqual(chain.map((p) => p.id), ["tavily", "brave", "duckduckgo"]);
+	});
+
+	it("excludes unconfigured providers (a keyless-but-opt-in rung must not reappear)", () => {
+		const r = makeRegistryWith([
+			fakeProvider("metered-optin", 90, false, false), // requiresCredential=false but NOT configured
+			fakeProvider("duckduckgo", 100, true, false),
+		]);
+		const chain = r.listWebSearchFallbackChain({} as never);
+		assert.deepEqual(chain.map((p) => p.id), ["duckduckgo"]);
+	});
+
+	it("excludes the specialised tier (autoDetectOrder > 100)", () => {
+		const r = makeRegistryWith([
+			fakeProvider("duckduckgo", 100, true, false),
+			fakeProvider("wikipedia", 150, true, false),
+			fakeProvider("arxiv", 165, true, false),
+		]);
+		const chain = r.listWebSearchFallbackChain({} as never);
+		assert.deepEqual(chain.map((p) => p.id), ["duckduckgo"]);
+	});
+
+	it("an operator pin disables the chain entirely (pin honored verbatim)", () => {
+		const r = makeRegistryWith([
+			fakeProvider("tavily", 20, true),
+			fakeProvider("duckduckgo", 100, true, false),
+		]);
+		const cfg = { tools: { web: { search: { provider: "tavily" } } } };
+		assert.deepEqual(r.listWebSearchFallbackChain(cfg as never), []);
+	});
+
+	it("respects allow/deny lists like the default resolver", () => {
+		const r = makeRegistryWith([
+			fakeProvider("tavily", 20, true),
+			fakeProvider("brave", 30, true),
+			fakeProvider("duckduckgo", 100, true, false),
+		]);
+		const cfg = { tools: { web: { search: { deny: ["tavily"] } } } };
+		const chain = r.listWebSearchFallbackChain(cfg as never);
+		assert.deepEqual(chain.map((p) => p.id), ["brave", "duckduckgo"]);
+	});
+});
+
 describe("BrigadeExtensionRegistry — b.tool({ create }) per-turn factory (Wave K)", () => {
 	it("invokes create({ agentId, sessionKey }) at toPiExtensionFactory replay", () => {
 		const r = new BrigadeExtensionRegistry();

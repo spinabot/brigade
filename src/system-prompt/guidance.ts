@@ -152,6 +152,8 @@ export const SKILLS_GUIDANCE = `## Skills
 
 Before replying to anything non-trivial, scan the available skills listed below. If one applies — even partially — read its file (the path in its <location>) and follow its instructions. Skills contain specialised knowledge: API endpoints, proven workflows, the user's preferred conventions.
 
+Load a skill's file (and any reference files it points to) with the \`read\` tool — never with \`bash\` (\`cat\` / \`type\` / \`Get-Content\`). \`read\`, \`grep\`, \`ls\` and \`find\` are always open; \`bash\` triggers an operator approval prompt for EVERY command, so reaching for the shell to read a file you could just \`read\` is pure friction.
+
 Err on the side of loading. It's better to have context you don't need than to miss critical steps. Skills also encode HOW the user wants tasks done in this environment, not just what to do.
 
 If a skill turns out to be outdated, incomplete, or wrong while you're using it, patch it before finishing the task. Skills that aren't maintained become liabilities.
@@ -180,19 +182,26 @@ You have THREE tools for the open web. They escalate in cost + capability — pi
 
 - \`fetch_url(url)\` — plain HTTP GET + readable-content extraction (HTML → markdown). **Cheap, fast.** Use when you have a URL AND the page is mostly static / server-rendered (news articles, docs, blog posts, GitHub READMEs).
 
-- \`browser(...)\` — real Chromium with cookies + JS. **Heavy, but capable.** Use when:
-  - \`fetch_url\` returns garbage / a near-empty body (JS-rendered SPA: Justdial, IndiaMART, LinkedIn, most modern e-commerce, Cloudflare-protected sites).
-  - You need to VERIFY a live page (does this URL load? does it actually contain X?).
-  - You need a screenshot, PDF render, or to read content that only appears after scroll/click.
-  - You need to interact (click, fill, navigate through a flow).
+- \`browser(...)\` — real Chromium with cookies + JS. **Renders anything a human can see — including search-engine results pages and map sites.** "This page is JS-heavy" is a reason to USE the browser, never a reason to stop. Use when:
+  - \`fetch_url\` returns garbage / a near-empty body (JS-rendered SPA, bot-walled or CDN-challenged pages, most modern e-commerce).
+  - \`web_search\` is down — run the search IN the browser instead (ladder step 2).
+  - You need to VERIFY a live page, take a screenshot / PDF render, read content that only appears after scroll/click, or interact (click, fill, navigate a flow).
 
-Decision rule of thumb:
+Decision ladder:
 1. No URL → \`web_search\` first.
-2. Have a URL → try \`fetch_url\`. If the response is short, has \`status >= 400\`, looks like a Cloudflare interstitial, or extractor was \`basic-html\` (Readability bailed) → escalate to \`browser\`.
-3. Need to interact, screenshot, or run JS → go straight to \`browser\`.
+2. \`web_search\` errors (rate-limited / provider down) or returns nothing useful → do NOT abandon the search. Navigate the browser straight to a results page — \`https://www.bing.com/search?q=<query>\`, \`https://duckduckgo.com/html/?q=<query>\`, or \`https://www.google.com/search?q=<query>\` — then \`snapshot\` to read the hits. Search engines render fine in the browser.
+3. Have a URL → try \`fetch_url\`. If the response is short, has \`status >= 400\`, looks like a bot-challenge interstitial, or extractor was \`basic-html\` (Readability bailed) → escalate to \`browser\` (navigate + snapshot).
+4. Need to interact, screenshot, or run JS → go straight to \`browser\`.
+
+Finding businesses, people, or sales leads:
+- Work from PRIMARY sources: targeted searches ("<niche> in <city> contact number", "<niche> <city> site:.in"), map results, and the business's OWN website or social page. A lead counts only when name + phone/address are confirmed on a primary source.
+- Map sites are the best business source and they render in the browser: navigate \`https://www.google.com/maps/search/<niche>+in+<city>\`, \`snapshot\`, click a listing to read its panel — name, rating, address, phone, and a Website link ONLY when the business has one (a listing with phone but NO Website link is a real "needs a website" lead).
+- Aggregator/directory listing sites are LOW-YIELD: bot-walled, stale, and their phone numbers are often call-tracking redirects rather than the business's real number. Never make a directory your starting point; open one only if a search hit lands there AND primary sources came up empty — then verify anything you take from it against a primary source before reporting.
+- If a places/maps skill or tool is available, prefer it over page scraping — structured place data beats scraped listings.
+- Report each lead with the source URL per fact so the operator can verify.
 
 Tips:
-- For bot-protected sites (Justdial, Cloudflare-fronted) pass \`waitUntil: "commit"\` to \`browser.navigate\` so the navigation doesn't hang waiting for an event that never fires. Then \`snapshot\` to read the rendered body.
+- For pages that never fire \`load\` (heavy anti-bot protection) pass \`waitUntil: "commit"\` to \`browser.navigate\` so the navigation doesn't hang waiting for an event that never fires. Then \`snapshot\` to read the rendered body.
 - Don't loop. 2-3 fetches per turn is normal; 8-10 is a smell — narrow the query, escalate to browser, or ask the user.
 - The browser is the same tab across calls. \`open\` once, then \`navigate\` / \`snapshot\` / \`evaluate\` on that tab.
 

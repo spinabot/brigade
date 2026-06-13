@@ -5,6 +5,7 @@ export declare const listProfiles: import("convex/server").RegisteredQuery<"publ
     _id: import("convex/values").GenericId<"authProfiles">;
     _creationTime: number;
     alias?: string | undefined;
+    expires?: number | undefined;
     metadata?: any;
     keyEnc?: ArrayBuffer | undefined;
     keyRef?: {
@@ -20,7 +21,6 @@ export declare const listProfiles: import("convex/server").RegisteredQuery<"publ
     } | undefined;
     accessEnc?: ArrayBuffer | undefined;
     refreshEnc?: ArrayBuffer | undefined;
-    expires?: number | undefined;
     type: "api_key" | "oauth" | "token";
     profileId: string;
     agentId: string;
@@ -36,6 +36,7 @@ export declare const getProfile: import("convex/server").RegisteredQuery<"public
     _id: import("convex/values").GenericId<"authProfiles">;
     _creationTime: number;
     alias?: string | undefined;
+    expires?: number | undefined;
     metadata?: any;
     keyEnc?: ArrayBuffer | undefined;
     keyRef?: {
@@ -51,7 +52,6 @@ export declare const getProfile: import("convex/server").RegisteredQuery<"public
     } | undefined;
     accessEnc?: ArrayBuffer | undefined;
     refreshEnc?: ArrayBuffer | undefined;
-    expires?: number | undefined;
     type: "api_key" | "oauth" | "token";
     profileId: string;
     agentId: string;
@@ -61,6 +61,7 @@ export declare const getProfile: import("convex/server").RegisteredQuery<"public
 } | null>>;
 export declare const upsertProfile: import("convex/server").RegisteredMutation<"public", {
     alias?: string | undefined;
+    expires?: number | undefined;
     metadata?: any;
     keyEnc?: ArrayBuffer | undefined;
     keyRef?: {
@@ -76,7 +77,6 @@ export declare const upsertProfile: import("convex/server").RegisteredMutation<"
     } | undefined;
     accessEnc?: ArrayBuffer | undefined;
     refreshEnc?: ArrayBuffer | undefined;
-    expires?: number | undefined;
     type: "api_key" | "oauth" | "token";
     profileId: string;
     agentId: string;

@@ -204,6 +204,29 @@ export function makeSpawnAgentsTool(
 			}
 
 			const combinedSignal = combineSignals(opts.parentSignal, signal);
+
+			// D2 — parent-abort fast-fail at the batch layer. If the parent run is
+			// already cancelled / out-of-budget by the time spawn_agents fires (the
+			// common case: a lead that exhausts its 300s budget on its own research,
+			// then emits a fan-out as its last act), refuse the WHOLE batch up-front
+			// with an honest envelope rather than dispatching children that each die
+			// on the dead signal in ~1ms and report back as fake `aborted` results.
+			if (combinedSignal?.aborted) {
+				return jsonResult({
+					total: tasks.length,
+					succeeded: 0,
+					failed: tasks.length,
+					totalDurationMs: 0,
+					results: tasks.map((t) => ({
+						label: typeof t.label === "string" && t.label.trim() ? t.label : "sub-agent",
+						status: "limit-refused" as const,
+						reason: "parent-aborted",
+						error:
+							"spawn_agents not started: the parent run was already cancelled or out of budget before children could be dispatched. Answer directly with what you have, or fan out earlier in the turn — before spending the run's time budget.",
+					})),
+				} satisfies SpawnAgentsResult) as AgentToolResult<SpawnAgentsResult>;
+			}
+
 			const { runSubagent } = await import("../subagent-runner.js");
 			const t0 = Date.now();
 

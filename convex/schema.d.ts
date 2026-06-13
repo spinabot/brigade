@@ -612,6 +612,7 @@ declare const _default: import("convex/server").SchemaDefinition<{
     }, {}, {}>;
     authProfiles: import("convex/server").TableDefinition<import("convex/values").VObject<{
         alias?: string | undefined;
+        expires?: number | undefined;
         metadata?: any;
         keyEnc?: ArrayBuffer | undefined;
         keyRef?: {
@@ -627,7 +628,6 @@ declare const _default: import("convex/server").SchemaDefinition<{
         } | undefined;
         accessEnc?: ArrayBuffer | undefined;
         refreshEnc?: ArrayBuffer | undefined;
-        expires?: number | undefined;
         type: "api_key" | "oauth" | "token";
         profileId: string;
         agentId: string;
@@ -666,7 +666,7 @@ declare const _default: import("convex/server").SchemaDefinition<{
         expires: import("convex/values").VFloat64<number | undefined, "optional">;
         metadata: import("convex/values").VAny<any, "optional", string>;
         updatedAt: import("convex/values").VFloat64<number, "required">;
-    }, "required", "type" | "alias" | "profileId" | "agentId" | "provider" | "metadata" | "ownerId" | "updatedAt" | `metadata.${string}` | "keyEnc" | "keyRef" | "tokenEnc" | "tokenRef" | "accessEnc" | "refreshEnc" | "expires" | "keyRef.id" | "keyRef.source" | "keyRef.provider" | "tokenRef.id" | "tokenRef.source" | "tokenRef.provider">, {
+    }, "required", "type" | "alias" | "expires" | "profileId" | "agentId" | "provider" | "metadata" | "ownerId" | "updatedAt" | `metadata.${string}` | "keyEnc" | "keyRef" | "tokenEnc" | "tokenRef" | "accessEnc" | "refreshEnc" | "keyRef.id" | "keyRef.source" | "keyRef.provider" | "tokenRef.id" | "tokenRef.source" | "tokenRef.provider">, {
         by_owner_agent: ["ownerId", "agentId", "_creationTime"];
         by_owner_agent_provider: ["ownerId", "agentId", "provider", "_creationTime"];
         by_owner_agent_profileId: ["ownerId", "agentId", "profileId", "_creationTime"];

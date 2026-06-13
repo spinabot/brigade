@@ -41,6 +41,7 @@ import {
 	releaseSubagentSlot,
 	reserveSubagentSlot,
 	resolveSubagentLimits,
+	SubagentLimitError,
 } from "./subagent-policy.js";
 
 const log = createSubsystemLogger("subagent/run");
@@ -233,6 +234,21 @@ export async function runSubagent(args: RunSubagentArgs): Promise<RunSubagentRes
 	// Operator-controlled — the model never gets to set this. Reads from
 	// `agents.defaults.subagents.cleanup` (default `"keep"`).
 	const cleanup = limits.defaultCleanup;
+
+	// D1 — parent-abort fast-fail. A depth-1 lead that spends its whole budget on
+	// its own work before fanning out can have its run timer fire (or be cancelled)
+	// in the same tick it dispatches children. Without this guard the child would
+	// reserve a slot, log "sub-agent starting", recurse into runSingleTurn, and die
+	// on the already-aborted signal at its first abort-aware await (durationMs≈1) —
+	// surfacing as a fake `aborted` child plus a misleading "starting" log and
+	// needless session-store churn. Refuse up-front with a typed signal so the
+	// spawn envelope reports, honestly, that the parent ran out of budget instead.
+	if (args.parentSignal?.aborted) {
+		throw new SubagentLimitError(
+			`Sub-agent "${label}" not started: the parent run was already cancelled or out of budget before this child could begin.`,
+			"parent-aborted",
+		);
+	}
 
 	const childSessionKey = buildChildSessionKey(args.parentSessionKey, randomUUID());
 

@@ -324,6 +324,48 @@ export function upsertApiKeyProfile(
   return id;
 }
 
+// OAuth counterpart — stores access / refresh / expiry for a `type: "oauth"`
+// profile (e.g. the `oauth_authorize` tool's Google/Gmail flow). Goes through
+// the SAME writeProfiles path as the api-key helper, so in convex mode the
+// access/refresh columns are sealed (AES-256-GCM) before the mutation leaves
+// the process, and on disk the file is atomic 0600. Field order matches the
+// other upsert helpers so the rendered JSON stays byte-comparable.
+export function upsertOAuthProfile(
+  agentId: string,
+  args: {
+    provider: string;
+    alias?: string;
+    access?: string;
+    refresh?: string;
+    /** Absolute epoch-ms (or seconds — caller's convention) the access token expires. */
+    expires?: number;
+    /**
+     * OAuth client secret — needed (with the refresh token) to mint a fresh
+     * access token when this one expires. Stored in the SEALED `key` column
+     * (keyEnc in convex; the api-key readers all gate on `type === "api_key"`,
+     * so reusing it for an oauth profile's secret is safe + avoids a schema
+     * change). Never returned to the model.
+     */
+    clientSecret?: string;
+    metadata?: Record<string, unknown>;
+  },
+): string {
+  const file = readProfiles(agentId);
+  const id = profileId(args.provider, args.alias);
+  file.profiles[id] = sanitizeProfileShape({
+    type: "oauth",
+    provider: args.provider,
+    ...(args.alias ? { alias: args.alias } : {}),
+    ...(args.clientSecret ? { key: args.clientSecret } : {}),
+    ...(args.access ? { access: args.access } : {}),
+    ...(args.refresh ? { refresh: args.refresh } : {}),
+    ...(args.expires !== undefined ? { expires: args.expires } : {}),
+    metadata: args.metadata,
+  });
+  writeProfiles(agentId, file);
+  return id;
+}
+
 // Ref-mode counterpart: stores a structured BrigadeSecretRef instead of the
 // literal key. The literal `key` field is NOT persisted — sanitizeProfileShape
 // drops it when keyRef is present.

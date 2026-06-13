@@ -228,6 +228,46 @@ export class BrigadeExtensionRegistry {
 	}
 
 	/**
+	 * Error-time fallback chain for `web_search` — the ordered list of
+	 * providers the tool may try when the active provider THROWS (rate
+	 * limit, anti-bot block, network failure). Production incident: the
+	 * default provider 429'd on a weekly quota and, with no fallback, the
+	 * agent lost web search entirely.
+	 *
+	 *   - Operator pin (`tools.web.search.provider`) → `[]`. A pin is
+	 *     honored verbatim; we never silently reroute around it.
+	 *   - Allow/deny filtered, exactly like the default resolver.
+	 *   - GENERAL-PURPOSE tier only (`autoDetectOrder <= 100`): the
+	 *     specialised keyless providers above 100 (wikipedia, arxiv,
+	 *     github, …) answer a different question — falling back to them
+	 *     for a general query would return junk with a 200 face.
+	 *   - Configured providers only. Keyless DDG self-reports configured,
+	 *     so the chain always ends at a zero-config rung unless the
+	 *     operator denied it.
+	 */
+	listWebSearchFallbackChain(
+		cfg: BrigadeConfig,
+		env?: NodeJS.ProcessEnv,
+	): import("./types.js").WebSearchProvider[] {
+		const slot = (cfg as {
+			tools?: { web?: { search?: { provider?: string; allow?: string[]; deny?: string[] } } };
+		}).tools?.web?.search;
+		if (slot?.provider?.trim()) return [];
+		return filterByAllowDeny(this.webSearchProviders, slot?.allow, slot?.deny)
+			.filter((p) => (p.autoDetectOrder ?? 100) <= 100)
+			.filter((p) => {
+				try {
+					return p.isConfigured(cfg, env);
+				} catch {
+					return false;
+				}
+			})
+			.sort(
+				(a, b) => (a.autoDetectOrder ?? 100) - (b.autoDetectOrder ?? 100) || a.id.localeCompare(b.id),
+			);
+	}
+
+	/**
 	 * Look up a web-search provider by id, respecting the operator's
 	 * allow/deny lists. Returns null when the id is unknown OR is gated
 	 * out by config. Used for per-call `provider` overrides on

@@ -40,7 +40,12 @@ import {
 
 import { brand } from "../ui/theme.js";
 
-export type ApprovalDecisionKind = "allow-once" | "allow-always" | "allow-pattern" | "deny";
+export type ApprovalDecisionKind =
+	| "allow-once"
+	| "allow-always"
+	| "allow-pattern"
+	| "allow-session"
+	| "deny";
 
 export interface ApprovalRenderRequest {
 	id: string;
@@ -150,9 +155,13 @@ export class ApprovalPrompt implements Component {
 			inner,
 			`${brand.amber("[P]")} ${brand.dim("Allow pattern…")}   ${brand.amber("[N]")} ${brand.dim("Deny")}`,
 		);
+		const row3 = boxLine(
+			inner,
+			`${brand.amber("[S]")} ${brand.dim("Allow all this session (skips prompts; safety guards still apply)")}`,
+		);
 		const bottom = drawHorizLine(w, "└", "┘");
 		const hint = fitToWidth(`   ${brand.dim("Esc = deny · single keystroke resolves")}`, w);
-		return [titleLine, cmdLine, spacer, row1, row2, bottom, hint];
+		return [titleLine, cmdLine, spacer, row1, row2, row3, bottom, hint];
 	}
 
 	private renderPatternState(): string[] {
@@ -206,6 +215,9 @@ export class ApprovalPrompt implements Component {
 				return;
 			case "a":
 				this.resolve({ decision: "allow-always" });
+				return;
+			case "s":
+				this.resolve({ decision: "allow-session" });
 				return;
 			case "p":
 				this.enterPatternMode();

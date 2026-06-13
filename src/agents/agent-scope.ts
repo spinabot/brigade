@@ -8,11 +8,20 @@
  *
  * Resolution order:
  *   1. `cfg.defaults.agentId` (operator-pinned default)
- *   2. The first agent id listed in `cfg.agents` (any non-`defaults` key)
- *   3. Hardcoded `"main"`
+ *   2. Brigade's canonical default agent, `"main"`
  *
- * Empty / non-string inputs in any of the above fall through to the next
- * step; never throws.
+ * Empty / non-string inputs fall through; never throws.
+ *
+ * NOTE (2026-06-13): step 2 used to be "the first agent id listed in
+ * `cfg.agents`", with `"main"` only as a last resort. That silently broke the
+ * moment an operator added agents: an org of 20 members made whichever key
+ * sorted/inserted first (e.g. `accountant`) the BOOT + routing default,
+ * demoting `main` — and a gateway restart re-derived the same wrong answer, so
+ * it couldn't be shaken without hand-pinning. `main` is the operator's primary
+ * agent (its workspace is `~/.brigade/workspace`, backed by `agents.defaults`
+ * even without an explicit `cfg.agents.main` block), so it is ALWAYS a valid
+ * default and must win over an arbitrary org agent. An operator who genuinely
+ * wants a different default pins `defaults.agentId`.
  */
 
 import { DEFAULT_AGENT_ID } from "../config/paths.js";
@@ -24,13 +33,8 @@ export function resolveDefaultAgentId(cfg: BrigadeConfig | undefined | null): st
 	if (typeof pinned === "string" && pinned.trim().length > 0) {
 		return pinned.trim();
 	}
-	const agents = cfg.agents;
-	if (agents && typeof agents === "object") {
-		for (const key of Object.keys(agents)) {
-			if (key === "defaults") continue;
-			if (key.trim().length === 0) continue;
-			return key.trim();
-		}
-	}
+	// No explicit pin → the canonical default agent. NEVER an arbitrary
+	// `cfg.agents` key (see the NOTE above — that demoted `main` once an org
+	// was created).
 	return DEFAULT_AGENT_ID;
 }

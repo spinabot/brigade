@@ -55,7 +55,7 @@ after(() => {
 });
 
 describe("assembleBrigadeToolset", () => {
-	it("returns 6 builtins + 10 brigade tools (find/generate_image/manage_provider/manage_access + 3 memory + agents_list + manage_agent + manage_skill) = 16 enabled names", () => {
+	it("returns 6 builtins + 11 brigade tools (find/generate_image/manage_provider/manage_access/oauth_authorize + 3 memory + agents_list + manage_agent + manage_skill) = 17 enabled names", () => {
 		// `find` moved from the Pi builtin list to a Brigade-native custom tool
 		// (fd's --glob --full-path matches nothing on Windows — see find-tool.ts).
 		const ts = assembleBrigadeToolset({ workspaceDir: workspace, agentId: "main", cwd: workspace });
@@ -68,12 +68,13 @@ describe("assembleBrigadeToolset", () => {
 			"manage_agent",
 			"manage_provider",
 			"manage_skill",
+			"oauth_authorize",
 			"read_memory",
 			"recall_memory",
 			"write_memory",
 		]);
-		assert.equal(ts.enabledToolNames.length, 16);
-		assert.equal(ts.customTools.length, 10);
+		assert.equal(ts.enabledToolNames.length, 17);
+		assert.equal(ts.customTools.length, 11);
 	});
 
 	it("derives capabilities.memory=true when recall_memory present", () => {

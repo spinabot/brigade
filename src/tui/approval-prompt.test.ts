@@ -104,6 +104,8 @@ test("legacy-terminal keystrokes resolve the prompt (Y/A/N as raw bytes)", () =>
 		["y", "allow-once"],
 		["Y", "allow-once"],
 		["a", "allow-always"],
+		["s", "allow-session"],
+		["S", "allow-session"],
 		["n", "deny"],
 	];
 	for (const [key, expected] of cases) {

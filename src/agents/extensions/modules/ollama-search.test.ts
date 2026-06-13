@@ -18,8 +18,28 @@ describe("createOllamaSearchProvider", () => {
 		assert.equal(p.id, "ollama");
 		assert.equal(p.requiresCredential, false);
 		assert.deepEqual(p.envVars, ["OLLAMA_HOST", "OLLAMA_API_KEY"]);
-		// Always isConfigured — defers daemon-presence check to execute time.
-		assert.equal(p.isConfigured({} as never, {} as never), true);
+	});
+
+	// CONTRACT CHANGE (2026-06-13, production incident): isConfigured used to
+	// be `() => true`, which made the account-metered, weekly-capped ollama.com
+	// cloud search the SILENT DEFAULT on every install (autoDetectOrder 90
+	// beats DDG's 100). When the quota ran dry mid-research, search died
+	// outright. The provider is now opt-in.
+	it("NOT configured by default — must never silently win auto-detect again", () => {
+		assert.equal(p.isConfigured({} as never, {} as never), false);
+	});
+
+	it("opt-in via config slot presence (even an empty object)", () => {
+		const cfg = { tools: { web: { search: { providers: { ollama: {} } } } } };
+		assert.equal(p.isConfigured(cfg as never, {} as never), true);
+	});
+
+	it("opt-in via OLLAMA_API_KEY (explicit Ollama Cloud setup)", () => {
+		assert.equal(p.isConfigured({} as never, { OLLAMA_API_KEY: "ol-x" } as never), true);
+	});
+
+	it("OLLAMA_HOST alone is NOT opt-in (chat-runtime var, not search consent)", () => {
+		assert.equal(p.isConfigured({} as never, { OLLAMA_HOST: "http://localhost:11434" } as never), false);
 	});
 });
 

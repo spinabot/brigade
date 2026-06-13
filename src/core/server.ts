@@ -153,6 +153,8 @@ import {
 } from "../agents/tools/sessions/shared.js";
 import { wireAgentEventsBridge } from "../agents/agent-events.js";
 import { requestHeartbeatNow, setHeartbeatsEnabled } from "../agents/heartbeat-wake.js";
+import { setExecAllowAll } from "../agents/exec-session-allow.js";
+import { grantSkill, revokeSkill } from "../agents/skills/grant.js";
 import {
 	addHeartbeatFiredHook,
 	setHeartbeatBootAgentId,
@@ -2501,6 +2503,60 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					return undefined as ResponseFor[M];
 				}
 				return undefined as ResponseFor[M];
+			}
+			case "exec-allow-all": {
+				const p = (params ?? {}) as RequestParams["exec-allow-all"];
+				// Resolve the SAME session key the operator's turns run under —
+				// identical resolution to `compact` above — so we arm the key the
+				// exec-gate will actually check.
+				const targetKey =
+					p?.sessionKey?.trim() ||
+					(p?.agentId ? defaultSessionKey(p.agentId.trim()) : sessionKey);
+				setExecAllowAll(targetKey, p?.enabled === true);
+				return { sessionKey: targetKey, enabled: p?.enabled === true } as ResponseFor[M];
+			}
+			case "exec-grant-skill": {
+				const p = (params ?? {}) as RequestParams["exec-grant-skill"];
+				const skillName = p?.skillName?.trim();
+				if (!skillName) throw new Error("exec-grant-skill: missing skillName");
+				const targetAgentId = p?.agentId?.trim() || agentId;
+				const cfgNow = await loadConfig();
+				const wsOverride = (
+					cfgNow.agents as Record<string, { workspace?: unknown }> | undefined
+				)?.[targetAgentId]?.workspace;
+				const workspaceDir = resolveAgentWorkspaceDir(
+					targetAgentId,
+					typeof wsOverride === "string" && wsOverride.trim() ? wsOverride.trim() : undefined,
+				);
+				if (p?.revoke === true) {
+					const r = revokeSkill({ config: cfgNow, workspaceDir, agentId: targetAgentId, skillName });
+					return {
+						found: r.found,
+						skill: r.skill,
+						applied: false,
+						manifest: { commands: [], patterns: [] },
+						granted: { commands: [], patterns: [] },
+						refused: [],
+						removed: r.removed,
+						revoked: true,
+					} as unknown as ResponseFor[M];
+				}
+				const res = grantSkill({
+					config: cfgNow,
+					workspaceDir,
+					agentId: targetAgentId,
+					skillName,
+					apply: p?.apply === true,
+				});
+				return {
+					found: res.found,
+					skill: res.skill,
+					applied: res.applied,
+					emptyManifest: res.emptyManifest,
+					manifest: res.manifest,
+					granted: res.granted,
+					refused: res.refused,
+				} as unknown as ResponseFor[M];
 			}
 			case "list-models": {
 				const models = modelRegistry.getAvailable().map((m: Model<any>) => modelToSummary(m));

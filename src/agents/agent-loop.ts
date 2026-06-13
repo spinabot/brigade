@@ -759,6 +759,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         // allow/deny config the default resolver does.
         lookupProviderById: (id) =>
           extensionRegistry.lookupWebSearchProviderById(id, turnConfig as never),
+        // Error-time fallback: when the active provider THROWS (429 /
+        // anti-bot / network), the tool walks this chain instead of losing
+        // search outright. Empty when the operator pinned a provider.
+        fallbackProviders: () =>
+          extensionRegistry.listWebSearchFallbackChain(turnConfig as never, process.env),
       })
     : null;
   // Diagnostic toggle — when BRIGADE_DEBUG_WEB=1 the gateway log gets one

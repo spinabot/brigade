@@ -249,3 +249,35 @@ describe("runSubagent end-to-end smoke: framing pieces", () => {
 		assert.equal(getSubagentDepthFromSessionKey(grand), 2);
 	});
 });
+
+/* ─────────────── Parent-abort fast-fail (D1) ─────────────── */
+
+describe("runSubagent: parent-abort fast-fail (D1)", () => {
+	it("a pre-aborted parent signal throws SubagentLimitError(parent-aborted) BEFORE reserving a slot", async () => {
+		// The runner's early guard fires before the dynamic import of the Pi
+		// loop, before reserveSubagentSlot, and before the "sub-agent starting"
+		// log — so a child handed an already-dead parent signal refuses cleanly
+		// instead of recursing into runSingleTurn and dying on the signal in
+		// ~1ms (which surfaced as a fake `aborted` child + a misleading log).
+		const { runSubagent } = await import("./subagent-runner.js");
+		const parentKey = "agent:main:main";
+		const ac = new AbortController();
+		ac.abort();
+		await assert.rejects(
+			runSubagent({
+				parentSessionKey: parentKey,
+				parentAgentId: "main",
+				task: "do the thing",
+				label: "child",
+				parentSignal: ac.signal,
+			}),
+			(err: unknown) => err instanceof SubagentLimitError && err.kind === "parent-aborted",
+		);
+		// No registry churn — the refusal precedes reserveSubagentSlot.
+		assert.equal(countActiveChildren(parentKey), 0);
+		assert.equal(
+			listRecentlyEndedChildren().filter((r) => r.childSessionKey.startsWith(parentKey)).length,
+			0,
+		);
+	});
+});

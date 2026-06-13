@@ -38,6 +38,7 @@ import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
 import { makeManageAccessTool } from "./manage-access-tool.js";
 import { makeManageProviderTool } from "./manage-provider-tool.js";
+import { makeOAuthAuthorizeTool } from "./oauth-authorize-tool.js";
 import { makeManageSkillTool } from "./manage-skill-tool.js";
 // Consolidated `org` tool — only registered when cfg.org is present
 // (gate is below). Replaces the prior two-tool surface
@@ -254,6 +255,17 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// org.a2a.mode, so "let main message marketing-lead" is one validated
 		// call instead of a guard-refused hand-edit.
 		makeManageAccessTool(),
+		// oauth_authorize — owner-only OAuth 2.0 authorization-code flow with a
+		// one-shot loopback callback. Exists so the model never hand-rolls an
+		// http listener in bash (the Gmail-OAuth flow fought EADDRINUSE +
+		// redirect-mismatch across six manual tries). Tokens land sealed in the
+		// agent's credential store; codes/tokens never echo.
+		makeOAuthAuthorizeTool({
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+			...(typeof opts.sessionContext?.key === "string" && opts.sessionContext.key.length > 0
+				? { sessionKey: opts.sessionContext.key }
+				: {}),
+		}),
 	];
 	// Consolidated org tool additive-gate: the single `org` tool is
 	// registered ONLY when cfg.org is present in the loaded config. When

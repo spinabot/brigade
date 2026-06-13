@@ -221,8 +221,8 @@ const recentlyEnded = resolveGlobalSingleton<ChildRunRecord[]>(
 );
 
 export class SubagentLimitError extends Error {
-	readonly kind: "depth" | "concurrent";
-	constructor(message: string, kind: "depth" | "concurrent") {
+	readonly kind: "depth" | "concurrent" | "parent-aborted";
+	constructor(message: string, kind: "depth" | "concurrent" | "parent-aborted") {
 		super(message);
 		this.name = "SubagentLimitError";
 		this.kind = kind;

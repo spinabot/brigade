@@ -327,7 +327,28 @@ export interface BrigadeSkillsConfig {
   enabled?: boolean;
   paths?: string[];
   entries?: Record<string, BrigadeSkillEntry>;
+  /**
+   * Let an agent see the skills of agents it's connected to in the org
+   * hierarchy. Off by default. Org-visible skills sit BELOW every operator-
+   * placed root (managed/personal/project/workspace) and below config paths,
+   * so they can never shadow a local skill, and an agent's OWN workspace
+   * skills always win a name collision. Honours the org POLICY graph, so an
+   * `org.a2a.mode: "explicit"` install turns this off (matches A2A posture).
+   */
+  orgAccess?: BrigadeSkillsOrgAccessConfig;
   [key: string]: unknown;
+}
+
+export interface BrigadeSkillsOrgAccessConfig {
+  enabled?: boolean;
+  /**
+   * `down` (default): the agent sees its reports' skills. `up`: its manager
+   * chain's skills. `both`: union. Direct relationships only unless
+   * `transitive` is set.
+   */
+  direction?: "down" | "up" | "both";
+  /** Walk the whole sub-tree / manager-chain rather than just direct edges. */
+  transitive?: boolean;
 }
 
 export interface BrigadeSkillEntry {

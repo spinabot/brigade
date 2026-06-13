@@ -529,6 +529,21 @@ export async function wireConnectUi(
 		{ name: "usage", description: "show token totals + estimated cost so far" },
 		{ name: "compact", description: "summarize older turns to free context" },
 		{
+			name: "allow-all",
+			description: "on|off — skip shell approval prompts this session (guards still apply)",
+			argumentHint: "<on|off>",
+		},
+		{
+			name: "grant-skill",
+			description: "preview/approve a skill's declared commands (--yes to apply)",
+			argumentHint: "<name> [--yes]",
+		},
+		{
+			name: "revoke-skill",
+			description: "remove a skill's granted commands from the allowlist",
+			argumentHint: "<name>",
+		},
+		{
 			name: "model",
 			description: "switch to another configured model (no arg = picker)",
 			argumentHint: "[<model-id>]",
@@ -670,6 +685,12 @@ export async function wireConnectUi(
 					`${subIndent}    ${brand.dim(`Pattern /${pat}/ saved to ~/.brigade/exec-approvals.json — any future command matching this regex runs without asking.`)}`,
 				].join("\n");
 			}
+			case "allow-session":
+				return [
+					`${subIndent}  ${brand.amber("⚠")} ${brand.amber("Allow all this session")} ${brand.dim("· running now…")}`,
+					cmd,
+					`${subIndent}    ${brand.dim("Shell commands run without asking for the rest of this session (safety guards still apply). /allow-all off to stop.")}`,
+				].join("\n");
 			case "deny":
 				return [
 					`${subIndent}  ${brand.error("✗")} ${brand.error("Denied")} ${brand.dim("· refused")}`,
@@ -1242,6 +1263,9 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/model <id>")} — switch to a configured model on the gateway\n` +
 						`- ${chalk.bold("/thinking <level>")} — set reasoning effort (off|minimal|low|medium|high|xhigh)\n` +
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
+						`- ${chalk.bold("/allow-all <on|off>")} — skip shell-approval prompts for this session (safety guards still apply)\n` +
+						`- ${chalk.bold("/grant-skill <name> [--yes]")} — preview/approve a skill's declared commands so the agent runs them without asking\n` +
+						`- ${chalk.bold("/revoke-skill <name>")} — remove a skill's granted commands\n` +
 						`- ${chalk.bold("/abort")} — stop the in-flight turn\n` +
 						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
 						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's thinking blocks before replies (default: off)\n` +
@@ -1725,6 +1749,193 @@ export async function wireConnectUi(
 				const msg = err instanceof Error ? err.message : String(err);
 				insertBeforeEditor(
 					new Text(`  ${brand.error("✗")} ${brand.error(`Compaction failed: ${msg}`)}`, 0, 0),
+				);
+			}
+			return;
+		}
+
+		// /allow-all <on|off> — arm/disarm session-scoped exec approval bypass.
+		// Skips the shell-approval PROMPT for this session only; it can't bypass
+		// the config/path-write guards or hard-deny patterns, and clears on
+		// gateway restart.
+		if (trimmed === "/allow-all" || trimmed.startsWith("/allow-all ")) {
+			editor.setText("");
+			const arg =
+				trimmed === "/allow-all" ? "" : trimmed.slice("/allow-all ".length).trim().toLowerCase();
+			if (arg !== "on" && arg !== "off") {
+				insertBeforeEditor(
+					new Markdown(
+						`${brand.dim("usage: /allow-all on|off")}\n` +
+							`Skips the shell-approval prompt for THIS session. It can't bypass the safety ` +
+							`guards (writes to brigade.json / encryption.key / auth, hard-deny patterns), ` +
+							`doesn't affect sub-agents, and clears on gateway restart.`,
+						1,
+						0,
+						markdownTheme,
+					),
+				);
+				return;
+			}
+			const enabled = arg === "on";
+			try {
+				const res = (await client.request("exec-allow-all", { ...withBinding(), enabled })) as
+					| { sessionKey?: string; enabled?: boolean }
+					| undefined;
+				insertBeforeEditor(
+					new Text(
+						enabled
+							? `  ${brand.amber("⚠")} ${brand.dim(`allow-all ON for ${res?.sessionKey ?? "this session"} — shell commands run without asking (safety guards still apply). /allow-all off to disarm.`)}`
+							: `  ${brand.amber("✓")} ${brand.dim("allow-all OFF — shell commands prompt for approval again.")}`,
+						0,
+						0,
+					),
+				);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(`allow-all failed: ${msg}`)}`, 0, 0),
+				);
+			}
+			return;
+		}
+
+		// /grant-skill <name> [--yes] — preview (default) or apply a skill's
+		// command grant. Preview shows the commands the skill declares; --yes
+		// pre-approves them so the agent runs its own skill without prompting.
+		// The grant is a SNAPSHOT — editing the skill later can't widen it.
+		if (trimmed === "/grant-skill" || trimmed.startsWith("/grant-skill ")) {
+			editor.setText("");
+			const rest = trimmed === "/grant-skill" ? "" : trimmed.slice("/grant-skill ".length).trim();
+			const apply = /(^|\s)(--yes|-y)(\s|$)/.test(rest);
+			const name = rest.replace(/(^|\s)(--yes|-y)(\s|$)/g, " ").trim();
+			if (!name) {
+				insertBeforeEditor(
+					new Markdown(
+						`${brand.dim("usage: /grant-skill <name> [--yes]")}\n` +
+							`Preview the shell commands a skill declares; add ${chalk.bold("--yes")} to pre-approve ` +
+							`them for this agent so it stops asking. A grant is a snapshot — editing the skill ` +
+							`later won't widen it. Revoke with /revoke-skill.`,
+						1,
+						0,
+						markdownTheme,
+					),
+				);
+				return;
+			}
+			try {
+				const res = (await client.request("exec-grant-skill", {
+					...withBinding(),
+					skillName: name,
+					apply,
+				})) as {
+					found?: boolean;
+					skill?: string;
+					emptyManifest?: boolean;
+					applied?: boolean;
+					manifest?: { commands: string[]; patterns: string[] };
+					granted?: { commands: string[]; patterns: string[] };
+					refused?: string[];
+				};
+				if (!res?.found) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.error("✗")} ${brand.error(`No skill named "${name}" is visible to this agent.`)}`,
+							0,
+							0,
+						),
+					);
+					return;
+				}
+				if (res.emptyManifest) {
+					insertBeforeEditor(
+						new Markdown(
+							`${brand.dim(`Skill "${res.skill}" declares no commands to grant.`)}\n` +
+								`Add a ${chalk.bold("commands:")} / ${chalk.bold("command-patterns:")} block to its SKILL.md ` +
+								`frontmatter, then re-run.`,
+							1,
+							0,
+							markdownTheme,
+						),
+					);
+					return;
+				}
+				const manifest = res.manifest ?? { commands: [], patterns: [] };
+				const lines = [
+					...manifest.commands.map((c) => `  • ${c}`),
+					...manifest.patterns.map((p) => `  ~ /${p}/`),
+				].join("\n");
+				if (res.applied) {
+					const granted = res.granted ?? { commands: [], patterns: [] };
+					const n = granted.commands.length + granted.patterns.length;
+					const refused =
+						res.refused && res.refused.length > 0
+							? `\n${brand.amber("refused (hard-deny):")} ${res.refused.join(", ")}`
+							: "";
+					insertBeforeEditor(
+						new Markdown(
+							`${brand.amber("✓")} Granted ${n} command(s) from ${chalk.bold(res.skill ?? name)} — ` +
+								`the agent can now run them without prompting.\n${lines}${refused}\n` +
+								`${brand.dim(`Revoke with /revoke-skill ${res.skill ?? name}`)}`,
+							1,
+							0,
+							markdownTheme,
+						),
+					);
+				} else {
+					insertBeforeEditor(
+						new Markdown(
+							`${chalk.bold(res.skill ?? name)} declares these commands:\n${lines}\n\n` +
+								`${brand.dim(`Approve them with: /grant-skill ${res.skill ?? name} --yes`)}`,
+							1,
+							0,
+							markdownTheme,
+						),
+					);
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(`grant-skill failed: ${msg}`)}`, 0, 0),
+				);
+			}
+			return;
+		}
+
+		// /revoke-skill <name> — remove a skill's granted commands from the allowlist.
+		if (trimmed === "/revoke-skill" || trimmed.startsWith("/revoke-skill ")) {
+			editor.setText("");
+			const name = trimmed === "/revoke-skill" ? "" : trimmed.slice("/revoke-skill ".length).trim();
+			if (!name) {
+				insertBeforeEditor(new Markdown(`${brand.dim("usage: /revoke-skill <name>")}`, 1, 0, markdownTheme));
+				return;
+			}
+			try {
+				const res = (await client.request("exec-grant-skill", {
+					...withBinding(),
+					skillName: name,
+					revoke: true,
+				})) as { found?: boolean; skill?: string; removed?: number };
+				if (!res?.found) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.error("✗")} ${brand.error(`No skill named "${name}" is visible to this agent.`)}`,
+							0,
+							0,
+						),
+					);
+					return;
+				}
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.amber("✓")} ${brand.dim(`Revoked ${res.removed ?? 0} approval(s) from skill "${res.skill ?? name}".`)}`,
+						0,
+						0,
+					),
+				);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(`revoke-skill failed: ${msg}`)}`, 0, 0),
 				);
 			}
 			return;

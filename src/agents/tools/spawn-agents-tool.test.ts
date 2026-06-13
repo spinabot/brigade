@@ -118,6 +118,43 @@ describe("spawn_agents tool — shape + guard rails (no runSubagent execution)",
 		assert.equal(result.results[0]!.reason, "access-denied");
 	});
 
+	it("parent-abort fast-fail (D2): a pre-aborted parent signal refuses the whole batch without dispatching", async () => {
+		// Reproduces the production cascade: a lead exhausts its run budget, its
+		// run timer fires, THEN it emits a fan-out. The children must not be
+		// dispatched onto a dead signal (they'd die in ~1ms and report as fake
+		// `aborted`). Instead the batch is refused up-front with reason
+		// "parent-aborted" so the lead gets an honest, actionable envelope.
+		const ac = new AbortController();
+		ac.abort();
+		const tool = makeSpawnAgentsTool({
+			parentSessionKey: "agent:main:main",
+			parentAgentId: "main",
+			bypassAccessGuard: true,
+			parentSignal: ac.signal,
+		});
+		const result = parseResult(
+			(
+				await tool.execute("c-parentabort", {
+					tasks: [
+						{ task: "a", label: "alpha" },
+						{ task: "b", label: "beta" },
+					],
+				})
+			).content,
+		);
+		assert.equal(result.total, 2);
+		assert.equal(result.succeeded, 0);
+		assert.equal(result.failed, 2);
+		assert.equal(result.totalDurationMs, 0);
+		for (const r of result.results) {
+			assert.equal(r.status, "limit-refused");
+			assert.equal(r.reason, "parent-aborted");
+			assert.match(r.error ?? "", /out of budget|cancelled/i);
+			// Crucially NOT a real child result — no session key, no duration.
+			assert.equal(r.childSessionKey, undefined);
+		}
+	});
+
 	it("exposes ownerOnly=false (sub-agent tool, not owner-only)", () => {
 		const tool = makeSpawnAgentsTool({
 			parentSessionKey: "agent:main:main",

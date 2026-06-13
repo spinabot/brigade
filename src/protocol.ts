@@ -100,9 +100,28 @@ export type RequestMethod =
 	 *   - `"allow-once"`     → this call only; nothing persisted
 	 *   - `"allow-always"`   → write the exact command to `~/.brigade/exec-approvals.json`
 	 *   - `"allow-pattern"`  → write a regex pattern (`params.pattern` required)
+	 *   - `"allow-session"`  → allow this call AND skip prompts for the rest of
+	 *                          the session (ephemeral; guards still apply)
 	 *   - `"deny"`           → this call refused; nothing persisted
 	 */
 	| "approval-resolve"
+	/**
+	 * Arm / disarm session-scoped exec "allow-all" (the TUI `/allow-all`
+	 * command). When ON, shell commands in that session skip the approval
+	 * PROMPT — but every protective layer still applies (hard-deny patterns,
+	 * workdir/env refusals, and the config/path-write guards that run before
+	 * the exec-gate). In-memory + per-session: clears on gateway restart,
+	 * never persists, never cascades to sub-agents. Reply: the resolved
+	 * sessionKey + state.
+	 */
+	| "exec-allow-all"
+	/**
+	 * Grant (or preview / revoke) a skill's declared command manifest into the
+	 * agent's exec-approvals allowlist — the TUI `/grant-skill` command. A
+	 * grant is a SNAPSHOT of the skill's current commands, so a later edit to
+	 * the skill can't widen it. Reply: the manifest + what was granted.
+	 */
+	| "exec-grant-skill"
 	/** List configured models. Reply: ModelSummary[]. */
 	| "list-models"
 	/** Reload the model registry from disk. Reply: void. */
@@ -259,9 +278,27 @@ export interface RequestParams {
 		/** Matches the `approval-request` event's `id`. */
 		id: string;
 		/** Operator's choice. */
-		decision: "allow-once" | "allow-always" | "allow-pattern" | "deny";
+		decision: "allow-once" | "allow-always" | "allow-pattern" | "allow-session" | "deny";
 		/** Required when `decision === "allow-pattern"`. Regex string. */
 		pattern?: string;
+	};
+	"exec-allow-all": {
+		/** Turn allow-all on (true) or off (false) for the resolved session. */
+		enabled: boolean;
+		/** Target session key. Defaults to the bound agent's main session. */
+		sessionKey?: string;
+		/** Agent id used to resolve the default session key when `sessionKey` is omitted. */
+		agentId?: string;
+	};
+	"exec-grant-skill": {
+		/** Skill name to grant / preview / revoke. */
+		skillName: string;
+		/** Apply the grant (true) or just preview the manifest (false/omitted). */
+		apply?: boolean;
+		/** Revoke a prior grant instead of granting. */
+		revoke?: boolean;
+		/** Agent whose allowlist + skills are used; defaults to the boot agent. */
+		agentId?: string;
 	};
 	"list-models": void;
 	"refresh-models": void;
@@ -308,6 +345,18 @@ export interface ResponseFor {
 	"set-thinking": void;
 	compact: void;
 	"approval-resolve": void;
+	"exec-allow-all": { sessionKey: string; enabled: boolean };
+	"exec-grant-skill": {
+		found: boolean;
+		skill: string;
+		applied: boolean;
+		emptyManifest?: boolean;
+		manifest: { commands: string[]; patterns: string[] };
+		granted: { commands: string[]; patterns: string[] };
+		refused: string[];
+		removed?: number;
+		revoked?: boolean;
+	};
 	"list-models": ModelSummary[];
 	"refresh-models": void;
 	"get-state": SessionStateSnapshot;
@@ -395,7 +444,7 @@ export interface EventPayload {
 		/** Wall-clock millis the gateway will wait before auto-denying. */
 		timeoutMs: number;
 		/** Subset of decisions the operator is allowed to pick. */
-		decisions: ReadonlyArray<"allow-once" | "allow-always" | "allow-pattern" | "deny">;
+		decisions: ReadonlyArray<"allow-once" | "allow-always" | "allow-pattern" | "allow-session" | "deny">;
 		/** Sub-agent attribution (Primitive #6). Present when the gated tool
 		 *  call originated inside a sub-agent run. The TUI surfaces this so
 		 *  the operator knows it isn't the top-level agent asking. */

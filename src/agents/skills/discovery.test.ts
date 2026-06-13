@@ -191,22 +191,88 @@ describe("discoverSkills", () => {
 		assert.ok(res.promptBlock?.includes("workspace"));
 	});
 
-	it("skillAllowlist drops names not in the list (S1)", () => {
-		const ws = path.join(root, "workspace", "skills");
-		writeSkill(ws, "alpha", "description: a");
-		writeSkill(ws, "beta", "description: b");
+	it("skillAllowlist drops names not in the list — for SHARED roots (S1)", () => {
+		// CONTRACT CHANGE (3a, 2026-06-13): the allowlist gates SHARED skill
+		// roots only (bundled/config/org/managed/personal/project). An agent's
+		// OWN workspace skills are exempt — see the workspace-exempt test below.
+		// So this test exercises the allowlist against a MANAGED root, with an
+		// empty workspace, to pin the shared-root semantics.
+		const managed = path.join(root, "managed");
+		writeSkill(managed, "alpha", "description: a");
+		writeSkill(managed, "beta", "description: b");
+		const ws = path.join(root, "workspace", "skills"); // empty
 		const res = discoverSkills({
 			workspaceSkillsDir: ws,
+			managedSkillsDir: managed,
 			skillAllowlist: ["alpha"],
 			eligibilityCtx: LINUX,
 		});
 		assert.deepEqual(res.skills.map((s) => s.name), ["alpha"]);
-		// `[]` denies all
+		// `[]` denies all SHARED skills.
+		const denied = discoverSkills({
+			workspaceSkillsDir: ws,
+			managedSkillsDir: managed,
+			skillAllowlist: [],
+			eligibilityCtx: LINUX,
+		});
+		assert.equal(denied.skills.length, 0);
+	});
+
+	it("an agent's OWN workspace skills are EXEMPT from the allowlist (3a)", () => {
+		// Regression: setting a shared `agents.defaults.skills` allowlist used to
+		// silently blind every agent to its self-authored workspace skills.
+		const ws = path.join(root, "workspace", "skills");
+		writeSkill(ws, "mine", "description: self-authored");
+		// Even a deny-all allowlist leaves the agent's own workspace skill visible.
 		const denied = discoverSkills({
 			workspaceSkillsDir: ws,
 			skillAllowlist: [],
 			eligibilityCtx: LINUX,
 		});
-		assert.equal(denied.skills.length, 0);
+		assert.deepEqual(denied.skills.map((s) => s.name), ["mine"]);
+		assert.equal(denied.skills[0]?.source, "workspace");
+		// A non-matching allowlist still leaves it visible (own ≠ shared).
+		const filtered = discoverSkills({
+			workspaceSkillsDir: ws,
+			skillAllowlist: ["something-else"],
+			eligibilityCtx: LINUX,
+		});
+		assert.deepEqual(filtered.skills.map((s) => s.name), ["mine"]);
+	});
+
+	it("orgSkillRoots surface as `org:<id>` and never shadow a local skill (3c)", () => {
+		// A peer (org-visible) skill is tagged org:<id> and ranks below every
+		// operator-placed root, so a same-named workspace skill wins.
+		const peer = path.join(root, "peer-skills");
+		const ws = path.join(root, "workspace", "skills");
+		writeSkill(peer, "shared", "description: PEER version.");
+		writeSkill(peer, "peeronly", "description: from a peer.");
+		writeSkill(ws, "shared", "description: OWN version.");
+		const res = discoverSkills({
+			workspaceSkillsDir: ws,
+			orgSkillRoots: [{ dir: peer, agentId: "accountant" }],
+			eligibilityCtx: LINUX,
+		});
+		const byName = new Map(res.skills.map((s) => [s.name, s]));
+		assert.equal(byName.get("peeronly")?.source, "org:accountant");
+		// Collision: own workspace beats the peer.
+		assert.equal(byName.get("shared")?.source, "workspace");
+		assert.ok(res.promptBlock?.includes("OWN version."));
+		assert.ok(!res.promptBlock?.includes("PEER version."));
+	});
+
+	it("org-visible skills ARE still gated by the allowlist (only OWN workspace is exempt) (3c)", () => {
+		const peer = path.join(root, "peer-skills");
+		const ws = path.join(root, "workspace", "skills");
+		writeSkill(peer, "peerskill", "description: from a peer.");
+		writeSkill(ws, "mine", "description: own.");
+		const res = discoverSkills({
+			workspaceSkillsDir: ws,
+			orgSkillRoots: [{ dir: peer, agentId: "cfo" }],
+			skillAllowlist: [], // deny-all
+			eligibilityCtx: LINUX,
+		});
+		// Own survives (exempt); the peer's skill is dropped by the allowlist.
+		assert.deepEqual(res.skills.map((s) => s.name), ["mine"]);
 	});
 });

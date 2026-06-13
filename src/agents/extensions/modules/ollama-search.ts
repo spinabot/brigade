@@ -87,11 +87,25 @@ function createOllamaSearchProvider(): WebSearchProvider {
 		docsUrl: "https://docs.ollama.com/cloud",
 		placeholder: "http://localhost:11434",
 		// Loses to commercial keyed backends but beats DDG when the operator
-		// has Ollama running — typically more reliable than HTML scraping.
+		// has OPTED IN — typically more reliable than HTML scraping.
 		autoDetectOrder: 90,
-		// Always "configured" in the sense that the provider can try; if the
-		// daemon isn't running, execute fails gracefully with a clear error.
-		isConfigured: () => true,
+		// OPT-IN ONLY. This endpoint proxies ollama.com's account-metered cloud
+		// search with a hard weekly quota — it must never be the silent default.
+		// (Production incident: a fresh-ish install auto-resolved here, burned
+		// the weekly quota dry mid-research, and with no fallback chain the
+		// agent lost web search entirely.) Configured =
+		//   - the operator wrote `tools.web.search.providers.ollama` in config
+		//     (even `{}` counts — presence is the opt-in), OR
+		//   - OLLAMA_API_KEY is exported (explicit Ollama Cloud setup).
+		// OLLAMA_HOST alone is NOT opt-in — that env var configures the chat
+		// runtime, and treating it as search opt-in would silently re-default
+		// every Ollama chat user onto the metered endpoint.
+		isConfigured: (cfg, env) => {
+			const slot = (cfg as {
+				tools?: { web?: { search?: { providers?: Record<string, unknown> } } };
+			}).tools?.web?.search?.providers?.ollama;
+			return slot !== undefined || Boolean(env?.OLLAMA_API_KEY?.trim());
+		},
 		createTool(ctx: WebProviderContext): WebProviderToolDefinition {
 			const cfgSlot = readProviderConfigSlot<OllamaConfig>({
 				cfg: ctx.config,

@@ -57,6 +57,14 @@ const ALLOWLIST_NO_GUARD_NEEDED = new Set<string>([
 	"subscribe",
 	"unsubscribe",
 	"approval-resolve",
+	// Operator-scoped exec-trust toggles (admin at the WS layer, like
+	// approval-resolve). `exec-allow-all` arms/disarms the operator's OWN
+	// session's approval-prompt-skip; `exec-grant-skill` writes the operator's
+	// own agent's exec-approvals allowlist. Neither targets, mutates, or
+	// discloses ANOTHER agent's session — the per-agent ownerOnly + the
+	// config/path-write guards are the real boundary.
+	"exec-allow-all",
+	"exec-grant-skill",
 	// Read-only registry / snapshot methods.
 	"list-models",
 	"refresh-models",

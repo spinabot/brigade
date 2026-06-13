@@ -206,6 +206,13 @@ export function assembleBrigadeToolset(opts: {
 		if (t.name === "sessions_send") {
 			return wrapToolExecutionTimeout(ownerWrapped, undefined, resolveSessionsSendTimeoutMs);
 		}
+		// oauth_authorize `await` blocks until the operator clicks the link —
+		// up to its own `waitSeconds` (default 240). The blanket 60s watchdog
+		// would kill that legitimate wait; size the budget from the call's
+		// waitSeconds + slack (same pattern as spawn / sessions_send).
+		if (t.name === "oauth_authorize") {
+			return wrapToolExecutionTimeout(ownerWrapped, undefined, resolveOAuthAuthorizeTimeoutMs);
+		}
 		return wrapToolExecutionTimeout(ownerWrapped);
 	});
 	// Per-job toolsAllow filter (cron). When omitted, every tool flows
@@ -279,6 +286,21 @@ export function resolveSessionsSendTimeoutMs(toolArgs: unknown): number {
 			? bag.timeoutSeconds
 			: 90;
 	return waitSeconds * 1000 + 10_000 + 30_000;
+}
+
+/**
+ * Per-call watchdog budget for `oauth_authorize`. The `await` action blocks
+ * until the operator clicks the authorization link — up to its own
+ * `waitSeconds` (default 240). `start` / `cancel` are fast but harmlessly
+ * inherit the same generous budget. Exported for tests.
+ */
+export function resolveOAuthAuthorizeTimeoutMs(toolArgs: unknown): number {
+	const bag = toolArgs as { waitSeconds?: unknown } | undefined;
+	const waitSeconds =
+		typeof bag?.waitSeconds === "number" && Number.isFinite(bag.waitSeconds) && bag.waitSeconds > 0
+			? bag.waitSeconds
+			: 240;
+	return waitSeconds * 1000 + 20_000;
 }
 
 /** Live correlation-id bag the guards read for `tool-blocked` bus events. */

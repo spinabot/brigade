@@ -13,11 +13,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import type { BrigadeConfig } from "../../config/io.js";
-import { resolveBundledSkillsDir, resolveManagedSkillsDir } from "../../config/paths.js";
+import {
+	resolveBundledSkillsDir,
+	resolveManagedSkillsDir,
+	resolveSkillsDir,
+} from "../../config/paths.js";
 import {
 	resolveEffectiveAgentSkillFilter,
 } from "./agent-filter.js";
 import { discoverSkills, type DiscoveredSkill, type SkillDiscoveryResult } from "./discovery.js";
+import { resolveOrgVisibleSkillAgents } from "./org-access.js";
 
 export {
 	discoverSkills,
@@ -47,6 +52,17 @@ const EMPTY: SkillDiscoveryResult = {
 	totalDiscovered: 0,
 	diagnostics: [],
 };
+
+/** Read a peer agent's `cfg.agents.<id>.workspace` override (string) or undefined. */
+function readAgentWorkspaceOverride(config: BrigadeConfig, agentId: string): string | undefined {
+	const agents = config.agents as Record<string, unknown> | undefined;
+	const entry = agents?.[agentId];
+	if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+		const ws = (entry as { workspace?: unknown }).workspace;
+		if (typeof ws === "string" && ws.trim().length > 0) return ws.trim();
+	}
+	return undefined;
+}
 
 /** Names disabled via `skills.entries[<name>].enabled === false`. */
 function resolveDisabledNames(config: BrigadeConfig): Set<string> {
@@ -81,6 +97,16 @@ export interface DiscoverEligibleSkillsArgs {
 export function discoverEligibleSkills(args: DiscoverEligibleSkillsArgs): SkillDiscoveryResult {
 	if (args.config.skills?.enabled === false) return EMPTY;
 	const allowlist = resolveEffectiveAgentSkillFilter(args.config, args.agentId);
+	// 3c — org-hierarchy skill access. Resolve OTHER agents whose workspace
+	// skills this agent may see (its reports / managers, per skills.orgAccess),
+	// and add each as a low-precedence root tagged `org:<id>`. Honours each
+	// peer's own `cfg.agents.<id>.workspace` override so the dir matches where
+	// that agent actually keeps its skills.
+	const orgSkillRoots = resolveOrgVisibleSkillAgents(
+		args.config,
+		args.agentId,
+		args.config.skills?.orgAccess,
+	).map((id) => ({ dir: resolveSkillsDir(id, readAgentWorkspaceOverride(args.config, id)), agentId: id }));
 	return discoverSkills({
 		workspaceSkillsDir: path.join(args.workspaceDir, "skills"),
 		bundledSkillsDir: resolveBundledSkillsDir(),
@@ -89,6 +115,7 @@ export function discoverEligibleSkills(args: DiscoverEligibleSkillsArgs): SkillD
 		projectSkillsDir: path.join(args.workspaceDir, ".agents", "skills"),
 		extraPaths: args.config.skills?.paths ?? [],
 		disabledNames: resolveDisabledNames(args.config),
+		...(orgSkillRoots.length > 0 ? { orgSkillRoots } : {}),
 		...(allowlist !== undefined ? { skillAllowlist: allowlist } : {}),
 		// Pass the active config so `requires.config` paths actually gate
 		// channel-specific skills (e.g. a bluebubbles skill is hidden when

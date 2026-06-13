@@ -107,6 +107,36 @@ export function createConsoleStream(opts: ConsoleStreamOptions = {}): ConsoleStr
 		return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 	};
 
+	// Pull a short human-readable snippet out of a tool result for the `✗` log
+	// line. Without it a failed tool logged only its name, so a prepare-stage
+	// refusal (malformed/empty args, schema-validation throw) or a provider error
+	// was undiagnosable from the gateway stream alone — exactly the `spawn_agents ✗`
+	// with no cause that sent us spelunking.
+	const toolResultText = (result: unknown): string | undefined => {
+		if (result == null) return undefined;
+		if (typeof result === "string") return result.trim() || undefined;
+		const r = result as { content?: unknown; error?: unknown; message?: unknown };
+		if (Array.isArray(r.content)) {
+			const text = r.content
+				.map((p) =>
+					p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string"
+						? (p as { text: string }).text
+						: "",
+				)
+				.filter(Boolean)
+				.join(" ")
+				.trim();
+			if (text) return text;
+		}
+		if (typeof r.error === "string" && r.error.trim()) return r.error;
+		if (typeof r.message === "string" && r.message.trim()) return r.message;
+		try {
+			return JSON.stringify(result);
+		} catch {
+			return String(result);
+		}
+	};
+
 	const fields = (kv: Record<string, unknown>): string =>
 		Object.entries(kv)
 			.filter(([, v]) => v !== undefined && v !== null && v !== "")
@@ -175,13 +205,18 @@ export function createConsoleStream(opts: ConsoleStreamOptions = {}): ConsoleStr
 						args: ev.args ? trunc(ev.args, 80) : undefined,
 					})}`;
 					break;
-				case "tool_execution_end":
+				case "tool_execution_end": {
 					sub = "tool";
 					body = `${arrow("event")} tool_end ${status(!ev.isError)} ${fields({
 						tool: ev.toolName,
 					})}`;
-					if (ev.isError) levelFor = "warn";
+					if (ev.isError) {
+						levelFor = "warn";
+						const snip = toolResultText(ev.result);
+						if (snip) body += ` ${c(chalk.dim, "err")}=${trunc(snip, 160)}`;
+					}
 					break;
+				}
 				case "message_start":
 				case "message_end":
 					body = `${arrow("event")} ${t} ${fields({ role: ev.message?.role })}`;

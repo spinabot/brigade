@@ -35,8 +35,17 @@ const log = createSubsystemLogger("brigade/approvals");
 
 export type { ChannelApprovalRoute } from "./channels/approval-router.js";
 
-/** Decisions the operator can pick. Aligned with protocol.ts. */
-export type ApprovalDecisionKind = "allow-once" | "allow-always" | "allow-pattern" | "deny";
+/** Decisions the operator can pick. Aligned with protocol.ts.
+ *  `allow-session` allows THIS call AND arms session-scoped allow-all (the
+ *  exec-gate stops prompting for the rest of the session) — the in-prompt
+ *  equivalent of `/allow-all on`. The gate performs the arming (it owns the
+ *  session key); persistence-wise it's ephemeral, never written to disk. */
+export type ApprovalDecisionKind =
+	| "allow-once"
+	| "allow-always"
+	| "allow-pattern"
+	| "allow-session"
+	| "deny";
 
 export interface ApprovalDecision {
 	kind: ApprovalDecisionKind;
@@ -248,6 +257,10 @@ export function applyApprovalDecision(args: {
 		case "deny":
 			return "deny";
 		case "allow-once":
+			return "allow";
+		case "allow-session":
+			// Allow THIS call. Arming session allow-all happens in the exec-gate
+			// (it owns the session key); nothing is persisted here.
 			return "allow";
 		case "allow-always":
 			recordApproval(command, "exact", agentId);
