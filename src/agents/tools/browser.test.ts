@@ -7,7 +7,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { BrowserSchema, makeBrowserTool } from "./browser.js";
+import { BrowserSchema, BROWSER_ACTIONS, makeBrowserTool } from "./browser.js";
 
 describe("makeBrowserTool — identity + schema", () => {
 	const tool = makeBrowserTool();
@@ -24,58 +24,32 @@ describe("makeBrowserTool — identity + schema", () => {
 		assert.match(tool.description, /[Aa]uto-detects/);
 	});
 
-	it("schema requires `action` and exposes the full action surface", () => {
+	it("schema requires `action` (a plain string) and documents the full surface", () => {
 		const props = (BrowserSchema as unknown as { properties: Record<string, unknown> }).properties;
 		assert.ok(props.action, "action is required");
 		const required = (BrowserSchema as unknown as { required: string[] }).required ?? [];
 		assert.ok(required.includes("action"));
-		const actionUnion = (props.action as { anyOf?: Array<{ const: string }> }).anyOf ?? [];
-		const values = actionUnion.map((a) => a.const).filter(Boolean);
-		// Exhaustive: every documented action must be in the schema.
-		// If a new action ships without an entry here, the test fails so
-		// we don't silently drop coverage.
-		const expectedActions = [
-			// Lifecycle / introspection
-			"status",
-			"start",
-			"stop",
-			"profiles",
-			"attach",
-			"tabs",
-			// Tab navigation
-			"open",
-			"focus",
-			"close",
-			"navigate",
-			// Capture
-			"snapshot",
-			"screenshot",
-			"pdf",
-			// Interaction
-			"click",
-			"type",
-			"press",
-			"hover",
-			"drag",
-			"select",
-			"fill",
-			"resize",
-			"scrollIntoView",
-			"evaluate",
-			"wait",
-			// Capture/handle event streams
-			"console",
-			"dialog",
-			"upload",
-		];
-		for (const expected of expectedActions) {
-			assert.ok(values.includes(expected), `missing action: ${expected}`);
+		// `action` is a free string (validated in-tool against BROWSER_ACTIONS),
+		// NOT a literal union — so an unknown action reaches the dispatch
+		// `default` and returns a clean "unknown action — valid: …" error
+		// instead of Pi's cryptic "must be equal to constant" repeated per
+		// literal. Pin that shape here.
+		const action = props.action as { type?: string; anyOf?: unknown; description?: string };
+		assert.equal(action.type, "string", "action is a plain string param");
+		assert.equal(action.anyOf, undefined, "action is no longer a literal union");
+		// The model loses the JSON-schema enum, so the description MUST still
+		// enumerate every action. If a new action ships without being named in
+		// the description, this fails so we don't silently drop guidance.
+		const desc = action.description ?? "";
+		for (const a of BROWSER_ACTIONS) {
+			assert.ok(desc.includes(a), `action "${a}" missing from the action description`);
 		}
-		// Inverse guard: schema doesn't sneak in actions we don't intend.
-		assert.equal(
-			values.length,
-			expectedActions.length,
-			`unexpected action count: schema has ${values.length}, expected ${expectedActions.length}. Got: ${values.join(",")}`,
+		// scroll is the action a live lead-gen test surfaced as missing;
+		// scrollIntoView (single element) stays distinct from it.
+		assert.ok((BROWSER_ACTIONS as readonly string[]).includes("scroll"), "scroll action present");
+		assert.ok(
+			(BROWSER_ACTIONS as readonly string[]).includes("scrollIntoView"),
+			"scrollIntoView still present",
 		);
 	});
 
@@ -97,6 +71,9 @@ describe("makeBrowserTool — identity + schema", () => {
 			"height",
 			"maxChars",
 			"compact",
+			"to",
+			"pixels",
+			"times",
 		]) {
 			assert.ok(props[param], `missing param: ${param}`);
 		}

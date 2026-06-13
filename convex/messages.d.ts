@@ -62,7 +62,7 @@ export declare const readMarkerTail: import("convex/server").RegisteredQuery<"pu
     sessionId: string;
 }, Promise<{
     type: string;
-    customType: string | undefined;
+    customType?: string;
 }[]>>;
 export declare const deleteTranscript: import("convex/server").RegisteredMutation<"public", {
     agentId: string;

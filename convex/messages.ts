@@ -1,5 +1,6 @@
 // convex/messages.ts — sessionTranscriptRecords + sessionInboxEvents
 import { v } from "convex/values";
+import type { Doc } from "./_generated/dataModel.js";
 import { mutation, query, type MutationCtx } from "./_generated/server.js";
 
 // Max sealed bytes per ROW. Convex caps a single DOCUMENT at 1 MiB; a record
@@ -165,18 +166,34 @@ export const readTranscript = query({
 		afterSeq: v.optional(v.number()),
 	},
 	handler: async (ctx, args) => {
-		// Cap a single page well under Convex's per-query document limit.
+		// Page cap by BOTH count AND bytes. `take(limit)` reads up to `limit`
+		// whole documents — but with chunked transcript records (each up to
+		// ~768 KiB) even ~20 rows blow Convex's 16 MiB per-EXECUTION read limit
+		// before the count cap is hit (the "Too many bytes read" crash at this
+		// handler). So iterate lazily and stop at a byte budget well under
+		// 16 MiB; the client pages with afterSeq until it receives an EMPTY page.
 		const limit = args.limit && args.limit > 0 ? Math.min(args.limit, 4000) : 1000;
 		const after = args.afterSeq;
-		const rows = await ctx.db
+		const BYTE_BUDGET = 8 * 1024 * 1024; // 8 MiB — half the 16 MiB exec read cap
+		const cursor = ctx.db
 			.query("sessionTranscriptRecords")
 			.withIndex("by_session_seq", (q) =>
 				after !== undefined
 					? q.eq("agentId", args.agentId).eq("sessionId", args.sessionId).gt("seq", after)
 					: q.eq("agentId", args.agentId).eq("sessionId", args.sessionId),
 			)
-			.order("asc")
-			.take(limit);
+			.order("asc");
+		const rows: Doc<"sessionTranscriptRecords">[] = [];
+		let bytes = 0;
+		for await (const row of cursor) {
+			const sz = row.payload?.byteLength ?? 0;
+			// Stop BEFORE exceeding the budget, but always return at least one
+			// row so the client makes forward progress even on an oversized one.
+			if (rows.length > 0 && bytes + sz > BYTE_BUDGET) break;
+			rows.push(row);
+			bytes += sz;
+			if (rows.length >= limit) break;
+		}
 		return rows;
 	},
 });
@@ -188,29 +205,60 @@ export const readTranscript = query({
 export const readMarkerTail = query({
 	args: { agentId: v.string(), sessionId: v.string(), limit: v.optional(v.number()) },
 	handler: async (ctx, args) => {
+		// Walk newest-first to find the most recent bootstrap-marker / compaction.
+		// `take(limit)` reads FULL documents (payloads included) just to look at
+		// type/customType — on a media-heavy session even a few hundred rows blow
+		// Convex's 16 MiB per-execution read cap. Iterate lazily, cap by bytes,
+		// and stop as soon as a `compaction` row is seen (the caller decides on
+		// the first marker/compaction anyway). Returns only {type, customType} —
+		// never the payload.
 		const limit = args.limit && args.limit > 0 ? Math.min(args.limit, 1000) : 500;
-		const rows = await ctx.db
+		const BYTE_BUDGET = 8 * 1024 * 1024; // 8 MiB — half the 16 MiB exec read cap
+		const out: Array<{ type: string; customType?: string }> = [];
+		let bytes = 0;
+		for await (const r of ctx.db
 			.query("sessionTranscriptRecords")
 			.withIndex("by_session_seq", (q) =>
 				q.eq("agentId", args.agentId).eq("sessionId", args.sessionId),
 			)
-			.order("desc")
-			.take(limit);
-		return rows.map((r) => ({ type: r.type, customType: r.customType }));
+			.order("desc")) {
+			out.push({ type: r.type, customType: r.customType });
+			// A compaction row is the caller's stopping point (it invalidates any
+			// older bootstrap marker) — no need to read further back.
+			if (r.type === "compaction") break;
+			bytes += r.payload?.byteLength ?? 0;
+			if (out.length >= limit || bytes >= BYTE_BUDGET) break;
+		}
+		return out;
 	},
 });
 
 export const deleteTranscript = mutation({
 	args: { agentId: v.string(), sessionId: v.string() },
 	handler: async (ctx, args) => {
-		const rows = await ctx.db
+		// Delete ONE bounded page and return how many rows were removed; the
+		// client loops until this returns 0. `.collect()` + delete-all would blow
+		// BOTH the 16 MiB per-execution READ cap (chunked rows are up to 768 KiB
+		// each) AND the ~8k-delete-per-mutation cap on a long/media-heavy session.
+		// Lossless — every row is eventually deleted across the client's calls.
+		const BYTE_BUDGET = 8 * 1024 * 1024; // half the 16 MiB read cap
+		const MAX_DELETE = 2000; // stay well under the per-mutation delete cap
+		const ids: Array<Doc<"sessionTranscriptRecords">["_id"]> = [];
+		let bytes = 0;
+		for await (const r of ctx.db
 			.query("sessionTranscriptRecords")
 			.withIndex("by_session_seq", (q) =>
 				q.eq("agentId", args.agentId).eq("sessionId", args.sessionId),
 			)
-			.collect();
-		for (const r of rows) await ctx.db.delete(r._id);
-		return rows.length;
+			.order("asc")) {
+			const sz = r.payload?.byteLength ?? 0;
+			if (ids.length > 0 && bytes + sz > BYTE_BUDGET) break;
+			ids.push(r._id);
+			bytes += sz;
+			if (ids.length >= MAX_DELETE) break;
+		}
+		for (const id of ids) await ctx.db.delete(id);
+		return ids.length;
 	},
 });
 

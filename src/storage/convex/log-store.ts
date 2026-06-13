@@ -177,10 +177,21 @@ export class ConvexLogStore implements LogStore {
 	}
 
 	async pruneSubsystemLogs(olderThanMs: number): Promise<{ removed: number }> {
-		return this.deps.client.mutation(api.logs.pruneSubsystemLogs, {
-			ownerId: this.deps.ownerId,
-			olderThanMs,
-		}) as unknown as Promise<{ removed: number }>;
+		// Server prunes one bounded page of expired rows per call; loop until a
+		// page removes nothing. A single delete-all `.collect()` would blow the
+		// 16 MiB read + 8k-delete caps on the (high-volume, unbounded) log table.
+		// Lossless — all expired rows are removed across the loop; the count
+		// matches the disk reader's return shape.
+		let removed = 0;
+		for (;;) {
+			const r = (await this.deps.client.mutation(api.logs.pruneSubsystemLogs, {
+				ownerId: this.deps.ownerId,
+				olderThanMs,
+			})) as { removed: number };
+			removed += r.removed;
+			if (r.removed <= 0) break;
+		}
+		return { removed };
 	}
 
 	async appendConfigAudit(entry: ConfigAuditInput): Promise<ConfigAuditRecord> {

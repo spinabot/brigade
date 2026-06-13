@@ -82,12 +82,21 @@ export const writeFact = mutation({
 /** Every fact row for a workspace across all lifecycles — boot hydration of
  *  the in-process facts cache. */
 export const listAllFacts = query({
-	args: { workspaceId: v.string() },
+	args: {
+		workspaceId: v.string(),
+		cursor: v.optional(v.union(v.string(), v.null())),
+		numItems: v.optional(v.number()),
+	},
 	handler: async (ctx, args) => {
-		return ctx.db
+		// PAGINATED. Boot hydration reads EVERY fact for a workspace; a single
+		// `.collect()` blows Convex's 16 MiB per-execution read cap once memory
+		// grows (this runs on every boot). The client loops with `continueCursor`
+		// until `isDone` and concatenates the pages — lossless at any fact count.
+		const numItems = args.numItems && args.numItems > 0 ? Math.min(args.numItems, 512) : 256;
+		return await ctx.db
 			.query("memoryFacts")
 			.withIndex("by_workspace_memoryId", (q) => q.eq("workspaceId", args.workspaceId))
-			.collect();
+			.paginate({ numItems, cursor: args.cursor ?? null });
 	},
 });
 
@@ -239,15 +248,21 @@ export const setLifecycle = mutation({
 });
 
 export const countActiveFacts = query({
-	args: { workspaceId: v.string() },
+	args: {
+		workspaceId: v.string(),
+		cursor: v.optional(v.union(v.string(), v.null())),
+	},
 	handler: async (ctx, args) => {
-		const rows = await ctx.db
+		// PAGINATED count. A single `.collect()` of all active facts blows the
+		// 16 MiB read cap at scale. The client loops summing `count` until
+		// `isDone`. Returns only the page size (+cursor) — never the rows.
+		const res = await ctx.db
 			.query("memoryFacts")
 			.withIndex("by_workspace_lifecycle_createdAt", (q) =>
 				q.eq("workspaceId", args.workspaceId).eq("lifecycle", "active"),
 			)
-			.collect();
-		return rows.length;
+			.paginate({ numItems: 512, cursor: args.cursor ?? null });
+		return { count: res.page.length, isDone: res.isDone, continueCursor: res.continueCursor };
 	},
 });
 

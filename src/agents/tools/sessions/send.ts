@@ -27,6 +27,8 @@ import { callGateway } from "../../gateway-call.js";
 import { nestedLane } from "../../../process/lanes.js";
 import { requestHeartbeatNow } from "../../heartbeat-wake.js";
 import { enqueueSystemEvent, removeMatchingSystemEvent } from "../../session-inbox.js";
+import { getLastChannelForAgent } from "../../channels/last-channel.js";
+import { normalizeDeliveryContext } from "../../../utils/delivery-context.js";
 import {
 	checkSessionToolAccess,
 	describeSessionsSendTool,
@@ -506,12 +508,33 @@ export function createSessionsSendTool(
 								: `A2A: peer ${parsed.sessionKey} finished the delegated turn but produced no text reply. ` +
 									`Check sessions_history({sessionKey: "${parsed.sessionKey}", limit: 3}) and tell the user honestly.`;
 						}
+						// P0-2: stamp the requester's CHANNEL on the event so the woken
+						// turn's relay reaches them where they actually are (WhatsApp /
+						// Slack), not just the TUI. The heartbeat dispatcher reads this
+						// deliveryContext and sends the reply out via the channel adapter
+						// (cron-announce-style). Resolved from the requester agent's last
+						// active channel; absent for pure-TUI requesters — then it stays
+						// TUI-only, exactly as before.
+						const requesterAgentId = resolveAgentIdFromSessionKey(requesterSessionKey);
+						const lastCh = requesterAgentId
+							? getLastChannelForAgent(requesterAgentId)
+							: undefined;
+						const deliveryContext = lastCh
+							? normalizeDeliveryContext({
+									channel: lastCh.channelId,
+									to: lastCh.conversationId,
+									accountId: lastCh.accountId,
+									threadId: lastCh.threadId,
+								})
+							: undefined;
 						enqueueSystemEvent(eventText, {
 							sessionKey: requesterSessionKey,
 							contextKey: `a2a:reply:${parsed.sessionKey}`,
 							trusted: true,
+							...(deliveryContext && deliveryContext.channel && deliveryContext.to
+								? { deliveryContext }
+								: {}),
 						});
-						const requesterAgentId = resolveAgentIdFromSessionKey(requesterSessionKey);
 						requestHeartbeatNow({
 							reason: "a2a-reply",
 							...(requesterAgentId ? { agentId: requesterAgentId } : {}),

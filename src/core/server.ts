@@ -110,7 +110,10 @@ import {
 } from "../agents/session-registry.js";
 import crypto from "node:crypto";
 import { enqueuePendingSystemEvent } from "../agents/pending-system-events.js";
-import { enqueueSystemEvent as enqueueSessionInboxEvent } from "../agents/session-inbox.js";
+import {
+	enqueueSystemEvent as enqueueSessionInboxEvent,
+	resolveSystemEventDeliveryContext,
+} from "../agents/session-inbox.js";
 // Multi-routing wiring (Step 1-27 lift): in-process gateway-call dispatcher,
 // per-method handlers (sessions.*, health), agent-events bridge, heartbeat
 // runner + wake flag, lane drain helpers. All exported but never called
@@ -3872,19 +3875,56 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// above (which emits `heartbeat` bus events). Without this both hooks
 	// would have raced for the single slot and the bridge's emit would
 	// have silently lost.
+	// P0-2 — deliver a woken turn's reply back to the requester's CHANNEL when
+	// a consumed event carries a deliveryContext (the A2A late-delivery stamps
+	// the requester's last channel). Without this, a WhatsApp/Slack-origin
+	// requester only ever sees the relayed reply in the TUI. Cron awareness
+	// events carry NO deliveryContext (cron delivers to its channel separately
+	// in maybeDeliverAnnounce), so they never double-deliver here. Best-effort:
+	// reuses the same adapter.sendText path the cron dispatcher uses.
+	const deliverReplyToChannel = async (
+		ctx: { channel?: string; to?: string; accountId?: string; threadId?: string | number },
+		replyText: string,
+	): Promise<boolean> => {
+		if (!channelManager || !ctx.channel || !ctx.to || !replyText.trim()) return false;
+		const adapter = channelManager.adapter(ctx.channel);
+		if (!adapter) return false;
+		try {
+			if (typeof adapter.health === "function" && !adapter.health().ok) return false;
+			await adapter.sendText(
+				ctx.to,
+				replyText,
+				ctx.threadId !== undefined ? { threadId: String(ctx.threadId) } : undefined,
+			);
+			return true;
+		} catch (err) {
+			createSubsystemLogger("agents/heartbeat-runner").warn("A2A channel delivery failed", {
+				channel: ctx.channel,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	};
+
 	const disposeHeartbeatHook = addHeartbeatFiredHook(async (params) => {
 		if (!params.consumedEvents.length && params.reason !== "interval") return;
 		const text =
 			params.consumedEvents.length > 0
 				? params.consumedEvents.map((e) => e.text).join("\n")
 				: "Heartbeat tick.";
+		// A2A late-delivery events stamp the requester's channel here; cron +
+		// plain system events leave it undefined (TUI-only, unchanged).
+		const deliveryContext = resolveSystemEventDeliveryContext(params.consumedEvents);
 		try {
-			await runGatewayTurn({
+			const result = await runGatewayTurn({
 				text,
 				sessionKey: params.sessionKey,
 				agentId: params.agentId,
 				senderIsOwner: true,
 			});
+			if (deliveryContext?.channel && deliveryContext.to && result?.reply?.trim()) {
+				void deliverReplyToChannel(deliveryContext, result.reply);
+			}
 		} catch {
 			// Heartbeat turns are best-effort; failures already log via the runner.
 			// Audit P2 (F3, 2026-06-11): the runner CONSUMED these events before

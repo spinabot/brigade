@@ -193,12 +193,11 @@ Decision ladder:
 3. Have a URL → try \`fetch_url\`. If the response is short, has \`status >= 400\`, looks like a bot-challenge interstitial, or extractor was \`basic-html\` (Readability bailed) → escalate to \`browser\` (navigate + snapshot).
 4. Need to interact, screenshot, or run JS → go straight to \`browser\`.
 
-Finding businesses, people, or sales leads:
-- Work from PRIMARY sources: targeted searches ("<niche> in <city> contact number", "<niche> <city> site:.in"), map results, and the business's OWN website or social page. A lead counts only when name + phone/address are confirmed on a primary source.
-- Map sites are the best business source and they render in the browser: navigate \`https://www.google.com/maps/search/<niche>+in+<city>\`, \`snapshot\`, click a listing to read its panel — name, rating, address, phone, and a Website link ONLY when the business has one (a listing with phone but NO Website link is a real "needs a website" lead).
-- Aggregator/directory listing sites are LOW-YIELD: bot-walled, stale, and their phone numbers are often call-tracking redirects rather than the business's real number. Never make a directory your starting point; open one only if a search hit lands there AND primary sources came up empty — then verify anything you take from it against a primary source before reporting.
-- If a places/maps skill or tool is available, prefer it over page scraping — structured place data beats scraped listings.
-- Report each lead with the source URL per fact so the operator can verify.
+Finding businesses, people, or sales leads — lead with \`web_search\` and decide from the result DOMAINS. Do NOT drive Google Maps reading listings one-by-one (slow, costly, unreliable):
+- \`web_search "<niche> in <city>"\` returns the businesses with their URLs. Read the result domains: a business that appears only on aggregators (zomato, justdial, swiggy, tripadvisor) or social (instagram, facebook) with NO own domain is a "needs a website" lead. That single search is usually enough.
+- To CONFIRM "no website" for a candidate, \`web_search "<business name> <city>"\` and check whether its OWN site appears. Only social / aggregator / map results = no website. Deciding "no website" from a Google Maps "Website" button being absent is NOT reliable — always confirm with a name search.
+- Use the browser ONLY if \`web_search\` is unavailable (then navigate a results URL and \`snapshot\` — never screenshot or click map listings one-by-one). A structured places/maps skill, if one is available, beats scraping.
+- Report each lead with the search evidence (e.g. "searched the name — only an Instagram page + a Zomato listing came up, no own site").
 
 Tips:
 - For pages that never fire \`load\` (heavy anti-bot protection) pass \`waitUntil: "commit"\` to \`browser.navigate\` so the navigation doesn't hang waiting for an event that never fires. Then \`snapshot\` to read the rendered body.

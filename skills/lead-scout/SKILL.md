@@ -1,6 +1,6 @@
 ---
 name: lead-scout
-description: How to find and VERIFY business leads (any niche, any city) using web_search, browser-rendered map listings, and primary sources. Use whenever the user asks to find businesses, shops, vendors, professionals, or sales leads in a location — especially "businesses without a website" prospecting.
+description: How to find and VERIFY business leads (any niche, any city) — especially "businesses without a website" prospecting. Decides "no website" by SEARCHING the business name, not by a map button. Use whenever the user asks to find businesses, shops, vendors, professionals, or sales leads in a location. No API key needed — web_search + the browser do everything.
 metadata:
   {
     "brigade":
@@ -12,21 +12,35 @@ metadata:
 
 # Lead Scout
 
-Goal: a VERIFIED lead = business name + phone/address confirmed on a primary source, with a source URL per fact. Needs no API key — the browser tool does all the heavy lifting.
+Goal: a **verified lead = a business that has NO website of its own**, confirmed by *searching for it* — the use case is selling websites to businesses that don't have one. Keyless: `web_search` + the browser do all the work, no API key.
 
-## The ladder (stop at the first level that yields verified leads)
+## The rule — what counts as "having a website"
+A business has a website only if it has its **own site**: an official domain (e.g. `cafeborkar.com`, `artjuna.in`). These do **NOT** count as a website:
+- **Social pages** — instagram.com, facebook.com
+- **Aggregators / directories** — zomato, swiggy, justdial, tripadvisor, magicpin, dineout
+- Its **Google Maps / Google Business** listing
 
-1. **Search first.** `web_search`: `"<niche> in <city> contact number"`, `"<niche> <city> site:.in"`, `"<city> <trade> phone"`. Open the top organic hits that are the business's OWN site or social page.
-2. **Search dead (rate-limited / empty)?** Run the same query in the browser: `navigate` to `https://www.bing.com/search?q=<query>` (or `https://duckduckgo.com/html/?q=<query>`, `https://www.google.com/search?q=<query>`), then `snapshot`. Search engines render fine in the browser — never declare them a dead end.
-3. **Map listings — the best business source.** `navigate` to `https://www.google.com/maps/search/<niche>+in+<city>`, then `snapshot` the results panel. Click a listing (use snapshot refs) and `snapshot` again to read its panel: name, rating, review count, address, phone — and a **Website link only when the business has one**.
-   - Prospecting for businesses that NEED a website: a listing with a phone number but NO Website link is exactly that lead. Listings whose "website" is only a social page are the next-best segment.
-   - Map pages never go network-idle; navigate with default `domcontentloaded` (or `waitUntil: "commit"` if it hangs) and just snapshot.
-4. **A places/maps tool or skill in your list?** Prefer it over any page scraping — structured place data beats snapshots.
-5. **Verify before reporting.** Cross-check phone/address on the business's own site or social page when one exists. Report each lead with the source URL per fact.
+So if searching for the business surfaces **only** those, it has **no website → it's a lead**.
+
+## Method — decide by SEARCH, never by a map button
+1. **Get candidate names — `web_search` FIRST** (don't drive Maps unless search is unavailable):
+   - `web_search "<niche> in <city>"` returns businesses + their domains. Often this single search already answers it — a business appearing only on aggregators/social with no own domain is your lead.
+   - ONLY if `web_search` is down/rate-limited: browser `navigate` to `https://www.google.com/maps/search/<niche>+in+<city>`, then **one** `snapshot` (snapshotFormat:`"text"`)/`evaluate` to read the whole list at once (never screenshot or click each listing). `scroll` (to:`"bottom"`) + snapshot again for more.
+2. **Decide per business with a search** — THIS is the step that determines "no website":
+   - `web_search "<business name> <city>"`. (If `web_search` is rate-limited, run the same query in the browser: navigate to a Bing / DuckDuckGo-html / Google results URL, then `snapshot`.)
+   - Scan the results: is any result the business's **own domain** (per the rule above)?
+     - **Yes** → it HAS a website — skip it, not a lead.
+     - **Only** social / aggregator / Maps results → **no website → it's a lead.**
+   - Not sure which result is theirs? Open the top non-social hit and `snapshot` to confirm whose site it is.
+3. **Report** each lead with the **evidence**: name, area/address + phone if found, and *why* it's a lead — e.g. *"searched 'Cafe Borkar Panaji' — only an Instagram page and a Zomato listing came up, no own website."*
+
+## Phone / address
+Read them from the search results or the business's own social page. Google Maps hides the phone behind a sign-in in its UI — don't fight that panel; the number is usually right there in the search results or on their Instagram/Facebook.
 
 ## Anti-patterns
-
-- Do NOT start at aggregator/directory listing sites. They are bot-walled, stale, and list call-tracking numbers instead of the business's real phone. Use one only as a last-resort pointer, then verify on a primary source.
-- Do NOT declare a search engine or map "JS-heavy" and give up — the browser renders JS by definition; snapshot the page.
-- Do NOT report a lead without a source URL, and never invent phone numbers from memory.
-- Do NOT hammer one site with rapid repeated navigations; pace requests like a human reading pages.
+- **NEVER decide "no website" from a missing Google Maps "Website" button.** That only means nobody linked a site to Google — the business may well have one. The ONLY valid way to decide is to **search the business name** and see whether its own site appears.
+- Don't screenshot a listing and read it visually, and don't click into each listing one-by-one — read a list with ONE `snapshot`/`evaluate`, then decide by search.
+- Don't spawn a sub-agent just to look up or verify a list — do it inline; a lookup doesn't need a crew.
+- Don't report a lead you haven't actually searched for; never invent phone numbers from memory.
+- If you find yourself repeating the same action without new results, STOP and report what you have so far.
+- Don't treat an aggregator/directory page as the business's website or as the source of truth.

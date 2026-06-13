@@ -30,7 +30,7 @@ export const ping = query({
 // per-turn transcript-flush errors). BUMP THIS — and the twin
 // EXPECTED_CONVEX_BUNDLE_VERSION in src/storage/boot.ts — together whenever
 // convex/ functions or the schema change shape.
-export const BUNDLE_VERSION = 3;
+export const BUNDLE_VERSION = 6;
 
 export const bundleVersion = query({
 	args: {},

@@ -205,9 +205,20 @@ export class ConvexMemoryStore implements MemoryStore {
 	}
 
 	async countActiveFacts(): Promise<number> {
-		return this.deps.client.query(api.memory.countActiveFacts, {
-			workspaceId: this.deps.workspaceId,
-		}) as unknown as number;
+		// Page-count until isDone — a single `.collect()` would exceed Convex's
+		// 16 MiB per-execution read cap once the fact set is large. Lossless.
+		let count = 0;
+		let cursor: string | null = null;
+		for (;;) {
+			const res = (await this.deps.client.query(api.memory.countActiveFacts, {
+				workspaceId: this.deps.workspaceId,
+				cursor,
+			})) as { count: number; isDone: boolean; continueCursor: string };
+			count += res.count;
+			if (res.isDone) break;
+			cursor = res.continueCursor;
+		}
+		return count;
 	}
 
 	async findSimilar(
@@ -353,9 +364,20 @@ export class ConvexMemoryStore implements MemoryStore {
 	}
 
 	async listAllFactRecordsRaw(workspaceId: string): Promise<MemoryRecord[]> {
-		const rows = (await this.deps.client.query(api.memory.listAllFacts, {
-			workspaceId,
-		})) as Array<Record<string, unknown>>;
+		// Page through ALL facts (boot hydration) until isDone — a single read
+		// would exceed Convex's 16 MiB per-execution cap once memory is large.
+		// Lossless: every page is concatenated.
+		const rows: Array<Record<string, unknown>> = [];
+		let cursor: string | null = null;
+		for (;;) {
+			const res = (await this.deps.client.query(api.memory.listAllFacts, {
+				workspaceId,
+				cursor,
+			})) as { page: Array<Record<string, unknown>>; isDone: boolean; continueCursor: string };
+			rows.push(...res.page);
+			if (res.isDone) break;
+			cursor = res.continueCursor;
+		}
 		return rows.map(rowToRecordOrNull).filter((r): r is MemoryRecord => r !== null);
 	}
 

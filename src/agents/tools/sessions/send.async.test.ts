@@ -30,6 +30,7 @@ import {
 	hasPendingHeartbeatWake,
 	resetHeartbeatWakeStateForTests,
 } from "../../heartbeat-wake.js";
+import { recordLastChannelForAgent } from "../../channels/last-channel.js";
 import { createSessionsSendTool } from "./send.js";
 import { createAgentToAgentPolicy } from "./shared.js";
 
@@ -146,6 +147,33 @@ describe("sessions_send: run-settle contract", () => {
 		assert.match(inbox[0]!.text, /^A2A reply from agent:eng-lead:main: DONE: full lead list…/);
 		assert.match(inbox[0]!.text, /relay this result to the user NOW/);
 		assert.equal(hasPendingHeartbeatWake(), true, "wake requested so the requester relays promptly");
+	});
+
+	it("P0-2: late delivery stamps the requester's channel as deliveryContext (so the relay can reach WhatsApp, not just the TUI)", async () => {
+		// The requester (accountant) was last active on WhatsApp — record it.
+		recordLastChannelForAgent("accountant", {
+			channelId: "whatsapp",
+			conversationId: "123@s.whatsapp.net",
+			accountId: "acct1",
+		});
+		const stub = installStubGateway();
+		const tool = permissiveTool();
+
+		const pending = tool.execute({ sessionKey: PEER, message: "long research", timeoutSeconds: 1 });
+		await pending; // status "accepted"
+
+		stub.messages.push({ role: "assistant", content: "DONE: lead list" });
+		stub.settle.resolve({ ok: true, reply: "DONE: lead list" });
+		await new Promise((r) => setTimeout(r, 100));
+
+		const inbox = peekSystemEventEntries(REQUESTER);
+		assert.equal(inbox.length, 1);
+		// The heartbeat dispatcher reads this and delivers the woken reply to the channel.
+		assert.deepEqual(inbox[0]!.deliveryContext, {
+			channel: "whatsapp",
+			accountId: "acct1",
+			to: "123@s.whatsapp.net",
+		});
 	});
 
 	it("failed dispatch surfaces as status error AND withdraws the ghost A2A event from the peer inbox", async () => {

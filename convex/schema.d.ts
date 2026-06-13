@@ -724,14 +724,14 @@ declare const _default: import("convex/server").SchemaDefinition<{
         by_owner_agent_kind: ["ownerId", "agentId", "kind", "_creationTime"];
     }, {}, {}>;
     systemMeta: import("convex/server").TableDefinition<import("convex/values").VObject<{
-        value: string;
         key: string;
+        value: string;
         updatedAt: number;
     }, {
         key: import("convex/values").VString<string, "required">;
         value: import("convex/values").VString<string, "required">;
         updatedAt: import("convex/values").VFloat64<number, "required">;
-    }, "required", "value" | "key" | "updatedAt">, {
+    }, "required", "key" | "value" | "updatedAt">, {
         by_key: ["key", "_creationTime"];
     }, {}, {}>;
     whatsappAuthCreds: import("convex/server").TableDefinition<import("convex/values").VObject<{

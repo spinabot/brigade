@@ -2,6 +2,7 @@
   "name": "brigade",
   "version": "0.1.0",
   "description": "Brigade — your personal AI crew",
+  "homepage": "https://brigade-agent.ai",
   "type": "module",
   "bin": {
     "brigade": "./brigade.mjs"

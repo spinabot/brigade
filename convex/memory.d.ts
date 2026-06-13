@@ -70,8 +70,10 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
 /** Every fact row for a workspace across all lifecycles — boot hydration of
  *  the in-process facts cache. */
 export declare const listAllFacts: import("convex/server").RegisteredQuery<"public", {
+    cursor?: string | null | undefined;
+    numItems?: number | undefined;
     workspaceId: string;
-}, Promise<{
+}, Promise<import("convex/server").PaginationResult<{
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
@@ -94,7 +96,7 @@ export declare const listAllFacts: import("convex/server").RegisteredQuery<"publ
     lastAccessedAt: number;
     lifecycle: "active" | "archived" | "pruned";
     workspaceId: string;
-}[]>>;
+}>>>;
 /** Authoritative single-record upsert — every field caller-supplied
  *  (accessCount, lifecycle, timestamps included). The FactStore dispatch
  *  realises its whole-file diffs through this. */
@@ -144,8 +146,13 @@ export declare const setLifecycle: import("convex/server").RegisteredMutation<"p
     memoryIds: string[];
 }, Promise<void>>;
 export declare const countActiveFacts: import("convex/server").RegisteredQuery<"public", {
+    cursor?: string | null | undefined;
     workspaceId: string;
-}, Promise<number>>;
+}, Promise<{
+    count: number;
+    isDone: boolean;
+    continueCursor: string;
+}>>;
 export declare const getExtractCursor: import("convex/server").RegisteredQuery<"public", {
     sessionId: string;
     workspaceId: string;

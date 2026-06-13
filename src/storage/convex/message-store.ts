@@ -69,18 +69,42 @@ export class ConvexMessageStore implements MessageStore {
 		records: PiTranscriptRecord[],
 	): Promise<void> {
 		if (records.length === 0) return;
-		await this.deps.client.mutation(api.messages.appendRecordsBatch, {
-			agentId,
-			sessionId,
-			records: records.map((record) => {
-				const customType = (record as { customType?: unknown }).customType;
-				return {
-					type: record.type,
-					...(typeof customType === "string" ? { customType } : {}),
-					payload: jsonToBytes(record),
-				};
-			}),
-		});
+		// Slice into byte- AND count-bounded sub-batches: one mutation can't
+		// carry an unbounded arg array (arg-size limit) or write unbounded rows
+		// (~8k-write cap; a single record may chunk into many rows). Each sub-
+		// batch is its own appendRecordsBatch call; the server derives seq from
+		// the live tail, so sequential sub-batches chain identically to one call.
+		const MAX_COUNT = 256;
+		const MAX_BYTES = 6 * 1024 * 1024;
+		let batch: Array<{ type: string; customType?: string; payload: ArrayBuffer }> = [];
+		let bytes = 0;
+		const flush = async (): Promise<void> => {
+			if (batch.length === 0) return;
+			await this.deps.client.mutation(api.messages.appendRecordsBatch, {
+				agentId,
+				sessionId,
+				records: batch,
+			});
+			batch = [];
+			bytes = 0;
+		};
+		for (const record of records) {
+			const customType = (record as { customType?: unknown }).customType;
+			const payload = jsonToBytes(record);
+			if (
+				batch.length > 0 &&
+				(batch.length >= MAX_COUNT || bytes + payload.byteLength > MAX_BYTES)
+			) {
+				await flush();
+			}
+			batch.push({
+				type: record.type,
+				...(typeof customType === "string" ? { customType } : {}),
+				payload,
+			});
+			bytes += payload.byteLength;
+		}
+		await flush();
 	}
 
 	async replaceTranscript(
@@ -88,18 +112,17 @@ export class ConvexMessageStore implements MessageStore {
 		sessionId: string,
 		records: PiTranscriptRecord[],
 	): Promise<void> {
-		await this.deps.client.mutation(api.messages.replaceTranscript, {
-			agentId,
-			sessionId,
-			records: records.map((record) => {
-				const customType = (record as { customType?: unknown }).customType;
-				return {
-					type: record.type,
-					...(typeof customType === "string" ? { customType } : {}),
-					payload: jsonToBytes(record),
-				};
-			}),
-		});
+		// Wholesale replace at ANY size, lossless: clear the session in bounded
+		// delete-pages, then append the new records in byte-bounded batches. The
+		// old single `replaceTranscript` mutation read + deleted + inserted the
+		// WHOLE transcript in one execution — it blew the 16 MiB read, the
+		// 8k-delete, the 8k-write AND the mutation arg-size caps on a long
+		// transcript. NOTE: no longer a single atomic transaction (unbounded
+		// delete+insert can't be one Convex mutation) — it deletes then appends;
+		// an interruption leaves the session empty and a re-run recovers (migrate
+		// is idempotent; Pi's _rewriteFile is always followed by a full rewrite).
+		await this.deleteTranscript(agentId, sessionId);
+		await this.appendRecordsBatch(agentId, sessionId, records);
 	}
 
 	async readTranscript(
@@ -158,8 +181,10 @@ export class ConvexMessageStore implements MessageStore {
 					pending = undefined;
 				}
 			}
-			// A short page means the index range is drained — stop.
-			if (rows.length < PAGE) break;
+			// Do NOT stop on a short page: the server caps each page by BYTES
+			// (~8 MiB) as well as count, so a page can be short mid-transcript.
+			// End-of-data is signalled ONLY by an empty page (handled above) —
+			// keep paging via afterSeq until then (bounded by `want`).
 		}
 		return out;
 	}
@@ -193,7 +218,17 @@ export class ConvexMessageStore implements MessageStore {
 	}
 
 	async deleteTranscript(agentId: string, sessionId: string): Promise<void> {
-		await this.deps.client.mutation(api.messages.deleteTranscript, { agentId, sessionId });
+		// Server deletes one bounded page per call (byte + count capped) and
+		// returns how many it removed; loop until nothing remains. A single
+		// delete-all would exceed the 16 MiB read + 8k-delete caps on a long
+		// session. Lossless — every row is removed across the loop.
+		for (;;) {
+			const deleted = (await this.deps.client.mutation(api.messages.deleteTranscript, {
+				agentId,
+				sessionId,
+			})) as number;
+			if (deleted <= 0) break;
+		}
 	}
 
 	async repairIfNeeded(_agentId: string, _sessionId: string): Promise<RepairReport> {

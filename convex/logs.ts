@@ -142,10 +142,18 @@ export const pruneSubsystemLogs = mutation({
 	args: { ownerId: v.string(), olderThanMs: v.number() },
 	handler: async (ctx, args) => {
 		const cutoff = new Date(Date.now() - args.olderThanMs).toISOString();
+		// Prune ONE bounded page of expired rows; the client loops until
+		// {removed:0}. `.collect()` of the whole (unbounded, high-volume)
+		// subsystemLog blows the 16 MiB read + 8k-delete caps once it's large —
+		// which is exactly when prune runs. Expired rows sort FIRST on
+		// by_owner_day (oldest day first), so each page makes progress until
+		// only kept rows remain. Page size is small + count-bounded (log rows
+		// are tiny) to stay under the read cap. Lossless.
 		const rows = await ctx.db
 			.query("subsystemLog")
 			.withIndex("by_owner_day", (q) => q.eq("ownerId", args.ownerId))
-			.collect();
+			.order("asc")
+			.take(500);
 		let removed = 0;
 		for (const r of rows) {
 			if (r.time < cutoff) {
