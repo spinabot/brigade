@@ -1,0 +1,23 @@
+{
+  /* TypeScript project config for the Convex functions directory. The convex
+   * CLI's deploy-time "Running TypeScript..." step compiles this folder; with
+   * NO tsconfig here it ran in an emitting mode and planted compiled .js/.map
+   * files next to the sources — which the NEXT deploy's bundler picked up as
+   * duplicate entry points ("Two output files share the same path"), making
+   * every successful push break the following one. `noEmit` is the fix; the
+   * rest mirrors Convex's standard template for the function runtime.
+   */
+  "compilerOptions": {
+    "allowJs": true,
+    "strict": true,
+    "target": "ESNext",
+    "lib": ["ES2021", "dom"],
+    "forceConsistentCasingInFileNames": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["./**/*"]
+}

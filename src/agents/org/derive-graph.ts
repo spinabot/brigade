@@ -46,7 +46,34 @@ export function deriveOrgGraph(cfg: BrigadeConfig): OrgGraph | undefined {
   return result;
 }
 
-function deriveImpl(cfg: BrigadeConfig): OrgGraph | undefined {
+/** Separate memo for the display variant — same cfg key, different answer. */
+const DISPLAY_CACHE = new WeakMap<object, OrgGraph | undefined>();
+
+/**
+ * Display-surface variant: identical derivation, but `a2a.mode: "explicit"`
+ * does NOT blank the graph. Explicit mode is an A2A POLICY choice (use the
+ * flat allow matrix instead of graph edges) — it was never meant to make
+ * the org chart / connect banner / agents_list metadata / prompt org blocks
+ * claim "your crew is flat" while a full hierarchy sits in config.
+ *
+ * Use THIS from anything that renders or describes the org. POLICY
+ * consumers (the A2A adapter in agent-loop, org.delegate, sessions_send
+ * remedies) must keep `deriveOrgGraph` — they self-gate on the mode and
+ * fall back to the legacy allow matrix when it's "explicit".
+ */
+export function deriveOrgDisplayGraph(cfg: BrigadeConfig): OrgGraph | undefined {
+  if (cfg && typeof cfg === "object") {
+    if (DISPLAY_CACHE.has(cfg as object)) return DISPLAY_CACHE.get(cfg as object);
+  }
+  const result = deriveImpl(cfg, { includeExplicitMode: true });
+  if (cfg && typeof cfg === "object") DISPLAY_CACHE.set(cfg as object, result);
+  return result;
+}
+
+function deriveImpl(
+  cfg: BrigadeConfig,
+  opts?: { includeExplicitMode?: boolean },
+): OrgGraph | undefined {
   if (!cfg || typeof cfg !== "object") return undefined;
 
   const org = cfg.org;
@@ -61,10 +88,17 @@ function deriveImpl(cfg: BrigadeConfig): OrgGraph | undefined {
   }
 
   // ── BRANCH 2: `mode === "explicit"`. Operator wants the legacy A2A
-  // allow matrix; we return undefined so Stage-C/D consumers fall back
-  // to it. (The cfg.org block is still validated by Stage A even in
+  // allow matrix; we return undefined so Stage-C/D POLICY consumers fall
+  // back to it. (The cfg.org block is still validated by Stage A even in
   // explicit mode, to catch typos / cycles before they bite later.)
-  if (org.a2a?.mode === "explicit") {
+  //
+  // Display surfaces must NOT use this function's undefined as "no org" —
+  // see `deriveOrgDisplayGraph` below. Production 2026-06-11: the operator
+  // set mode "explicit" to widen A2A and every display surface (connect
+  // banner, org.snapshot, org show/describe) reported a 14-agent 4-tier
+  // hierarchy as "your crew is flat"; the model then "rebuilt" org data
+  // that was never missing and bash-edited brigade.json chasing the ghost.
+  if (org.a2a?.mode === "explicit" && !opts?.includeExplicitMode) {
     // Still validate so cfg-level bugs are surfaced eagerly.
     validateOrgConfig(cfg);
     return undefined;
@@ -73,7 +107,17 @@ function deriveImpl(cfg: BrigadeConfig): OrgGraph | undefined {
   // ── BRANCH 3: derived / open mode. Validate, then build the graph.
   validateOrgConfig(cfg);
 
-  const mode = org.a2a?.mode === "open" ? "open" : "derived";
+  // Stamp the graph with the cfg's REAL mode. "explicit" only reaches here
+  // via the display variant (the policy path returned undefined above) —
+  // stamping it keeps `--json` / tool `show` output truthful instead of
+  // labelling an explicit-mode install "derived", and lets diagnostic
+  // surfaces (explain / describe) caveat themselves off `graph.mode`.
+  const mode =
+    org.a2a?.mode === "open"
+      ? "open"
+      : org.a2a?.mode === "explicit"
+        ? "explicit"
+        : "derived";
   const topOrder = resolveTopOrder(cfg);
   const members = collectMembers(cfg);
   const departments = invertDepartments(members);

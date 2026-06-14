@@ -2,6 +2,75 @@ import { Command } from "commander";
 
 import { formatVersion } from "../../version.js";
 
+// ─────────────────────────── exit drain ───────────────────────────
+// Every command action terminates with `await exitAfterFlush(code)` instead
+// of a bare `process.exit(code)`. In convex mode the storage adapters batch
+// mutations onto write-behind chains; a short-lived CLI command that mutates
+// then exits immediately would terminate the process before the enqueued
+// write reached the backend (a silent lost write — `brigade exec allow`,
+// `brigade config set`, `brigade channels allow`, …). Draining first closes
+// that window. Filesystem mode + read-only commands drain already-settled
+// chains, so this is free there.
+async function exitAfterFlush(code: number): Promise<never> {
+  try {
+    const { flushAllPendingWrites } = await import("../../storage/flush.js");
+    await flushAllPendingWrites();
+  } catch {
+    // Never let a drain failure block process termination.
+  }
+  process.exit(code);
+}
+
+// ─────────────────────────── storage boot hook ───────────────────────────
+// One preAction hook initialises the RuntimeContext (mode sentinel → store →
+// `store.init()`) before ANY command action runs. Subsystems then reach
+// storage via `getRuntimeContext().store` without re-resolving mode.
+//
+// Three tiers:
+//   • BOOT_SKIP     — commands that must run BEFORE a context exists.
+//                     `onboard` creates the mode sentinel; it builds its own
+//                     store after the wizard picks a mode.
+//   • BOOT_OPTIONAL — diagnostic / repair / reconfigure commands. They boot
+//                     when the backend is healthy but keep working when it
+//                     isn't — a broken convex deployment must never brick
+//                     the tools an operator uses to fix it (`doctor`,
+//                     `status`, `gateway stop`, `store mode set`, `migrate`).
+//   • everything else — workloads (tui, agent, gateway run, connect, config,
+//                     channels, cron, agents, org, exec). Boot failure is
+//                     fatal with the storage layer's operator-facing error.
+
+const BOOT_SKIP = new Set(["onboard"]);
+
+const BOOT_OPTIONAL_PREFIXES = [
+  "doctor",
+  "status",
+  "gateway status",
+  "gateway stop",
+  "gateway install",
+  "gateway uninstall",
+  "gateway restart",
+  "gateway supervise",
+  "store",
+  "encrypt",
+  "migrate",
+  "backup",
+];
+
+/** "gateway status"-style path for the action command (root name elided). */
+function commandPath(cmd: Command): string {
+  const parts: string[] = [];
+  let cur: Command | null = cmd;
+  while (cur && cur.name() !== "brigade") {
+    parts.unshift(cur.name());
+    cur = cur.parent;
+  }
+  return parts.join(" ");
+}
+
+function isBootOptional(path: string): boolean {
+  return BOOT_OPTIONAL_PREFIXES.some((p) => path === p || path.startsWith(`${p} `));
+}
+
 // Lazy command-registration pattern. Each subcommand's real body (action
 // handler) lives in a separate module under `src/cli/commands/`. Commander
 // still needs each command DECLARED at the program level so `brigade
@@ -33,6 +102,27 @@ export function buildProgram(): Command {
   // Commander killing the process directly with exit(1).
   program.exitOverride();
 
+  // Storage boot — fires for every action in the command tree (Commander
+  // propagates program-level hooks to subcommands). Help/version never reach
+  // an action, so they stay storage-free. The import is dynamic to keep the
+  // `brigade --help` fast-path from paying for the storage layer.
+  program.hook("preAction", async (_thisCommand, actionCommand) => {
+    const path = commandPath(actionCommand);
+    if (BOOT_SKIP.has(path)) return;
+    const { bootRuntimeContext } = await import("../../storage/boot.js");
+    try {
+      await bootRuntimeContext();
+    } catch (err) {
+      if (isBootOptional(path)) {
+        process.stderr.write(
+          `brigade: storage backend unavailable — continuing without it (${(err as Error).message})\n`,
+        );
+        return;
+      }
+      throw err;
+    }
+  });
+
   // Each command does the same dance:
   //   1. Declare the subcommand + its options (synchronous; cheap).
   //   2. Inside .action(), dynamic-import the command's runner.
@@ -62,7 +152,7 @@ export function buildProgram(): Command {
         noEnvDetect: opts.envDetect === false,
         secretInputMode: mode,
       });
-      process.exit(code);
+      await exitAfterFlush(code);
     });
 
   program
@@ -80,17 +170,32 @@ export function buildProgram(): Command {
   program
     .command("tui", { isDefault: true })
     .description("Launch the Brigade chat TUI (auto-starts the gateway if needed)")
+    // Positional agent id — the npm-friendly spelling. `npm run tui <agent>`
+    // passes the bare word straight through (no `--` dance), and even
+    // `npm run tui --agent <agent>` works because npm strips its own
+    // `--agent` config flag and forwards just `<agent>` as this positional.
+    // The `--agent <id>` flag below is the equivalent for `brigade tui`.
+    .argument("[agent]", "agent id to bind at startup (positional alias for --agent)")
     // Same Commander `--no-X` pattern as `onboard` above — no third arg.
     .option("--no-env-detect", "ignore API keys from the shell environment")
     .option("-h, --host <host>", "gateway host to connect to / spawn on (default: 127.0.0.1)")
     .option("-p, --port <port>", "gateway port (default: 7777)", (v) => parseInt(v, 10))
-    .action(async (opts: { envDetect?: boolean; host?: string; port?: number }) => {
+    .option("--agent <id>", "bind the TUI to this agent at startup (skips the /agent step)")
+    .action(async (agentArg: string | undefined, opts: { envDetect?: boolean; host?: string; port?: number; agent?: string }) => {
       const { runChatCommand } = await import("../commands/chat.js");
-      await runChatCommand({ noEnvDetect: opts.envDetect === false, host: opts.host, port: opts.port });
+      // Flag wins over positional when both are given; otherwise the
+      // positional (npm path) supplies the binding.
+      const agentId = opts.agent ?? agentArg;
+      await runChatCommand({
+        noEnvDetect: opts.envDetect === false,
+        host: opts.host,
+        port: opts.port,
+        ...(agentId ? { agentId } : {}),
+      });
       // Hold the action handler open — `runChatCommand` resolves once the
-      // editor is wired; without this pin, entry.ts's `process.exit(0)`
+      // editor is wired; without this pin, the entry-point exit hook
       // would kill the chat before the user could type. The chat itself
-      // exits via process.exit() on /exit / Ctrl+D / two-Ctrl+C.
+      // terminates on /exit / Ctrl+D / two-Ctrl+C.
       await new Promise<void>(() => {});
     });
 
@@ -145,7 +250,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { host?: string; port?: number; json?: boolean }) => {
       const { runGatewayStatusCommand } = await import("../commands/gateway.js");
-      process.exit(await runGatewayStatusCommand(opts));
+      await exitAfterFlush(await runGatewayStatusCommand(opts));
     });
 
   gw.command("stop")
@@ -154,7 +259,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { timeout?: number; json?: boolean }) => {
       const { runGatewayStopCommand } = await import("../commands/gateway.js");
-      process.exit(await runGatewayStopCommand(opts));
+      await exitAfterFlush(await runGatewayStopCommand(opts));
     });
 
   // OS-service installer: macOS launchd / Linux systemd-user / Windows Task
@@ -165,7 +270,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runGatewayInstall } = await import("../commands/gateway-install.js");
-      process.exit(await runGatewayInstall({ json: opts.json }));
+      await exitAfterFlush(await runGatewayInstall({ json: opts.json }));
     });
 
   gw.command("uninstall")
@@ -173,7 +278,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runGatewayUninstall } = await import("../commands/gateway-install.js");
-      process.exit(await runGatewayUninstall({ json: opts.json }));
+      await exitAfterFlush(await runGatewayUninstall({ json: opts.json }));
     });
 
   gw.command("restart")
@@ -181,7 +286,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runGatewayRestart } = await import("../commands/gateway-install.js");
-      process.exit(await runGatewayRestart({ json: opts.json }));
+      await exitAfterFlush(await runGatewayRestart({ json: opts.json }));
     });
 
   // Out-of-process watchdog. Reads the gateway's heartbeat file every N
@@ -225,7 +330,7 @@ export function buildProgram(): Command {
         json?: boolean;
       }) => {
         const { runGatewaySupervise } = await import("../commands/gateway-supervise.js");
-        process.exit(
+        await exitAfterFlush(
           await runGatewaySupervise({
             intervalMs: opts.interval,
             maxStaleMs: opts.maxStale,
@@ -246,18 +351,24 @@ export function buildProgram(): Command {
       "Connect to a running Brigade gateway from a thin TUI client.\n" +
         "  Examples:\n" +
         "    brigade connect                          # default 127.0.0.1:7777\n" +
+        "    brigade connect marketing-lead           # open bound to that agent\n" +
+        "    brigade connect --agent marketing-lead   # same, flag form\n" +
         "    brigade connect --host 192.168.1.5 -p 7777\n" +
         "    brigade connect --timeout 120000",
     )
+    .argument("[agent]", "agent id to bind at startup (positional alias for --agent)")
     .option("-h, --host <host>", "gateway host (default: 127.0.0.1)")
     .option("-p, --port <port>", "gateway port", (v) => parseInt(v, 10))
     .option("--timeout <ms>", "request timeout in ms", (v) => parseInt(v, 10))
-    .action(async (opts: { host?: string; port?: number; timeout?: number }) => {
+    .option("--agent <id>", "bind the TUI to this agent at startup (skips the /agent step)")
+    .action(async (agentArg: string | undefined, opts: { host?: string; port?: number; timeout?: number; agent?: string }) => {
       const { runConnectCommand } = await import("../commands/connect.js");
+      const agentId = opts.agent ?? agentArg;
       await runConnectCommand({
         host: opts.host,
         port: opts.port,
         requestTimeoutMs: opts.timeout,
+        ...(agentId ? { agentId } : {}),
       });
       await new Promise<void>(() => {});
     });
@@ -292,7 +403,7 @@ export function buildProgram(): Command {
     .option("--strict", "exit non-zero on warnings (CI mode)", false)
     .action(async (opts: { host?: string; port?: number; json?: boolean; strict?: boolean }) => {
       const { runDoctorCommand } = await import("../commands/doctor.js");
-      process.exit(
+      await exitAfterFlush(
         await runDoctorCommand({ host: opts.host, port: opts.port, json: opts.json, strict: opts.strict }),
       );
     });
@@ -310,7 +421,7 @@ export function buildProgram(): Command {
     .option("--no-redact", "show raw values including secrets (use carefully)", false)
     .action(async (opts: { json?: boolean; redact?: boolean }) => {
       const { runConfigList } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigList({ json: opts.json, noRedact: opts.redact === false }));
+      await exitAfterFlush(await runConfigList({ json: opts.json, noRedact: opts.redact === false }));
     });
 
   cfg
@@ -325,7 +436,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of bare-string output", false)
     .action(async (rawPath: string, opts: { json?: boolean }) => {
       const { runConfigGet } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigGet(rawPath, { json: opts.json }));
+      await exitAfterFlush(await runConfigGet(rawPath, { json: opts.json }));
     });
 
   cfg
@@ -343,7 +454,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON status instead of human text", false)
     .action(async (rawPath: string, rawValue: string, opts: { strictJson?: boolean; dryRun?: boolean; json?: boolean }) => {
       const { runConfigSet } = await import("../commands/config-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runConfigSet(rawPath, rawValue, {
           strictJson: opts.strictJson,
           dryRun: opts.dryRun,
@@ -361,7 +472,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON status instead of human text", false)
     .action(async (rawPath: string, opts: { json?: boolean }) => {
       const { runConfigUnset } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigUnset(rawPath, { json: opts.json }));
+      await exitAfterFlush(await runConfigUnset(rawPath, { json: opts.json }));
     });
 
   cfg
@@ -370,7 +481,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of bare-path output", false)
     .action(async (opts: { json?: boolean }) => {
       const { runConfigFile } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigFile({ json: opts.json }));
+      await exitAfterFlush(await runConfigFile({ json: opts.json }));
     });
 
   cfg
@@ -378,7 +489,7 @@ export function buildProgram(): Command {
     .description("Print the Brigade config TypeBox schema as JSON")
     .action(async () => {
       const { runConfigSchema } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigSchema());
+      await exitAfterFlush(await runConfigSchema());
     });
 
   cfg
@@ -387,7 +498,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runConfigValidate } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigValidate({ json: opts.json }));
+      await exitAfterFlush(await runConfigValidate({ json: opts.json }));
     });
 
   /* ───────────────────────────── channels ───────────────────────────── */
@@ -405,7 +516,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runChannelsList } = await import("../commands/channels.js");
-      process.exit(await runChannelsList({ json: opts.json }));
+      await exitAfterFlush(await runChannelsList({ json: opts.json }));
     });
 
   channels
@@ -415,7 +526,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
       const { runChannelsStatus } = await import("../commands/channels.js");
-      process.exit(await runChannelsStatus({ channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsStatus({ channel: opts.channel }, { json: opts.json }));
     });
 
   channels
@@ -432,7 +543,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; timeout?: number; force?: boolean; json?: boolean }) => {
       const { runChannelsLink } = await import("../commands/channels.js");
-      process.exit(
+      await exitAfterFlush(
         await runChannelsLink(
           { channel: opts.channel, timeoutMs: opts.timeout, force: opts.force },
           { json: opts.json },
@@ -451,7 +562,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; yes?: boolean; json?: boolean }) => {
       const { runChannelsUnlink } = await import("../commands/channels.js");
-      process.exit(await runChannelsUnlink({ channel: opts.channel, yes: opts.yes }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsUnlink({ channel: opts.channel, yes: opts.yes }, { json: opts.json }));
     });
 
   channels
@@ -461,7 +572,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
       const { runChannelsEnable } = await import("../commands/channels.js");
-      process.exit(await runChannelsEnable({ channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsEnable({ channel: opts.channel }, { json: opts.json }));
     });
 
   channels
@@ -471,7 +582,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
       const { runChannelsDisable } = await import("../commands/channels.js");
-      process.exit(await runChannelsDisable({ channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsDisable({ channel: opts.channel }, { json: opts.json }));
     });
 
   // `channels allow <list|add|remove>` — manage the per-channel allow-from list.
@@ -487,7 +598,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
       const { runChannelsAllowList } = await import("../commands/channels.js");
-      process.exit(await runChannelsAllowList({ channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsAllowList({ channel: opts.channel }, { json: opts.json }));
     });
 
   channelsAllow
@@ -497,7 +608,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (id: string, opts: { channel?: string; json?: boolean }) => {
       const { runChannelsAllowAdd } = await import("../commands/channels.js");
-      process.exit(await runChannelsAllowAdd({ id, channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsAllowAdd({ id, channel: opts.channel }, { json: opts.json }));
     });
 
   channelsAllow
@@ -507,7 +618,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (id: string, opts: { channel?: string; json?: boolean }) => {
       const { runChannelsAllowRemove } = await import("../commands/channels.js");
-      process.exit(await runChannelsAllowRemove({ id, channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsAllowRemove({ id, channel: opts.channel }, { json: opts.json }));
     });
 
   // `channels add` — credential-prompt wizard for token-based channels
@@ -533,7 +644,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; nonInteractive?: boolean; json?: boolean }) => {
       const { runChannelsAdd } = await import("../commands/channels.js");
-      process.exit(
+      await exitAfterFlush(
         await runChannelsAdd(
           { channel: opts.channel, nonInteractive: opts.nonInteractive },
           { json: opts.json },
@@ -554,7 +665,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { agent?: string; json?: boolean }) => {
       const { runSessionsList } = await import("../commands/sessions.js");
-      process.exit(await runSessionsList({ agent: opts.agent }, { json: opts.json }));
+      await exitAfterFlush(await runSessionsList({ agent: opts.agent }, { json: opts.json }));
     });
 
   sessions
@@ -566,7 +677,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { agent?: string; olderThan: string; dryRun?: boolean; json?: boolean }) => {
       const { runSessionsCleanup } = await import("../commands/sessions.js");
-      process.exit(
+      await exitAfterFlush(
         await runSessionsCleanup(
           { agent: opts.agent, olderThan: opts.olderThan, dryRun: opts.dryRun },
           { json: opts.json },
@@ -582,7 +693,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runSkillsList } = await import("../commands/skills.js");
-      process.exit(await runSkillsList({ json: opts.json }));
+      await exitAfterFlush(await runSkillsList({ json: opts.json }));
     });
   skills
     .command("info <name>")
@@ -590,7 +701,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (name: string, opts: { json?: boolean }) => {
       const { runSkillsInfo } = await import("../commands/skills.js");
-      process.exit(await runSkillsInfo({ name }, { json: opts.json }));
+      await exitAfterFlush(await runSkillsInfo({ name }, { json: opts.json }));
     });
 
   /* ───────────────────────────── logs ───────────────────────────── */
@@ -602,7 +713,7 @@ export function buildProgram(): Command {
     .option("--json", "emit raw JSON lines instead of one-line formatted output", false)
     .action(async (opts: { follow?: boolean; limit?: number; json?: boolean }) => {
       const { runLogsCommand } = await import("../commands/logs.js");
-      process.exit(await runLogsCommand({ follow: opts.follow, limit: opts.limit }, { json: opts.json }));
+      await exitAfterFlush(await runLogsCommand({ follow: opts.follow, limit: opts.limit }, { json: opts.json }));
     });
 
   /* ───────────────────────────── secrets ───────────────────────────── */
@@ -616,7 +727,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { strict?: boolean; json?: boolean }) => {
       const { runSecretsAudit } = await import("../commands/secrets-audit.js");
-      process.exit(await runSecretsAudit({ strict: opts.strict }, { json: opts.json }));
+      await exitAfterFlush(await runSecretsAudit({ strict: opts.strict }, { json: opts.json }));
     });
 
   /* ───────────────────────────── pairing ───────────────────────────── */
@@ -635,7 +746,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
       const { runPairingList } = await import("../commands/pairing.js");
-      process.exit(await runPairingList({ channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runPairingList({ channel: opts.channel }, { json: opts.json }));
     });
 
   pairing
@@ -645,7 +756,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (code: string, opts: { channel?: string; json?: boolean }) => {
       const { runPairingApprove } = await import("../commands/pairing.js");
-      process.exit(await runPairingApprove({ code, channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runPairingApprove({ code, channel: opts.channel }, { json: opts.json }));
     });
 
   pairing
@@ -655,7 +766,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (code: string, opts: { channel?: string; json?: boolean }) => {
       const { runPairingRevoke } = await import("../commands/pairing.js");
-      process.exit(await runPairingRevoke({ code, channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runPairingRevoke({ code, channel: opts.channel }, { json: opts.json }));
     });
 
   /* ───────────────────────────── backup ───────────────────────────── */
@@ -674,7 +785,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { output?: string; force?: boolean; json?: boolean }) => {
       const { runBackupCreate } = await import("../commands/backup.js");
-      process.exit(await runBackupCreate({ output: opts.output, force: opts.force }, { json: opts.json }));
+      await exitAfterFlush(await runBackupCreate({ output: opts.output, force: opts.force }, { json: opts.json }));
     });
 
   backup
@@ -683,7 +794,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (archive: string, opts: { json?: boolean }) => {
       const { runBackupVerify } = await import("../commands/backup.js");
-      process.exit(await runBackupVerify({ archive }, { json: opts.json }));
+      await exitAfterFlush(await runBackupVerify({ archive }, { json: opts.json }));
     });
 
   backup
@@ -694,7 +805,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (archive: string, opts: { target?: string; force?: boolean; json?: boolean }) => {
       const { runBackupRestore } = await import("../commands/backup.js");
-      process.exit(
+      await exitAfterFlush(
         await runBackupRestore({ archive, target: opts.target, force: opts.force }, { json: opts.json }),
       );
     });
@@ -715,7 +826,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist to inspect", "main")
     .action(async (opts: { json?: boolean; agent?: string }) => {
       const { runExecList } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecList({ json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecList({ json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -729,7 +840,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist to mutate", "main")
     .action(async (parts: string[], opts: { json?: boolean; agent?: string }) => {
       const { runExecAllow } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecAllow(parts.join(" "), { json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecAllow(parts.join(" "), { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -744,7 +855,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist to mutate", "main")
     .action(async (regex: string, opts: { json?: boolean; agent?: string }) => {
       const { runExecAllowPattern } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecAllowPattern(regex, { json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecAllowPattern(regex, { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -757,7 +868,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist to mutate", "main")
     .action(async (parts: string[], opts: { json?: boolean; agent?: string }) => {
       const { runExecRemove } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecRemove(parts.join(" "), { json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecRemove(parts.join(" "), { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -770,7 +881,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist to consult", "main")
     .action(async (parts: string[], opts: { json?: boolean; agent?: string }) => {
       const { runExecDenyTest } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecDenyTest(parts.join(" "), { json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecDenyTest(parts.join(" "), { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -780,7 +891,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist path to print", "main")
     .action(async (opts: { json?: boolean; agent?: string }) => {
       const { runExecFile } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecFile({ json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecFile({ json: opts.json, agentId: opts.agent }));
     });
 
   // ──────────────── cron ────────────────
@@ -796,7 +907,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runCronStatus } = await import("../commands/cron.js");
-      process.exit(await runCronStatus({ json: opts.json }));
+      await exitAfterFlush(await runCronStatus({ json: opts.json }));
     });
 
   cron
@@ -808,7 +919,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { all?: boolean; query?: string; limit?: number; json?: boolean }) => {
       const { runCronList } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronList({
           ...(opts.all !== undefined ? { all: opts.all } : {}),
           ...(opts.query !== undefined ? { query: opts.query } : {}),
@@ -848,9 +959,10 @@ export function buildProgram(): Command {
       const job = buildCronJobCreateFromCliOpts(opts);
       if (typeof job === "string") {
         process.stderr.write(`cron add: ${job}\n`);
-        process.exit(1);
+        await exitAfterFlush(1);
+        return; // unreachable at runtime; restores `job` narrowing for tsc
       }
-      process.exit(
+      await exitAfterFlush(
         await runCronAdd({
           job,
           ...(opts.json !== undefined ? { json: opts.json } : {}),
@@ -873,11 +985,11 @@ export function buildProgram(): Command {
       if (opts.description !== undefined) patch.description = opts.description;
       if (opts.enable && opts.disable) {
         process.stderr.write("cron edit: --enable and --disable are mutually exclusive\n");
-        process.exit(1);
+        await exitAfterFlush(1);
       }
       if (opts.enable) patch.enabled = true;
       if (opts.disable) patch.enabled = false;
-      process.exit(
+      await exitAfterFlush(
         await runCronEdit({
           jobId,
           patch,
@@ -894,7 +1006,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (jobId: string, opts: { json?: boolean }) => {
       const { runCronRemove } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronRemove({ jobId, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
       );
     });
@@ -905,7 +1017,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (jobId: string, opts: { json?: boolean }) => {
       const { runCronEnable } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronEnable({ jobId, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
       );
     });
@@ -916,7 +1028,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (jobId: string, opts: { json?: boolean }) => {
       const { runCronDisable } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronDisable({ jobId, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
       );
     });
@@ -928,7 +1040,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (jobId: string, opts: { due?: boolean; json?: boolean }) => {
       const { runCronRunCmd } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronRunCmd({
           jobId,
           mode: opts.due ? "due" : "force",
@@ -944,7 +1056,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (jobId: string, opts: { limit?: number; json?: boolean }) => {
       const { runCronRuns } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronRuns({
           jobId,
           ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
@@ -969,7 +1081,7 @@ export function buildProgram(): Command {
     .description("Manage isolated agents (workspace + auth + routing)")
     .action(async () => {
       const { runAgentsList } = await import("../commands/agents-cmd.js");
-      process.exit(await runAgentsList({}));
+      await exitAfterFlush(await runAgentsList({}));
     });
 
   agents
@@ -979,7 +1091,7 @@ export function buildProgram(): Command {
     .option("--bindings", "include routing bindings per agent", false)
     .action(async (opts: { json?: boolean; bindings?: boolean }) => {
       const { runAgentsList } = await import("../commands/agents-cmd.js");
-      process.exit(await runAgentsList({ json: opts.json, bindings: opts.bindings }));
+      await exitAfterFlush(await runAgentsList({ json: opts.json, bindings: opts.bindings }));
     });
 
   agents
@@ -989,7 +1101,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { agent?: string; json?: boolean }) => {
       const { runAgentsBindings } = await import("../commands/agents-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runAgentsBindings({
           ...(opts.agent !== undefined ? { agent: opts.agent } : {}),
           ...(opts.json !== undefined ? { json: opts.json } : {}),
@@ -1010,7 +1122,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { agent: string; bind: string[]; json?: boolean }) => {
       const { runAgentsBind } = await import("../commands/agents-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runAgentsBind({
           agent: opts.agent,
           bind: opts.bind,
@@ -1033,7 +1145,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { agent: string; bind: string[]; all?: boolean; json?: boolean }) => {
       const { runAgentsUnbind } = await import("../commands/agents-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runAgentsUnbind({
           agent: opts.agent,
           bind: opts.bind,
@@ -1075,7 +1187,7 @@ export function buildProgram(): Command {
         },
       ) => {
         const { runAgentsAdd } = await import("../commands/agents-cmd.js");
-        process.exit(
+        await exitAfterFlush(
           await runAgentsAdd({
             ...(name !== undefined ? { name } : {}),
             ...(opts.workspace !== undefined ? { workspace: opts.workspace } : {}),
@@ -1115,7 +1227,7 @@ export function buildProgram(): Command {
         json?: boolean;
       }) => {
         const { runAgentsSetIdentity } = await import("../commands/agents-cmd.js");
-        process.exit(
+        await exitAfterFlush(
           await runAgentsSetIdentity({
             agent: opts.agent,
             ...(opts.workspace !== undefined ? { workspace: opts.workspace } : {}),
@@ -1138,7 +1250,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (id: string, opts: { force?: boolean; json?: boolean }) => {
       const { runAgentsDelete } = await import("../commands/agents-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runAgentsDelete({
           id,
           ...(opts.force !== undefined ? { force: opts.force } : {}),
@@ -1171,7 +1283,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { template: string; skipEditor?: boolean; json?: boolean }) => {
       const { runOrgInit } = await import("../commands/org-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runOrgInit({
           template: opts.template,
           ...(opts.skipEditor !== undefined ? { skipEditor: opts.skipEditor } : {}),
@@ -1186,7 +1298,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runOrgShow } = await import("../commands/org-cmd.js");
-      process.exit(await runOrgShow({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+      await exitAfterFlush(await runOrgShow({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
     });
 
   org
@@ -1197,7 +1309,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (from: string, to: string, opts: { json?: boolean }) => {
       const { runOrgExplain } = await import("../commands/org-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runOrgExplain({ from, to, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
       );
     });
@@ -1208,7 +1320,136 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runOrgDoctor } = await import("../commands/org-cmd.js");
-      process.exit(await runOrgDoctor({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+      await exitAfterFlush(await runOrgDoctor({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+    });
+
+  /* ─────────────────────────────── store ─────────────────────────────── */
+  // Phase 2 storage toggle — inspect or flip the mode.sentinel that pins
+  // Brigade to filesystem vs convex. `brigade store mode show` reports the
+  // active mode (and probes the URL on convex mode in `brigade doctor`).
+  // `brigade store mode set <mode>` rewrites the sentinel. Data migration
+  // between modes lands as `brigade store migrate` in a later PR.
+  const store = program
+    .command("store")
+    .description("Inspect or flip Brigade's storage backend (filesystem / convex)");
+
+  const storeMode = store.command("mode").description("Manage the storage-mode sentinel");
+
+  storeMode
+    .command("show")
+    .description("Print the active storage mode (and Convex URL if applicable)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runStoreModeShow } = await import("../commands/store-cmd.js");
+      await exitAfterFlush(await runStoreModeShow({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+    });
+
+  storeMode
+    .command("set <mode>")
+    .description(
+      "Pin the storage mode for this machine.\n" +
+        "  Examples:\n" +
+        "    brigade store mode set filesystem\n" +
+        "    brigade store mode set convex --convex-url http://127.0.0.1:3210",
+    )
+    .option("--convex-url <url>", "deployment URL (required when <mode> is convex)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (mode: string, opts: { convexUrl?: string; json?: boolean }) => {
+      const { runStoreModeSet } = await import("../commands/store-cmd.js");
+      await exitAfterFlush(
+        await runStoreModeSet({
+          mode,
+          ...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  store
+    .command("reset")
+    .description(
+      "Factory-reset the convex backend: permanently erase every stored record,\n" +
+        "remove the mode pin, and set the encryption key aside so the next onboard\n" +
+        "starts truly fresh. (Wiping ~/.brigade alone RESTORES — this erases.)",
+    )
+    .option("--convex-url <url>", "deployment URL (defaults to the pinned sentinel URL)")
+    .option("--yes", "skip the interactive confirmation", false)
+    .option("--purge-local", "also delete the local Brigade folder", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { convexUrl?: string; yes?: boolean; purgeLocal?: boolean; json?: boolean }) => {
+      const { runStoreReset } = await import("../commands/store-cmd.js");
+      await exitAfterFlush(
+        await runStoreReset({
+          ...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
+          ...(opts.yes !== undefined ? { yes: opts.yes } : {}),
+          ...(opts.purgeLocal !== undefined ? { purgeLocal: opts.purgeLocal } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  /* ───────────────────────────── encrypt ───────────────────────────── */
+  // At-rest encryption for Convex byte columns. Operator-supplied master
+  // key via `BRIGADE_ENCRYPTION_KEY` (hex). When unset, payloads pass
+  // through unencrypted; when set, every credential / persona / memory
+  // fact / cron payload / transcript record is sealed before it hits the
+  // backend. See src/storage/encryption.ts.
+  const encrypt = program
+    .command("encrypt")
+    .description("Manage Brigade's at-rest encryption key (AES-256-GCM)");
+
+  encrypt
+    .command("status")
+    .description("Report whether the encryption key is configured + run a self-check")
+    .option("--json", "emit JSON instead of human text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runEncryptStatus } = await import("../commands/encrypt-cmd.js");
+      await exitAfterFlush(await runEncryptStatus(opts));
+    });
+
+  encrypt
+    .command("init")
+    .description("Generate a fresh 32-byte master key")
+    .option("--json", "emit JSON instead of human text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runEncryptInit } = await import("../commands/encrypt-cmd.js");
+      await exitAfterFlush(await runEncryptInit(opts));
+    });
+
+  encrypt
+    .command("test")
+    .description("Round-trip a sample string through seal/open to verify the key")
+    .option("--json", "emit JSON instead of human text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runEncryptTest } = await import("../commands/encrypt-cmd.js");
+      await exitAfterFlush(await runEncryptTest(opts));
+    });
+
+  store
+    .command("migrate")
+    .description(
+      "Copy your Brigade data between storage backends.\n" +
+        "  Examples:\n" +
+        "    brigade store migrate --to convex --convex-url http://127.0.0.1:3210\n" +
+        "    brigade store migrate --to filesystem\n" +
+        "    brigade store migrate --to convex --dry-run",
+    )
+    .requiredOption("--to <mode>", "destination mode: filesystem | convex")
+    .option("--convex-url <url>", "deployment URL")
+    .option("--dry-run", "report what would be copied without writing", false)
+    .option("--skip-verify", "skip sha256 verification (faster)", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { to: string; convexUrl?: string; dryRun?: boolean; skipVerify?: boolean; json?: boolean }) => {
+      const { runStoreMigrateCmd } = await import("../commands/store-cmd.js");
+      await exitAfterFlush(
+        await runStoreMigrateCmd({
+          to: opts.to,
+          ...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
+          ...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
+          ...(opts.skipVerify !== undefined ? { skipVerify: opts.skipVerify } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
     });
 
   return program;

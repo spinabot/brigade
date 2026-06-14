@@ -12,6 +12,19 @@ export async function runMain(argv: string[]): Promise<number> {
     return 0;
   } catch (err) {
     return mapErrorToExitCode(err);
+  } finally {
+    // Safety net for commands that RETURN through here (e.g. `brigade agent`)
+    // rather than self-exiting via `exitAfterFlush`. An agent turn enqueues
+    // transcript / facts / session writes onto convex write-behind chains;
+    // entry.ts calls `process.exit(code)` the instant runMain resolves, so we
+    // drain first or those writes are lost. No-op in filesystem mode and when
+    // a command already drained (chains are then settled).
+    try {
+      const { flushAllPendingWrites } = await import("../storage/flush.js");
+      await flushAllPendingWrites();
+    } catch {
+      // Never let a drain failure mask the real exit code.
+    }
   }
 }
 

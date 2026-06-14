@@ -40,6 +40,8 @@ export interface ChatCommandOptions {
 	 * accepted but has no effect on the client path.
 	 */
 	noEnvDetect?: boolean;
+	/** Bind the TUI to this agent at startup (forwarded to the connect TUI). */
+	agentId?: string;
 }
 
 /**
@@ -100,6 +102,8 @@ export async function runChatCommand(opts: ChatCommandOptions = {}): Promise<Con
 
 	// Hand off to the shared connect TUI. From here `brigade chat` and
 	// `brigade connect` are the same client; the only difference is chat
-	// auto-spawned the gateway it talks to.
-	return runConnectCommand({ host, port });
+	// auto-spawned the gateway it talks to. `--agent` forwards straight
+	// through so `brigade --agent <id>` / `npm run tui -- --agent <id>`
+	// open pre-bound to that agent.
+	return runConnectCommand({ host, port, ...(opts.agentId ? { agentId: opts.agentId } : {}) });
 }

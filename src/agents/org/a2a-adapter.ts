@@ -34,12 +34,26 @@ import type { EdgeRecord, OrgGraph } from "./types.js";
  * defers every cross-agent decision to `graph.edges` — `isAllowed(from,
  * to)` returns true iff there exists a directed edge `from → to` in
  * the graph (regardless of the edge's `reason`).
+ *
+ * `opts.orchestratorId` — the operator's DEFAULT agent (usually "main").
+ * It is the operator's own voice, not an org member: a derived-mode org
+ * chart used to hard-refuse it on the non-member check below, so the agent
+ * the operator actually talks to couldn't message its own crew ("ask
+ * eng-lead if they're up for work" → forbidden) and the model would offer
+ * to flip the WHOLE org to explicit mode as a workaround. Pairs touching
+ * the orchestrator bypass the chart; member↔member traffic stays
+ * graph-governed. Callers omit it (or pass undefined) to keep the strict
+ * members-only contract — `org.a2a.restrictDefaultAgent: true` does that.
  */
-export function orgGraphAsA2APolicy(graph: OrgGraph): AgentToAgentPolicy {
+export function orgGraphAsA2APolicy(
+  graph: OrgGraph,
+  opts: { orchestratorId?: string } = {},
+): AgentToAgentPolicy {
   // Precompute a Set<`from|to`> once so every isAllowed call is O(1).
   // Edges are rebuilt by `deriveOrgGraph` on each cache miss, so the
   // set is in sync with the graph it was created from.
   const edgeSet = buildEdgeSet(graph.edges);
+  const orchestratorId = opts.orchestratorId?.trim() || undefined;
 
   const matchesAllow = (_agentId: string): boolean => {
     // Legacy policies use this to seed catalog-side reachability hints.
@@ -54,6 +68,14 @@ export function orgGraphAsA2APolicy(graph: OrgGraph): AgentToAgentPolicy {
 
   const isAllowed = (requesterAgentId: string, targetAgentId: string): boolean => {
     if (requesterAgentId === targetAgentId) return true;
+    // Orchestrator bypass — the operator's default agent reaches (and is
+    // reachable by) everyone regardless of chart membership.
+    if (
+      orchestratorId !== undefined &&
+      (requesterAgentId === orchestratorId || targetAgentId === orchestratorId)
+    ) {
+      return true;
+    }
     // If either side isn't an org member, fall back to the safer
     // answer: false. An ad-hoc agent without a `cfg.agents.<id>.org`
     // block in a multi-agent org install is intentionally outside the

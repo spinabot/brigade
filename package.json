@@ -2,6 +2,7 @@
   "name": "brigade",
   "version": "0.1.0",
   "description": "Brigade — your personal AI crew",
+  "homepage": "https://brigade-agent.ai",
   "type": "module",
   "bin": {
     "brigade": "./brigade.mjs"
@@ -31,7 +32,7 @@
     "build:watch": "tsc -p tsconfig.build.json --watch",
     "clean": "node -e \"import('node:fs').then(fs => fs.rmSync('dist', { recursive: true, force: true }))\"",
     "prepack": "npm run build",
-    "test": "tsx --test src/**/*.test.ts",
+    "test": "node scripts/run-tests.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "brigade": "node brigade.mjs",
     "start": "node scripts/run-brigade.mjs",
@@ -111,7 +112,19 @@
     "logs": "node scripts/run-brigade.mjs logs",
     "logs:follow": "node scripts/run-brigade.mjs logs --follow",
     "secrets:audit": "node scripts/run-brigade.mjs secrets audit",
-    "exec:list": "node scripts/run-brigade.mjs exec list"
+    "exec:list": "node scripts/run-brigade.mjs exec list",
+    "store:mode": "node scripts/run-brigade.mjs store mode show",
+    "store:mode:show": "node scripts/run-brigade.mjs store mode show",
+    "store:mode:set": "node scripts/run-brigade.mjs store mode set",
+    "convex:install": "node scripts/install-convex.mjs",
+    "convex:dev": "node scripts/install-convex.mjs && node scripts/convex-dev.mjs",
+    "convex:codegen": "convex codegen --admin-key \"$(node -e \"process.stdout.write(require('node:fs').readFileSync('.convex-data/admin-key.txt', 'utf8').trim())\")\" --url http://127.0.0.1:3210",
+    "smoke:strict-zero": "tsx scripts/strict-zero-smoke.mjs",
+    "convex:push": "node scripts/convex-push.mjs",
+    "store": "node scripts/run-brigade.mjs store",
+    "store:reset": "node scripts/run-brigade.mjs store reset",
+    "store:reset:purge": "node scripts/run-brigade.mjs store reset --purge-local",
+    "store:migrate": "node scripts/run-brigade.mjs store migrate"
   },
   "engines": {
     "node": ">=22.12"
@@ -125,9 +138,11 @@
     "chalk": "^5.3.0",
     "cli-highlight": "^2.1.11",
     "commander": "^12.1.0",
+    "convex": "^1.40.0",
     "croner": "^10.0.1",
     "json5": "^2.2.3",
     "linkedom": "^0.18.12",
+    "minimatch": "^10.2.5",
     "playwright-core": "^1.59.0",
     "prompts": "^2.4.2",
     "proper-lockfile": "^4.1.2",

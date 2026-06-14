@@ -15,16 +15,29 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 let stateDir: string;
 let prev: string | undefined;
+let prevMode: string | undefined;
+let prevConvexUrl: string | undefined;
 
 beforeEach(() => {
 	stateDir = mkdtempSync(path.join(tmpdir(), "brigade-iolock-"));
 	prev = process.env.BRIGADE_STATE_DIR;
 	process.env.BRIGADE_STATE_DIR = stateDir;
+	// Hermeticity: a stray BRIGADE_MODE/BRIGADE_CONVEX_URL in the dev shell
+	// would make peekConvexMode see convex (no context, no tmpdir sentinel)
+	// and the config writer fail closed. Same isolation as boot.test.ts.
+	prevMode = process.env.BRIGADE_MODE;
+	prevConvexUrl = process.env.BRIGADE_CONVEX_URL;
+	delete process.env.BRIGADE_MODE;
+	delete process.env.BRIGADE_CONVEX_URL;
 });
 
 afterEach(() => {
 	if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
 	else process.env.BRIGADE_STATE_DIR = prev;
+	if (prevMode === undefined) delete process.env.BRIGADE_MODE;
+	else process.env.BRIGADE_MODE = prevMode;
+	if (prevConvexUrl === undefined) delete process.env.BRIGADE_CONVEX_URL;
+	else process.env.BRIGADE_CONVEX_URL = prevConvexUrl;
 	rmSync(stateDir, { recursive: true, force: true });
 });
 

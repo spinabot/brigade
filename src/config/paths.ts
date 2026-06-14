@@ -3,6 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// NOTE: paths ⇄ storage/runtime-context is a benign ESM cycle — both sides
+// only dereference the other inside function bodies (call time), never
+// during module evaluation.
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
+
 // All filesystem paths the brigade runtime touches resolve through this module.
 // Override via BRIGADE_STATE_DIR / BRIGADE_CONFIG_PATH so tests + alt installs
 // can run isolated from ~/.brigade.
@@ -16,6 +21,41 @@ export function resolveStateDir(): string {
   const override = process.env.BRIGADE_STATE_DIR?.trim();
   if (override && override.length > 0) return path.resolve(override);
   return path.join(os.homedir(), ".brigade");
+}
+
+/**
+ * True when Brigade is in convex mode — INCLUDING the pre-context windows
+ * (onboard before bootRuntimeContext, the BOOT_OPTIONAL repair commands when
+ * the backend is unreachable, and the boot window before setRuntimeContext is
+ * installed).
+ *
+ * The installed runtime context is authoritative and fast, so consult it
+ * first. Only when NO context exists do we peek the sticky sentinel/env
+ * directly — so callers fail CLOSED (resolve to the OS cache, never under
+ * ~/.brigade; refuse a disk write) instead of leaking state just because the
+ * context hadn't booted yet. Mirrors subsystem-logger's peekStorageMode, the
+ * proven fail-closed pattern. No caching: the no-context branch is rare (when
+ * a context exists we return immediately), and not caching avoids serving a
+ * stale mode across an onboard that flips the sentinel mid-process.
+ */
+export function peekConvexMode(): boolean {
+  const ctx = tryGetRuntimeContext();
+  if (ctx) return ctx.mode === "convex";
+  try {
+    const explicit = process.env.BRIGADE_MODE?.trim();
+    if (explicit === "convex") return true;
+    if (explicit === "filesystem") return false;
+    const sentinelPath = path.join(resolveStateDir(), "mode.sentinel");
+    if (fs.existsSync(sentinelPath)) {
+      const parsed = JSON.parse(fs.readFileSync(sentinelPath, "utf8")) as { mode?: string };
+      return parsed.mode === "convex";
+    }
+    if (process.env.BRIGADE_CONVEX_URL?.trim()) return true;
+  } catch {
+    // Unreadable/corrupt sentinel — boot will throw a proper error. Default to
+    // filesystem behaviour meanwhile (matches subsystem-logger's peek).
+  }
+  return false;
 }
 
 export function resolveConfigPath(): string {
@@ -52,6 +92,15 @@ export function resolveModelsPath(_agentId: string): string {
   // ~/.brigade/models.json) but the turn failed "Model not registered"
   // (reading an empty ~/.brigade/agents/<id>/agent/models.json). Auth
   // profiles stay per-agent; the provider catalog is shared per-user.
+  //
+  // Convex mode: Pi's ModelRegistry.create reads this path with sync fs, so
+  // a real file is unavoidable — but it lives in the OS cache dir (NOT under
+  // ~/.brigade). Boot materialises the catalog from its Convex blob there;
+  // catalog writers push the blob back after every file write so the file
+  // is a regenerable cache, never the source of truth.
+  if (peekConvexMode()) {
+    return path.join(resolveOsCacheDir(), "models.json");
+  }
   return path.join(resolveStateDir(), "models.json");
 }
 
@@ -65,6 +114,13 @@ export function resolveSessionStorePath(agentId: string): string {
 }
 
 export function resolveSessionTranscriptPath(agentId: string, sessionId: string): string {
+  // Convex mode: the transcript JSONL is never written (SessionManager.inMemory
+  // + the write-behind factory own it), but Pi's getSessionFile() and the
+  // advisory write-lock sidecar still need a real path — route it to the OS
+  // cache dir, NEVER under ~/.brigade. Filesystem mode unchanged.
+  if (peekConvexMode()) {
+    return path.join(resolveOsCacheDir(), "sessions", agentId, `${sessionId}.jsonl`);
+  }
   return path.join(resolveSessionsDir(agentId), `${sessionId}.jsonl`);
 }
 
@@ -115,6 +171,17 @@ export function resolveSkillsDir(agentId: string, override?: string): string {
 // bundled-shipped skills (so a managed install shadows a stale bundled
 // copy) but BELOW the workspace dir (so user-authored skills always win).
 export function resolveManagedSkillsDir(): string {
+  // Convex mode: managed skills must NOT live under ~/.brigade. The skills
+  // table is the source of truth; the on-disk dir is a regenerable cache that
+  // persists in the OS cache location (survives `rm -rf ~/.brigade`). Pre-
+  // context callers peek the sentinel so an agent's manage_skill({scope:
+  // "managed"}) on a not-yet-booted process still resolves to the OS cache,
+  // never leaking under ~/.brigade — and never tripping the strict guard
+  // (which would THROW under BRIGADE_STRICT_MODE=enforce and break skill
+  // creation). Filesystem mode unchanged.
+  if (peekConvexMode()) {
+    return path.join(resolveOsCacheDir(), "skills");
+  }
   return path.join(resolveStateDir(), "skills");
 }
 
@@ -161,7 +228,69 @@ export function resolveCredentialsDir(): string {
 }
 
 export function resolveCacheDir(): string {
+  // Regenerable cache artifacts (org-chart PNGs, twemoji SVGs). In convex
+  // mode NOTHING may live under ~/.brigade, and these are machine-local
+  // scratch by nature — so convex mode uses the OS cache location:
+  //   Windows %LOCALAPPDATA%\Brigade\cache, macOS ~/Library/Caches/brigade,
+  //   Linux $XDG_CACHE_HOME|~/.cache/brigade.
+  // Filesystem mode keeps today's ~/.brigade/cache path unchanged. Pre-boot
+  // callers (no runtime context yet) resolve via peekConvexMode's sentinel
+  // peek — "no context" does NOT mean convex is inactive (onboard, repair
+  // commands with the backend down, the pre-setRuntimeContext boot window),
+  // and the old context-only check leaked cache files under ~/.brigade in
+  // exactly those windows.
+  if (peekConvexMode()) {
+    return resolveOsCacheDir();
+  }
   return path.join(resolveStateDir(), "cache");
+}
+
+/** OS-conventional per-user cache root for Brigade (NOT under ~/.brigade). */
+export function resolveOsCacheDir(): string {
+  const override = process.env.BRIGADE_CACHE_DIR?.trim();
+  if (override) return path.resolve(override);
+  if (process.platform === "win32") {
+    const base = process.env.LOCALAPPDATA?.trim() || path.join(os.homedir(), "AppData", "Local");
+    return path.join(base, "Brigade", "cache");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Caches", "brigade");
+  }
+  const xdg = process.env.XDG_CACHE_HOME?.trim();
+  return path.join(xdg || path.join(os.homedir(), ".cache"), "brigade");
+}
+
+/**
+ * OS-conventional CONFIG dir (NOT cache — cache dirs are "safe to delete" by
+ * platform convention and cleanup tools honour that; config dirs are durable).
+ * Windows %LOCALAPPDATA%\Brigade, macOS ~/Library/Application Support/brigade,
+ * Linux $XDG_CONFIG_HOME|~/.config/brigade.
+ */
+export function resolveOsConfigDir(): string {
+  if (process.platform === "win32") {
+    const base = process.env.LOCALAPPDATA?.trim() || path.join(os.homedir(), "AppData", "Local");
+    return path.join(base, "Brigade");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "brigade");
+  }
+  const xdg = process.env.XDG_CONFIG_HOME?.trim();
+  return path.join(xdg || path.join(os.homedir(), ".config"), "brigade");
+}
+
+/**
+ * Where the auto-generated at-rest encryption key lives. DELIBERATELY outside
+ * `~/.brigade`: the key decrypts the Convex data, and `rm -rf ~/.brigade` is
+ * the operation convex mode is designed to survive — a key stored inside the
+ * wiped dir would turn every wipe into permanent data loss (the n8n lockout
+ * failure mode). Also deliberately NOT in the cache dir (cleanup tools may
+ * reap caches). `BRIGADE_ENCRYPTION_KEY_FILE` overrides for tests / exotic
+ * setups; the `BRIGADE_ENCRYPTION_KEY` env var always beats the file.
+ */
+export function resolveEncryptionKeyFilePath(): string {
+  const override = process.env.BRIGADE_ENCRYPTION_KEY_FILE?.trim();
+  if (override) return path.resolve(override);
+  return path.join(resolveOsConfigDir(), "encryption.key");
 }
 
 // Per-channel state root, e.g. `~/.brigade/channels/whatsapp`. Channels keep

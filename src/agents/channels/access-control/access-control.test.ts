@@ -188,6 +188,115 @@ describe("evaluateAccess", () => {
 		assert.equal(noMention.kind, "block", "wildcard doesn't bypass the mention requirement");
 		assert.match(String(noMention.reason), /^group:allow-from-without-mention$/);
 	});
+
+	it("a JID-allowlisted group is FULLY TRUSTED — responds untagged, any sender", () => {
+		const r = evaluateAccess({
+			policy: "pairing",
+			groupPolicy: "allowlist",
+			senderId: "stranger",
+			isGroup: true,
+			mentioned: false, // no mention…
+			allowFrom: [],
+			groupAllowFrom: [], // …and not on the sender list…
+			groupId: "120363000000000000@g.us",
+			groupAllowJids: ["120363000000000000@g.us"], // …but the GROUP is opted in
+		});
+		assert.equal(r.kind, "allow");
+		assert.match(String(r.reason), /^group:jid-allowlisted$/);
+	});
+
+	it("a group NOT on the JID allow-list is unaffected (still mention+sender gated)", () => {
+		const r = evaluateAccess({
+			policy: "pairing",
+			groupPolicy: "allowlist",
+			senderId: "stranger",
+			isGroup: true,
+			mentioned: false,
+			allowFrom: [],
+			groupAllowFrom: [],
+			groupId: "999@g.us",
+			groupAllowJids: ["120363000000000000@g.us"], // a DIFFERENT group
+		});
+		assert.equal(r.kind, "block");
+		assert.match(String(r.reason), /^group:not-allowlisted$/);
+	});
+
+	it("`*` in groupAllowJids trusts every group (untagged)", () => {
+		const r = evaluateAccess({
+			policy: "allowlist",
+			groupPolicy: "allowlist",
+			senderId: "stranger",
+			isGroup: true,
+			mentioned: false,
+			allowFrom: [],
+			groupAllowFrom: [],
+			groupId: "any@g.us",
+			groupAllowJids: ["*"],
+		});
+		assert.equal(r.kind, "allow");
+		assert.match(String(r.reason), /^group:jid-allowlisted$/);
+	});
+
+	it("`disabled` group policy still wins over a JID allow-list", () => {
+		const r = evaluateAccess({
+			policy: "open",
+			groupPolicy: "disabled",
+			senderId: "stranger",
+			isGroup: true,
+			mentioned: false,
+			allowFrom: [],
+			groupAllowFrom: [],
+			groupId: "g@g.us",
+			groupAllowJids: ["g@g.us"],
+		});
+		assert.equal(r.kind, "block");
+		assert.match(String(r.reason), /^group:disabled$/);
+	});
+
+	it("`addressed` (reply-to-bot / follow-up window) admits an allow-listed sender untagged", () => {
+		const r = evaluateAccess({
+			policy: "allowlist",
+			groupPolicy: "allowlist",
+			senderId: "+15551230000",
+			isGroup: true,
+			mentioned: false, // not tagged this message…
+			addressed: true, // …but addressed (reply-to-bot / within window)
+			allowFrom: [],
+			groupAllowFrom: ["+15551230000"],
+		});
+		assert.equal(r.kind, "allow");
+		assert.match(String(r.reason), /^group:allow-from\+mention$/);
+	});
+
+	it("`addressed:false` keeps the group silent (still requires addressing)", () => {
+		const r = evaluateAccess({
+			policy: "allowlist",
+			groupPolicy: "allowlist",
+			senderId: "+15551230000",
+			isGroup: true,
+			mentioned: false,
+			addressed: false,
+			allowFrom: [],
+			groupAllowFrom: ["+15551230000"],
+		});
+		assert.equal(r.kind, "block");
+		assert.match(String(r.reason), /^group:allow-from-without-mention$/);
+	});
+
+	it("`addressed` in an `open` group admits untagged", () => {
+		const r = evaluateAccess({
+			policy: "open",
+			groupPolicy: "open",
+			senderId: "stranger",
+			isGroup: true,
+			mentioned: false,
+			addressed: true,
+			allowFrom: [],
+			groupAllowFrom: [],
+		});
+		assert.equal(r.kind, "allow");
+		assert.match(String(r.reason), /^group:open\+mention$/);
+	});
 });
 
 /* ──────────────────────────── store: allow-from ──────────────────────────── */

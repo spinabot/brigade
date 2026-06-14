@@ -49,3 +49,45 @@ codebase audit. Brigade borrows that prior system's *patterns* and *invariants*
 
 - Never add a `Co-Authored-By: Claude` trailer (per user's repo-wide rule).
 - Commit messages explain *why*, not *what*.
+
+## Convex (local self-hosted backend)
+
+Brigade Phase 2 uses Convex as a swap-in storage adapter. The dev loop is
+**fully self-hosted** — no Convex Cloud account, no telemetry, no `npx convex
+dev` cloud handshake.
+
+- `npm run convex:install` — downloads the standalone `convex-local-backend`
+  Rust binary + static dashboard from the official GitHub release (pin
+  `precompiled-2026-06-03-7eff2e7`) into `bin/`. Skipped if already present.
+  License: FSL-1.1-Apache-2.0 (see `bin/LICENSE.md`).
+- `npm run convex:dev` — runs install (no-op if cached) then starts:
+  - backend  → `http://127.0.0.1:3210` (Convex API)
+  - site proxy → `http://127.0.0.1:3211` (http actions)
+  - dashboard → `http://127.0.0.1:6791` (static SPA — add the local deployment
+    by URL `http://127.0.0.1:3210` + the contents of `.convex-data/admin-key.txt`)
+- `npm run convex:codegen` — regenerates `convex/_generated/` against the
+  running local backend using the derived admin key.
+
+Per-machine state lives under `F:\Brigade\.convex-data\` (gitignored):
+  - `identity.json`              — stable instance name + secret (generated once)
+  - `admin-key.txt`              — derived from identity at every run
+  - `convex_local_backend.sqlite3` — Convex's SQLite engine file
+  - `storage/`                   — Convex File Storage objects (local fs)
+  - `logs/`                      — backend stderr captures
+
+`.env.local` is also generated per-run (gitignored) and exports:
+  - `CONVEX_SELF_HOSTED_URL` + `CONVEX_SELF_HOSTED_ADMIN_KEY` (for `npx convex` CLI)
+  - `CONVEX_URL` (for client-side code)
+
+**Auditor notes:**
+- The backend binary phones home to a Convex beacon by default. Brigade does
+  **not** disable it (the dev loop should reflect what OSS users see), but
+  `--disable-beacon` / `DISABLE_BEACON=1` is available if a deployment needs
+  to stay strictly air-gapped.
+- `npx convex dev` IS allowed in this repo — but ONLY when the self-hosted
+  env vars are active (`CONVEX_SELF_HOSTED_URL` + `CONVEX_SELF_HOSTED_ADMIN_KEY`,
+  both written to `.env.local` by `scripts/convex-dev.mjs`). Then the Convex
+  CLI talks straight to `http://127.0.0.1:3210` and never touches cloud.
+  Without those env vars, `npx convex dev` will try to create/claim a cloud
+  project — DON'T run it in that state. Quick check: `npm run convex:dev` must
+  be running first, so `.env.local` is present and current.

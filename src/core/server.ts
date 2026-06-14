@@ -78,6 +78,7 @@ import { createPluginChannelManagerFacade } from "../agents/channels/plugin-chan
 import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
+import { listOpenRouterModels } from "../integrations/provider-discovery.js";
 import { switchModelMidTurn as piSwitchModelMidTurn } from "../agents/mid-turn-switch.js";
 import { onAgentEvent } from "../agents/agent-event-bus.js";
 import {
@@ -88,12 +89,16 @@ import { getActiveCronService, setActiveCronService } from "../cron/active-servi
 import { runCronIsolatedAgentJob } from "../cron/isolated-agent/run.js";
 import { createCronServiceState } from "../cron/service/state.js";
 import { start as cronStart, stop as cronStop } from "../cron/service/ops.js";
+import { bootRuntimeContext, enableConfigLiveRefresh } from "../storage/boot.js";
+import { onConfigCachePrimed } from "../storage/config-cache.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import {
 	DEFAULT_AGENT_ID,
 	resolveAgentDir,
 	resolveAgentWorkspaceDir,
 	resolveConfigPath,
+	resolveModelsPath,
 } from "../config/paths.js";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import type { BrigadeConfig } from "../config/types.js";
@@ -106,6 +111,10 @@ import {
 } from "../agents/session-registry.js";
 import crypto from "node:crypto";
 import { enqueuePendingSystemEvent } from "../agents/pending-system-events.js";
+import {
+	enqueueSystemEvent as enqueueSessionInboxEvent,
+	resolveSystemEventDeliveryContext,
+} from "../agents/session-inbox.js";
 // Multi-routing wiring (Step 1-27 lift): in-process gateway-call dispatcher,
 // per-method handlers (sessions.*, health), agent-events bridge, heartbeat
 // runner + wake flag, lane drain helpers. All exported but never called
@@ -148,6 +157,8 @@ import {
 } from "../agents/tools/sessions/shared.js";
 import { wireAgentEventsBridge } from "../agents/agent-events.js";
 import { requestHeartbeatNow, setHeartbeatsEnabled } from "../agents/heartbeat-wake.js";
+import { setExecAllowAll } from "../agents/exec-session-allow.js";
+import { grantSkill, revokeSkill } from "../agents/skills/grant.js";
 import {
 	addHeartbeatFiredHook,
 	setHeartbeatBootAgentId,
@@ -216,7 +227,7 @@ function persistDefaultModel(cfg: Config, provider: string, modelId: string): Co
 }
 import { type ConsoleStream } from "./console-stream.js";
 import { attachEventLogger, getTodayLogPath } from "./event-logger.js";
-import { pickInitialThinkingLevel, readPersistedThinkingLevel } from "./model-caps.js";
+import { pickInitialThinkingLevel, readPersistedThinkingLevel, remapThinkingLevel } from "./model-caps.js";
 import { getBuildInfo } from "../version.js";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { extractIdentityName, isIdentityNameUnset } from "./system-prompt.js";
@@ -262,10 +273,10 @@ function isLocalhostBind(host: string): boolean {
  * the caller's `limit`. Defensive fallbacks on every error path so a
  * corrupt or missing file never crashes the gateway.
  */
-function readSessionTranscriptMessages(params: {
+async function readSessionTranscriptMessages(params: {
 	sessionKey: string;
 	limit?: number;
-}): ReadonlyArray<unknown> {
+}): Promise<ReadonlyArray<unknown>> {
 	const sessionKey = (params.sessionKey ?? "").trim();
 	if (!sessionKey) return [];
 	const parsed = parseAgentSessionKey(sessionKey);
@@ -279,6 +290,28 @@ function readSessionTranscriptMessages(params: {
 	}
 	const sessionId = entry?.sessionId;
 	if (!sessionId) return [];
+
+	// Convex mode — project the transcript rows instead of the JSONL file.
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		try {
+			const records = await rctx.store.messages.readTranscript(agentId, sessionId);
+			const messages: unknown[] = [];
+			for (const record of records) {
+				const r = record as { type?: string; message?: unknown };
+				if (r?.type === "message" && r.message !== undefined) messages.push(r.message);
+			}
+			const limit =
+				typeof params.limit === "number" && params.limit > 0 ? params.limit : undefined;
+			if (limit !== undefined && messages.length > limit) {
+				return messages.slice(messages.length - limit);
+			}
+			return messages;
+		} catch {
+			return [];
+		}
+	}
+
 	let transcriptPath: string;
 	try {
 		transcriptPath = resolveSessionTranscriptPath(agentId, sessionId);
@@ -335,6 +368,18 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 	// Capture the boot start time so the `ready (Xs)` line can report total
 	// startup duration. Threaded through the boot chain.
 	const startupStartedAt = Date.now();
+
+	// Phase 0 — storage layer. Idempotent: the CLI preAction hook normally
+	// booted it already; this covers embedded/test paths that call
+	// `startServer` directly. After this line every subsystem may reach
+	// storage via `getRuntimeContext().store`. Convex mode with an
+	// unreachable deployment fails HERE, before the lock/port are touched.
+	await bootRuntimeContext();
+	// Convex mode: keep the config cache hot via the live-query subscription
+	// (the convex-mode counterpart of the brigade.json hot-reload watcher).
+	// No-op in filesystem mode. The gateway is the only long-lived process,
+	// so this is the only call site; handle.stop() disables it.
+	enableConfigLiveRefresh();
 
 	// Phase logger — emits to the verbose console-stream when present, falls
 	// back to plain stderr lines so the bare-mode boot still surfaces
@@ -419,7 +464,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 		// `${BRIGADE_DIR}/auth.json`. Without this bridge the gateway would
 		// never see keys that onboarding produced.
 		const authStorage = loadBrigadeAuthStorage() as AuthStorage;
-		const modelRegistry = ModelRegistry.create(authStorage, `${BRIGADE_DIR}/models.json`);
+		const modelRegistry = ModelRegistry.create(authStorage, resolveModelsPath(DEFAULT_AGENT_ID));
 
 		// F:\Brigade's brigade.json (post-2026-05-02 wizard refactor) stores
 		// the default model under `agents.defaults.{provider, model.primary}`.
@@ -438,7 +483,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 				modelRegistry,
 				provider,
 				modelId,
-				modelsFile: `${BRIGADE_DIR}/models.json`,
+				modelsFile: resolveModelsPath(DEFAULT_AGENT_ID),
 				authStorage,
 			})) as Model<string> | undefined);
 		if (!model) {
@@ -489,7 +534,7 @@ interface BootContinueArgs {
 
 async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const { opts, port, host, startupStartedAt, lockHandle, modelRegistry, authStorage, bootLog } = args;
-	const modelsFile = `${BRIGADE_DIR}/models.json`;
+	const modelsFile = resolveModelsPath(DEFAULT_AGENT_ID);
 
 	// Wave L P2#3 — clear stale lane state from any prior in-process boot
 	// (test harness double-boots, dev hot-reload). `markGatewayDraining`
@@ -612,7 +657,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						| undefined;
 			  }
 			| undefined,
-	): Promise<{ added: string[]; removed: string[] }> {
+	): Promise<{ added: string[]; removed: string[]; updated: string[] }> {
 		const map = cfgAgents ?? {};
 		const defaultsEntry = map.defaults;
 		const defaultsProvider =
@@ -624,6 +669,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				: undefined;
 		const seenIds = new Set<string>([agentId]);
 		const added: string[] = [];
+		const updated: string[] = [];
 		// H4: honour a persisted `thinking` on the boot agent entry even when
 		// re-seeding (config hot-reload edits the level for the boot agent).
 		const bootPersisted = readPersistedThinking(map[agentId]);
@@ -636,13 +682,63 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		for (const [id, entry] of Object.entries(map)) {
 			if (id === "defaults" || !entry || typeof entry !== "object") continue;
 			seenIds.add(id);
-			if (perAgentRuntime.has(id)) continue; // already seeded
 			const aProvider =
 				(typeof entry.provider === "string" ? entry.provider : undefined) ?? defaultsProvider;
 			const aModelId =
 				(typeof entry.model === "object" && entry.model && typeof entry.model.primary === "string"
 					? entry.model.primary
 					: undefined) ?? defaultsModelId;
+			if (perAgentRuntime.has(id)) {
+				// BOOT AGENT EXCEPTION (audit P0 F5/F6, 2026-06-11): the boot
+				// agent's model is owned by the in-process set-model path
+				// (perAgentRuntime.set + persistDefaultModel → agents.defaults),
+				// NOT by its `agents.<id>` entry. Re-deriving it here from a
+				// stale per-agent pin REVERTED a just-applied set-model ~500ms
+				// later (config write → this watcher). HEAD skipped every
+				// already-seeded agent; preserve that for the boot agent exactly
+				// (its thinking hot-reload is handled separately above at the
+				// bootPersistedThinking block). Only NON-boot agents get the
+				// model hot-reload this branch was added for.
+				if (id === agentId) continue;
+				// Hot-reload model/provider edits for EXISTING non-boot agents.
+				// Previously this skipped outright, so changing an agent's model
+				// in brigade.json silently required a full gateway restart while
+				// every surface claimed "applies next turn". Rebuild the runtime
+				// only when the configured pair actually changed; the operator's
+				// in-session thinking choice survives the swap.
+				const current = perAgentRuntime.get(id);
+				if (
+					current &&
+					aProvider &&
+					aModelId &&
+					(current.provider !== aProvider || current.modelId !== aModelId)
+				) {
+					const rebuilt =
+						modelRegistry.find(aProvider, aModelId) ??
+						((await resolveModelNeverMiss({
+							modelRegistry,
+							provider: aProvider,
+							modelId: aModelId,
+							modelsFile,
+							authStorage: getAuthStorageForAgent(id),
+						})) as Model<string> | undefined);
+					if (rebuilt) {
+						perAgentRuntime.set(id, {
+							provider: aProvider,
+							modelId: aModelId,
+							model: rebuilt,
+							thinkingLevel:
+								readPersistedThinking(entry) ?? current.thinkingLevel,
+						});
+						updated.push(id);
+					} else {
+						bootLog(
+							`hot-reload: agent "${id}" model ${aProvider}/${aModelId} could not be resolved — keeping ${current.provider}/${current.modelId}`,
+						);
+					}
+				}
+				continue;
+			}
 			if (!aProvider || !aModelId) {
 				bootLog(
 					`skipping agent "${id}" — no provider/model resolved (per-agent entry has none and cfg.agents.defaults is incomplete)`,
@@ -684,7 +780,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			perAgentRuntime.delete(existingId);
 			removed.push(existingId);
 		}
-		return { added, removed };
+		return { added, removed, updated };
 	}
 
 	await seedAgentsFromConfig(
@@ -714,44 +810,61 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		return fab;
 	};
 
-	// H1: hot-reload watcher. fs.watch on brigade.json + a 500ms debounce
-	// so we coalesce the editor's atomic-write burst (rename + write + close)
-	// into a single re-seed. Newly added agents become usable without
-	// restarting the gateway; removed agents are evicted from perAgentRuntime.
+	// H1: hot-reload. One debounced re-seed body, two triggers by mode:
+	//
+	//   • Filesystem — fs.watch on brigade.json (editor atomic-write bursts
+	//     coalesce via the 500ms debounce). Unchanged behaviour.
+	//   • Convex — there is no brigade.json; config changes land in the
+	//     in-process config cache (primed by io.ts on every local write AND by
+	//     the live subscription for cross-process writes). Subscribe to those
+	//     primes. Without this, a mid-session `manage_agent add` / org init
+	//     updated the CONFIG but never perAgentRuntime: 20 agents in config
+	//     while `agents on the gateway` listed only main and `/agent <id>` /
+	//     `brigade tui <id>` refused every new agent until a restart.
+	//
+	// Newly added agents become usable without restarting the gateway;
+	// removed agents are evicted from perAgentRuntime.
 	let configWatcher: ReturnType<typeof fsWatch> | undefined;
 	let configReloadTimer: ReturnType<typeof setTimeout> | undefined;
+	let configPrimeUnsub: (() => void) | undefined;
+	const scheduleAgentReseed = (): void => {
+		if (configReloadTimer) clearTimeout(configReloadTimer);
+		configReloadTimer = setTimeout(() => {
+			configReloadTimer = undefined;
+			void (async () => {
+				try {
+					const fresh = await loadConfig();
+					const result = await seedAgentsFromConfig(
+						(fresh as { agents?: Record<string, unknown> }).agents as
+							| {
+									[id: string]:
+										| {
+												provider?: string;
+												model?: { primary?: string };
+												thinking?: string;
+										  }
+										| undefined;
+							  }
+							| undefined,
+					);
+					for (const id of result.added) bootLog(`hot-reload: seeded agent "${id}"`);
+					for (const id of result.removed) bootLog(`hot-reload: evicted agent "${id}"`);
+					for (const id of result.updated) bootLog(`hot-reload: updated agent "${id}" model`);
+				} catch (err) {
+					bootLog(
+						`hot-reload failed: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+			})();
+		}, 500);
+	};
+	if (tryGetRuntimeContext()?.mode === "convex") {
+		configPrimeUnsub = onConfigCachePrimed(scheduleAgentReseed);
+		bootLog("config hot-reload: convex mode — following backend config changes (no disk watcher)");
+	} else
 	try {
 		const configPath = resolveConfigPath();
-		configWatcher = fsWatch(configPath, { persistent: false }, () => {
-			if (configReloadTimer) clearTimeout(configReloadTimer);
-			configReloadTimer = setTimeout(() => {
-				configReloadTimer = undefined;
-				void (async () => {
-					try {
-						const fresh = await loadConfig();
-						const result = await seedAgentsFromConfig(
-							(fresh as { agents?: Record<string, unknown> }).agents as
-								| {
-										[id: string]:
-											| {
-													provider?: string;
-													model?: { primary?: string };
-													thinking?: string;
-											  }
-											| undefined;
-								  }
-								| undefined,
-						);
-						for (const id of result.added) bootLog(`hot-reload: seeded agent "${id}"`);
-						for (const id of result.removed) bootLog(`hot-reload: evicted agent "${id}"`);
-					} catch (err) {
-						bootLog(
-							`hot-reload failed: ${err instanceof Error ? err.message : String(err)}`,
-						);
-					}
-				})();
-			}, 500);
-		});
+		configWatcher = fsWatch(configPath, { persistent: false }, scheduleAgentReseed);
 		configWatcher.on("error", (err: Error) => {
 			bootLog(`config watcher error: ${err.message}`);
 		});
@@ -1323,22 +1436,30 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					agentId: cronTargetAgentId,
 					sessionId: cronTargetSessionKey,
 				});
-				// TRACK 2 — model awareness. ALSO queue the text per-session so
-				// the NEXT agent turn for that session picks it up via
-				// `drainPendingSystemEvents` and prepends a `<system_event>`
-				// block to the user message. Without this the model would be
-				// answering the operator's next "did the cron fire?" question
-				// blind and might bullshit "any moment now" while the actual
-				// fire happened minutes ago. The operator's main session is
-				// the default target — a cron without a channel target is
-				// announcing into "wherever the operator is", which on a
-				// TUI / connect-mode setup is the main session.
+				// TRACK 2 — model awareness. Queue the text in the SESSION INBOX
+				// (`agents/session-inbox.ts`) — the queue the heartbeat runner
+				// peeks/consumes. The cron timer follows its enqueue with a
+				// `requestHeartbeatNow` wake; the runner inspects this inbox and
+				// dispatches a synthetic turn that receives the event text as its
+				// message, so the agent ACTS on the reminder at fire time (e.g.
+				// sends the WhatsApp message) instead of the text sleeping until
+				// the operator happens to type. This used to write to
+				// `pending-system-events.ts` (Track 2's original cron-only queue)
+				// — a queue the runner never reads — so every wake was skipped
+				// "no-pending-events" and main-target reminders only ever
+				// piggybacked on the operator's next message. Real turns drain
+				// the session inbox at turn start too (`drainFormattedSessionEvents`
+				// in agent-loop.ts), so the catch-up path this write used to serve
+				// is preserved.
 				const targetSessionKey = args.sessionKey ?? defaultSessionKey(args.agentId ?? agentId);
-				enqueuePendingSystemEvent(targetSessionKey, {
-					text: args.text,
-					queuedAtMs: at,
-					...(args.jobId !== undefined ? { jobId: args.jobId } : {}),
-					...(args.jobName !== undefined ? { jobName: args.jobName } : {}),
+				const attribution =
+					args.jobName && !args.text.startsWith("[cron ")
+						? `[cron "${args.jobName}"] ${args.text}`
+						: args.text;
+				enqueueSessionInboxEvent(attribution, {
+					sessionKey: targetSessionKey,
+					...(args.jobId !== undefined ? { contextKey: `cron:${args.jobId}` } : {}),
+					trusted: true,
 				});
 			},
 			/**
@@ -2129,7 +2250,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					provider: p.provider,
 					modelId: p.modelId,
 					model: target,
-					thinkingLevel: pickInitialThinkingLevel(target),
+					// Preserve the operator's thinking level across the switch (clamp
+					// only if the new model can't honor it) instead of resetting it.
+					thinkingLevel: remapThinkingLevel(getAgentRuntime(targetAgentId).thinkingLevel, target),
 				});
 				// Boot agent's set-model also refreshes the snapshot's cached
 				// thinking caps (since the snapshot mirrors the boot agent).
@@ -2241,7 +2364,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					provider: p.provider,
 					modelId: p.modelId,
 					model: target,
-					thinkingLevel: pickInitialThinkingLevel(target),
+					// Preserve the operator's thinking level across the switch (clamp
+					// only if the new model can't honor it) instead of resetting it.
+					thinkingLevel: remapThinkingLevel(getAgentRuntime(targetAgentId).thinkingLevel, target),
 				});
 				if (targetAgentId === agentId) {
 					cachedSupportsThinking = !!target.reasoning;
@@ -2291,11 +2416,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					throw err;
 				}
 				const cur = getAgentRuntime(targetAgentId);
+				// Clamp the requested level against what THIS agent's model can do —
+				// e.g. `high` on a non-reasoning model → off; `off` on a reasoning-
+				// only model → low — so we never persist a level the model rejects.
+				const effective = remapThinkingLevel(p.level as ThinkingLevel, cur.model);
 				// Mutate only the target agent's thinking level. The next turn
 				// for that agent reads it back; other agents' turns are unaffected.
 				perAgentRuntime.set(targetAgentId, {
 					...cur,
-					thinkingLevel: p.level as ThinkingLevel,
+					thinkingLevel: effective,
 				});
 				// If a turn is live for this agent's selected session, push the
 				// level into the in-flight session so it takes effect immediately.
@@ -2305,7 +2434,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const liveSession = liveSessionsByKey.get(targetKey);
 				if (liveSession) {
 					try {
-						liveSession.setThinkingLevel(p.level as never);
+						liveSession.setThinkingLevel(effective as never);
 					} catch {
 						/* clamp / unsupported — snapshot still reflects intent */
 					}
@@ -2326,7 +2455,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 							agentsMap[targetAgentId] && typeof agentsMap[targetAgentId] === "object"
 								? (agentsMap[targetAgentId] as Record<string, unknown>)
 								: {};
-						agentsMap[targetAgentId] = { ...prevEntry, thinking: p.level };
+						agentsMap[targetAgentId] = { ...prevEntry, thinking: effective };
 						(next as Record<string, unknown>).agents = agentsMap;
 						return next as unknown as typeof cur2;
 					});
@@ -2387,8 +2516,82 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				}
 				return undefined as ResponseFor[M];
 			}
+			case "exec-allow-all": {
+				const p = (params ?? {}) as RequestParams["exec-allow-all"];
+				// Resolve the SAME session key the operator's turns run under —
+				// identical resolution to `compact` above — so we arm the key the
+				// exec-gate will actually check.
+				const targetKey =
+					p?.sessionKey?.trim() ||
+					(p?.agentId ? defaultSessionKey(p.agentId.trim()) : sessionKey);
+				setExecAllowAll(targetKey, p?.enabled === true);
+				return { sessionKey: targetKey, enabled: p?.enabled === true } as ResponseFor[M];
+			}
+			case "exec-grant-skill": {
+				const p = (params ?? {}) as RequestParams["exec-grant-skill"];
+				const skillName = p?.skillName?.trim();
+				if (!skillName) throw new Error("exec-grant-skill: missing skillName");
+				const targetAgentId = p?.agentId?.trim() || agentId;
+				const cfgNow = await loadConfig();
+				const wsOverride = (
+					cfgNow.agents as Record<string, { workspace?: unknown }> | undefined
+				)?.[targetAgentId]?.workspace;
+				const workspaceDir = resolveAgentWorkspaceDir(
+					targetAgentId,
+					typeof wsOverride === "string" && wsOverride.trim() ? wsOverride.trim() : undefined,
+				);
+				if (p?.revoke === true) {
+					const r = revokeSkill({ config: cfgNow, workspaceDir, agentId: targetAgentId, skillName });
+					return {
+						found: r.found,
+						skill: r.skill,
+						applied: false,
+						manifest: { commands: [], patterns: [] },
+						granted: { commands: [], patterns: [] },
+						refused: [],
+						removed: r.removed,
+						revoked: true,
+					} as unknown as ResponseFor[M];
+				}
+				const res = grantSkill({
+					config: cfgNow,
+					workspaceDir,
+					agentId: targetAgentId,
+					skillName,
+					apply: p?.apply === true,
+				});
+				return {
+					found: res.found,
+					skill: res.skill,
+					applied: res.applied,
+					emptyManifest: res.emptyManifest,
+					manifest: res.manifest,
+					granted: res.granted,
+					refused: res.refused,
+				} as unknown as ResponseFor[M];
+			}
 			case "list-models": {
-				const models = modelRegistry.getAvailable().map((m: Model<any>) => modelToSummary(m));
+				const registryModels = modelRegistry.getAvailable() as Array<Model<any>>;
+				// Live-merge OpenRouter's CURRENT catalog (only when OpenRouter is
+				// configured) so `/model` lists models newer than Pi's bundled
+				// snapshot. Best-effort + cached + short timeout; on any failure the
+				// registry list stands alone. Registry entries win (richer metadata).
+				let merged: Array<Model<any>> = registryModels;
+				if (registryModels.some((m) => m.provider === "openrouter")) {
+					try {
+						const live = await listOpenRouterModels();
+						if (live.length > 0) {
+							const seen = new Set(registryModels.map((m) => m.id));
+							merged = [...registryModels];
+							for (const lm of live) {
+								if (!seen.has(lm.id)) merged.push(lm as unknown as Model<any>);
+							}
+						}
+					} catch {
+						/* keep the registry list */
+					}
+				}
+				const models = merged.map((m: Model<any>) => modelToSummary(m));
 				return models as ResponseFor[M];
 			}
 			case "refresh-models": {
@@ -3083,6 +3286,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				idempotencyKey?: string;
 				thinking?: string;
 				timeout?: number;
+				/** Sync-style: await the run's settled outcome (ok/reply/error)
+				 *  instead of the fire-and-forget {ok, runId} ack. */
+				wait?: boolean;
 				deliver?: boolean;
 				channel?: string;
 				accountId?: string;
@@ -3172,6 +3378,33 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					},
 				},
 			);
+			// `wait: true` — sync-style: await the run's settled outcome and
+			// return it (ok/error/reply). sessions_send needs this to know
+			// when the PEER'S RUN actually finished: the in-process gateway
+			// caller resolves when this handler RETURNS, so without `wait`
+			// the caller's "held run promise" settled in ~1 tick and every
+			// settle-gated behaviour (final-reply reads, async late delivery)
+			// was dead code. Awaiting blocks only this handler invocation —
+			// each call is independently async — and a caller-side timeout or
+			// rejection does NOT abort the run (the dispatcher owns the run).
+			if (p.wait === true) {
+				const settled = await run.settled.catch(
+					(err): { ok: false; error: string } => ({
+						ok: false,
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
+				return {
+					ok: settled.ok,
+					runId: run.runId,
+					...(settled.error ? { error: settled.error } : {}),
+					...("reply" in settled && typeof settled.reply === "string"
+						? { reply: settled.reply }
+						: {}),
+					...("aborted" in settled && settled.aborted ? { aborted: true } : {}),
+					...("timedOut" in settled && settled.timedOut ? { timedOut: true } : {}),
+				};
+			}
 			// Same fire-and-forget pattern as sessions.send - return runId now,
 			// let the lifecycle stream surface the settled outcome.
 			void run.settled.catch(() => undefined);
@@ -3671,21 +3904,76 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// above (which emits `heartbeat` bus events). Without this both hooks
 	// would have raced for the single slot and the bridge's emit would
 	// have silently lost.
+	// P0-2 — deliver a woken turn's reply back to the requester's CHANNEL when
+	// a consumed event carries a deliveryContext (the A2A late-delivery stamps
+	// the requester's last channel). Without this, a WhatsApp/Slack-origin
+	// requester only ever sees the relayed reply in the TUI. Cron awareness
+	// events carry NO deliveryContext (cron delivers to its channel separately
+	// in maybeDeliverAnnounce), so they never double-deliver here. Best-effort:
+	// reuses the same adapter.sendText path the cron dispatcher uses.
+	const deliverReplyToChannel = async (
+		ctx: { channel?: string; to?: string; accountId?: string; threadId?: string | number },
+		replyText: string,
+	): Promise<boolean> => {
+		if (!channelManager || !ctx.channel || !ctx.to || !replyText.trim()) return false;
+		const adapter = channelManager.adapter(ctx.channel);
+		if (!adapter) return false;
+		try {
+			if (typeof adapter.health === "function" && !adapter.health().ok) return false;
+			await adapter.sendText(
+				ctx.to,
+				replyText,
+				ctx.threadId !== undefined ? { threadId: String(ctx.threadId) } : undefined,
+			);
+			return true;
+		} catch (err) {
+			createSubsystemLogger("agents/heartbeat-runner").warn("A2A channel delivery failed", {
+				channel: ctx.channel,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	};
+
 	const disposeHeartbeatHook = addHeartbeatFiredHook(async (params) => {
 		if (!params.consumedEvents.length && params.reason !== "interval") return;
 		const text =
 			params.consumedEvents.length > 0
 				? params.consumedEvents.map((e) => e.text).join("\n")
 				: "Heartbeat tick.";
+		// A2A late-delivery events stamp the requester's channel here; cron +
+		// plain system events leave it undefined (TUI-only, unchanged).
+		const deliveryContext = resolveSystemEventDeliveryContext(params.consumedEvents);
 		try {
-			await runGatewayTurn({
+			const result = await runGatewayTurn({
 				text,
 				sessionKey: params.sessionKey,
 				agentId: params.agentId,
 				senderIsOwner: true,
 			});
+			if (deliveryContext?.channel && deliveryContext.to && result?.reply?.trim()) {
+				void deliverReplyToChannel(deliveryContext, result.reply);
+			}
 		} catch {
 			// Heartbeat turns are best-effort; failures already log via the runner.
+			// Audit P2 (F3, 2026-06-11): the runner CONSUMED these events before
+			// firing this hook, so a dispatch throw (e.g. shutdown drain) would
+			// silently drop a real cron/system event. Re-enqueue the consumed
+			// payload events so the next turn/wake still surfaces them. Interval
+			// ticks carry no payload ("Heartbeat tick.") — nothing to restore.
+			// No tight loop: this hook only fires on a wake tick, not in a spin.
+			for (const ev of params.consumedEvents) {
+				if (!ev?.text) continue;
+				try {
+					enqueueSessionInboxEvent(ev.text, {
+						sessionKey: params.sessionKey,
+						...(ev.contextKey ? { contextKey: ev.contextKey } : {}),
+						trusted: ev.trusted !== false,
+					});
+				} catch {
+					/* best-effort restore */
+				}
+			}
 		}
 	});
 
@@ -4359,6 +4647,120 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			try {
 				if (configReloadTimer) clearTimeout(configReloadTimer);
 				configWatcher?.close();
+				configPrimeUnsub?.();
+			} catch {
+				/* best-effort */
+			}
+			// Convex mode: stop the config live-query subscription and drain
+			// any config writes still on the flush chain so a save made just
+			// before shutdown isn't lost. Both are no-ops in filesystem mode.
+			try {
+				const { disableConfigLiveRefresh } = await import("../storage/boot.js");
+				disableConfigLiveRefresh();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitConfigFlush } = await import("../config/io.js");
+				await awaitConfigFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitSessionFlush } = await import("../storage/session-cache.js");
+				await awaitSessionFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitApprovalsFlush } = await import("./exec-approvals.js");
+				await awaitApprovalsFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitAccessFlush } = await import(
+					"../agents/channels/access-control/store.js"
+				);
+				await awaitAccessFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitCronFlush } = await import("../storage/cron-cache.js");
+				await awaitCronFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitFactsFlush } = await import("../storage/facts-cache.js");
+				await awaitFactsFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitCursorFlush } = await import("../agents/memory/extract.js");
+				await awaitCursorFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitAuthFlush } = await import("../auth/profiles.js");
+				await awaitAuthFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitProfileStateFlush } = await import("../auth/profile-cooldown.js");
+				await awaitProfileStateFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitTranscriptFlush } = await import(
+					"../sessions/session-manager-factory.js"
+				);
+				await awaitTranscriptFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitEventLogFlush } = await import("./event-logger.js");
+				await awaitEventLogFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitSubsystemLogFlush } = await import(
+					"../logging/subsystem-logger.js"
+				);
+				await awaitSubsystemLogFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitMediaMirrorFlush } = await import(
+					"../agents/channels/whatsapp/media.js"
+				);
+				await awaitMediaMirrorFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitInboxMirrorFlush } = await import("../agents/session-inbox.js");
+				await awaitInboxMirrorFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				// Drain the live workspace mirror (forces a final persona sweep so
+				// an edit inside the watcher debounce window isn't lost), then
+				// close the watchers.
+				const { awaitWorkspaceMirrorFlush, disposeWorkspaceLiveMirror } = await import(
+					"../storage/workspace-live-mirror.js"
+				);
+				await awaitWorkspaceMirrorFlush();
+				disposeWorkspaceLiveMirror();
 			} catch {
 				/* best-effort */
 			}

@@ -44,6 +44,7 @@ import {
 } from "../../config/paths.js";
 import { loadConfig, saveConfig } from "../../core/config.js";
 import { mutateConfigAtomic } from "../../config/io.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { bootstrapWorkspace } from "../../workspace/bootstrap.js";
 
 import {
@@ -1263,6 +1264,22 @@ export async function runAgentsDelete(
 	safeRm(agentDir, sink);
 	safeRm(sessionsDir, sink);
 
+	// Convex mode: the disk rm's above only clear the (mostly empty) local
+	// surface — without this, EVERY backend row of the deleted agent survived
+	// forever: sessions + transcripts, sealed auth profiles, mirrored persona
+	// files, memory facts, and its cron jobs kept firing. Purge per domain via
+	// the store; best-effort per domain so one failure can't strand the whole
+	// delete (the config prune above already made the agent unroutable).
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		const purged = await purgeAgentBackendRows(rctx.store, agentId, sink);
+		sink.log(
+			`Backend cleanup: ${purged.sessions} session(s), ${purged.transcripts} transcript(s), ` +
+				`${purged.profiles} auth profile(s), ${purged.personas} persona file(s), ` +
+				`${purged.facts} memory fact(s), ${purged.cronJobs} cron job(s).`,
+		);
+	}
+
 	if (opts.json) {
 		writeJson(sink, {
 			agentId,
@@ -1278,4 +1295,138 @@ export async function runAgentsDelete(
 		if (result.removedAllow > 0) sink.log(`Removed ${result.removedAllow} agent-to-agent allow pair(s).`);
 	}
 	return 0;
+}
+
+/** Names the boot mirror + live mirror sync — the set a deleted agent may
+ *  have rows for in the personaFiles table. */
+const PURGE_PERSONA_NAMES = [
+	"AGENTS.md",
+	"SOUL.md",
+	"IDENTITY.md",
+	"USER.md",
+	"TOOLS.md",
+	"BOOTSTRAP.md",
+	"MEMORY.md",
+	"HEARTBEAT.md",
+] as const;
+
+/**
+ * Convex-mode backend cleanup for `agents delete`. Removes the deleted
+ * agent's rows across every per-agent domain the store exposes: sessions
+ * (+ their transcripts), sealed auth profiles, mirrored persona files,
+ * memory facts, and cron jobs pinned to the agent (which otherwise kept
+ * firing forever — pruneAgentConfig only strips bindings + allow pairs).
+ * Also drops the regenerable OS-cache transcript JSONLs. Best-effort per
+ * domain: a failure logs and moves on, never aborts the delete.
+ */
+async function purgeAgentBackendRows(
+	store: import("../../storage/store.js").BrigadeStore,
+	agentId: string,
+	sink: OutputSink,
+): Promise<{
+	sessions: number;
+	transcripts: number;
+	profiles: number;
+	personas: number;
+	facts: number;
+	cronJobs: number;
+}> {
+	const purged = { sessions: 0, transcripts: 0, profiles: 0, personas: 0, facts: 0, cronJobs: 0 };
+
+	// Sessions + transcripts.
+	try {
+		const entries = await store.sessions.listEntries(agentId);
+		for (const { sessionKey, entry } of entries) {
+			const sessionId = (entry as { sessionId?: string }).sessionId;
+			if (typeof sessionId === "string" && sessionId) {
+				try {
+					await store.messages.deleteTranscript(agentId, sessionId);
+					purged.transcripts += 1;
+				} catch {
+					/* per-row best-effort */
+				}
+			}
+			try {
+				if (await store.sessions.deleteEntry(agentId, sessionKey)) purged.sessions += 1;
+			} catch {
+				/* per-row best-effort */
+			}
+		}
+	} catch (err) {
+		sink.log(`Backend cleanup: sessions purge failed — ${(err as Error).message}`);
+	}
+
+	// Sealed auth profiles.
+	try {
+		const profiles = await store.auth.listProfiles(agentId);
+		for (const p of profiles) {
+			const profileId = (p as { profileId?: string }).profileId;
+			if (!profileId) continue;
+			try {
+				await store.auth.deleteProfile(agentId, profileId);
+				purged.profiles += 1;
+			} catch {
+				/* per-row best-effort */
+			}
+		}
+	} catch (err) {
+		sink.log(`Backend cleanup: auth purge failed — ${(err as Error).message}`);
+	}
+
+	// Mirrored persona files.
+	for (const name of PURGE_PERSONA_NAMES) {
+		try {
+			if (await store.workspace.deletePersona(agentId, name as never)) purged.personas += 1;
+		} catch {
+			/* per-row best-effort */
+		}
+	}
+
+	// Memory facts (workspaceId === agentId for per-agent workspaces).
+	try {
+		const records = await store.memory.listAllFactRecordsRaw(agentId);
+		for (const r of records) {
+			const id = (r as { id?: string }).id;
+			if (!id) continue;
+			try {
+				await store.memory.deleteFactRecordRaw(agentId, id);
+				purged.facts += 1;
+			} catch {
+				/* per-row best-effort */
+			}
+		}
+	} catch (err) {
+		sink.log(`Backend cleanup: memory purge failed — ${(err as Error).message}`);
+	}
+
+	// Cron jobs pinned to the deleted agent.
+	try {
+		const jobs = await store.cron.listJobs();
+		for (const job of jobs) {
+			if ((job as { agentId?: string }).agentId !== agentId) continue;
+			// The store interface types rows as {jobId}; the convex impl's
+			// rebuilt rows carry the internal {id}. Accept either spelling.
+			const raw = job as { id?: string; jobId?: string };
+			const jobId = raw.id ?? raw.jobId;
+			if (!jobId) continue;
+			try {
+				if (await store.cron.deleteJob(jobId)) purged.cronJobs += 1;
+			} catch {
+				/* per-row best-effort */
+			}
+		}
+	} catch (err) {
+		sink.log(`Backend cleanup: cron purge failed — ${(err as Error).message}`);
+	}
+
+	// Regenerable OS-cache transcripts for this agent.
+	try {
+		const { rm } = await import("node:fs/promises");
+		const { resolveOsCacheDir } = await import("../../config/paths.js");
+		await rm(path.join(resolveOsCacheDir(), "sessions", agentId), { recursive: true, force: true });
+	} catch {
+		/* cache cleanup is cosmetic */
+	}
+
+	return purged;
 }

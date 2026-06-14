@@ -12,7 +12,9 @@ process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 delete process.env.BRIGADE_HOME;
 
-const { assembleBrigadeToolset, composeBrigadeBeforeToolCall } = await import("./session-wiring.js");
+const { assembleBrigadeToolset, composeBrigadeBeforeToolCall, resolveSpawnToolTimeoutMs } =
+	await import("./session-wiring.js");
+const { wrapToolExecutionTimeout } = await import("./tools/common.js");
 const approvalsMod = await import("../core/exec-approvals.js");
 const busMod = await import("./agent-event-bus.js");
 
@@ -53,19 +55,27 @@ after(() => {
 });
 
 describe("assembleBrigadeToolset", () => {
-	it("returns 7 builtins + 3 memory tools + agents_list + manage_agent + manage_skill = 13 enabled names", () => {
+	it("returns 6 builtins + 12 brigade tools (find/generate_image/manage_provider/manage_access/manage_channel_access/oauth_authorize + 3 memory + agents_list + manage_agent + manage_skill) = 18 enabled names", () => {
+		// `find` moved from the Pi builtin list to a Brigade-native custom tool
+		// (fd's --glob --full-path matches nothing on Windows — see find-tool.ts).
 		const ts = assembleBrigadeToolset({ workspaceDir: workspace, agentId: "main", cwd: workspace });
-		assert.deepEqual(ts.builtinToolNames, ["read", "write", "edit", "bash", "grep", "find", "ls"]);
+		assert.deepEqual(ts.builtinToolNames, ["read", "write", "edit", "bash", "grep", "ls"]);
 		assert.deepEqual(ts.brigadeToolNames.sort(), [
 			"agents_list",
+			"find",
+			"generate_image",
+			"manage_access",
 			"manage_agent",
+			"manage_channel_access",
+			"manage_provider",
 			"manage_skill",
+			"oauth_authorize",
 			"read_memory",
 			"recall_memory",
 			"write_memory",
 		]);
-		assert.equal(ts.enabledToolNames.length, 13);
-		assert.equal(ts.customTools.length, 6);
+		assert.equal(ts.enabledToolNames.length, 18);
+		assert.equal(ts.customTools.length, 12);
 	});
 
 	it("derives capabilities.memory=true when recall_memory present", () => {
@@ -152,5 +162,83 @@ describe("composeBrigadeBeforeToolCall — chain order + behavior", () => {
 		const r = await chain({ toolCall: { name: "read", arguments: { path: "x" } } } as never);
 		assert.equal(r?.block, true);
 		assert.match(r?.reason ?? "", /policy hook error/);
+	});
+});
+
+describe("resolveSpawnToolTimeoutMs — spawn tools escape the blanket 60s watchdog", () => {
+	// Production failure (2026-06-11): spawn_agents awaits its children
+	// (up to 300s each by contract) but the uniform 60s execution-timeout
+	// wrapper killed every longer fan-out with "assume the call hung" while
+	// the children kept running and announced later.
+	it("defaults to the sub-agent child timeout + slack", () => {
+		assert.equal(resolveSpawnToolTimeoutMs({}), 300_000 + 30_000);
+		assert.equal(resolveSpawnToolTimeoutMs(undefined), 300_000 + 30_000);
+	});
+
+	it("honours the call's own per-child timeoutSeconds", () => {
+		assert.equal(resolveSpawnToolTimeoutMs({ timeoutSeconds: 600 }), 600_000 + 30_000);
+	});
+
+	it("ignores invalid timeoutSeconds values", () => {
+		assert.equal(resolveSpawnToolTimeoutMs({ timeoutSeconds: -5 }), 330_000);
+		assert.equal(resolveSpawnToolTimeoutMs({ timeoutSeconds: "x" }), 330_000);
+	});
+
+	// Audit F4 (2026-06-11): spawn_agents carries timeoutSeconds PER-TASK, not
+	// top-level. Reading only the top-level field left every spawn_agents call
+	// on the 300s default, so a >300s task was still watchdog-killed at 330s.
+	it("takes the MAX over spawn_agents tasks[].timeoutSeconds", () => {
+		assert.equal(
+			resolveSpawnToolTimeoutMs({ tasks: [{ timeoutSeconds: 120 }, { timeoutSeconds: 600 }] }),
+			600_000 + 30_000,
+		);
+	});
+
+	it("spawn_agents with no per-task timeout falls back to the default", () => {
+		assert.equal(
+			resolveSpawnToolTimeoutMs({ tasks: [{ prompt: "x" }, { prompt: "y" }] }),
+			330_000,
+		);
+	});
+
+	it("ignores invalid per-task timeouts and keeps the largest valid one", () => {
+		assert.equal(
+			resolveSpawnToolTimeoutMs({ tasks: [{ timeoutSeconds: -1 }, { timeoutSeconds: 450 }, { timeoutSeconds: "x" }] }),
+			450_000 + 30_000,
+		);
+	});
+});
+
+describe("wrapToolExecutionTimeout — per-call budget resolver", () => {
+	it("a slow tool survives when the resolver grants a bigger budget", async () => {
+		const slowTool = {
+			name: "spawn_agents",
+			label: "t",
+			description: "d",
+			parameters: {} as never,
+			execute: async () => {
+				await new Promise((r) => setTimeout(r, 80));
+				return { content: [{ type: "text" as const, text: "ok" }], details: {} };
+			},
+		};
+		// Static budget 30ms would kill it; resolver grants 5s.
+		const wrapped = wrapToolExecutionTimeout(slowTool as never, 30, () => 5_000);
+		const res = await wrapped.execute("id", {} as never);
+		assert.equal((res.content[0] as { text: string }).text, "ok");
+	});
+
+	it("without a resolver the static budget still applies", async () => {
+		const slowTool = {
+			name: "x",
+			label: "t",
+			description: "d",
+			parameters: {} as never,
+			execute: async () => {
+				await new Promise((r) => setTimeout(r, 200));
+				return { content: [{ type: "text" as const, text: "ok" }], details: {} };
+			},
+		};
+		const wrapped = wrapToolExecutionTimeout(slowTool as never, 30);
+		await assert.rejects(() => wrapped.execute("id", {} as never), /did not return within/);
 	});
 });

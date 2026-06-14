@@ -30,7 +30,7 @@
  * identifiers referenced in this file.
  */
 
-import { deriveOrgGraph } from "../../agents/org/derive-graph.js";
+import { deriveOrgDisplayGraph } from "../../agents/org/derive-graph.js";
 import {
   PRIDE_CHART_FLAT_CREW_NOTE,
   renderPrideChartWithPins,
@@ -111,7 +111,7 @@ export function handleOrgSnapshot(
   deps: OrgSnapshotDeps,
 ): OrgSnapshotResult {
   const cfg = deps.loadConfig();
-  const graph = deriveOrgGraph(cfg as never);
+  const graph = deriveOrgDisplayGraph(cfg as never);
   if (!graph) {
     return {
       ok: false,

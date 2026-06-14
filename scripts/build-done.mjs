@@ -100,6 +100,9 @@ try {
 	const ASSET_TREES = [
 		// Pride org-chart mascot PNGs + any other org-chart static assets.
 		["src/agents/org/assets", "dist/agents/org/assets"],
+		// Brand assets: the Brigade favicon shown on the OAuth callback page
+		// (and reusable by any future surface).
+		["src/assets", "dist/assets"],
 	];
 	for (const [src, dst] of ASSET_TREES) copyTree(src, dst);
 } catch {

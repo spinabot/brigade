@@ -46,31 +46,38 @@ import {
 	resolveSkillsDir,
 } from "../../config/paths.js";
 import { listAgentEntries } from "../../cli/commands/agents-config.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
+import { enqueueWorkspaceMirrorOp } from "../../storage/workspace-live-mirror.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { jsonResult } from "./common.js";
 import type { BrigadeTool } from "./types.js";
 
 const ManageSkillParams = Type.Object({
-	action: Type.Union([Type.Literal("create"), Type.Literal("delete")], {
-		description:
-			"create: write a new SKILL.md under the resolved scope root. delete: remove the skill directory.",
-	}),
-	name: Type.String({
-		description:
-			"Skill name. Becomes the directory name + SKILL.md frontmatter `name`. kebab-case recommended (e.g. `weather-fetcher`).",
-		minLength: 1,
-		maxLength: 64,
-	}),
+	action: Type.Union(
+		[Type.Literal("create"), Type.Literal("delete"), Type.Literal("list")],
+		{
+			description:
+				"create: write a new SKILL.md under the resolved scope root. delete: remove the skill directory. list: enumerate existing skills across scopes/agents.",
+		},
+	),
+	name: Type.Optional(
+		Type.String({
+			description:
+				"Skill name (REQUIRED for create/delete; ignored for list). Becomes the directory name + SKILL.md frontmatter `name`. kebab-case recommended (e.g. `weather-fetcher`).",
+			minLength: 1,
+			maxLength: 64,
+		}),
+	),
 	scope: Type.Optional(
 		Type.Union([Type.Literal("agent"), Type.Literal("managed")], {
 			description:
-				"agent (default): scope to a specific agent's workspace at `~/.brigade/agents/<agentId>/workspace/skills/<name>/` (or `~/.brigade/workspace/skills/<name>/` for the default agent). managed: cross-agent shared at `~/.brigade/skills/<name>/`.",
+				"agent (default for create/delete): scope to a specific agent's workspace at `~/.brigade/agents/<agentId>/workspace/skills/<name>/` (or `~/.brigade/workspace/skills/<name>/` for the default agent). managed: cross-agent shared at `~/.brigade/skills/<name>/`. For list: omit to enumerate BOTH scopes.",
 		}),
 	),
 	agentId: Type.Optional(
 		Type.String({
 			description:
-				"Agent id (only used when scope=agent). Defaults to the caller's agent. Must be a configured agent or `main`.",
+				"Agent id (used when scope=agent; for list, filters to one agent's skills). Defaults to the caller's agent for create/delete. Must be a configured agent or `main`.",
 			minLength: 1,
 			maxLength: 64,
 		}),
@@ -104,6 +111,22 @@ interface ManageSkillResult {
 	message: string;
 }
 
+interface ManageSkillListEntry {
+	name: string;
+	scope: "agent" | "managed";
+	agentId?: string;
+	description?: string;
+	skillDir: string;
+}
+
+interface ManageSkillListResult {
+	action: "list";
+	ok: boolean;
+	count: number;
+	skills: ManageSkillListEntry[];
+	message: string;
+}
+
 export interface MakeManageSkillToolOptions {
 	/** Caller's agent id — used as the default for `scope=agent` when `agentId` is omitted. */
 	requesterAgentId?: string;
@@ -111,28 +134,50 @@ export interface MakeManageSkillToolOptions {
 
 export function makeManageSkillTool(
 	opts: MakeManageSkillToolOptions = {},
-): BrigadeTool<typeof ManageSkillParams, ManageSkillResult> {
+): BrigadeTool<typeof ManageSkillParams, ManageSkillResult | ManageSkillListResult> {
 	const requesterId = normalizeAgentId(opts.requesterAgentId ?? DEFAULT_AGENT_ID);
 	return {
 		name: "manage_skill",
 		label: "Manage Skill",
 		ownerOnly: true,
 		description: [
-			"Owner-only LLM-driven skill CRUD. Use this to create or delete a SKILL.md, NEVER hand-write to a `skills/` directory with the `write` tool.",
+			"Owner-only LLM-driven skill CRUD. Use this to create, delete, or LIST skills — NEVER hand-write to a `skills/` directory with the `write` tool, and NEVER answer 'what skills exist' by searching the filesystem with find/bash: action=list is the authoritative answer.",
 			"action=create: writes `<scope-root>/<name>/SKILL.md` with frontmatter + body.",
 			"action=delete: removes the entire `<scope-root>/<name>/` directory.",
-			"scope=agent (default): scoped to one agent's workspace — `~/.brigade/agents/<agentId>/workspace/skills/<name>/` (or `~/.brigade/workspace/skills/<name>/` for the default agent `main`). Only that agent sees the skill.",
+			"action=list: enumerates every skill across the managed scope AND every configured agent's workspace (filter with scope and/or agentId). Returns {skills: [{name, scope, agentId?, description, skillDir}], count}.",
+			"scope=agent (default for create/delete): scoped to one agent's workspace — `~/.brigade/agents/<agentId>/workspace/skills/<name>/` (or `~/.brigade/workspace/skills/<name>/` for the default agent `main`). Only that agent sees the skill.",
 			"scope=managed: shared across every agent — `~/.brigade/skills/<name>/`. Subject to each agent's `cfg.agents.<id>.skills` allowlist.",
 			"NEVER target the install dir (`<package>/skills/`) — that path is bundled+read-only and wiped on reinstall.",
-			"Returns {action, name, scope, agentId?, skillDir, skillFile, ok, message}.",
+			"create/delete return {action, name, scope, agentId?, skillDir, skillFile, ok, message}.",
 		].join(" "),
 		parameters: ManageSkillParams,
 		execute: async (
 			_toolCallId: string,
 			args,
-		): Promise<AgentToolResult<ManageSkillResult>> => {
+		): Promise<AgentToolResult<ManageSkillResult | ManageSkillListResult>> => {
+			if (args.action === "list") {
+				return jsonResult(
+					listSkills({
+						...(args.scope !== undefined ? { scope: args.scope } : {}),
+						...(args.agentId !== undefined
+							? { agentId: normalizeAgentId(args.agentId) }
+							: {}),
+					}),
+				) as AgentToolResult<ManageSkillListResult>;
+			}
 			const scope = args.scope ?? "agent";
-			const rawName = args.name.trim();
+			const rawName = (args.name ?? "").trim();
+			if (!rawName) {
+				return jsonResult({
+					action: args.action,
+					name: "",
+					scope,
+					skillDir: "",
+					skillFile: "",
+					ok: false,
+					message: "`name` is required for create/delete.",
+				} satisfies ManageSkillResult) as AgentToolResult<ManageSkillResult>;
+			}
 
 			const safeName = sanitizeSkillName(rawName);
 			if (!safeName) {
@@ -218,6 +263,7 @@ export function makeManageSkillTool(
 					body: (args.body ?? "").trim(),
 				});
 				fs.writeFileSync(skillFile, content, "utf8");
+				mirrorSkillWrite(scope, resolvedAgentId, safeName, content);
 				return jsonResult({
 					action: "create",
 					name: safeName,
@@ -246,6 +292,7 @@ export function makeManageSkillTool(
 				} satisfies ManageSkillResult) as AgentToolResult<ManageSkillResult>;
 			}
 			fs.rmSync(skillDir, { recursive: true, force: true });
+			mirrorSkillRemove(scope, resolvedAgentId, safeName);
 			return jsonResult({
 				action: "delete",
 				name: safeName,
@@ -259,6 +306,144 @@ export function makeManageSkillTool(
 			} satisfies ManageSkillResult) as AgentToolResult<ManageSkillResult>;
 		},
 	};
+}
+
+// Convex mode: the on-disk write above is what discovery reads (workspace
+// stays local-authoritative), but the skills TABLE used to learn about this
+// skill only at the next gateway boot via the mirror reconcile — a wipe in
+// between lost the skill entirely. Dual-write the table on the live-mirror
+// flush chain immediately. Tool scope "agent" maps to the table's
+// "workspace" source; "managed" maps to "managed". Best-effort: a failed
+// table write logs via the chain and the boot reconcile self-heals.
+function mirrorSkillWrite(
+	scope: "agent" | "managed",
+	agentId: string | undefined,
+	name: string,
+	content: string,
+): void {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode !== "convex") return;
+	const store = rctx.store;
+	enqueueWorkspaceMirrorOp(() =>
+		store.skills.write({
+			scope: scope === "agent" ? "workspace" : "managed",
+			...(agentId !== undefined ? { agentId } : {}),
+			name,
+			content,
+		}),
+	);
+}
+
+function mirrorSkillRemove(
+	scope: "agent" | "managed",
+	agentId: string | undefined,
+	name: string,
+): void {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode !== "convex") return;
+	const store = rctx.store;
+	enqueueWorkspaceMirrorOp(() =>
+		store.skills.remove({
+			scope: scope === "agent" ? "workspace" : "managed",
+			...(agentId !== undefined ? { agentId } : {}),
+			name,
+		}),
+	);
+}
+
+/**
+ * Enumerate skills on disk for `action=list`. Scans the managed root and/or
+ * every configured agent's workspace skills dir (plus the default agent),
+ * honouring optional scope/agent filters. Each `<root>/<dir>/SKILL.md` found
+ * becomes one entry; the frontmatter `description` is extracted with a
+ * cheap line parse (full YAML parsing is overkill for one known key).
+ */
+function listSkills(filter: {
+	scope?: "agent" | "managed";
+	agentId?: string;
+}): ManageSkillListResult {
+	const skills: ManageSkillListEntry[] = [];
+	if (filter.scope !== "agent") {
+		collectSkillsFromRoot(resolveManagedSkillsDir(), { scope: "managed" }, skills);
+	}
+	if (filter.scope !== "managed") {
+		const cfg = loadConfig();
+		const agentIds = new Set<string>([DEFAULT_AGENT_ID]);
+		for (const entry of listAgentEntries(cfg)) {
+			agentIds.add(normalizeAgentId(entry.id));
+		}
+		for (const agentId of [...agentIds].sort()) {
+			if (filter.agentId !== undefined && agentId !== filter.agentId) continue;
+			collectSkillsFromRoot(resolveSkillsDir(agentId), { scope: "agent", agentId }, skills);
+		}
+	}
+	const scopeLabel =
+		filter.scope ?? (filter.agentId !== undefined ? `agent "${filter.agentId}" + managed` : "all scopes");
+	return {
+		action: "list",
+		ok: true,
+		count: skills.length,
+		skills,
+		message: `${skills.length} skill(s) found (${scopeLabel}).`,
+	};
+}
+
+function collectSkillsFromRoot(
+	root: string,
+	origin: { scope: "agent" | "managed"; agentId?: string },
+	out: ManageSkillListEntry[],
+): void {
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(root, { withFileTypes: true });
+	} catch {
+		return; // root doesn't exist yet — zero skills, not an error
+	}
+	entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		const skillDir = path.join(root, entry.name);
+		const skillFile = path.join(skillDir, "SKILL.md");
+		if (!fs.existsSync(skillFile)) continue;
+		const description = readFrontmatterDescription(skillFile);
+		out.push({
+			name: entry.name,
+			scope: origin.scope,
+			...(origin.agentId !== undefined ? { agentId: origin.agentId } : {}),
+			...(description !== undefined ? { description } : {}),
+			skillDir,
+		});
+	}
+}
+
+/** Pull `description:` out of the SKILL.md frontmatter block, if present. */
+function readFrontmatterDescription(skillFile: string): string | undefined {
+	let head: string;
+	try {
+		const fd = fs.openSync(skillFile, "r");
+		try {
+			const buf = Buffer.alloc(2048);
+			const n = fs.readSync(fd, buf, 0, buf.length, 0);
+			head = buf.subarray(0, n).toString("utf8");
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return undefined;
+	}
+	if (!head.startsWith("---")) return undefined;
+	const end = head.indexOf("\n---", 3);
+	const block = end === -1 ? head : head.slice(0, end);
+	const match = /^description:\s*(.+)$/m.exec(block);
+	if (!match) return undefined;
+	let value = (match[1] ?? "").trim();
+	if (
+		(value.startsWith('"') && value.endsWith('"')) ||
+		(value.startsWith("'") && value.endsWith("'"))
+	) {
+		value = value.slice(1, -1);
+	}
+	return value || undefined;
 }
 
 /**

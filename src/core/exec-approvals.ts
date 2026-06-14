@@ -66,6 +66,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { DEFAULT_AGENT_ID, resolveAgentDir, resolveStateDir } from "../config/paths.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
 const SUPPORTED_SCHEMA_VERSION = 1 as const;
 
@@ -249,6 +250,21 @@ function emptyApprovals(): ApprovalsFile {
  */
 function loadApprovals(agentId: string): ApprovalsFile {
 	const id = normaliseAgentId(agentId);
+
+	// Convex mode — serve from the in-process cache. Boot hydration
+	// (storage/boot.ts) fills every config agent's slot from the
+	// execApprovals table; the mutators below pin the slot on every write;
+	// the gateway's live-query watch keeps cross-process changes fresh.
+	// An agent with no slot has no approvals — the empty shape is correct.
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		const existing = cache.get(id);
+		if (existing) return existing.contents;
+		const empty = emptyApprovals();
+		cache.set(id, { contents: empty, mtimeMs: -1 });
+		return empty;
+	}
+
 	maybeMigrateLegacyApprovals(id);
 	const filePath = resolveExecApprovalsPath(id);
 	const existing = cache.get(id);
@@ -259,6 +275,34 @@ function loadApprovals(agentId: string): ApprovalsFile {
 	const contents = loadApprovalsFromDisk(filePath);
 	cache.set(id, { contents, mtimeMs: observed });
 	return contents;
+}
+
+/** Convex-mode boot hydration — install the agent's allowlist into the
+ *  module cache so the synchronous gate (`decideApproval`) works without
+ *  disk or network on the hot path. Called from storage/boot.ts. */
+export function primeApprovalsCache(
+	agentId: string,
+	contents: { commands: string[]; patterns: string[] },
+): void {
+	const id = normaliseAgentId(agentId);
+	cache.set(id, {
+		contents: {
+			version: SUPPORTED_SCHEMA_VERSION,
+			commands: [...contents.commands],
+			patterns: [...contents.patterns],
+		},
+		mtimeMs: -1,
+	});
+}
+
+// Serialises convex-mode approval mutations; errors are surfaced loudly but
+// don't poison later writes.
+let approvalsFlushChain: Promise<void> = Promise.resolve();
+
+/** Resolves when every approval mutation enqueued so far reached the
+ *  backend (convex mode). */
+export function awaitApprovalsFlush(): Promise<void> {
+	return approvalsFlushChain;
 }
 
 /**
@@ -464,6 +508,38 @@ export function recordApproval(
 		);
 	}
 	const id = normaliseAgentId(agentId);
+
+	// Convex mode — mutate the cached shape (the gate sees the approval
+	// immediately) and enqueue the row insert. The insert mutation is
+	// idempotent on (agentId, kind, valueNormalised), matching the
+	// duplicate-skip below.
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		const current = loadApprovals(id);
+		const next: ApprovalsFile = {
+			version: current.version,
+			commands: [...current.commands],
+			patterns: [...current.patterns],
+		};
+		if (kind === "exact") {
+			if (next.commands.includes(value)) return;
+			next.commands.push(value);
+		} else {
+			if (next.patterns.includes(value)) return;
+			next.patterns.push(value);
+		}
+		cache.set(id, { contents: next, mtimeMs: -1 });
+		const store = rctx.store;
+		approvalsFlushChain = approvalsFlushChain
+			.then(() => store.execApprovals.recordApproval({ agentId: id, value, kind }))
+			.catch((err) => {
+				console.error(
+					`brigade: approval write to convex failed (agent ${id}) — ${(err as Error).message}`,
+				);
+			});
+		return;
+	}
+
 	maybeMigrateLegacyApprovals(id);
 	const filePath = resolveExecApprovalsPath(id);
 	const fresh = loadApprovalsFromDisk(filePath);
@@ -488,6 +564,34 @@ export function removeApproval(
 	const v = value.trim();
 	if (!v) return { removedCommands: 0, removedPatterns: 0 };
 	const id = normaliseAgentId(agentId);
+
+	// Convex mode — drop from the cached shape and enqueue the row delete.
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		const current = loadApprovals(id);
+		const next: ApprovalsFile = {
+			version: current.version,
+			commands: current.commands.filter((c) => c !== v),
+			patterns: current.patterns.filter((p) => p !== v),
+		};
+		const removedCommands = current.commands.length - next.commands.length;
+		const removedPatterns = current.patterns.length - next.patterns.length;
+		if (removedCommands === 0 && removedPatterns === 0) {
+			return { removedCommands: 0, removedPatterns: 0 };
+		}
+		cache.set(id, { contents: next, mtimeMs: -1 });
+		const store = rctx.store;
+		approvalsFlushChain = approvalsFlushChain
+			.then(() => store.execApprovals.removeApproval(id, v))
+			.then(() => {})
+			.catch((err) => {
+				console.error(
+					`brigade: approval removal in convex failed (agent ${id}) — ${(err as Error).message}`,
+				);
+			});
+		return { removedCommands, removedPatterns };
+	}
+
 	maybeMigrateLegacyApprovals(id);
 	const filePath = resolveExecApprovalsPath(id);
 	const fresh = loadApprovalsFromDisk(filePath);
@@ -558,6 +662,27 @@ export function getApprovalsFilePath(
  * `error` field instead of throwing so `brigade doctor` can render a
  * remediation hint without crashing.
  */
+/**
+ * Enumerate every approval row for an agent. Returned in a stable shape:
+ *   { commands: string[], patterns: string[] }
+ *
+ * Used by the `brigade store migrate` engine — earlier versions only had
+ * `readApprovalsSummary` (counts), which forced operators to copy entries
+ * by hand. This enumerator exposes the underlying data without leaking
+ * the on-disk file shape.
+ */
+export function listApprovals(
+	agentId: string | undefined = DEFAULT_AGENT_ID,
+): { commands: string[]; patterns: string[] } {
+	const id = normaliseAgentId(agentId);
+	maybeMigrateLegacyApprovals(id);
+	const file = loadApprovals(id);
+	return {
+		commands: [...(file.commands ?? [])],
+		patterns: [...(file.patterns ?? [])],
+	};
+}
+
 export function readApprovalsSummary(
 	agentId: string | undefined = DEFAULT_AGENT_ID,
 ): {

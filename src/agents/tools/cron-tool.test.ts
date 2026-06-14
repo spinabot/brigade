@@ -106,7 +106,44 @@ describe("cron-tool — flat-params recovery (add)", () => {
 				// no schedule / payload / message / text → recovery refuses
 			});
 			const text = JSON.stringify(res);
-			assert.equal(text.includes("`job` parameter required"), true);
+			assert.equal(text.includes("needs `job` as an inline OBJECT"), true);
+		} finally {
+			fx.cleanup();
+		}
+	});
+
+	it("parses a JSON-STRINGIFIED `job` (OpenRouter double-encoding quirk)", async () => {
+		// Regression for the exact production failure (2026-06-11): the model
+		// sent a perfectly valid job but as a STRING — '{"name": …}' — and the
+		// old required-error misled it into retrying identically 7 times.
+		const fx = setupCronService();
+		try {
+			const tool = makeCronTool();
+			const res = await callTool(tool, {
+				action: "add",
+				job: JSON.stringify({
+					name: "gym-reminder",
+					schedule: { kind: "in", inMinutes: 3 },
+					sessionTarget: "isolated",
+					payload: { kind: "agentTurn", message: "Time to hit the gym!" },
+				}),
+			});
+			const text = JSON.stringify(res);
+			assert.equal(text.includes("gym-reminder"), true);
+			assert.equal(text.includes("inline OBJECT"), false); // no error reply
+		} finally {
+			fx.cleanup();
+		}
+	});
+
+	it("an unparseable string job still fails — with the actionable example", async () => {
+		const fx = setupCronService();
+		try {
+			const tool = makeCronTool();
+			const res = await callTool(tool, { action: "add", job: "{not valid json" });
+			const text = JSON.stringify(res);
+			assert.equal(text.includes("needs `job` as an inline OBJECT"), true);
+			assert.equal(text.includes("gym-reminder"), true); // the example shape is shown
 		} finally {
 			fx.cleanup();
 		}
@@ -601,6 +638,76 @@ describe("cron-tool — createdBy ownership tracking", () => {
 			const res = await callTool(tool, { action: "remove", jobId: legacyId });
 			assert.equal(wasRefused(res), true);
 			assert.match(JSON.stringify(res), /not scheduled by this chat/i);
+		} finally {
+			fx.cleanup();
+		}
+	});
+});
+
+describe("cron-tool — stagger surfacing in add/update results", () => {
+	// Production failure (2026-06-11): a "7 PM daily" job silently fired at
+	// 7:04 (top-of-hour default staggerMs: 300000) and, asked why, the model
+	// improvised from the raw job JSON — "random" (it's deterministic) and
+	// "can't be disabled" (it can). The result now carries a ready-to-say
+	// `staggerNote` grounding the WHY + the staggerMs: 0 opt-out.
+	it("top-of-hour cron add → result carries a plain-language staggerNote", async () => {
+		const fx = setupCronService();
+		try {
+			const tool = makeCronTool();
+			const res = await callTool(tool, {
+				action: "add",
+				job: {
+					name: "gym-7pm",
+					schedule: { kind: "cron", expr: "0 19 * * *", tz: "Asia/Kolkata" },
+					sessionTarget: "isolated",
+					payload: { kind: "agentTurn", message: "gym time" },
+				},
+			});
+			const details = (res as { details?: { staggerNote?: string } }).details;
+			assert.ok(details?.staggerNote, "expected staggerNote on a staggered job");
+			assert.match(details.staggerNote, /staggerMs: 0/);
+			assert.match(details.staggerNote, /PLAIN LANGUAGE/i);
+			assert.match(details.staggerNote, /not\s+random/i);
+		} finally {
+			fx.cleanup();
+		}
+	});
+
+	it("explicit staggerMs: 0 → fires exact, NO staggerNote", async () => {
+		const fx = setupCronService();
+		try {
+			const tool = makeCronTool();
+			const res = await callTool(tool, {
+				action: "add",
+				job: {
+					name: "gym-7pm-exact",
+					schedule: { kind: "cron", expr: "0 19 * * *", tz: "Asia/Kolkata", staggerMs: 0 },
+					sessionTarget: "isolated",
+					payload: { kind: "agentTurn", message: "gym time" },
+				},
+			});
+			const details = (res as { details?: { staggerNote?: string } }).details;
+			assert.equal(details?.staggerNote, undefined);
+		} finally {
+			fx.cleanup();
+		}
+	});
+
+	it("non-top-of-hour expressions get no default stagger and no note", async () => {
+		const fx = setupCronService();
+		try {
+			const tool = makeCronTool();
+			const res = await callTool(tool, {
+				action: "add",
+				job: {
+					name: "gym-730pm",
+					schedule: { kind: "cron", expr: "30 19 * * *", tz: "Asia/Kolkata" },
+					sessionTarget: "isolated",
+					payload: { kind: "agentTurn", message: "gym time" },
+				},
+			});
+			const details = (res as { details?: { staggerNote?: string } }).details;
+			assert.equal(details?.staggerNote, undefined);
 		} finally {
 			fx.cleanup();
 		}

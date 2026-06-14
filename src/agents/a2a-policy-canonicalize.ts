@@ -50,27 +50,45 @@ export function canonicalizeA2APolicy(
 	// Operator opted out via the named gate flag — leave the policy alone.
 	if (sessionRaw[opts.gateFlag] === false) return cfg;
 
+	// ── Part A: agentToAgent canonicalisation ───────────────────────────
 	const a2aRaw = sessionRaw["agentToAgent"];
-
 	const canonical = { enabled: true, allow: [{ from: "*", to: "*" }] };
-
-	// (1) Missing → write the canonical default.
-	// (2 broken legacy) The literal boolean `true` → coerce to canonical.
 	const isPlainObject =
 		a2aRaw !== null && typeof a2aRaw === "object" && !Array.isArray(a2aRaw);
+	let nextA2A: Record<string, unknown> | undefined;
 	if (a2aRaw === undefined || a2aRaw === null || !isPlainObject) {
-		const nextSession: Record<string, unknown> = { ...sessionRaw, agentToAgent: canonical };
-		return { ...cfg, session: nextSession as BrigadeConfig["session"] };
+		// (1) Missing / (2) broken legacy boolean → canonical default.
+		nextA2A = canonical;
+	} else if ((a2aRaw as Record<string, unknown>)["enabled"] !== true) {
+		// (3) Object with enabled missing/false → flip enabled, preserve the rest.
+		nextA2A = { ...(a2aRaw as Record<string, unknown>), enabled: true };
 	}
+	// else (4) already enabled → no agentToAgent change.
 
-	const a2aObj = a2aRaw as Record<string, unknown>;
-	const currentEnabled = a2aObj["enabled"];
-	// (4) Already enabled — idempotent no-op.
-	if (currentEnabled === true) return cfg;
+	// ── Part B: sessionTools.visibility canonicalisation ────────────────
+	// A2A messaging is GATED on `session.sessionTools.visibility === "all"`
+	// (see checkSessionToolAccess). Enabling `agentToAgent` without also
+	// seeding visibility left A2A half-on: `sessions_send` cross-agent still
+	// refused, and the operator had to hand-add `sessionTools.visibility:
+	// "all"` every time. Seed it here so "A2A works out of the box" is
+	// actually true. Only when visibility is UNSET — an explicit operator
+	// choice (e.g. "self"/"tree" for a deliberately locked-down install) is
+	// respected. Same gate flag as Part A; `=false` already returned above.
+	const sessionToolsRaw = sessionRaw["sessionTools"] as Record<string, unknown> | undefined;
+	const visibilityUnset =
+		!sessionToolsRaw ||
+		typeof sessionToolsRaw !== "object" ||
+		sessionToolsRaw["visibility"] === undefined;
+	const nextSessionTools = visibilityUnset
+		? { ...(sessionToolsRaw && typeof sessionToolsRaw === "object" ? sessionToolsRaw : {}), visibility: "all" }
+		: undefined;
 
-	// (3) Object with `enabled` missing/false → set enabled:true, preserve allow + other fields.
-	const nextA2A: Record<string, unknown> = { ...a2aObj, enabled: true };
-	const nextSession: Record<string, unknown> = { ...sessionRaw, agentToAgent: nextA2A };
+	// Idempotent no-op — nothing to change in either part.
+	if (!nextA2A && !nextSessionTools) return cfg;
+
+	const nextSession: Record<string, unknown> = { ...sessionRaw };
+	if (nextA2A) nextSession.agentToAgent = nextA2A;
+	if (nextSessionTools) nextSession.sessionTools = nextSessionTools;
 	return { ...cfg, session: nextSession as BrigadeConfig["session"] };
 }
 

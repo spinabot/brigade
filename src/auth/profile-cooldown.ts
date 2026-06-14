@@ -33,6 +33,7 @@ import type { RetryReason } from "../agents/error-classifier.js";
 import { ensureDir, resolveAuthDir } from "../config/paths.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
 const log = createSubsystemLogger("auth/cooldown");
 
@@ -161,7 +162,41 @@ export function resolveProfileStatePath(agentId: string): string {
   return path.join(resolveAuthDir(agentId), "profile-state.json");
 }
 
+// Convex-mode cache + flush for profile-state.json. The whole file rides
+// the authFiles blob table VERBATIM (sealed) so cooldown stats, failure
+// histograms, and the failover order array round-trip without semantic
+// drift. The per-agent FIFO lock above still serialises read-modify-write
+// in-process; Convex linearises across processes.
+const convexProfileStateCache = new Map<string, ProfileStateFile>();
+let profileStateFlushChain: Promise<void> = Promise.resolve();
+
+/** Convex-mode boot hydration — install an agent's profile-state blob. */
+export function primeProfileStateCache(agentId: string, state: ProfileStateFile): void {
+  convexProfileStateCache.set(agentId, structuredClone(state));
+}
+
+/** Resolves when every profile-state write enqueued so far reached the
+ *  backend (convex mode). */
+export function awaitProfileStateFlush(): Promise<void> {
+  return profileStateFlushChain;
+}
+
+/** Test-only. */
+export function __resetProfileStateCacheForTests(): void {
+  convexProfileStateCache.clear();
+  profileStateFlushChain = Promise.resolve();
+}
+
 export function loadProfileState(agentId: string): ProfileStateFile {
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    const cached = convexProfileStateCache.get(agentId);
+    if (cached) return structuredClone(cached);
+    const empty: ProfileStateFile = { version: 1, usageStats: {} };
+    convexProfileStateCache.set(agentId, empty);
+    return structuredClone(empty);
+  }
+
   const p = resolveProfileStatePath(agentId);
   if (!fs.existsSync(p)) return { version: 1, usageStats: {} };
   try {
@@ -180,6 +215,22 @@ export function loadProfileState(agentId: string): ProfileStateFile {
 }
 
 export function saveProfileState(agentId: string, state: ProfileStateFile): void {
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    convexProfileStateCache.set(agentId, structuredClone(state));
+    const store = rctx.store;
+    const frozen = structuredClone(state) as unknown as Record<string, unknown>;
+    profileStateFlushChain = profileStateFlushChain
+      .then(() => store.auth.writeAuthFileBlob(agentId, "profile-state", frozen))
+      .catch((err) => {
+        log.warn("profile state write to convex failed", {
+          agentId,
+          error: (err as Error).message,
+        });
+      });
+    return;
+  }
+
   const p = resolveProfileStatePath(agentId);
   ensureDir(path.dirname(p));
   const tmp = `${p}.tmp-${process.pid}-${Date.now().toString(36)}`;

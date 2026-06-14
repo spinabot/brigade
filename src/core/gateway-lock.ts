@@ -44,8 +44,22 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { BRIGADE_DIR } from "./config.js";
+import { resolveOsCacheDir } from "../config/paths.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import { isProcessAlive } from "./gateway-probe.js";
 
+/** Lock file location. Convex mode keeps the kernel-mutex semantics but
+ * the file lives in the OS cache dir — never under ~/.brigade. Computed
+ * per call so the mode resolved at boot is honoured. */
+export function resolveGatewayLockPath(): string {
+  if (tryGetRuntimeContext()?.mode === "convex") {
+    return path.join(resolveOsCacheDir(), "gateway.lock");
+  }
+  return path.join(BRIGADE_DIR, "gateway.lock");
+}
+
+/** @deprecated import resolveGatewayLockPath() — kept for older call sites;
+ *  filesystem-mode value only. */
 export const GATEWAY_LOCK_PATH = path.join(BRIGADE_DIR, "gateway.lock");
 
 const DEFAULT_TIMEOUT_MS = 5000;
@@ -111,7 +125,7 @@ export async function acquireGatewayLock(opts: GatewayLockOptions): Promise<Gate
   const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
   const startedAt = Date.now();
 
-  await fs.mkdir(path.dirname(GATEWAY_LOCK_PATH), { recursive: true });
+  await fs.mkdir(path.dirname(resolveGatewayLockPath()), { recursive: true });
 
   let lastHolderPid: number | undefined;
 
@@ -126,7 +140,7 @@ export async function acquireGatewayLock(opts: GatewayLockOptions): Promise<Gate
     if (await isLockStale(payload, staleMs)) {
       // Stale — try to remove and re-acquire on next loop iteration.
       try {
-        await fs.unlink(GATEWAY_LOCK_PATH);
+        await fs.unlink(resolveGatewayLockPath());
       } catch {
         // Another process may have unlinked it concurrently; that's fine.
       }
@@ -146,7 +160,7 @@ export async function acquireGatewayLock(opts: GatewayLockOptions): Promise<Gate
 async function tryCreateLock(port: number): Promise<GatewayLockHandle | undefined> {
   let fh: fs.FileHandle | undefined;
   try {
-    fh = await fs.open(GATEWAY_LOCK_PATH, "wx");
+    fh = await fs.open(resolveGatewayLockPath(), "wx");
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "EEXIST") return undefined;
@@ -168,7 +182,7 @@ async function tryCreateLock(port: number): Promise<GatewayLockHandle | undefine
 async function readLockPayload(): Promise<LockPayload | undefined> {
   let raw: string;
   try {
-    raw = await fs.readFile(GATEWAY_LOCK_PATH, "utf8");
+    raw = await fs.readFile(resolveGatewayLockPath(), "utf8");
   } catch {
     return undefined;
   }
@@ -197,7 +211,7 @@ async function isLockStale(payload: LockPayload | undefined, staleMs: number): P
 function makeHandle(pid: number): GatewayLockHandle {
   let released = false;
   return {
-    path: GATEWAY_LOCK_PATH,
+    path: resolveGatewayLockPath(),
     pid,
     async release() {
       if (released) return;
@@ -209,7 +223,7 @@ function makeHandle(pid: number): GatewayLockHandle {
         // got a chance to run.
         const payload = await readLockPayload();
         if (!payload || payload.pid === pid) {
-          await fs.unlink(GATEWAY_LOCK_PATH);
+          await fs.unlink(resolveGatewayLockPath());
         }
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") {

@@ -1,6 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { workspaceIdFromDir } from "../storage/facts-cache.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
+import { enqueueWorkspaceMirrorOp } from "../storage/workspace-live-mirror.js";
+
 import { fileExists } from "./fs-utils.js";
 
 // Lifecycle markers for the agent's workspace.
@@ -110,6 +114,7 @@ export async function markBootstrapSeeded(workspaceDir: string): Promise<void> {
     ...state,
     bootstrapSeededAt: new Date().toISOString(),
   });
+  mirrorLifecycleStamp(workspaceDir, "bootstrapSeeded");
 }
 
 // Stamp `setupCompletedAt` once BOOTSTRAP.md has been consumed. The agent
@@ -124,5 +129,27 @@ export async function markSetupCompleted(workspaceDir: string): Promise<void> {
     ...state,
     setupCompletedAt: new Date().toISOString(),
   });
+  mirrorLifecycleStamp(workspaceDir, "setupCompleted");
+}
+
+// Convex mode: the lifecycle stamps used to reach the workspaceState table
+// only at the NEXT gateway boot (boot.ts mirror reconcile) — so a wipe in
+// between forgot that setup had completed and resurrected the first-run
+// flow. Dual-write the stamp onto the live-mirror flush chain immediately;
+// the disk file stays the local source of truth (workspace stays local by
+// design), Convex is the durable copy.
+function mirrorLifecycleStamp(
+  workspaceDir: string,
+  kind: "bootstrapSeeded" | "setupCompleted",
+): void {
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode !== "convex") return;
+  const store = rctx.store;
+  const agentId = workspaceIdFromDir(workspaceDir);
+  enqueueWorkspaceMirrorOp(() =>
+    kind === "bootstrapSeeded"
+      ? store.workspace.markBootstrapSeeded(agentId)
+      : store.workspace.markSetupCompleted(agentId),
+  );
 }
 

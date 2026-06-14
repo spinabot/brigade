@@ -10,7 +10,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { readPersistedThinkingLevel } from "./model-caps.js";
+import { readPersistedThinkingLevel, remapThinkingLevel } from "./model-caps.js";
 
 describe("readPersistedThinkingLevel (H4)", () => {
 	it("returns the persisted level for every valid ThinkingLevel string", () => {
@@ -58,5 +58,34 @@ describe("readPersistedThinkingLevel (H4)", () => {
 		const modelDefault = "low" as const; // pretend pickInitialThinkingLevel returned this
 		const resolved = persisted ?? modelDefault;
 		assert.equal(resolved, "high");
+	});
+});
+
+describe("remapThinkingLevel (model-switch continuity)", () => {
+	const reasoning = { id: "anthropic/claude-opus-4.8", reasoning: true } as never;
+	const nonReasoning = { id: "openai/gpt-4o", reasoning: false } as never;
+	const reasoningOnly = { id: "google/gemini-2.5-pro", reasoning: false } as never; // rejects budget=0
+
+	it("preserves the operator's level when the new model can reason", () => {
+		assert.equal(remapThinkingLevel("high", reasoning), "high");
+		assert.equal(remapThinkingLevel("medium", reasoning), "medium");
+	});
+
+	it("drops to off when the new model can't reason", () => {
+		assert.equal(remapThinkingLevel("high", nonReasoning), "off");
+		assert.equal(remapThinkingLevel("xhigh", nonReasoning), "off");
+	});
+
+	it("bumps off→low for a reasoning-only model that rejects a zero budget", () => {
+		assert.equal(remapThinkingLevel("off", reasoningOnly), "low");
+	});
+
+	it("keeps off for a normal reasoning model", () => {
+		assert.equal(remapThinkingLevel("off", reasoning), "off");
+	});
+
+	it("falls back to the model's initial level when current is missing/invalid", () => {
+		assert.equal(remapThinkingLevel(undefined, reasoning), "low"); // reasoning → low
+		assert.equal(remapThinkingLevel(undefined, nonReasoning), "off");
 	});
 });

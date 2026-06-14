@@ -1,9 +1,28 @@
 import { strict as assert } from "node:assert";
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// File-wide state-dir isolation. The ACL-specific tests below pin
+// BRIGADE_STATE_DIR per-test, but the older startChannels tests don't — and
+// the fake channel's pairing flow + subsystem logger resolve their paths via
+// resolveStateDir(), so those tests wrote channels/fake/pairing.json and
+// logs/brigade-*.log into the DEVELOPER'S real ~/.brigade. Caught 2026-06-12
+// when a full suite run leaked into a freshly-reset operator state dir.
+let __stateDirTmp: string;
+let __prevStateDir: string | undefined;
+beforeEach(() => {
+	__stateDirTmp = mkdtempSync(join(tmpdir(), "brigade-mgr-statedir-"));
+	__prevStateDir = process.env.BRIGADE_STATE_DIR;
+	process.env.BRIGADE_STATE_DIR = __stateDirTmp;
+});
+afterEach(() => {
+	if (__prevStateDir === undefined) delete process.env.BRIGADE_STATE_DIR;
+	else process.env.BRIGADE_STATE_DIR = __prevStateDir;
+	rmSync(__stateDirTmp, { recursive: true, force: true });
+});
 
 import type { BrigadeConfig } from "../../config/io.js";
 import type { ChannelAdapter, ChannelStartContext, InboundMessage, OutboundSendOptions } from "../extensions/types.js";

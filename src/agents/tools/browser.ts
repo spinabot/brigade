@@ -35,6 +35,8 @@ import { Type, type Static } from "typebox";
 import { buildExternalContentMeta, wrapWebContent } from "../../security/external-content.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { BRIGADE_DIR } from "../../core/config.js";
+import { resolveOsCacheDir } from "../../config/paths.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { classifyUrlForSsrf, SsrfBlockedError } from "../../infra/net/fetch-guard.js";
 import { htmlToMarkdown, stripEnvelopeMarkers, stripInvisibleUnicode } from "./web-fetch-utils.js";
 import type { AgentToolResult, AgentToolUpdateCallback, AnyBrigadeTool, BrigadeTool } from "./types.js";
@@ -288,6 +290,16 @@ function profileUserDataDir(name: string): string {
 	// Keep profile names tame — restrict to a portable charset so we
 	// don't generate unwriteable paths on Windows.
 	const safe = name.replace(/[^a-z0-9_.-]/gi, "_");
+	// Convex mode: Chromium owns this directory (SQLite + LevelDB + caches —
+	// hundreds of files only Chromium can coherently write), so it cannot
+	// ride Convex; it lives in the OS cache dir instead of ~/.brigade.
+	// Machine-local by nature: cookies/logins don't roam, which is the
+	// accepted trade-off. BRIGADE_BROWSER_USER_DATA_DIR overrides both modes.
+	const override = process.env.BRIGADE_BROWSER_USER_DATA_DIR?.trim();
+	if (override) return join(override, safe || DEFAULT_PROFILE);
+	if (tryGetRuntimeContext()?.mode === "convex") {
+		return join(resolveOsCacheDir(), "browser", safe || DEFAULT_PROFILE);
+	}
 	return join(BRIGADE_DIR, "browser", safe || DEFAULT_PROFILE);
 }
 
@@ -647,41 +659,17 @@ async function openNewTab(
 /* ─────────────────────────── schema + result ─────────────────────────── */
 
 const BrowserSchema = Type.Object({
-	action: Type.Union(
-		[
-			Type.Literal("status"),
-			Type.Literal("start"),
-			Type.Literal("stop"),
-			Type.Literal("profiles"),
-			Type.Literal("attach"),
-			Type.Literal("tabs"),
-			Type.Literal("open"),
-			Type.Literal("focus"),
-			Type.Literal("close"),
-			Type.Literal("navigate"),
-			Type.Literal("snapshot"),
-			Type.Literal("screenshot"),
-			Type.Literal("pdf"),
-			Type.Literal("click"),
-			Type.Literal("type"),
-			Type.Literal("press"),
-			Type.Literal("hover"),
-			Type.Literal("drag"),
-			Type.Literal("select"),
-			Type.Literal("fill"),
-			Type.Literal("resize"),
-			Type.Literal("scrollIntoView"),
-			Type.Literal("evaluate"),
-			Type.Literal("wait"),
-			Type.Literal("console"),
-			Type.Literal("dialog"),
-			Type.Literal("upload"),
-		],
-		{
-			description:
-				"Action to perform. `start`/`stop`/`profiles`/`attach` manage lifecycle; `status`/`tabs` introspect; `open`/`navigate` for nav; `snapshot` returns the page as markdown; `screenshot` returns base64 PNG; `pdf` returns base64 PDF; `click`/`type`/`press`/`hover`/`drag`/`select`/`fill`/`scrollIntoView` for interaction; `resize` changes the viewport; `evaluate` runs JS; `wait` blocks on a condition; `console` returns captured logs; `dialog` arms an auto-handler; `upload` sets file inputs.",
-		},
-	),
+	// A plain string (validated in-tool against BROWSER_ACTIONS) rather than a
+	// literal union: an unknown/hallucinated action then reaches the dispatch
+	// `default` case and gets a clean, actionable "unknown action — valid: …"
+	// error instead of Pi's cryptic "must be equal to constant" dump (repeated
+	// once per literal). The full surface is enumerated in the description so
+	// the model still sees every valid action.
+	action: Type.String({
+		description:
+			"Action to perform — must be EXACTLY one of: status, start, stop, profiles, attach, tabs, open, focus, close, navigate, snapshot, screenshot, pdf, click, type, press, hover, drag, select, fill, resize, scroll, scrollIntoView, evaluate, wait, console, dialog, upload. " +
+			"`start`/`stop`/`profiles`/`attach` manage lifecycle; `status`/`tabs` introspect; `open`/`navigate` for nav; `snapshot` returns the page as markdown; `screenshot` returns base64 PNG; `pdf` returns base64 PDF; `click`/`type`/`press`/`hover`/`drag`/`select`/`fill` for interaction; `scroll` scrolls the page (or a `selector` container) — use `to:\"bottom\"` with `times` to load infinite-scroll feeds like Google Maps results or directory listings; `scrollIntoView` brings ONE element into view; `resize` changes the viewport; `evaluate` runs JS; `wait` blocks on a condition; `console` returns captured logs; `dialog` arms an auto-handler; `upload` sets file inputs.",
+	}),
 	profile: Type.Optional(
 		Type.String({
 			description:
@@ -706,7 +694,7 @@ const BrowserSchema = Type.Object({
 	selector: Type.Optional(
 		Type.String({
 			description:
-				"CSS selector for `click`/`type`/`press`/`hover`/`select`/`fill`/`scrollIntoView`/`upload`/`wait` actions.",
+				"CSS selector for `click`/`type`/`press`/`hover`/`select`/`fill`/`scrollIntoView`/`upload`/`wait` actions. For `scroll`, the scroll CONTAINER (e.g. `div[role=\"feed\"]` for the Google Maps results panel); omit to scroll the whole page.",
 		}),
 	),
 	targetSelector: Type.Optional(
@@ -812,7 +800,7 @@ const BrowserSchema = Type.Object({
 			],
 			{
 				description:
-					"For `navigate`: when to consider the nav done. `commit` = first byte (fastest, use for bot-protected pages like Justdial / Cloudflare-fronted that never fire load). `domcontentloaded` = HTML parsed (default). `load` = all resources fetched. `networkidle` = no requests for 500ms (slowest).",
+					"For `navigate`: when to consider the nav done. `commit` = first byte (fastest; use for heavily bot-protected pages that never fire load). `domcontentloaded` = HTML parsed (default). `load` = all resources fetched. `networkidle` = no requests for 500ms (slowest).",
 			},
 		),
 	),
@@ -849,7 +837,65 @@ const BrowserSchema = Type.Object({
 			description: "For `snapshot`: collapse runs of blank lines + strip empty list items.",
 		}),
 	),
+	to: Type.Optional(
+		Type.Union([Type.Literal("top"), Type.Literal("bottom")], {
+			description:
+				"For `scroll`: jump to the top or bottom of the page (or of the `selector` container). Omit BOTH `to` and `pixels` to default to scrolling to the bottom (loads more on infinite-scroll feeds).",
+		}),
+	),
+	pixels: Type.Optional(
+		Type.Integer({
+			description:
+				"For `scroll`: scroll by this many pixels (positive = down, negative = up). Ignored when `to` is set.",
+			minimum: -100_000,
+			maximum: 100_000,
+		}),
+	),
+	times: Type.Optional(
+		Type.Integer({
+			description:
+				"For `scroll`: repeat the scroll step N times with a short pause between — triggers infinite-scroll / lazy-loaded feeds (Google Maps results, Justdial listings). Default 1, max 30.",
+			minimum: 1,
+			maximum: 30,
+		}),
+	),
 });
+
+/**
+ * The complete `browser` action surface — single source of truth for the
+ * unknown-action error (dispatch `default` case) and the schema test. Keep
+ * in sync with the `action` description above and the dispatch switch below.
+ */
+export const BROWSER_ACTIONS = [
+	"status",
+	"start",
+	"stop",
+	"profiles",
+	"attach",
+	"tabs",
+	"open",
+	"focus",
+	"close",
+	"navigate",
+	"snapshot",
+	"screenshot",
+	"pdf",
+	"click",
+	"type",
+	"press",
+	"hover",
+	"drag",
+	"select",
+	"fill",
+	"resize",
+	"scroll",
+	"scrollIntoView",
+	"evaluate",
+	"wait",
+	"console",
+	"dialog",
+	"upload",
+] as const;
 
 export interface BrowserDetails {
 	action: string;
@@ -873,6 +919,12 @@ export interface BrowserDetails {
 	dialogEvents?: DialogEvent[];
 	refs?: Array<{ ref: string; tag: string; role?: string; name?: string; selector: string }>;
 	error?: string;
+	/** For `scroll`: vertical offset (px) of the scrolled target afterward. */
+	scrollTop?: number;
+	/** For `scroll`: total scrollable height (px) of the target afterward. */
+	scrollHeight?: number;
+	/** For `scroll`: true when the target reached (within ~2px of) the bottom. */
+	reachedBottom?: boolean;
 	externalContent: { untrusted: true; source: "web_fetch"; provider?: string; wrapped: boolean };
 }
 
@@ -899,9 +951,12 @@ export function makeBrowserTool(opts: MakeBrowserToolOptions = {}): AnyBrigadeTo
 		name: "browser",
 		label: "browser",
 		description: [
-			"Control the browser via Playwright + your system Chromium (status/start/stop/profiles/attach/tabs/open/focus/close/navigate/snapshot/screenshot/pdf/click/type/press/hover/drag/select/fill/resize/scrollIntoView/evaluate/wait/console/dialog/upload).",
+			"Control the browser via Playwright + your system Chromium (status/start/stop/profiles/attach/tabs/open/focus/close/navigate/snapshot/screenshot/pdf/click/type/press/hover/drag/select/fill/resize/scroll/scrollIntoView/evaluate/wait/console/dialog/upload).",
+			"To load more on an infinite-scroll page (Google Maps results, directory listings), use action 'scroll' with to:'bottom' and times:5-10 (optionally a selector for the inner scroll container), then snapshot again — never give up on a JS-heavy page.",
 			"Auto-detects Chrome / Chromium / Edge / Brave (a supported Chromium-based browser must be installed).",
-			"Use only when existing logins/cookies matter, the page is JS-rendered, or you need UI automation / screenshots / PDF render.",
+			'Renders JavaScript and keeps cookies — a "JS-heavy" page (search results, maps, SPAs) is exactly what this tool is for, never a dead end. Use it whenever fetch_url can\'t read a page, whenever web_search is unavailable (navigate to a search-engine results URL, then snapshot the hits), and for UI automation / screenshots / PDF render / pages where existing logins matter.',
+			"For FINDING or READING information on the web, prefer `web_search` and `fetch_url` FIRST — they're lighter and faster than the browser and usually answer the question (incl. finding businesses/leads: search and read the result domains). Reach for the browser only when those genuinely can't do it: a real UI interaction, a login/cookie-gated page, or content that only renders under JS.",
+			"READ A PAGE CHEAPLY — this is important: to read content or a LIST (search results, map/business listings, directories, tables), call `snapshot` ONCE (snapshotFormat:'interactive' for clickable items with refs, or 'text'/'markdown' for content) OR `evaluate` ONCE to scrape the DOM (e.g. document.querySelectorAll(...).map(...)). One snapshot/evaluate returns the WHOLE list in a single call. Do NOT take a `screenshot` and read it visually to extract data — that costs vision tokens, is less accurate, and is the #1 way to burn money here. Do NOT click into each result one-by-one to read it. Do NOT spawn a sub-agent just to read a page. Screenshots are for VISUAL confirmation only, not for extracting text/data.",
 			"The browser keeps a persistent profile under `~/.brigade/browser/default/` — cookies and Cloudflare passes survive across turns.",
 			"Screenshots + PDFs auto-save to `~/.brigade/captures/<timestamp>-<host>.<ext>` and the path is returned in details.path — point users at that path directly. Pass `outputPath` to override.",
 			"When using refs from snapshot (e.g. e12), keep the same tab: prefer passing targetId from the snapshot response into subsequent actions (click/type/wait/etc).",
@@ -1334,6 +1389,61 @@ async function dispatchAction(
 			};
 		}
 
+		case "scroll": {
+			const { handle, targetId } = await getActivePage(state, args.targetId);
+			const times = Math.min(Math.max(args.times ?? 1, 1), 30);
+			const mode: "top" | "bottom" | "by" =
+				args.to ?? (typeof args.pixels === "number" ? "by" : "bottom");
+			const pixels = typeof args.pixels === "number" ? args.pixels : 0;
+			const selector = args.selector ?? null;
+			// Params JSON-inlined into the page script (PageLike.evaluate takes a
+			// source string). JSON.stringify safely escapes the selector.
+			const params = JSON.stringify({ selector, mode, pixels, times, settleMs: 350 });
+			const fnSource = `async () => {
+				const p = ${params};
+				const doc = globalThis.document;
+				const getTarget = () => p.selector ? doc.querySelector(p.selector) : (doc.scrollingElement || doc.documentElement || doc.body);
+				const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+				if (!getTarget()) return { ok: false, error: "scroll target not found" };
+				for (let i = 0; i < p.times; i++) {
+					const el = getTarget();
+					if (!el) break;
+					if (p.mode === "top") { el.scrollTop = 0; if (!p.selector && globalThis.scrollTo) globalThis.scrollTo(0, 0); }
+					else if (p.mode === "bottom") { el.scrollTop = el.scrollHeight; if (!p.selector && globalThis.scrollTo) globalThis.scrollTo(0, el.scrollHeight); }
+					else { el.scrollTop = el.scrollTop + p.pixels; if (!p.selector && globalThis.scrollBy) globalThis.scrollBy(0, p.pixels); }
+					if (i < p.times - 1) await sleep(p.settleMs);
+				}
+				const el = getTarget();
+				const scrollTop = el ? el.scrollTop : 0;
+				const scrollHeight = el ? el.scrollHeight : 0;
+				const clientHeight = el ? el.clientHeight : 0;
+				return { ok: true, scrollTop, scrollHeight, reachedBottom: scrollHeight > 0 ? (scrollTop + clientHeight >= scrollHeight - 2) : false };
+			}`;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const raw = (await (handle.page as any).evaluate(fnSource)) as {
+				ok?: boolean;
+				error?: string;
+				scrollTop?: number;
+				scrollHeight?: number;
+				reachedBottom?: boolean;
+			} | null;
+			if (raw && raw.ok === false) {
+				throw new Error(
+					`browser scroll: ${raw.error ?? "target not found"}${selector ? ` (selector="${selector}")` : ""}`,
+				);
+			}
+			return {
+				action: "scroll",
+				profile: state.profile,
+				targetId,
+				url: handle.page.url(),
+				scrollTop: typeof raw?.scrollTop === "number" ? raw.scrollTop : undefined,
+				scrollHeight: typeof raw?.scrollHeight === "number" ? raw.scrollHeight : undefined,
+				reachedBottom: raw?.reachedBottom === true,
+				externalContent: meta,
+			};
+		}
+
 		case "scrollIntoView": {
 			if (!args.selector) throw new Error("browser scrollIntoView: missing selector");
 			const { handle, targetId } = await getActivePage(state, args.targetId);
@@ -1477,6 +1587,16 @@ async function dispatchAction(
 			// Handled at the execute() level — should never reach dispatch.
 			throw new Error(
 				`browser: action "${args.action}" was not dispatched at the lifecycle layer (this is a Brigade bug).`,
+			);
+		}
+
+		default: {
+			// `action` is a plain string in the schema (see BrowserSchema), so an
+			// unknown/hallucinated action lands here with a clean, recoverable
+			// error instead of Pi's "must be equal to constant" dump.
+			throw new Error(
+				`browser: unknown action "${args.action}". Valid actions: ${BROWSER_ACTIONS.join(", ")}. ` +
+					`To scroll a page or a results feed (Google Maps, directory listings) use action "scroll" (optional selector/to/pixels/times); "scrollIntoView" only brings a single element into view.`,
 			);
 		}
 	}
@@ -1678,7 +1798,13 @@ function persistCapture(args: {
 	url: string;
 	outputPath?: string;
 }): { path: string; bytes: number } {
-	const captureDir = join(BRIGADE_DIR, "captures");
+	// Convex mode: captures land in the OS cache dir, never under ~/.brigade.
+	// They're working artifacts the agent forwards (send_media reads the
+	// path) — regenerable, machine-local.
+	const captureDir =
+		tryGetRuntimeContext()?.mode === "convex"
+			? join(resolveOsCacheDir(), "captures")
+			: join(BRIGADE_DIR, "captures");
 	try {
 		mkdirSync(captureDir, { recursive: true });
 	} catch {

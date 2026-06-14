@@ -5,11 +5,14 @@ import JSON5 from "json5";
 
 import {
   ensureDir,
+  peekConvexMode,
   resolveConfigAuditLogPath,
   resolveConfigHealthPath,
   resolveConfigPath,
   resolveLogsDir,
 } from "./paths.js";
+import { getCachedConfigRaw, primeConfigCache } from "../storage/config-cache.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
 // brigade.json shape — intentionally loose at this stage so individual
 // subsystems can extend it without churning a central schema. Tightening
@@ -324,7 +327,28 @@ export interface BrigadeSkillsConfig {
   enabled?: boolean;
   paths?: string[];
   entries?: Record<string, BrigadeSkillEntry>;
+  /**
+   * Let an agent see the skills of agents it's connected to in the org
+   * hierarchy. Off by default. Org-visible skills sit BELOW every operator-
+   * placed root (managed/personal/project/workspace) and below config paths,
+   * so they can never shadow a local skill, and an agent's OWN workspace
+   * skills always win a name collision. Honours the org POLICY graph, so an
+   * `org.a2a.mode: "explicit"` install turns this off (matches A2A posture).
+   */
+  orgAccess?: BrigadeSkillsOrgAccessConfig;
   [key: string]: unknown;
+}
+
+export interface BrigadeSkillsOrgAccessConfig {
+  enabled?: boolean;
+  /**
+   * `down` (default): the agent sees its reports' skills. `up`: its manager
+   * chain's skills. `both`: union. Direct relationships only unless
+   * `transitive` is set.
+   */
+  direction?: "down" | "up" | "both";
+  /** Walk the whole sub-tree / manager-chain rather than just direct edges. */
+  transitive?: boolean;
 }
 
 export interface BrigadeSkillEntry {
@@ -368,6 +392,26 @@ const SECRET_REF_PATTERN = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;
 let lastParsedConfig: unknown = undefined;
 
 export function readConfigOrInit(): BrigadeConfig {
+  // Convex mode — serve from the boot-primed in-process cache. This is THE
+  // dispatch point for every config read in the codebase (the call sites
+  // stay untouched; sync callers like the per-turn loop keep working).
+  // The cache holds the raw `${VAR}`-refs-intact form; clone + resolve per
+  // call, mirroring the disk path's read-parse-resolve sequence below.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    const raw = getCachedConfigRaw();
+    if (raw === undefined) {
+      throw new Error(
+        "config cache not primed — storage boot did not complete. " +
+          "This is a Brigade bug: bootRuntimeContext() must hydrate the config cache in convex mode.",
+      );
+    }
+    const parsed = structuredClone(raw);
+    lastParsedConfig = structuredClone(parsed);
+    resolveSecretsInPlace(parsed);
+    return parsed;
+  }
+
   const cfgPath = resolveConfigPath();
   if (!fs.existsSync(cfgPath)) {
     // Minimum viable shape — `agents` map is added so the onboard runner
@@ -404,6 +448,19 @@ export function readConfigOrInit(): BrigadeConfig {
 // observes (and writes back) the freshest state on disk.
 let writeChain: Promise<void> = Promise.resolve();
 
+// Convex-mode persistence chain. `writeConfigSafeInternal`'s convex branch
+// updates the in-process cache synchronously and appends the actual store
+// write here; async awaiters join it for durability.
+let convexConfigFlushChain: Promise<void> = Promise.resolve();
+
+/** Resolves when every config write enqueued so far has reached the
+ *  backend (convex mode) — shutdown paths await this so a sync
+ *  `writeConfigSafe` just before exit isn't lost. Filesystem mode resolves
+ *  immediately (sync writes are already durable). */
+export function awaitConfigFlush(): Promise<void> {
+  return convexConfigFlushChain;
+}
+
 export function writeConfigSafe(config: BrigadeConfig): void {
   writeConfigSafeInternal(config);
   // Refresh the queue head so any async awaiter that lands later
@@ -414,9 +471,14 @@ export function writeConfigSafe(config: BrigadeConfig): void {
 }
 
 export function writeConfigSafeAsync(config: BrigadeConfig): Promise<void> {
-  const next = writeChain.then(() => {
-    writeConfigSafeInternal(config);
-  });
+  const next = writeChain
+    .then(() => {
+      writeConfigSafeInternal(config);
+    })
+    // In convex mode the internal call only ENQUEUES the persist; join the
+    // flush chain so awaiters get end-to-end durability. Filesystem mode:
+    // resolved chain, no added latency.
+    .then(() => convexConfigFlushChain);
   writeChain = next.catch(() => {});
   return next;
 }
@@ -438,10 +500,87 @@ export function mutateConfigAtomic(
     resultRef = updated;
   });
   writeChain = next.catch(() => {});
-  return next.then(() => resultRef as BrigadeConfig);
+  return (
+    next
+      // Convex mode: the internal call only enqueues the persist — join the
+      // flush chain so the resolved promise means "the backend has it".
+      .then(() => awaitConfigFlush())
+      .then(() => resultRef as BrigadeConfig)
+  );
 }
 
 function writeConfigSafeInternal(config: BrigadeConfig): void {
+  // Convex mode — the brigadeConfig row is the destination, never disk.
+  // Same `${VAR}` restoration as the disk path (resolved secrets must not
+  // land in the row either), then: (1) prime the in-process cache so the
+  // very next readConfigOrInit sees this write, (2) enqueue the Convex
+  // persist on a serial flush chain. `writeConfigSafe` stays synchronous
+  // for its callers; awaiters that need durability use
+  // `writeConfigSafeAsync` / `mutateConfigAtomic`, which join the chain.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    const restoredForStore = restoreEnvVarRefsRecursive(
+      config,
+      lastParsedConfig,
+      process.env,
+    ) as BrigadeConfig;
+    primeConfigCache(restoredForStore);
+    lastParsedConfig = structuredClone(restoredForStore);
+    const store = rctx.store;
+    convexConfigFlushChain = convexConfigFlushChain
+      .then(async () => {
+        await store.config.write(restoredForStore);
+        // Observability parity with the disk path's 4-file commit: the
+        // audit chain + health snapshot land in their tables after the
+        // config row. Best-effort — a failed audit row never blocks the
+        // config write itself.
+        const serialized = JSON.stringify(restoredForStore, null, 2);
+        const sha = createHash("sha256").update(serialized).digest("hex");
+        await store.logs
+          .appendConfigAudit({
+            ts: new Date().toISOString(),
+            sha256: sha,
+            bytes: Buffer.byteLength(serialized, "utf8"),
+            pid: process.pid,
+          } as never)
+          .catch(() => {});
+        await store.logs
+          .writeConfigHealth({
+            ts: new Date().toISOString(),
+            configPath: "convex://brigadeConfig",
+            bytes: Buffer.byteLength(serialized, "utf8"),
+            sha256: sha,
+            mtimeMs: Date.now(),
+            pid: process.pid,
+          } as never)
+          .catch(() => {});
+      })
+      .catch((err) => {
+        // The cache already serves the new value in-process; surface the
+        // persistence failure loudly so the operator knows the backend
+        // didn't take the write. Subsequent writes retry the chain.
+        console.error(
+          `brigade: config write to convex failed — ${(err as Error).message}`,
+        );
+      });
+    return;
+  }
+
+  // Fail CLOSED: the sentinel/env says convex but no runtime context (and thus
+  // no store) is installed in this process — a context-less window such as a
+  // command that skipped storage boot or a BOOT_OPTIONAL command whose backend
+  // was unreachable. Falling through to the disk write would (a) leak
+  // brigade.json + .bak + config logs under ~/.brigade and (b) be silently
+  // ignored on the next convex boot (the brigadeConfig row is authoritative,
+  // not the file). Refuse loudly instead of writing somewhere that gets lost.
+  if (!rctx && peekConvexMode()) {
+    throw new Error(
+      "Cannot write Brigade config: storage is in convex mode but the backend " +
+        "isn't connected in this process. Run this after the gateway is up, or " +
+        "verify the deployment URL — config must go to the convex backend, not disk.",
+    );
+  }
+
   const cfgPath = resolveConfigPath();
   ensureDir(path.dirname(cfgPath));
 
@@ -681,6 +820,215 @@ export function restoreEnvVarRefsRecursive(
 // process can run readConfigOrInit/writeConfigSafe pairs in isolation.
 export function __resetConfigParseCacheForTests(): void {
   lastParsedConfig = undefined;
+}
+
+// ============================================================================
+// Public config-audit + config-health helpers (added in Phase 2 PR4 so the
+// BrigadeStore `LogStore` adapter wraps the audit chain through a typed
+// seam). The internal `appendConfigAudit` + `writeConfigHealth` keep firing
+// from `writeConfigSafe` unchanged — these public siblings are for explicit
+// audit-line writes (test fixtures, recovery flows, the future store layer).
+//
+// Audit-chain integrity: each new line carries a `prevHash` referencing
+// the previous line's `lineHash`. `verifyConfigAuditChain()` walks the
+// file and reports the first break, if any. Backward-compatible: pre-PR4
+// lines without `prevHash` are treated as the start of a new chain.
+// ============================================================================
+
+export interface ConfigAuditInput {
+  /** ISO timestamp; defaults to `new Date().toISOString()` when omitted. */
+  ts?: string;
+  /** Path the audit row refers to (defaults to the active config path). */
+  path?: string;
+  /** SHA-256 of the contents this row records. Required. */
+  sha256: string;
+  /** Byte length of the recorded contents. Optional but recommended. */
+  bytes?: number;
+  /** Free-form tag (e.g. "write", "restore", "migrate"). Optional. */
+  kind?: string;
+  /** Arbitrary structured fields the operator wants to capture alongside. */
+  fields?: Record<string, unknown>;
+}
+
+export interface ConfigAuditRecord {
+  ts: string;
+  path: string;
+  sha256: string;
+  bytes?: number;
+  kind?: string;
+  prevHash?: string;
+  /** sha256 of the canonical-stringified row excluding `lineHash`. */
+  lineHash: string;
+  /** Monotonic sequence (1-indexed). */
+  seq: number;
+  [field: string]: unknown;
+}
+
+function readAuditLinesRaw(): string[] {
+  const p = resolveConfigAuditLogPath();
+  if (!fs.existsSync(p)) return [];
+  try {
+    return fs
+      .readFileSync(p, "utf8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function computeLineHash(payload: Record<string, unknown>): string {
+  // Canonical serialisation: keys sorted alphabetically so equivalent
+  // payloads always hash to the same digest. The hash NEVER includes
+  // `lineHash` itself.
+  const filtered: Record<string, unknown> = {};
+  for (const key of Object.keys(payload).sort()) {
+    if (key === "lineHash") continue;
+    filtered[key] = payload[key];
+  }
+  return createHash("sha256").update(JSON.stringify(filtered)).digest("hex");
+}
+
+/**
+ * Append one row to the config-audit JSONL. Chains via `prevHash` →
+ * `lineHash`. Returns the persisted record so callers can hand it back
+ * to the storage layer.
+ */
+export function appendConfigAuditLine(entry: ConfigAuditInput): ConfigAuditRecord {
+  ensureDir(resolveLogsDir());
+  const lines = readAuditLinesRaw();
+  let prevHash: string | undefined;
+  let nextSeq = 1;
+  if (lines.length > 0) {
+    const last = lines[lines.length - 1];
+    if (last) {
+      try {
+        const parsed = JSON.parse(last) as Partial<ConfigAuditRecord>;
+        if (typeof parsed.lineHash === "string") prevHash = parsed.lineHash;
+        if (typeof parsed.seq === "number" && Number.isFinite(parsed.seq)) {
+          nextSeq = parsed.seq + 1;
+        }
+      } catch {
+        // Treat malformed tail as "start a new chain from here".
+      }
+    }
+  }
+  const payload: Record<string, unknown> = {
+    ts: entry.ts ?? new Date().toISOString(),
+    path: entry.path ?? resolveConfigPath(),
+    sha256: entry.sha256,
+    seq: nextSeq,
+    ...(entry.bytes !== undefined ? { bytes: entry.bytes } : {}),
+    ...(entry.kind !== undefined ? { kind: entry.kind } : {}),
+    ...(entry.fields ?? {}),
+    ...(prevHash !== undefined ? { prevHash } : {}),
+  };
+  const lineHash = computeLineHash(payload);
+  const record: ConfigAuditRecord = { ...payload, lineHash } as ConfigAuditRecord;
+  try {
+    fs.appendFileSync(resolveConfigAuditLogPath(), `${JSON.stringify(record)}\n`, "utf8");
+  } catch {
+    // Best-effort — surface the record to the caller so an in-memory
+    // chain can keep advancing even when disk writes fail.
+  }
+  return record;
+}
+
+/**
+ * Walk the config-audit chain and verify each row's `lineHash` matches
+ * the canonical hash of its own payload + that its `prevHash` matches
+ * the previous row's `lineHash`. Returns the seq number of the first
+ * broken row, or `undefined` when the chain is intact.
+ *
+ * Pre-PR4 rows without a `lineHash` are tolerated — they're treated as
+ * the start of a new chain, so existing audit files stay valid.
+ */
+export function verifyConfigAuditChain(): { ok: boolean; brokenAt?: number } {
+  const lines = readAuditLinesRaw();
+  let previousLineHash: string | undefined;
+  let expectedSeq: number | undefined;
+  for (const raw of lines) {
+    let row: Partial<ConfigAuditRecord>;
+    try {
+      row = JSON.parse(raw) as Partial<ConfigAuditRecord>;
+    } catch {
+      return { ok: false, brokenAt: expectedSeq ?? 0 };
+    }
+    // Legacy row (no lineHash) → reset the chain from here.
+    if (typeof row.lineHash !== "string") {
+      previousLineHash = undefined;
+      expectedSeq = typeof row.seq === "number" ? row.seq + 1 : undefined;
+      continue;
+    }
+    // prevHash must match
+    if (previousLineHash !== undefined && row.prevHash !== previousLineHash) {
+      return { ok: false, brokenAt: typeof row.seq === "number" ? row.seq : 0 };
+    }
+    // lineHash must match the canonical hash of the rest of the row
+    const recomputed = computeLineHash(row as Record<string, unknown>);
+    if (recomputed !== row.lineHash) {
+      return { ok: false, brokenAt: typeof row.seq === "number" ? row.seq : 0 };
+    }
+    // seq must be monotonic
+    if (
+      expectedSeq !== undefined &&
+      typeof row.seq === "number" &&
+      row.seq !== expectedSeq
+    ) {
+      return { ok: false, brokenAt: row.seq };
+    }
+    previousLineHash = row.lineHash;
+    expectedSeq = typeof row.seq === "number" ? row.seq + 1 : undefined;
+  }
+  return { ok: true };
+}
+
+export interface ConfigHealthRecord {
+  ts: string;
+  configPath: string;
+  bytes: number;
+  sha256: string;
+  mtimeMs: number;
+  pid: number;
+  ownerId?: string;
+  [field: string]: unknown;
+}
+
+/**
+ * Atomically write a config-health snapshot. The internal writer fired by
+ * `writeConfigSafe` keeps doing its own write — this sibling is for
+ * explicit snapshots from the storage layer / tests / `brigade doctor`.
+ */
+export function writeConfigHealthSnapshot(snapshot: ConfigHealthRecord): void {
+  try {
+    ensureDir(resolveLogsDir());
+    const out = resolveConfigHealthPath();
+    const tmp = `${out}.tmp-${process.pid}-${Date.now().toString(36)}`;
+    fs.writeFileSync(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+    fs.renameSync(tmp, out);
+  } catch {
+    // Best-effort — same discipline as the internal writer.
+  }
+}
+
+/** Read the latest config-health snapshot, or `undefined` when none exists. */
+export function readConfigHealthSnapshot(): ConfigHealthRecord | undefined {
+  const p = resolveConfigHealthPath();
+  if (!fs.existsSync(p)) return undefined;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(p, "utf8")) as Partial<ConfigHealthRecord>;
+    if (
+      typeof parsed.ts === "string" &&
+      typeof parsed.configPath === "string" &&
+      typeof parsed.sha256 === "string"
+    ) {
+      return parsed as ConfigHealthRecord;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // Top-level key order mirroring the reference's onboard output:

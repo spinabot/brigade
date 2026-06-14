@@ -336,3 +336,77 @@ describe("makeToolLoopDetector — composition with other guards", () => {
 		assert.equal(r?.block, true);
 	});
 });
+
+describe("makeToolLoopDetector — per-turn runaway guard (varied flail)", () => {
+	// Each call has DIFFERENT args (n: i) so the identical-streak detector
+	// never fires (consecutive stays 1) — this isolates the per-turn guard,
+	// which counts total calls regardless of tool/args. Mirrors the live
+	// incident: browser navigate→screenshot→click→snapshot with drifting args.
+	const varied = (i: number) =>
+		({ toolCall: { name: "browser", arguments: { action: "screenshot", n: i } } }) as never;
+
+	it("blocks a VARIED flail once it exceeds the per-turn ceiling", async () => {
+		const detector = makeToolLoopDetector({
+			config: { perTurnBlockAt: 5, perTurnWarnAt: 100, warnAfter: 1000, blockAfter: 1000 },
+		});
+		for (let i = 0; i < 4; i++) {
+			assert.equal(await detector(varied(i)), undefined, `call ${i + 1} should pass through`);
+		}
+		const r = await detector(varied(99)); // 5th call → block
+		assert.equal(r?.block, true);
+		assert.match(r?.reason ?? "", /tool calls/i);
+		assert.match(r?.reason ?? "", /report what you have|couldn.?t complete/i);
+	});
+
+	it("resets after a per-turn block so the model gets a fresh budget", async () => {
+		const detector = makeToolLoopDetector({
+			config: { perTurnBlockAt: 3, perTurnWarnAt: 100, warnAfter: 1000, blockAfter: 1000 },
+		});
+		await detector(varied(1));
+		await detector(varied(2));
+		assert.equal((await detector(varied(3)))?.block, true, "3rd call blocks");
+		// Streak was reset on block — the next call starts a fresh budget.
+		assert.equal(await detector(varied(4)), undefined, "post-block call passes");
+	});
+
+	it("emits an operator warning at perTurnWarnAt (still passes through)", async () => {
+		const events: string[] = [];
+		onAgentEvent((e) => {
+			if (e.type === "tool-blocked") events.push(e.reason);
+		});
+		const detector = makeToolLoopDetector({
+			config: { perTurnWarnAt: 3, perTurnBlockAt: 1000, warnAfter: 1000, blockAfter: 1000 },
+		});
+		assert.equal(await detector(varied(1)), undefined);
+		assert.equal(await detector(varied(2)), undefined);
+		assert.equal(await detector(varied(3)), undefined, "warn level passes through");
+		assert.ok(
+			events.some((r) => /volume this turn/i.test(r)),
+			"per-turn volume warning should be emitted",
+		);
+	});
+
+	it("a new runId resets the per-turn count (counts don't bleed across turns)", async () => {
+		const ctxRef = { value: { runId: "turn-1", sessionKey: "s1" } };
+		const detector = makeToolLoopDetector({
+			ctxRef,
+			config: { perTurnBlockAt: 3, perTurnWarnAt: 100, warnAfter: 1000, blockAfter: 1000 },
+		});
+		await detector(varied(1));
+		await detector(varied(2)); // turn-1: 2 calls, under the ceiling
+		ctxRef.value.runId = "turn-2"; // operator's next turn
+		assert.equal(await detector(varied(3)), undefined, "new turn → count reset to 1");
+		assert.equal(await detector(varied(4)), undefined, "new turn → 2 calls, still under 3");
+	});
+
+	it("does NOT block legit varied work below the ceiling (no false positive)", async () => {
+		const detector = makeToolLoopDetector(); // defaults: perTurnBlockAt 60
+		// 30 distinct reads — a normal codebase exploration — must all pass.
+		for (let i = 0; i < 30; i++) {
+			const r = await detector({
+				toolCall: { name: "read", arguments: { path: `src/file-${i}.ts` } },
+			} as never);
+			assert.equal(r?.block, undefined, `read ${i} should not be blocked`);
+		}
+	});
+});

@@ -231,3 +231,60 @@ test("wrapStreamFnWithPayloadMutations: is a no-op when streamFn is missing", ()
   wrapStreamFnWithPayloadMutations(stubSession as never);
   assert.ok(true);
 });
+
+// ─── OpenRouter attribution header injection (folded into the same wrapper) ───
+
+function captureWrappedOptions(
+  model: unknown,
+  callerOptions: Record<string, unknown>,
+): { headers?: Record<string, string> } | undefined {
+  let capturedOptions: { headers?: Record<string, string> } | undefined;
+  const stubSession = {
+    agent: {
+      streamFn: (_model: unknown, _ctx: unknown, options: typeof capturedOptions) => {
+        capturedOptions = options;
+        return undefined;
+      },
+    },
+  };
+  wrapStreamFnWithPayloadMutations(stubSession as never);
+  (stubSession.agent.streamFn as unknown as Function)(model, {}, callerOptions);
+  return capturedOptions;
+}
+
+test("wrapStreamFnWithPayloadMutations: injects Brigade attribution headers for OpenRouter", () => {
+  const opts = captureWrappedOptions({ provider: "openrouter", id: "anthropic/claude" }, {});
+  assert.equal(opts?.headers?.["HTTP-Referer"], "https://brigade-agent.ai");
+  assert.equal(opts?.headers?.["X-OpenRouter-Title"], "Brigade");
+  assert.equal(opts?.headers?.["X-OpenRouter-Categories"], "cli-agent");
+});
+
+test("wrapStreamFnWithPayloadMutations: does NOT add headers for non-OpenRouter providers", () => {
+  // Anthropic / Vertex / Bedrock must be left untouched — no headers key added.
+  const anthropic = captureWrappedOptions({ provider: "anthropic", id: "claude" }, {});
+  assert.equal(anthropic?.headers, undefined);
+  const vertex = captureWrappedOptions({ provider: "google-vertex", id: "claude" }, {});
+  assert.equal(vertex?.headers, undefined);
+});
+
+test("wrapStreamFnWithPayloadMutations: caller-supplied header wins over attribution default", () => {
+  const opts = captureWrappedOptions(
+    { provider: "openrouter", id: "x" },
+    { headers: { "HTTP-Referer": "https://override.example", "X-Custom": "1" } },
+  );
+  // Caller value overrides the Brigade default…
+  assert.equal(opts?.headers?.["HTTP-Referer"], "https://override.example");
+  // …the caller's extra header survives…
+  assert.equal(opts?.headers?.["X-Custom"], "1");
+  // …and the non-overridden attribution header is still present.
+  assert.equal(opts?.headers?.["X-OpenRouter-Title"], "Brigade");
+});
+
+test("wrapStreamFnWithPayloadMutations: preserves a caller's headers for non-OpenRouter too", () => {
+  const opts = captureWrappedOptions(
+    { provider: "anthropic", id: "claude" },
+    { headers: { "X-Trace": "abc" } },
+  );
+  // No attribution added, but the caller's own headers pass through untouched.
+  assert.deepEqual(opts?.headers, { "X-Trace": "abc" });
+});

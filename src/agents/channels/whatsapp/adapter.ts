@@ -13,6 +13,8 @@
 
 import path from "node:path";
 
+import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
+
 import type { BrigadeConfig } from "../../../config/io.js";
 import { ensureDir, resolveChannelStateDir } from "../../../config/paths.js";
 import type {
@@ -104,9 +106,14 @@ export function createWhatsAppAdapter(opts: CreateWhatsAppAdapterOptions = {}): 
 				(accountId === DEFAULT_ACCOUNT_ID
 					? path.join(resolveChannelStateDir(CHANNEL_ID), "auth")
 					: resolveWhatsAppAccountAuthDir(accountId));
-			ensureDir(authDir);
+			// Convex mode never uses the on-disk auth dir (useConvexAuthState
+			// owns auth) — creating it would write under ~/.brigade and trip
+			// the strict-zero guard. Skip; pass accountId so the convex auth
+			// tables key per-account (multi-account safe).
+			if (tryGetRuntimeContext()?.mode !== "convex") ensureDir(authDir);
 			connection = await connectWhatsApp({
 				authDir,
+				accountId,
 				verbose: false,
 				log: ctx.log,
 				// Plumb linkMode from the channel-start context so the CLI's
@@ -161,6 +168,9 @@ export function createWhatsAppAdapter(opts: CreateWhatsAppAdapterOptions = {}): 
 						mentions: msg.mentions,
 						replyTo: msg.replyTo,
 						media: msg.media,
+						// Deferred media thunk rides through untouched — the pipeline
+						// resolves it only after the access gate admits the sender.
+						resolveMedia: msg.resolveMedia,
 						raw: msg.raw,
 					});
 				},

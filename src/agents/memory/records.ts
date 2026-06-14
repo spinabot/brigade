@@ -19,6 +19,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import {
+	getCachedFacts,
+	primeFactsCache,
+	workspaceIdFromDir,
+	writeThroughFactsCache,
+} from "../../storage/facts-cache.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
+
 /** What kind of fact this is — drives tier/importance/decay defaults. */
 export type MemorySegment =
 	| "identity"
@@ -274,6 +282,19 @@ export class FactStore {
 
 	/** Read every record. Malformed lines are skipped (never throws on a bad line). */
 	readAll(): MemoryRecord[] {
+		// Convex mode — serve from the boot-hydrated per-workspace cache. An
+		// unprimed workspace genuinely has no facts (boot hydrates every
+		// config agent's workspace + main); prime the empty shape so later
+		// writes diff against it.
+		const rctx = tryGetRuntimeContext();
+		if (rctx?.mode === "convex") {
+			const wsId = workspaceIdFromDir(path.dirname(path.dirname(this.file)));
+			const cached = getCachedFacts(wsId);
+			if (cached) return structuredClone(cached);
+			primeFactsCache(wsId, []);
+			return [];
+		}
+
 		let raw: string;
 		try {
 			raw = fs.readFileSync(this.file, "utf8");
@@ -454,6 +475,17 @@ export class FactStore {
 
 	/** Atomic whole-file rewrite (tmp + rename) so a crash can't corrupt the store. */
 	private writeAll(records: MemoryRecord[]): void {
+		// Convex mode — prime the cache (next readAll sees this write) and
+		// enqueue per-record mutations realising the diff. All FactStore
+		// mutators (write/markAccessed/setLifecycle/dedup-reinforce) funnel
+		// through here, so this one branch covers every memory write path.
+		const rctx = tryGetRuntimeContext();
+		if (rctx?.mode === "convex") {
+			const wsId = workspaceIdFromDir(path.dirname(path.dirname(this.file)));
+			writeThroughFactsCache(rctx.store, wsId, records);
+			return;
+		}
+
 		fs.mkdirSync(path.dirname(this.file), { recursive: true });
 		const body = records.map((r) => JSON.stringify(r)).join("\n") + (records.length > 0 ? "\n" : "");
 		const tmp = `${this.file}.tmp-${process.pid}-${Date.now()}`;

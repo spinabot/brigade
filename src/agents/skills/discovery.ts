@@ -82,6 +82,17 @@ export interface DiscoverSkillsArgs {
 	projectSkillsDir?: string;
 	/** Extra search roots from config (`skills.paths`). Above bundled, below managed. */
 	extraPaths?: string[];
+	/**
+	 * Org-hierarchy-visible roots — OTHER agents' workspace skill dirs the
+	 * current agent may see via `skills.orgAccess`. Each becomes a root tagged
+	 * `org:<agentId>`, inserted just ABOVE bundled and BELOW every other root
+	 * (config paths, managed, personal, project, workspace) so an org-visible
+	 * skill can never shadow a skill the operator placed locally, and the
+	 * agent's own workspace always wins a name collision. Still subject to the
+	 * per-agent allowlist + eligibility (they're shared surface, unlike the
+	 * agent's OWN workspace skills which are allowlist-exempt).
+	 */
+	orgSkillRoots?: Array<{ dir: string; agentId: string }>;
 	/** Names disabled via config (`skills.entries[name].enabled === false`). */
 	disabledNames?: Set<string>;
 	/**
@@ -127,6 +138,9 @@ export function discoverSkills(args: DiscoverSkillsArgs): SkillDiscoveryResult {
 	//          < personal (~/.agents/skills) < project (<ws>/.agents/skills)
 	//          < workspace (<ws>/skills)
 	const roots: Array<[string | undefined, string]> = [[args.bundledSkillsDir, SOURCE_BUNDLED]];
+	// Org-visible peers sit just above bundled — below everything operator-
+	// placed, so they can shadow only a shipped starter, never a local skill.
+	for (const r of args.orgSkillRoots ?? []) roots.push([r.dir, `org:${r.agentId}`]);
 	for (const p of args.extraPaths ?? []) roots.push([p, SOURCE_CONFIG]);
 	roots.push([args.managedSkillsDir, SOURCE_MANAGED]);
 	roots.push([args.personalSkillsDir, SOURCE_PERSONAL]);
@@ -152,7 +166,17 @@ export function discoverSkills(args: DiscoverSkillsArgs): SkillDiscoveryResult {
 		// Per-agent allowlist (S1) — `undefined` is "no restriction"; `[]` is
 		// explicit deny-all. `includes` keeps it O(n*m) for small lists; if
 		// the catalogue grows past dozens of skills this becomes a Set lookup.
-		if (allowlist !== undefined && !allowlist.includes(skill.name)) continue;
+		//
+		// 3a: an agent's OWN workspace skills are EXEMPT from the allowlist —
+		// it is the whole-and-sole owner of what it authored, so a shared
+		// `agents.defaults.skills` allowlist (set for shared-skill hygiene) can
+		// never silently blind an agent to its own self-authored skills. The
+		// allowlist still gates every SHARED root (bundled/config/org/managed/
+		// personal/project). `skills.entries[x].enabled=false` and global
+		// `skills.enabled=false` remain operator kill-switches that DO apply.
+		if (allowlist !== undefined && source !== SOURCE_WORKSPACE && !allowlist.includes(skill.name)) {
+			continue;
+		}
 		const eligibility = readSkillEligibility(skill.filePath);
 		if (!(ctx ? isSkillEligible(eligibility, ctx) : isSkillEligible(eligibility))) continue;
 		eligiblePi.push(skill);

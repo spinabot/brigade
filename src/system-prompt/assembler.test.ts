@@ -840,3 +840,49 @@ describe("assembleSystemPrompt — sub-agent mode (no operator-facing anchor; ep
 	});
 });
 
+
+describe("assembleSystemPrompt — ## Messaging linked self-accounts", () => {
+	it("surfaces the linked operator number and forbids asking for it", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			channels: {
+				started: ["whatsapp"],
+				linked: [{ channelId: "whatsapp", selfId: "917702616808" }],
+			},
+		});
+		assert.match(out.text, /## Messaging/);
+		assert.match(out.text, /whatsapp is linked to the operator's own account: `917702616808`/);
+		assert.match(out.text, /never ask the operator for their number/);
+		assert.match(out.text, /send_message\(\{channel: "whatsapp", to: "917702616808", text\}\)/);
+	});
+
+	it("omits the linked line when no adapter reported a selfId", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			channels: { started: ["whatsapp"] },
+		});
+		assert.match(out.text, /## Messaging/);
+		assert.doesNotMatch(out.text, /linked to the operator's own account/);
+	});
+
+	it("emits one linked line per channel", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			channels: {
+				started: ["whatsapp", "telegram"],
+				linked: [
+					{ channelId: "whatsapp", selfId: "917702616808" },
+					{ channelId: "telegram", selfId: "operator_tg" },
+				],
+			},
+		});
+		assert.match(out.text, /whatsapp is linked to the operator's own account: `917702616808`/);
+		assert.match(out.text, /telegram is linked to the operator's own account: `operator_tg`/);
+	});
+});

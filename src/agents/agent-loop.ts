@@ -40,6 +40,10 @@ import {
   defaultSessionKey,
   resolveOrCreateSession,
 } from "../sessions/session-store.js";
+import {
+  awaitTranscriptFlush,
+  openSessionManagerForAgent,
+} from "../sessions/session-manager-factory.js";
 import { readConfigOrInit, type BrigadeConfig } from "../config/io.js";
 import { discoverEligibleSkills } from "./skills/index.js";
 import { BUNDLED_MODULES } from "./extensions/index.js";
@@ -53,7 +57,7 @@ import {
 import { resolveSystemPromptOverride } from "../system-prompt/override.js";
 import { resolveRuntimeParams } from "../system-prompt/runtime-params.js";
 import { applyPersonaOverrideToSession } from "../system-prompt/pi-injection.js";
-import { deriveOrgGraph } from "./org/derive-graph.js";
+import { deriveOrgDisplayGraph } from "./org/derive-graph.js";
 import { renderSubAgentAnchor } from "../system-prompt/org/sub-agent-anchor.js";
 import { bootstrapWorkspace } from "../workspace/bootstrap.js";
 import {
@@ -81,15 +85,11 @@ import {
   drainFormattedSessionEvents,
   inspectPendingSessionEvents,
 } from "./session-event-prompt.js";
-import {
-  createAgentToAgentPolicy,
-  type SessionToolsVisibility,
-} from "./tools/sessions/shared.js";
-// Stage C — derived A2A adapter. Only activated when cfg.org is present
-// and `cfg.org.a2a.mode === "derived"` (or "open"); legacy installs see
-// the identical createAgentToAgentPolicy code path that shipped pre-org.
-// `deriveOrgGraph` is already imported above (for Stage B prompt rendering).
-import { orgGraphAsA2APolicy } from "./org/a2a-adapter.js";
+// Per-turn session-tool access policy resolution. The flatten + org-graph-
+// vs-flat-allow logic lives in `resolve-access.ts` so `sessions_send` can
+// re-resolve it live (honouring a mid-run manage_access change) with the
+// exact same derivation this build uses.
+import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
@@ -120,6 +120,8 @@ import {
 } from "../auth/profile-cooldown.js";
 import { PROVIDERS } from "../providers/catalog.js";
 import { orderProfilesForSelection } from "../auth/profile-cooldown.js";
+import { readProfiles } from "../auth/profiles.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import {
   wrapStreamFnWithIdleTimeout,
   wrapStreamFnWithStopReasonRecovery,
@@ -338,11 +340,15 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // longer interleave their snapshots — each waits for the previous
   // mark to land on disk before reading.
   let cooldownState = await loadProfileStateLocked(agentId);
-  const authBuild = buildAuthStorage(authProfilesPath, {
-    cooldownState,
-    provider: args.provider,
-    modelId: args.modelId,
-  });
+  const authBuild = buildAuthStorage(
+    authProfilesPath,
+    {
+      cooldownState,
+      provider: args.provider,
+      modelId: args.modelId,
+    },
+    agentId,
+  );
   const authStorage = authBuild.storage;
   const selectedProfileId = authBuild.selectedProfileId;
   const modelRegistry = buildModelRegistry(authStorage, modelsFile);
@@ -435,6 +441,18 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
       model,
     });
   } finally {
+    // Convex mode: drain the transcript write-behind queue before the lock
+    // releases — the next turn's readTranscript must see this turn's rows.
+    // Filesystem mode resolves immediately (Pi appended inline). Bounded so
+    // a wedged backend can't hold the session lock hostage.
+    try {
+      await Promise.race([
+        awaitTranscriptFlush(),
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000).unref?.()),
+      ]);
+    } catch {
+      /* flush failures already logged by the factory */
+    }
     await sessionLock.release();
   }
 
@@ -462,9 +480,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   let cooldownState = p.cooldownState;
   const selectedProfileId = p.selectedProfileId;
 
-  // SessionManager.open creates the JSONL on first write; passing the
-  // canonical transcript path keeps Pi and brigade aligned on filenames.
-  const sessionManager = SessionManager.open(resolved.transcriptPath);
+  // Filesystem mode: SessionManager.open creates the JSONL on first write;
+  // passing the canonical transcript path keeps Pi and brigade aligned on
+  // filenames. Convex mode: an inMemory() manager pre-seeded from the
+  // sessionTranscriptRecords table whose appends flush to Convex — the
+  // factory owns that dispatch (src/sessions/session-manager-factory.ts).
+  const sessionManager = await openSessionManagerForAgent({
+    agentId,
+    sessionId: resolved.sessionId,
+    transcriptPath: resolved.transcriptPath,
+  });
 
   // Anthropic models are the only family today that enforce a hard
   // cache_control breakpoint cap (Anthropic accepts ≤4). Run the sweep
@@ -562,37 +587,12 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // four sessions tools fail-closed when the caller is not allowed to read /
   // send to the target session. Defaults stay backward-compatible:
   // visibility="self" (tool only sees the caller's own session) + A2A disabled.
-  const sessionToolsCfg = (turnConfig.session as { sessionTools?: { visibility?: SessionToolsVisibility } } | undefined)?.sessionTools;
-  const visibility: SessionToolsVisibility = sessionToolsCfg?.visibility ?? "self";
-  const a2aRaw = (turnConfig.session as { agentToAgent?: { enabled?: boolean; allow?: Array<{ from?: unknown; to?: unknown }> } } | undefined)?.agentToAgent;
-  // The shared policy factory takes a flat allow-list of agent ids;
-  // brigade.json stores `{from, to}` pairs. Flatten to the union of every
-  // id mentioned on either side — the matcher checks both sides anyway.
-  const a2aAllow: string[] = [];
-  if (Array.isArray(a2aRaw?.allow)) {
-    for (const pair of a2aRaw.allow) {
-      const from = typeof pair?.from === "string" ? pair.from.trim() : "";
-      const to = typeof pair?.to === "string" ? pair.to.trim() : "";
-      if (from) a2aAllow.push(from);
-      if (to) a2aAllow.push(to);
-    }
-  }
-  // Stage C additive-gate: when cfg.org is present AND mode === "derived"
-  // (or "open"), the derived a2a-adapter replaces the legacy
-  // flat-allowlist policy. ALL other branches (cfg.org absent / mode ===
-  // "explicit") keep the LEGACY createAgentToAgentPolicy code path
-  // unchanged so pre-org installs run bit-for-bit identical to today.
-  const orgCfg = (turnConfig as { org?: { a2a?: { mode?: string } } }).org;
-  let a2aPolicy = createAgentToAgentPolicy({
-    enabled: !!a2aRaw?.enabled,
-    allow: a2aAllow,
-  });
-  if (orgCfg && orgCfg.a2a?.mode !== "explicit") {
-    const graph = deriveOrgGraph(turnConfig as never);
-    if (graph) {
-      a2aPolicy = orgGraphAsA2APolicy(graph);
-    }
-  }
+  // Resolve the per-turn session-tool access policy. Extracted to
+  // `resolveSessionAccessPolicy` (2026-06-11) so the SAME derivation backs
+  // both this build AND the `sessions_send` live re-check that honours a
+  // mid-run `manage_access` change — identical flatten + org-graph-vs-flat
+  // logic in one place. Behaviour is bit-for-bit the legacy block.
+  const { visibility, a2aPolicy } = resolveSessionAccessPolicy(turnConfig);
 
   // Wave O0.5 (fix #3): populate spawnedKeys so visibility="tree" actually
   // permits the caller to reach its own sub-agents. The registry walk
@@ -759,6 +759,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         // allow/deny config the default resolver does.
         lookupProviderById: (id) =>
           extensionRegistry.lookupWebSearchProviderById(id, turnConfig as never),
+        // Error-time fallback: when the active provider THROWS (429 /
+        // anti-bot / network), the tool walks this chain instead of losing
+        // search outright. Empty when the operator pinned a provider.
+        fallbackProviders: () =>
+          extensionRegistry.listWebSearchFallbackChain(turnConfig as never, process.env),
       })
     : null;
   // Diagnostic toggle — when BRIGADE_DEBUG_WEB=1 the gateway log gets one
@@ -995,9 +1000,19 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   //      recovery emit the first-turn nudge again when needed, while
   //      the workspace has long since completed setup.
   const phaseBefore = await evaluateBootstrapPhase(workspaceDir);
-  const sessionAlreadyHasBootstrap = await hasDeliveredBootstrapToSession(
-    resolved.transcriptPath,
-  );
+  // Per-session bootstrap-delivery marker. Convex mode has no JSONL on disk,
+  // so the file-scan returns false every turn (→ wasteful re-delivery); read
+  // the marker from the convex transcript records instead. The marker is
+  // WRITTEN via markBootstrapDeliveredToSession (appendCustomEntry → the
+  // convex-backed SessionManager persists it), so both sides agree on the
+  // canonical customType.
+  const rctxForBootstrap = tryGetRuntimeContext();
+  const sessionAlreadyHasBootstrap =
+    rctxForBootstrap?.mode === "convex"
+      ? await rctxForBootstrap.store.messages
+          .hasBootstrapDelivered(agentId, resolved.sessionId)
+          .catch(() => false)
+      : await hasDeliveredBootstrapToSession(resolved.transcriptPath);
   // `senderIsOwner` defaults to true — TUI, bash, and direct-RPC callers are
   // always the operator. Channel adapters set this to `false` when the
   // approved peer is NOT the operator's own linked-channel id, so a friend's
@@ -1072,9 +1087,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         reason: string;
         remediation?: string;
       }> = [];
+      // Linked self-account per adapter (sync, cheap — reads the cached
+      // connection id). The assembler surfaces it in `## Messaging` so the
+      // model knows the operator's own number instead of asking for it.
+      const linked: Array<{ channelId: string; selfId: string }> = [];
       for (const id of manager.started) {
         const adapter = manager.adapter(id);
-        if (!adapter || typeof adapter.health !== "function") continue;
+        if (!adapter) continue;
+        const selfId = typeof adapter.selfId === "function" ? adapter.selfId() : undefined;
+        if (selfId) linked.push({ channelId: id, selfId });
+        if (typeof adapter.health !== "function") continue;
         const status = adapter.health();
         if (!status.ok) {
           degraded.push({
@@ -1086,6 +1108,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       }
       return {
         started: manager.started,
+        ...(linked.length > 0 ? { linked } : {}),
         ...(degraded.length > 0 ? { degraded } : {}),
         ...(route
           ? {
@@ -1187,17 +1210,15 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // The user message is scrubbed of the Anthropic refusal-trigger magic
   // string before Pi sees it; otherwise a paste-through of that literal
   // would coerce Claude into refusing the next turn.
-  // Drain any pending system events queued for THIS session (today: cron's
-  // announce text when its delivery had no channel target, fallback path
-  // in `cron/service/timer.ts:maybeDeliverAnnounce`). Each pending event
-  // becomes a `<system_event>` block prepended to the user's text so the
-  // model sees the cron's reminder fired BEFORE it answers the new
-  // message. Without this the model would be answering the operator's
-  // next "did the cron fire?" question blind. Cron's gateway wiring
-  // dual-writes: a `system-event` WS frame for live TUI visibility AND
-  // the per-session queue this drain consumes — see `src/core/server.ts`
-  // `enqueueSystemEvent` for the writer + `src/agents/pending-system-events.ts`
-  // for the queue itself.
+  // Drain any pending system events queued for THIS session. Cron's
+  // fire-time announces now land in the SESSION INBOX (drained below as
+  // `inboxBlock`) so the heartbeat runner can consume them for synthetic
+  // turns; this legacy pending queue still carries cron DELIVERY-FAILURE
+  // notices ("couldn't deliver via whatsapp — …", see the announce
+  // dispatcher in `src/core/server.ts`). Each pending event becomes a
+  // `<system_event>` block prepended to the user's text so the model sees
+  // the failure BEFORE it answers the new message instead of bullshitting
+  // "should be landing any moment now".
   const pendingEvents = drainPendingSystemEvents(resolved.sessionKey);
   const pendingPrefix = formatPendingEventsPrefix(pendingEvents);
   // SessionInbox drain (Step 12). A2A messages (`sessions_send`), sub-agent
@@ -1227,7 +1248,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         const hints = renderReceiverHints(inspected.events);
         if (hints) orgBlocks.push(hints);
         // Top-of-org escalation inbox summary (only when caller is topOrder).
-        const orgGraph = deriveOrgGraph(turnConfig as never);
+        const orgGraph = deriveOrgDisplayGraph(turnConfig as never);
         if (orgGraph) {
           const { renderEscalationInbox } = await import(
             "../system-prompt/org/escalation-inbox.js"
@@ -1697,6 +1718,10 @@ async function buildPersonaPrompt(args: {
    */
   channels?: {
     started: readonly string[];
+    linked?: ReadonlyArray<{
+      channelId: string;
+      selfId: string;
+    }>;
     degraded?: ReadonlyArray<{
       channelId: string;
       reason: string;
@@ -1748,7 +1773,7 @@ async function buildPersonaPrompt(args: {
   // block emits ZERO bytes. Sub-agent runs get a one-line anchor merged
   // into `ephemeralSuffix` instead of the full block. Existing callers
   // see no behavioural change when `cfg.org` is absent.
-  const orgGraph = config.org ? deriveOrgGraph(config) : undefined;
+  const orgGraph = config.org ? deriveOrgDisplayGraph(config) : undefined;
 
   // Sub-agent anchor: when this turn IS a sub-agent run AND we have an
   // org graph, append a one-line "Spawned by <id>, inheriting <dept>"
@@ -1818,10 +1843,12 @@ interface AuthStorageBuildResult {
 function buildAuthStorage(
   authProfilesPath: string,
   cooldownFilter?: AuthStorageCooldownFilter,
+  agentId?: string,
 ): AuthStorageBuildResult {
   const { credentials, selectedProfileId } = readAuthProfilesAsCredentialMap(
     authProfilesPath,
     cooldownFilter,
+    agentId,
   );
   const Storage = AuthStorage as unknown as {
     inMemory?: (data?: unknown) => unknown;
@@ -1875,16 +1902,34 @@ interface ReadCredentialsResult {
 export function readAuthProfilesAsCredentialMap(
   authProfilesPath: string,
   cooldownFilter?: AuthStorageCooldownFilter,
+  agentId?: string,
 ): ReadCredentialsResult {
   const out: Record<string, unknown> = {};
   let selectedProfileId: string | undefined;
   let parsed: {
     profiles?: Record<
       string,
-      { provider?: string; type?: string; key?: string; keyRef?: string; alias?: string }
+      {
+        provider?: string;
+        type?: string;
+        key?: string;
+        keyRef?: string | { source?: string; provider?: string; id?: string };
+        alias?: string;
+      }
     >;
   } = {};
-  if (fs.existsSync(authProfilesPath)) {
+  // Convex mode — no auth-profiles.json on disk; the secrets live as sealed
+  // columns mirrored into the in-process cache at boot. Route through the
+  // mode-aware `readProfiles` choke point so the credential map is populated
+  // identically to filesystem mode. Requires the agentId (the path can't be
+  // reverse-mapped reliably); falls back to the fs read when it's absent.
+  if (agentId && tryGetRuntimeContext()?.mode === "convex") {
+    try {
+      parsed = readProfiles(agentId) as unknown as typeof parsed;
+    } catch {
+      parsed = {};
+    }
+  } else if (fs.existsSync(authProfilesPath)) {
     try {
       parsed = JSON.parse(fs.readFileSync(authProfilesPath, "utf8"));
     } catch {
@@ -1901,8 +1946,11 @@ export function readAuthProfilesAsCredentialMap(
   >();
   for (const [profileId, profile] of Object.entries(parsed.profiles ?? {})) {
     if (!profile?.provider || profile.type !== "api_key") continue;
-    const literal = profile.key ?? profile.keyRef ?? "";
-    const resolvedKey = expandEnvRef(literal, profile.provider);
+    const resolvedKey = resolveCredentialSecret(
+      profile.key,
+      profile.keyRef,
+      profile.provider,
+    );
     if (!resolvedKey) continue;
     const list = byProvider.get(profile.provider) ?? [];
     list.push({ profileId, provider: profile.provider, resolvedKey });
@@ -1946,6 +1994,24 @@ export function readAuthProfilesAsCredentialMap(
   }
 
   return { credentials: out, selectedProfileId };
+}
+
+// Resolve a profile's api-key secret across both persisted shapes:
+//   • literal `key`                       → returned verbatim
+//   • string `keyRef` (legacy `${VAR}`)   → env-expanded
+//   • object `keyRef` (BrigadeSecretRef)  → env-source resolved by `id`
+// File/exec backends need an async resolver and are out of scope for this
+// synchronous credential-map build (they surface "no key" → env fallback).
+function resolveCredentialSecret(
+  key: string | undefined,
+  keyRef: string | { source?: string; provider?: string; id?: string } | undefined,
+  provider: string,
+): string {
+  if (key && key.length > 0) return key;
+  if (!keyRef) return "";
+  if (typeof keyRef === "string") return expandEnvRef(keyRef, provider);
+  if (keyRef.source === "env" && keyRef.id) return process.env[keyRef.id] ?? "";
+  return "";
 }
 
 const ENV_REF_PATTERN = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;

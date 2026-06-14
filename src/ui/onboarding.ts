@@ -20,7 +20,7 @@ import type { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
 import { CancellableLoader, Input, type SelectItem, SelectList, Text, TUI } from "@mariozechner/pi-tui";
 
 import { upsertApiKeyProfile, upsertApiKeyRefProfile } from "../auth/profiles.js";
-import { DEFAULT_AGENT_ID, resolveAuthProfilesPath } from "../config/paths.js";
+import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveModelsPath } from "../config/paths.js";
 import { BRIGADE_DIR, saveConfig } from "../core/config.js";
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
 import {
@@ -33,11 +33,16 @@ import {
 import { validateApiKeyOnline } from "../providers/validate-key.js";
 import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
+import { pickStorageMode, type StorageModeResult } from "./onboard-storage-mode.js";
 import { SearchableSelectList } from "./searchable-select.js";
+import { listOpenRouterModels } from "../integrations/provider-discovery.js";
 
 export interface OnboardingResult {
 	provider: string;
 	modelId: string;
+	/** Storage backend the operator picked in Step 0. The caller writes the
+	 *  mode.sentinel after the rest of the wizard finishes. */
+	storage: StorageModeResult;
 }
 
 /* ────────────────────────────── public API ────────────────────────────── */
@@ -50,14 +55,35 @@ export interface OnboardingResult {
  * the dynamic registry — that way both code paths produce the same `Model<any>[]`
  * shape that the picker expects.
  */
-function getProviderModels(modelRegistry: ModelRegistry, providerId: string): Array<Model<any>> {
+async function getProviderModels(modelRegistry: ModelRegistry, providerId: string): Promise<Array<Model<any>>> {
+	const staticModels: Array<Model<any>> = (() => {
+		try {
+			const fromCatalog = getModels(providerId as KnownProvider) as Array<Model<any>>;
+			if (fromCatalog && fromCatalog.length > 0) return fromCatalog;
+		} catch {
+			/* unknown provider — fall through */
+		}
+		return modelRegistry.getAll().filter((m) => m.provider === providerId) as Array<Model<any>>;
+	})();
+
+	// Live-merge OpenRouter's CURRENT catalog so models newer than Pi's bundled
+	// snapshot (e.g. the latest Opus/GPT/Gemini) show up in the picker. Best-
+	// effort, cached, short timeout — on ANY failure we keep the static list so
+	// offline onboarding still works. Static/catalogued entries win (richer
+	// metadata); live-only ids are appended.
+	if (providerId !== "openrouter") return staticModels;
 	try {
-		const fromCatalog = getModels(providerId as KnownProvider) as Array<Model<any>>;
-		if (fromCatalog && fromCatalog.length > 0) return fromCatalog;
+		const live = await listOpenRouterModels();
+		if (live.length === 0) return staticModels;
+		const seen = new Set(staticModels.map((m) => m.id));
+		const merged = [...staticModels];
+		for (const lm of live) {
+			if (!seen.has(lm.id)) merged.push(lm as unknown as Model<any>);
+		}
+		return merged;
 	} catch {
-		/* unknown provider — fall through */
+		return staticModels;
 	}
-	return modelRegistry.getAll().filter((m) => m.provider === providerId) as Array<Model<any>>;
 }
 
 export interface OnboardingOptions {
@@ -93,6 +119,15 @@ export interface OnboardingOptions {
 	 * environment.
 	 */
 	secretInputMode?: "plaintext" | "ref";
+	/**
+	 * Storage mode the CALLER already picked (and for which it already
+	 * established the runtime context). When set, the wizard SKIPS its own
+	 * Step 0 storage picker. The `brigade onboard` command hoists Step 0 so it
+	 * can boot the convex context before any secret/config write — without
+	 * this, every wizard write would run context-less in filesystem mode and
+	 * land plaintext on disk even for a convex pick.
+	 */
+	storage?: StorageModeResult;
 }
 
 export async function runOnboarding(
@@ -111,13 +146,39 @@ export async function runOnboarding(
 	// → "Use existing X?" Yes/No prompt (with default = Yes). Skipping
 	// silently to "we picked for you" was explicitly rejected because it
 	// removes the explicit choice the user expects.
+
+	// Step 0 — storage mode. Throws "onboarding-cancelled" if the user Escs
+	// the mode picker (we treat that as bail-out, same as Esc on provider).
+	// The storage-mode UI handles its own retry loop for the convex URL probe
+	// and throws a special "storage-mode-revert-to-filesystem" when the user
+	// Escs the convex sub-flow — we catch and default to filesystem so the
+	// rest of the wizard always sees a settled choice.
+	let storage: StorageModeResult;
+	if (opts.storage) {
+		// Caller already picked the mode AND booted the matching runtime context
+		// (the onboard command hoists Step 0 so convex writes seal into the
+		// backend). Don't re-run the picker or we'd prompt twice and risk a
+		// second, conflicting mode pick.
+		storage = opts.storage;
+	} else {
+		try {
+			storage = await pickStorageMode(tui);
+		} catch (err) {
+			if ((err as Error).message === "storage-mode-revert-to-filesystem") {
+				storage = { mode: "filesystem" };
+			} else {
+				throw err; // "onboarding-cancelled" propagates to caller
+			}
+		}
+	}
+
 	let step: "provider" | "key" | "model" = "provider";
 	let provider = "";
 	let modelId = "";
 
 	while (true) {
 		if (step === "provider") {
-			renderScreen(tui, "Step 1 of 4 · Pick a provider");
+			renderScreen(tui, "Step 1 of 5 · Pick a provider");
 			provider = await pickProvider(tui); // throws "onboarding-cancelled" on Esc
 			step = "key";
 			continue;
@@ -152,7 +213,7 @@ export async function runOnboarding(
 		}
 
 		// step === "model"
-		renderScreen(tui, "Step 3 of 4 · Default model");
+		renderScreen(tui, "Step 3 of 5 · Default model");
 		const result = await pickModel(tui, modelRegistry, provider);
 		if (result === "back") {
 			step = "provider"; // go all the way back so they can change provider too
@@ -168,12 +229,12 @@ export async function runOnboarding(
 	// agent boot via `buildAgent → seedDefaultPrompts`.
 	await saveConfig({ defaultProvider: provider, defaultModelId: modelId });
 
-	// Step 4 of 4 — web-search backend. Same Pi-TUI components, same brand
+	// Step 4 of 5 — web-search backend. Same Pi-TUI components, same brand
 	// header. Re-runnable via `brigade onboard web`.
 	try {
 		const { runWebSetupStep } = await import("../cli/flows/web-setup.js");
 		await runWebSetupStep(tui, {
-			stepLabel: "Step 4 of 4 · Web search",
+			stepLabel: "Step 4 of 5 · Web search",
 			secretInputMode: opts.secretInputMode,
 		});
 	} catch {
@@ -186,7 +247,7 @@ export async function runOnboarding(
 	await delay(900);
 	clear(tui);
 
-	return { provider, modelId };
+	return { provider, modelId, storage };
 }
 
 /* ────────────────────────── screen scaffolding ────────────────────────── */
@@ -310,7 +371,7 @@ export async function ensureApiKey(
 		// OPENROUTER_API_KEY, sk-o…52b5)?`. Single line, default = Yes.
 		// No explanatory paragraphs.
 		const envVar = provider.envVar ?? "the env var";
-		renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
+		renderScreen(tui, `Step 2 of 5 · ${provider.name}`);
 		tui.addChild(
 			new Text(
 				`  ${brand.amber("?")} Use existing ${envVar} (env: ${envVar}, ${formatApiKeyPreview(envKey)})?`,
@@ -351,7 +412,7 @@ export async function ensureApiKey(
 			// and let them paste their own. The typed-key loop below treats
 			// `lastError === null` as a clean first iteration, so no stale
 			// error text leaks in.
-			renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
+			renderScreen(tui, `Step 2 of 5 · ${provider.name}`);
 			// Fall through to typed-key loop without `lastError` set.
 			// (Variable declared just below the env block.)
 			return await promptTypedKey(tui, authStorage, provider, providerId, null);
@@ -471,7 +532,7 @@ async function promptTypedKey(
 	let lastError: string | null = seedError;
 
 	while (true) {
-		renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
+		renderScreen(tui, `Step 2 of 5 · ${provider.name}`);
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
@@ -608,7 +669,7 @@ async function ensureLocalOllama(
 	let lastError: string | null = null;
 
 	while (true) {
-		renderScreen(tui, "Step 2 of 4 · Connect Ollama");
+		renderScreen(tui, "Step 2 of 5 · Connect Ollama");
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
@@ -655,7 +716,7 @@ async function ensureLocalOllama(
 		}
 
 		// Persist the provider entry so Pi sees the models from now on.
-		const modelsJsonPath = path.join(BRIGADE_DIR, "models.json");
+		const modelsJsonPath = resolveModelsPath(DEFAULT_AGENT_ID);
 		try {
 			await writeOllamaToModelsJson(modelsJsonPath, baseUrl, discovered);
 			modelRegistry.refresh();
@@ -674,7 +735,7 @@ async function ensureLocalOllama(
 }
 
 async function pickModel(tui: TUI, modelRegistry: ModelRegistry, providerId: string): Promise<"back" | { modelId: string }> {
-	const models = getProviderModels(modelRegistry, providerId);
+	const models = await getProviderModels(modelRegistry, providerId);
 
 	if (models.length === 0) {
 		tui.addChild(new Text(brand.dim("  Type the model name you'd like to use, then press Enter. Esc to go back."), 0, 0));

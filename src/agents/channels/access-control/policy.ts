@@ -38,6 +38,29 @@ export interface EvaluateAccessArgs {
 	groupAllowFrom?: ReadonlyArray<string>;
 	/** True if the bot was explicitly @-mentioned in a group message. */
 	mentioned?: boolean;
+	/**
+	 * Whether the crew is being ADDRESSED, computed by the caller as a superset of
+	 * a bare @-mention: mention OR a reply/quote to one of the bot's own messages
+	 * OR within an active-conversation follow-up window. When provided it REPLACES
+	 * `mentioned` for the group gate — so a member can tag once (or reply to the
+	 * bot) and keep talking untagged for a while. Falls back to `mentioned` when
+	 * unset (today's strict per-message tagging).
+	 */
+	addressed?: boolean;
+	/**
+	 * The group's stable room id (WhatsApp `…@g.us` JID / Slack channel id), when
+	 * this is a group message. Used for per-group JID allow-listing.
+	 */
+	groupId?: string;
+	/**
+	 * Group ids the operator has explicitly opted in as FULLY TRUSTED. In these
+	 * groups the crew responds WITHOUT requiring an @-mention and regardless of
+	 * who spoke — for a dedicated group the operator wants the crew live in.
+	 * Empty by default (no behaviour change). A `*` entry trusts EVERY group (the
+	 * bot then answers every message in every group it's in — use with care). A
+	 * `disabled` group policy still wins over this.
+	 */
+	groupAllowJids?: ReadonlyArray<string>;
 }
 
 function eq(a: string, b: string): boolean {
@@ -88,11 +111,29 @@ export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
 	if (args.isGroup) {
 		const policy = args.groupPolicy ?? args.policy;
 		const allow = args.groupAllowFrom ?? args.allowFrom;
+		// "Addressed" = mention OR reply-to-bot OR active follow-up window (the
+		// caller computes the superset). Lets a member tag once / reply to the
+		// bot and keep the thread going untagged. Defaults to the bare mention.
+		const addressed = args.addressed ?? args.mentioned;
 		if (policy === "disabled") return { kind: "block", reason: "group:disabled" };
+		// Per-group allow-list: a group whose id the operator explicitly opted in
+		// is FULLY TRUSTED — the crew responds without an @-mention and regardless
+		// of who spoke. Opt-in (empty list ⇒ no effect), takes precedence over the
+		// mention/sender gates below. `disabled` (above) still wins; `*` trusts
+		// every group. This is the only path that responds in a group untagged.
+		if (
+			args.groupId &&
+			args.groupAllowJids &&
+			args.groupAllowJids.length > 0 &&
+			isOnAllowList(args.groupId, args.groupAllowJids)
+		) {
+			return { kind: "allow", reason: "group:jid-allowlisted" };
+		}
 		if (policy === "open") {
-			// Even in `open`, only respond when the bot was explicitly @-mentioned —
-			// otherwise the bot answers every group message and gets kicked.
-			return args.mentioned
+			// Even in `open`, only respond when the crew is addressed (mention /
+			// reply-to-bot / follow-up window) — otherwise it answers every group
+			// message and gets kicked.
+			return addressed
 				? { kind: "allow", reason: "group:open+mention" }
 				: { kind: "block", reason: "group:open-without-mention" };
 		}
@@ -103,7 +144,7 @@ export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
 		// a wildcard and matches everyone (still mention-gated below).
 		const senderAllowed = isSelf || isOnAllowList(args.senderId, allow, args.senderLid);
 		if (!senderAllowed) return { kind: "block", reason: "group:not-allowlisted" };
-		return args.mentioned
+		return addressed
 			? {
 					kind: "allow",
 					reason: isSelf ? "group:self+mention" : "group:allow-from+mention",

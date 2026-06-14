@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { workspaceIdFromDir } from "../storage/facts-cache.js";
+import { ensureAgentInWorkspaceLiveMirror } from "../storage/workspace-live-mirror.js";
 import { tryLoadWorkspaceTemplate } from "./template-loader.js";
 import { markBootstrapSeeded } from "./state.js";
 import { fileExists } from "./fs-utils.js";
@@ -116,6 +118,16 @@ export async function bootstrapWorkspace(workspaceDir: string): Promise<Bootstra
     const result = await ensureWorkspaceGitRepo(workspaceDir);
     gitInitialised = result.initialised;
   }
+
+  // Convex-mode durability: register this workspace with the LIVE mirror
+  // and push the just-seeded persona files immediately. The mirror's watch
+  // set was built at gateway boot from the config — an agent created
+  // MID-SESSION (manage_agent add / org init) wasn't in it, so its
+  // personas existed only on disk until the next boot and a wipe in that
+  // window lost them (skills, which dual-write, were durably mirrored;
+  // personas were not). No-op in filesystem mode / when the mirror isn't
+  // running; idempotent for already-watched agents.
+  ensureAgentInWorkspaceLiveMirror(workspaceIdFromDir(workspaceDir));
 
   return {
     workspaceDir,

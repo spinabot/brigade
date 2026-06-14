@@ -33,13 +33,19 @@ import {
 	decodeKittyPrintable,
 	Input,
 	matchesKey,
+	truncateToWidth,
 	type TUI,
 	visibleWidth,
 } from "@mariozechner/pi-tui";
 
 import { brand } from "../ui/theme.js";
 
-export type ApprovalDecisionKind = "allow-once" | "allow-always" | "allow-pattern" | "deny";
+export type ApprovalDecisionKind =
+	| "allow-once"
+	| "allow-always"
+	| "allow-pattern"
+	| "allow-session"
+	| "deny";
 
 export interface ApprovalRenderRequest {
 	id: string;
@@ -125,14 +131,19 @@ export class ApprovalPrompt implements Component {
 	}
 
 	render(width: number): string[] {
-		this.lastWidth = Math.max(40, Math.min(width, 100));
+		// NEVER widen beyond the real terminal width: pi-tui hard-throws (and
+		// the throw kills the whole TUI process) on any rendered line wider
+		// than the terminal. The old `Math.max(40, …)` floor forced exactly
+		// that on narrow terminals, and `drawTitleLine` overflowed by 2 at
+		// EVERY width (only visible-as-a-crash below 102 cols).
+		this.lastWidth = Math.min(width, 100);
 		if (this.state === "pattern") return this.renderPatternState();
 		return this.renderMenuState();
 	}
 
 	private renderMenuState(): string[] {
 		const w = this.lastWidth;
-		const inner = w - 4; // 2 for "│ " + 2 for " │"
+		const inner = Math.max(0, w - 4); // 2 for "│ " + 2 for " │"
 		const titleLine = drawTitleLine(w, deriveTitle(this.opts.request));
 		const cmdLine = boxLine(inner, truncateForBox(this.opts.request.command, inner));
 		const spacer = boxLine(inner, "");
@@ -144,28 +155,33 @@ export class ApprovalPrompt implements Component {
 			inner,
 			`${brand.amber("[P]")} ${brand.dim("Allow pattern…")}   ${brand.amber("[N]")} ${brand.dim("Deny")}`,
 		);
+		const row3 = boxLine(
+			inner,
+			`${brand.amber("[S]")} ${brand.dim("Allow all this session (skips prompts; safety guards still apply)")}`,
+		);
 		const bottom = drawHorizLine(w, "└", "┘");
-		const hint = `   ${brand.dim("Esc = deny · single keystroke resolves")}`;
-		return [titleLine, cmdLine, spacer, row1, row2, bottom, hint];
+		const hint = fitToWidth(`   ${brand.dim("Esc = deny · single keystroke resolves")}`, w);
+		return [titleLine, cmdLine, spacer, row1, row2, row3, bottom, hint];
 	}
 
 	private renderPatternState(): string[] {
 		const w = this.lastWidth;
+		const inner = Math.max(0, w - 4);
 		const titleLine = drawTitleLine(w, " Approve matching pattern ");
 		const helpLine = boxLine(
-			w - 4,
+			inner,
 			`${brand.dim("Regex matched against the FULL command. e.g.")} ${brand.amber("^git status$")}`,
 		);
 		const helpLine2 = boxLine(
-			w - 4,
+			inner,
 			`${brand.dim("Cancel with Esc · Enter to confirm")}`,
 		);
 		const bottom = drawHorizLine(w, "└", "┘");
-		const inputBlock = this.patternInput?.render(w - 4) ?? [];
+		const inputBlock = this.patternInput?.render(inner) ?? [];
 		const framedInput = inputBlock.map((line) => {
-			const visible = visibleWidth(line);
-			const pad = " ".repeat(Math.max(0, w - 4 - visible));
-			return `${brand.dim("│ ")}${line}${pad}${brand.dim(" │")}`;
+			const fitted = fitToWidth(line, inner);
+			const pad = " ".repeat(Math.max(0, inner - visibleWidth(fitted)));
+			return `${brand.dim("│ ")}${fitted}${pad}${brand.dim(" │")}`;
 		});
 		return [titleLine, helpLine, helpLine2, ...framedInput, bottom];
 	}
@@ -176,15 +192,22 @@ export class ApprovalPrompt implements Component {
 			this.handlePatternInput(keyData);
 			return;
 		}
-		// MENU state — single-letter dispatch + Esc. Pi-TUI uses the kitty
-		// keyboard protocol, so `keyData` is a CSI-u sequence (e.g.
-		// `\x1b[121u` for 'y'), NOT a literal char. Use the helpers.
+		// MENU state — single-letter dispatch + Esc. On kitty-protocol
+		// terminals `keyData` is a CSI-u sequence (e.g. `\x1b[121u` for 'y');
+		// on legacy terminals (classic Windows console, many SSH/tmux setups)
+		// it is the RAW character byte. Decode both — the kitty-only decode
+		// silently swallowed Y/A/P/N on legacy input, leaving the operator
+		// unable to approve anything (observed in production on Windows
+		// PowerShell; only Esc worked because `matchesKey` handles legacy
+		// `\x1b`). The editor's Input component accepts raw printables, so
+		// the prompt must too or typing works everywhere except the one
+		// keystroke that gates tool execution.
 		if (matchesKey(keyData, "escape")) {
 			this.opts.onCancel?.();
 			this.resolve({ decision: "deny" });
 			return;
 		}
-		const ch = decodeKittyPrintable(keyData);
+		const ch = decodeKittyPrintable(keyData) ?? decodeLegacyPrintable(keyData);
 		if (!ch) return;
 		switch (ch.toLowerCase()) {
 			case "y":
@@ -192,6 +215,9 @@ export class ApprovalPrompt implements Component {
 				return;
 			case "a":
 				this.resolve({ decision: "allow-always" });
+				return;
+			case "s":
+				this.resolve({ decision: "allow-session" });
 				return;
 			case "p":
 				this.enterPatternMode();
@@ -245,22 +271,51 @@ export class ApprovalPrompt implements Component {
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
+/**
+ * Legacy-terminal printable decode: a single raw character byte ≥ 0x20
+ * (and not DEL). Escape sequences can never false-positive here — they are
+ * multi-byte strings starting with `\x1b` (0x1b < 0x20). Inert on kitty
+ * terminals, where printables always arrive as CSI-u sequences.
+ */
+function decodeLegacyPrintable(data: string): string | undefined {
+	if (data.length !== 1) return undefined;
+	const code = data.codePointAt(0) ?? 0;
+	if (code < 0x20 || code === 0x7f) return undefined;
+	return data;
+}
+
+/** ANSI-aware "make this line ≤ maxVisible cols" — pass-through when it fits. */
+function fitToWidth(line: string, maxVisible: number): string {
+	if (maxVisible <= 0) return "";
+	if (visibleWidth(line) <= maxVisible) return line;
+	return truncateToWidth(line, maxVisible);
+}
+
 function drawTitleLine(width: number, title: string): string {
-	const styledTitle = brand.amber(title);
-	const titleVisibleLen = title.length;
-	const remaining = Math.max(2, width - titleVisibleLen - 1);
-	return `${brand.dim("┌─")}${styledTitle}${brand.dim("─".repeat(remaining))}${brand.dim("┐")}`;
+	// Frame budget: "┌─" (2) + title + dashes (≥1) + "┐" (1). The sum MUST
+	// equal `width` exactly — pi-tui throws on any over-wide line and that
+	// throw takes the whole TUI process down. The previous arithmetic
+	// (`width - titleLen - 1`) summed to width + 2 on every render; it only
+	// presented as a crash on terminals narrower than the 100-col cap + 2.
+	// Long sub-agent titles are truncated so the frame never gives up its
+	// trailing dash + corner.
+	if (width < 4) return brand.dim("─".repeat(Math.max(0, width)));
+	const titleBudget = width - 4;
+	const fitted = fitToWidth(title, titleBudget);
+	const remaining = Math.max(1, width - 3 - visibleWidth(fitted));
+	return `${brand.dim("┌─")}${brand.amber(fitted)}${brand.dim("─".repeat(remaining))}${brand.dim("┐")}`;
 }
 
 function drawHorizLine(width: number, left: string, right: string): string {
+	if (width < 2) return brand.dim("─".repeat(Math.max(0, width)));
 	const inner = "─".repeat(Math.max(0, width - 2));
 	return brand.dim(`${left}${inner}${right}`);
 }
 
 function boxLine(innerWidth: number, content: string): string {
-	const visible = visibleWidth(content);
-	const pad = Math.max(0, innerWidth - visible);
-	return `${brand.dim("│ ")}${content}${" ".repeat(pad)}${brand.dim(" │")}`;
+	const fitted = fitToWidth(content, innerWidth);
+	const pad = Math.max(0, innerWidth - visibleWidth(fitted));
+	return `${brand.dim("│ ")}${fitted}${" ".repeat(pad)}${brand.dim(" │")}`;
 }
 
 /**

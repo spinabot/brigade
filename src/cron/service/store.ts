@@ -18,6 +18,8 @@ import path from "node:path";
 import { ensureDir } from "../../config/paths.js";
 import { renameWithRetry } from "../../infra/fs/atomic-rename.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
+import { getCachedCronJobs, writeThroughCronCache } from "../../storage/cron-cache.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { coerceScheduleInput, normalizeSchedule } from "../normalize.js";
 import { computeNextRunAtMs } from "../schedule.js";
 import type { CronJob, CronStoreFile } from "../types.js";
@@ -45,6 +47,30 @@ export function loadCronStore(storePath: string): CronStoreFile {
 }
 
 export function loadCronStoreWithRepairFlag(storePath: string): LoadCronStoreResult {
+	// Convex mode — serve from the boot-hydrated cache. Jobs run through the
+	// same schedule-repair pass as the disk path so a malformed row stored by
+	// an older build is healed identically in both modes.
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		const cached = getCachedCronJobs();
+		const jobs: CronJob[] = [];
+		let repaired = false;
+		for (const raw of cached) {
+			if (!isMinimalJobShape(raw)) {
+				repaired = true;
+				continue;
+			}
+			const result = repairLoadedJobWithFlag(structuredClone(raw));
+			if (!result) {
+				repaired = true;
+				continue;
+			}
+			if (result.changed) repaired = true;
+			jobs.push(result.job);
+		}
+		return { store: { version: CURRENT_STORE_VERSION, jobs }, repaired };
+	}
+
 	if (!fs.existsSync(storePath)) {
 		return { store: { version: CURRENT_STORE_VERSION, jobs: [] }, repaired: false };
 	}
@@ -233,6 +259,15 @@ function repairLoadedJobWithFlag(job: CronJob): RepairResult | null {
  * backup over a previously-good one).
  */
 export function saveCronStore(storePath: string, store: CronStoreFile): void {
+	// Convex mode — prime the cache (next load sees this write) and enqueue
+	// the per-job mutations realising the diff. The cron service serialises
+	// its own saves, so the diff base is always the previous save's state.
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		writeThroughCronCache(rctx.store, store);
+		return;
+	}
+
 	ensureDir(path.dirname(storePath));
 	const tmp = `${storePath}.tmp`;
 	const bak = `${storePath}.bak`;

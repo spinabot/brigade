@@ -326,3 +326,92 @@ describe("manage_skill — full round-trip (create → discover)", () => {
 		);
 	});
 });
+
+describe("manage_skill — action=list", () => {
+	// Production failure (2026-06-11): with no list action the model answered
+	// "what skills exist?" by filesystem-spelunking (find/bash/ls) — and a
+	// broken find led it to claim freshly-created skills "failed silently".
+	// list is the grounded, single-call answer.
+	interface ListResult {
+		action: "list";
+		ok: boolean;
+		count: number;
+		skills: Array<{
+			name: string;
+			scope: "agent" | "managed";
+			agentId?: string;
+			description?: string;
+			skillDir: string;
+		}>;
+		message: string;
+	}
+
+	function parseList(content: unknown): ListResult {
+		const arr = content as Array<{ type: string; text?: string }>;
+		return JSON.parse(arr[0]?.text ?? "") as ListResult;
+	}
+
+	it("enumerates managed + agent scopes with descriptions", async () => {
+		const tool = makeManageSkillTool({ requesterAgentId: "main" });
+		await tool.execute("c1", {
+			action: "create",
+			name: "weather-fetcher",
+			scope: "managed",
+			description: "Fetch the weather",
+		});
+		await tool.execute("c2", {
+			action: "create",
+			name: "gym-playbook",
+			scope: "agent",
+			agentId: "main",
+			description: "Gym routines",
+		});
+		const res = await tool.execute("l1", { action: "list" });
+		const list = parseList(res.content);
+		assert.equal(list.ok, true);
+		assert.equal(list.count, 2);
+		const byName = new Map(list.skills.map((s) => [s.name, s]));
+		assert.equal(byName.get("weather-fetcher")?.scope, "managed");
+		assert.equal(byName.get("weather-fetcher")?.description, "Fetch the weather");
+		assert.equal(byName.get("gym-playbook")?.scope, "agent");
+		assert.equal(byName.get("gym-playbook")?.agentId, "main");
+	});
+
+	it("scope/agentId filters narrow the listing", async () => {
+		const tool = makeManageSkillTool({ requesterAgentId: "main" });
+		await tool.execute("c3", { action: "create", name: "shared-one", scope: "managed" });
+		await tool.execute("c4", { action: "create", name: "mine-one", scope: "agent", agentId: "main" });
+		const managedOnly = parseList(
+			(await tool.execute("l2", { action: "list", scope: "managed" })).content,
+		);
+		assert.deepEqual(
+			managedOnly.skills.map((s) => s.name),
+			["shared-one"],
+		);
+		const agentOnly = parseList(
+			(await tool.execute("l3", { action: "list", scope: "agent", agentId: "main" })).content,
+		);
+		assert.deepEqual(
+			agentOnly.skills.map((s) => s.name),
+			["mine-one"],
+		);
+	});
+
+	it("empty install lists zero skills without erroring", async () => {
+		const tool = makeManageSkillTool({ requesterAgentId: "main" });
+		const list = parseList((await tool.execute("l4", { action: "list" })).content);
+		assert.equal(list.ok, true);
+		assert.equal(list.count, 0);
+		assert.deepEqual(list.skills, []);
+	});
+
+	it("create/delete without a name now fail with a clear message", async () => {
+		const tool = makeManageSkillTool({ requesterAgentId: "main" });
+		const res = await tool.execute("c5", { action: "create" });
+		const parsed = JSON.parse(
+			(res.content as Array<{ text?: string }>)[0]?.text ?? "",
+		) as { ok: boolean; message: string };
+		assert.equal(parsed.ok, false);
+		assert.match(parsed.message, /`name` is required/);
+	});
+});

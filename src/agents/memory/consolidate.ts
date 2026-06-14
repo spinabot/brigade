@@ -18,6 +18,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { makeIsolatedLlm, type MakeExtractionLlmArgs } from "./extract.js";
 import { FactStore } from "./records.js";
 
@@ -114,12 +115,40 @@ function statePath(workspaceDir: string): string {
 	return path.join(workspaceDir, CONSOLIDATE_STATE_PATH);
 }
 
+// Convex-mode throttle cache. A miss reads "eligible" once; the stamp lands
+// both here and in the backend so subsequent ticks throttle normally.
+let convexLastRunAt: number | undefined;
+
+/** Test-only. */
+export function __resetConsolidateCacheForTests(): void {
+	convexLastRunAt = undefined;
+}
+
 /** True when consolidation hasn't run within `intervalMs` (and records nothing). */
 export function shouldRunConsolidation(
 	workspaceDir: string,
 	intervalMs: number = DEFAULT_CONSOLIDATE_INTERVAL_MS,
 	now: number = Date.now(),
 ): boolean {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		if (convexLastRunAt === undefined) {
+			// Async backfill for the next tick; this tick reads "eligible" —
+			// at worst consolidation runs once more than strictly needed,
+			// which is harmless (it's idempotent over the same facts).
+			void rctx.store.memory
+				.getConsolidateLastRunAt()
+				.then((at) => {
+					if (convexLastRunAt === undefined && typeof at === "number") {
+						convexLastRunAt = at;
+					}
+				})
+				.catch(() => {});
+			return true;
+		}
+		return now - convexLastRunAt >= intervalMs;
+	}
+
 	try {
 		const parsed = JSON.parse(fs.readFileSync(statePath(workspaceDir), "utf8")) as {
 			lastRunAt?: number;
@@ -133,6 +162,17 @@ export function shouldRunConsolidation(
 
 /** Stamp the last-run time so the throttle window starts now. */
 export function markConsolidationRun(workspaceDir: string, now: number = Date.now()): void {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		convexLastRunAt = now;
+		void rctx.store.memory.markConsolidateRunAt(now).catch((err) => {
+			console.error(
+				`brigade: consolidate stamp to convex failed — ${(err as Error).message}`,
+			);
+		});
+		return;
+	}
+
 	const p = statePath(workspaceDir);
 	try {
 		fs.mkdirSync(path.dirname(p), { recursive: true });

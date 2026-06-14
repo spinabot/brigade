@@ -273,6 +273,94 @@ describe("inbound-pipeline: cmdCtx carries accountId + isGroup", () => {
 	});
 });
 
+describe("inbound-pipeline: deferred media downloads only AFTER the access gate admits", () => {
+	// Production incident (2026-06-12): strangers' group videos were
+	// downloaded from WhatsApp, sealed, and archived into the backend even
+	// though every one of their messages was DROPPED by policy — media
+	// download ran at the socket layer, before the gate. The fix defers the
+	// download behind msg.resolveMedia, invoked only post-admission.
+	it("BLOCKED group sender: resolveMedia is NEVER invoked", async () => {
+		let downloads = 0;
+		const SELF_ID = "+15550000000";
+		const fake = makeFakeChannel({ selfId: () => SELF_ID });
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			// Groups not allowlisted → evaluateAccess blocks (group:not-allowlisted).
+			config: {
+				channels: { fake: { dmPolicy: "open", groupPolicy: "allowlist" } },
+			} as unknown as BrigadeConfig,
+			agentId: "main",
+			runTurn: async () => ({ reply: "x" }),
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "12025550100@g.us",
+			from: "+15551112222",
+			text: "", // media-only — exactly the production shape
+			isGroup: true,
+			resolveMedia: async () => {
+				downloads += 1;
+				return [{ kind: "video", path: "/tmp/spam.mp4", mimeType: "video/mp4" }];
+			},
+		});
+		assert.equal(downloads, 0, "blocked sender's media must never be downloaded/archived");
+	});
+
+	it("ADMITTED sender: resolveMedia runs once and the media note reaches the turn", async () => {
+		let downloads = 0;
+		let turnText: string | undefined;
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async (args) => {
+				turnText = args.text;
+				return { reply: "ok" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "",
+			resolveMedia: async () => {
+				downloads += 1;
+				return [{ kind: "image", path: "C:/cache/pic.png", mimeType: "image/png" }];
+			},
+		});
+		assert.equal(downloads, 1, "admitted sender's media downloads exactly once");
+		assert.match(turnText ?? "", /attached image/, "media note reaches the agent turn");
+	});
+
+	it("ADMITTED sender whose deferred download FAILS: message drops quietly (no turn)", async () => {
+		let turns = 0;
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turns += 1;
+				return { reply: "x" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "", // media-only
+			resolveMedia: async () => {
+				throw new Error("media expired on server");
+			},
+		});
+		assert.equal(turns, 0, "no usable content → no agent turn (mirrors pre-change empty-drop)");
+	});
+});
+
 describe("inbound-pipeline: /agent persists across gateway restart", () => {
 	it("a /agent <id> binding written by one process is read by a fresh startChannels()", async () => {
 		writeConfig({

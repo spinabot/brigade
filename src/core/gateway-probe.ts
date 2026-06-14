@@ -25,6 +25,7 @@ import * as path from "node:path";
 import { WebSocket } from "ws";
 
 import { BRIGADE_DIR } from "./config.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import type { SessionStateSnapshot } from "../protocol.js";
 
 export const GATEWAY_PID_PATH = path.join(BRIGADE_DIR, "gateway.pid");
@@ -71,6 +72,20 @@ export async function writeHeartbeatFile(): Promise<void> {
     pid: process.pid,
     uptimeMs: Math.round(process.uptime() * 1000),
   };
+
+  // Convex mode — the heartbeat is a gatewayCoord row, never a file.
+  // (The supervisor + doctor read it back through the same store.)
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    try {
+      await rctx.store.instance.writeHeartbeat(payload);
+    } catch {
+      // Heartbeat write failures degrade to "stale heartbeat" on the
+      // supervisor side — same posture as a failed file write.
+    }
+    return;
+  }
+
   await fsAsync.mkdir(path.dirname(GATEWAY_HEARTBEAT_PATH), { recursive: true });
   const tmp = `${GATEWAY_HEARTBEAT_PATH}.tmp`;
   await fsAsync.writeFile(tmp, JSON.stringify(payload), "utf8");
@@ -83,6 +98,22 @@ export async function writeHeartbeatFile(): Promise<void> {
  * `pathOverride` is for tests; production callers leave it omitted so the
  * canonical `~/.brigade/gateway.heartbeat` is consulted.
  */
+/** Mode-aware heartbeat read — convex consults the gatewayCoord row,
+ *  filesystem reads the file. `pathOverride` (tests) forces the file. */
+export async function readHeartbeat(pathOverride?: string): Promise<GatewayHeartbeat | undefined> {
+  if (pathOverride === undefined) {
+    const rctx = tryGetRuntimeContext();
+    if (rctx?.mode === "convex") {
+      try {
+        return (await rctx.store.instance.readHeartbeat()) as GatewayHeartbeat | undefined;
+      } catch {
+        return undefined;
+      }
+    }
+  }
+  return readHeartbeatFile(pathOverride);
+}
+
 export function readHeartbeatFile(pathOverride?: string): GatewayHeartbeat | undefined {
   try {
     const raw = fs.readFileSync(pathOverride ?? GATEWAY_HEARTBEAT_PATH, "utf8");
@@ -105,6 +136,18 @@ export function readHeartbeatFile(pathOverride?: string): GatewayHeartbeat | und
 
 /** Delete the heartbeat file. Called on graceful shutdown. */
 export async function clearHeartbeatFile(): Promise<void> {
+  // Convex mode — clear the gatewayCoord row's heartbeat columns so the next
+  // status/supervise probe doesn't see a stale beat from a stopped gateway.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    try {
+      await rctx.store.instance.clearHeartbeat();
+    } catch {
+      // Best-effort; a stale heartbeat ages out of the freshness window.
+    }
+    return;
+  }
+
   try {
     await fsAsync.unlink(GATEWAY_HEARTBEAT_PATH);
   } catch (err) {
@@ -243,6 +286,17 @@ export async function probeGateway(opts: GatewayProbeOptions = {}): Promise<Gate
  * is created by `loadBrigadeConfig` on first read).
  */
 export async function writePidFile(): Promise<void> {
+  // Convex mode — the pid is a gatewayCoord row, never a file.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    try {
+      await rctx.store.instance.writePid(process.pid);
+    } catch {
+      // Degrades to "no pid visible" — same posture as a failed file write.
+    }
+    return;
+  }
+
   await fsAsync.mkdir(path.dirname(GATEWAY_PID_PATH), { recursive: true });
   await fsAsync.writeFile(GATEWAY_PID_PATH, String(process.pid), "utf8");
 }
@@ -253,6 +307,18 @@ export async function writePidFile(): Promise<void> {
  * missing file.
  */
 export async function clearPidFile(): Promise<void> {
+  // Convex mode — clear the gatewayCoord row's pid so the next
+  // `brigade gateway status` doesn't report a dead PID as running.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    try {
+      await rctx.store.instance.clearPid();
+    } catch {
+      // Best-effort; a stale pid is reconciled by the next liveness probe.
+    }
+    return;
+  }
+
   try {
     await fsAsync.unlink(GATEWAY_PID_PATH);
   } catch (err) {
@@ -276,6 +342,22 @@ export function readPidFile(pathOverride?: string): number | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** Mode-aware pid read — convex consults the gatewayCoord row, filesystem
+ *  reads the file. `pathOverride` (tests) forces the file. */
+export async function readPid(pathOverride?: string): Promise<number | undefined> {
+  if (pathOverride === undefined) {
+    const rctx = tryGetRuntimeContext();
+    if (rctx?.mode === "convex") {
+      try {
+        return await rctx.store.instance.readPid();
+      } catch {
+        return undefined;
+      }
+    }
+  }
+  return readPidFile(pathOverride);
 }
 
 /**

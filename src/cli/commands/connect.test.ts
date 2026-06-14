@@ -33,6 +33,23 @@ import {
 	BRIGADE_TAUNTS,
 } from "../../agents/org/pride-taunts.js";
 import type { OrgGraph } from "../../agents/org/types.js";
+import { snapshotSessionSeedable } from "./connect.js";
+
+describe("snapshotSessionSeedable — --agent cross-agent-session guard", () => {
+	it("seeds when unbound (normal first-snapshot path)", () => {
+		assert.equal(snapshotSessionSeedable(undefined, "main"), true);
+	});
+	it("seeds when the snapshot is for the same bound agent", () => {
+		assert.equal(snapshotSessionSeedable("marketing-lead", "marketing-lead"), true);
+		assert.equal(snapshotSessionSeedable("main", "main"), true);
+	});
+	it("does NOT seed when bound to a different agent (the bug: --agent X, boot snapshot for main)", () => {
+		assert.equal(snapshotSessionSeedable("marketing-lead", "main"), false);
+	});
+	it("does NOT seed when the snapshot has no agent id while we're bound", () => {
+		assert.equal(snapshotSessionSeedable("marketing-lead", undefined), false);
+	});
+});
 
 /* ─── Helpers ───────────────────────────────────────────────────────── */
 

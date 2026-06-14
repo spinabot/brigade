@@ -23,6 +23,7 @@ import path from "node:path";
 import { resolveStateDir } from "../config/paths.js";
 import { renameWithRetryAsync } from "../infra/fs/atomic-rename.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import type { CronRunLogEntry } from "./types.js";
 
 const log = createSubsystemLogger("cron/runs");
@@ -89,6 +90,21 @@ export async function appendCronRunLog(
 	entry: CronRunLogEntry,
 	limits?: CronRunLogLimits,
 ): Promise<void> {
+	// Convex mode — one row per run event in the cronRuns table; retention
+	// is the backend's concern (no per-file prune).
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		try {
+			await rctx.store.cron.appendRunLog(entry as never);
+		} catch (err) {
+			log.warn("append to convex failed — run history may be missing this entry", {
+				jobId: entry.jobId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		return;
+	}
+
 	const dir = resolveCronRunLogDir();
 	let filePath: string;
 	try {
@@ -178,6 +194,25 @@ export async function readCronRunLogEntries(
 	jobId: string,
 	opts: ReadCronRunLogOpts = {},
 ): Promise<CronRunLogEntry[]> {
+	// Convex mode — newest-first query against cronRuns. The status filter +
+	// offset/limit window are applied here so both modes return identical
+	// shapes for identical inputs.
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		try {
+			const limit = Math.max(0, opts.limit ?? 50);
+			const offset = Math.max(0, opts.offset ?? 0);
+			const rows = (await rctx.store.cron.listRunLog(jobId, {
+				limit: offset + limit + (opts.status !== undefined ? 200 : 0),
+			})) as unknown as CronRunLogEntry[];
+			const filtered =
+				opts.status !== undefined ? rows.filter((r) => r.status === opts.status) : rows;
+			return filtered.slice(offset, offset + limit);
+		} catch {
+			return [];
+		}
+	}
+
 	// Path-traversal guard applies on read too — a malformed jobId from a
 	// caller that bypassed the store should still be rejected.
 	let filePath: string;

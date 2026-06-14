@@ -43,6 +43,7 @@ import type { BeforeToolCallContext, BeforeToolCallResult } from "@mariozechner/
 import {
 	resolveBundledSkillsDir,
 	resolveConfigPath,
+	resolveEncryptionKeyFilePath,
 	resolveStateDir,
 } from "../config/paths.js";
 import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
@@ -60,13 +61,38 @@ interface ProtectedRoot {
 
 function buildProtectedRoots(): ProtectedRoot[] {
 	const stateDir = resolveStateDir();
+	const stateFileRedirect =
+		"Brigade state files must never be hand-edited — use the owning tool instead: " +
+		"manage_agent (agents), manage_provider (API keys + per-agent models), manage_access " +
+		"(agent-to-agent visibility / enabled / org a2a mode), org (hierarchy), manage_skill " +
+		"(skills), cron (jobs). If no tool covers the change, tell the operator the exact edit " +
+		"to make — do not apply it yourself.";
 	return [
 		{
 			target: path.resolve(resolveConfigPath()),
 			directory: false,
 			id: "brigade-config",
+			redirect: stateFileRedirect,
+		},
+		// Top-level state files beside brigade.json. The state DIR itself can't
+		// be a protected root — `<stateDir>/workspace/` is the default agent's
+		// user-writable home — so the files are enumerated.
+		...["cron.json", "models.json", "exec-approvals.json", "mode.sentinel"].map(
+			(name) => ({
+				target: path.resolve(path.join(stateDir, name)),
+				directory: false,
+				id: "brigade-state",
+				redirect: stateFileRedirect,
+			}),
+		),
+		{
+			// At-rest encryption key (lives OUTSIDE ~/.brigade by design —
+			// wiping state must not delete the key). Never model-writable.
+			target: path.resolve(resolveEncryptionKeyFilePath()),
+			directory: false,
+			id: "encryption-key",
 			redirect:
-				"Use the `manage_agent` tool (action=add/delete/set-identity) — never hand-edit brigade.json. The CLI helpers do atomic rotation, workspace bootstrap, and `.brigade-trash/` soft-delete that a raw write skips, producing orphan agents.",
+				"The encryption key file is never edited by the agent. Key management is operator-only: `brigade encrypt` / onboarding handle generation and rotation.",
 		},
 		{
 			target: path.resolve(resolveBundledSkillsDir()),
@@ -121,7 +147,13 @@ function extractPathArg(toolName: string, args: unknown): string | undefined {
 		return typeof p === "string" ? p : undefined;
 	}
 	if (toolName === "edit") {
-		const p = bag["file_path"];
+		// Pi's edit tool sends `path` (verified against its schema). The old
+		// `file_path`-only read extracted nothing and silently ALLOWED every
+		// edit — production 2026-06-11: the model edited brigade.json twice
+		// through this hole, immediately after telling the operator the guard
+		// made that impossible. Accept both spellings so a future Pi rename
+		// can't reopen it.
+		const p = bag["path"] ?? bag["file_path"];
 		return typeof p === "string" ? p : undefined;
 	}
 	return undefined;
@@ -158,6 +190,7 @@ function extractBashCommand(args: unknown): string | undefined {
 function detectBashWriteIntent(
 	command: string,
 	roots: readonly ProtectedRoot[],
+	baseCwd: string,
 ): { root: ProtectedRoot; absPath: string; indicator: string } | undefined {
 	if (!command || !command.trim()) return undefined;
 
@@ -175,7 +208,7 @@ function detectBashWriteIntent(
 			if (!tok || tok.kind !== "word") continue;
 			const candidate = tok.value;
 			if (!looksLikePathToken(candidate)) continue;
-			const abs = resolvePathToken(candidate);
+			const abs = resolvePathToken(candidate, baseCwd);
 			if (!isPathInside(root.target, abs, root.directory)) continue;
 			if (allowWriteCarveOut(root, abs)) continue;
 
@@ -238,7 +271,7 @@ function detectBashWriteIntent(
 	if (nodeIntent) {
 		for (const root of roots) {
 			for (const lit of nodeIntent.literals) {
-				const abs = resolvePathToken(lit);
+				const abs = resolvePathToken(lit, baseCwd);
 				if (!isPathInside(root.target, abs, root.directory)) continue;
 				if (allowWriteCarveOut(root, abs)) continue;
 				return { root, absPath: abs, indicator: `${nodeIntent.label} against` };
@@ -393,9 +426,12 @@ function expandTilde(p: string): string {
 	return p;
 }
 
-/** Resolve a path token to an absolute, normalised path. */
-function resolvePathToken(value: string): string {
-	return path.resolve(expandTilde(value));
+/** Resolve a path token to an absolute, normalised path against the
+ *  SESSION cwd (the directory the bash tool actually runs in) — not the
+ *  gateway's process.cwd(), which is unrelated to where relative shell
+ *  paths land. */
+function resolvePathToken(value: string, baseCwd: string): string {
+	return path.resolve(baseCwd, expandTilde(value));
 }
 
 /**
@@ -617,6 +653,18 @@ export interface PathWriteGuardOptions {
 	 * leave this undefined and the guard reads the live runtime paths.
 	 */
 	roots?: ProtectedRoot[];
+	/**
+	 * The SESSION cwd Pi's tools resolve relative paths against (the
+	 * per-turn agent workspace). Audit P0 (2026-06-11): the guard used to
+	 * resolve candidates with bare `path.resolve(...)` — gateway
+	 * process.cwd(), no tilde expansion — while Pi's write/edit expand `~`
+	 * and resolve against the session cwd. `edit({path:
+	 * "~/.brigade/brigade.json"})` or `edit({path: "../brigade.json"})`
+	 * from the default workspace therefore hit the real config while the
+	 * guard compared a different absolute path. Defaults to process.cwd()
+	 * when omitted (test back-compat with absolute-path fixtures).
+	 */
+	cwd?: string;
 }
 
 /**
@@ -632,6 +680,7 @@ export interface PathWriteGuardOptions {
  */
 export function makePathWriteGuard(opts: PathWriteGuardOptions = {}): BrigadeBeforeToolCallHook {
 	const roots = opts.roots ?? buildProtectedRoots();
+	const baseCwd = opts.cwd ?? process.cwd();
 	return async (ctx) => {
 		const rawName = (ctx as { toolCall?: { name?: unknown }; name?: unknown })?.toolCall?.name
 			?? (ctx as { name?: unknown })?.name
@@ -644,11 +693,13 @@ export function makePathWriteGuard(opts: PathWriteGuardOptions = {}): BrigadeBef
 			?? (ctx as { args?: unknown })?.args
 			?? {};
 
-		// Branch 1 — write / edit. Resolve the path arg and check directly.
+		// Branch 1 — write / edit. Resolve the path arg EXACTLY the way Pi's
+		// tools do — tilde-expand, then resolve relative to the SESSION cwd —
+		// so the guard compares the same absolute path the tool will write.
 		if (name === "write" || name === "edit") {
 			const candidate = extractPathArg(name, args);
 			if (!candidate) return undefined;
-			const absPath = path.resolve(candidate);
+			const absPath = path.resolve(baseCwd, expandTilde(candidate));
 			for (const root of roots) {
 				if (!isPathInside(root.target, absPath, root.directory)) continue;
 				const carve = allowWriteCarveOut(root, absPath);
@@ -666,13 +717,16 @@ export function makePathWriteGuard(opts: PathWriteGuardOptions = {}): BrigadeBef
 		if (BASH_TOOL_NAMES.has(name)) {
 			const command = extractBashCommand(args);
 			if (!command) return undefined;
-			const hit = detectBashWriteIntent(command, roots);
+			const hit = detectBashWriteIntent(command, roots, baseCwd);
 			if (!hit) return undefined;
 			return {
 				block: true,
+				// Audit P2: use the ROOT's own remedy — the old hardcoded
+				// manage_agent/manage_skill line was simply wrong for roots
+				// like the encryption key.
 				reason:
 					`bash: refusing to mutate ${hit.absPath} — protected by Brigade structural guard. ` +
-					`Use \`manage_agent\` or \`manage_skill\` for catalog changes; A2A/allowlist changes go through \`manage_agent\` (auto-seeded on add). ` +
+					`${hit.root.redirect} ` +
 					`(${hit.indicator} \`${hit.absPath}\`; root: ${hit.root.id})`,
 			} satisfies BeforeToolCallResult;
 		}

@@ -77,7 +77,10 @@ describe("a2a-policy-canonicalize: state matrix (both gates)", () => {
 				assert.equal(a2a.maxPingPongTurns, 7);
 			});
 
-			it("(4) enabled:true already → idempotent no-op (same ref)", () => {
+			it("(4) enabled:true AND visibility:all already → idempotent no-op (same ref)", () => {
+				// Fully canonical = agentToAgent enabled AND sessionTools
+				// visibility "all". Both must be present for the no-op, since
+				// the canonicaliser now also seeds visibility.
 				const cfg: BrigadeConfig = {
 					agents: { main: {} },
 					session: {
@@ -85,10 +88,46 @@ describe("a2a-policy-canonicalize: state matrix (both gates)", () => {
 							enabled: true,
 							allow: [{ from: "*", to: "*" }],
 						},
+						sessionTools: { visibility: "all" },
 					},
 				};
 				const next = canonicalizeA2APolicy(cfg, { gateFlag });
 				assert.strictEqual(next, cfg);
+			});
+
+			it("(4b) enabled:true but visibility UNSET → seeds visibility:all (the half-on bug)", () => {
+				const cfg: BrigadeConfig = {
+					agents: { main: {} },
+					session: { agentToAgent: { enabled: true, allow: [{ from: "*", to: "*" }] } },
+				};
+				const next = canonicalizeA2APolicy(cfg, { gateFlag });
+				assert.notStrictEqual(next, cfg, "must produce a new cfg — visibility needed seeding");
+				const vis = (next.session as { sessionTools?: { visibility?: string } } | undefined)
+					?.sessionTools?.visibility;
+				assert.equal(vis, "all", "A2A out-of-the-box requires visibility all");
+				// agentToAgent untouched (already enabled).
+				assert.deepEqual(readA2A(next), { enabled: true, allow: [{ from: "*", to: "*" }] });
+			});
+
+			it("(4c) explicit visibility:self is RESPECTED (deliberate lockdown not overridden)", () => {
+				const cfg: BrigadeConfig = {
+					agents: { main: {} },
+					session: {
+						agentToAgent: { enabled: true, allow: [{ from: "*", to: "*" }] },
+						sessionTools: { visibility: "self" },
+					},
+				};
+				const next = canonicalizeA2APolicy(cfg, { gateFlag });
+				assert.strictEqual(next, cfg, "operator's explicit visibility choice must survive");
+			});
+
+			it("(4d) missing agentToAgent ALSO seeds visibility:all in one pass", () => {
+				const cfg: BrigadeConfig = { agents: { main: {} } };
+				const next = canonicalizeA2APolicy(cfg, { gateFlag });
+				assert.deepEqual(readA2A(next), { enabled: true, allow: [{ from: "*", to: "*" }] });
+				const vis = (next.session as { sessionTools?: { visibility?: string } } | undefined)
+					?.sessionTools?.visibility;
+				assert.equal(vis, "all");
 			});
 
 			it(`(5) ${gateFlag}=false → bypass canonicalisation entirely`, () => {

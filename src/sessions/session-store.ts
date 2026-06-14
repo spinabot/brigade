@@ -11,6 +11,12 @@ import {
   resolveSessionsDir,
 } from "../config/paths.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import {
+  getCachedSessionFile,
+  primeSessionCache,
+  writeThroughSessionCache,
+} from "../storage/session-cache.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
 /**
  * Wave L P2#11 — cross-process advisory file lock for `sessions.json`.
@@ -96,8 +102,14 @@ function withSyncStoreLock<T>(agentId: string, fn: () => T): T {
   // sync mutex above already serialises in-process callers; the file lock
   // closes the cross-process gap. Best-effort: on lock-acquisition failure
   // we proceed without it (degraded same as before — last writer wins).
+  // Convex mode: no sessions.json on disk to lock — Convex linearises
+  // cross-process writes and the in-process mutex above covers same-process
+  // serialisation. Skip the sidecar so nothing is created under ~/.brigade.
   const filePath = resolveSessionStorePath(agentId);
-  const releaseFileLock = tryAcquireSessionStoreFileLockSync(filePath);
+  const releaseFileLock =
+    tryGetRuntimeContext()?.mode === "convex"
+      ? null
+      : tryAcquireSessionStoreFileLockSync(filePath);
   try {
     return fn();
   } finally {
@@ -260,6 +272,21 @@ export interface SessionStoreFile {
 const CURRENT_VERSION = 1;
 
 export function readSessionStore(agentId: string): SessionStoreFile {
+  // Convex mode — serve from the boot-hydrated cache. All higher helpers
+  // (resolveOrCreateSession, upsert/update/delete, listers) are built on
+  // this function + writeSessionStore, so the dispatch pair covers every
+  // session caller in the codebase. An agent without a cache slot (created
+  // after boot) genuinely has no rows; start it from the empty shape and
+  // prime so later writes diff against it.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    const cached = getCachedSessionFile(agentId);
+    if (cached) return structuredClone(cached);
+    const empty: SessionStoreFile = { version: CURRENT_VERSION, sessions: {} };
+    primeSessionCache(agentId, empty);
+    return empty;
+  }
+
   const storePath = resolveSessionStorePath(agentId);
   if (!fs.existsSync(storePath)) {
     return { version: CURRENT_VERSION, sessions: {} };
@@ -275,6 +302,16 @@ export function readSessionStore(agentId: string): SessionStoreFile {
 }
 
 export function writeSessionStore(agentId: string, file: SessionStoreFile): void {
+  // Convex mode — prime the cache synchronously (the next read sees this
+  // write) and enqueue the per-key Convex mutations realising the diff.
+  // Callers sit inside the per-agent sync lock, so cache mutations are
+  // serialised in-process; the backend linearises the rest.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    writeThroughSessionCache(rctx.store, agentId, file);
+    return;
+  }
+
   const storePath = resolveSessionStorePath(agentId);
   ensureDir(path.dirname(storePath));
   const tmp = `${storePath}.tmp`;
@@ -371,7 +408,8 @@ export function resolveOrCreateSession(args: {
 
     // Make sure the sessions/ directory exists; the JSONL itself is created
     // lazily by Pi's SessionManager on first write.
-    ensureDir(resolveSessionsDir(agentId));
+    // Convex mode never writes the JSONL here (inMemory + factory) — skip.
+    if (tryGetRuntimeContext()?.mode !== "convex") ensureDir(resolveSessionsDir(agentId));
 
     return {
       sessionKey,
@@ -514,7 +552,8 @@ export function upsertSessionEntry(
       store.sessions[sessionKey] = entry;
     }
     writeSessionStore(agentId, store);
-    ensureDir(resolveSessionsDir(agentId));
+    // Convex mode never writes the JSONL here (inMemory + factory) — skip.
+    if (tryGetRuntimeContext()?.mode !== "convex") ensureDir(resolveSessionsDir(agentId));
     return entry;
   });
 }
@@ -554,5 +593,44 @@ export function listSubagentSessionEntries(
     out.push({ sessionKey, entry, subagent: entry.subagent });
   }
   out.sort((a, b) => a.subagent.spawnedAt.localeCompare(b.subagent.spawnedAt));
+  return out;
+}
+
+/**
+ * Generic filter-aware session entry lister. Used by the BrigadeStore
+ * adapter to satisfy `SessionStore.listEntries(agentId, filter?)`.
+ *
+ *   filter.isolatedCronRunOlderThanMs — keep only `isolated:cron:` keys
+ *     whose `lastUsedAt` is older than `now - ms`. Used by the cron-store
+ *     adapter to drive `listIsolatedCronSessions` (a follow-up will route
+ *     `src/cron/session-reaper.ts` through this instead of duplicating
+ *     iteration).
+ *   filter.subagentOnly — keep only entries with a `subagent` metadata block.
+ *
+ * Returns entries in insertion order (matches `Object.entries` on the
+ * underlying sessions map). Callers that need a different ordering re-sort.
+ */
+export function listSessionEntries(
+  agentId: string,
+  filter: { isolatedCronRunOlderThanMs?: number; subagentOnly?: boolean } = {},
+): Array<{ sessionKey: string; entry: SessionEntry }> {
+  const store = readSessionStore(agentId);
+  const now = Date.now();
+  const cutoffMs =
+    filter.isolatedCronRunOlderThanMs !== undefined
+      ? now - filter.isolatedCronRunOlderThanMs
+      : undefined;
+  const out: Array<{ sessionKey: string; entry: SessionEntry }> = [];
+  for (const [sessionKey, entry] of Object.entries(store.sessions)) {
+    if (filter.subagentOnly && !entry.subagent) continue;
+    if (cutoffMs !== undefined) {
+      // Lazy import to avoid cron/session-reaper depending on this file
+      // (which would create a cycle); the helper is a pure string predicate.
+      if (!sessionKey.startsWith("isolated:cron:")) continue;
+      const lastUsedAt = Date.parse(entry.lastUsedAt ?? "");
+      if (!Number.isFinite(lastUsedAt) || lastUsedAt > cutoffMs) continue;
+    }
+    out.push({ sessionKey, entry });
+  }
   return out;
 }

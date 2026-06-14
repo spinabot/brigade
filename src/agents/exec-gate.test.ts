@@ -22,6 +22,7 @@ const { decideApproval: _ensureLoaded, recordApproval, getApprovalsFilePath, _re
 void _ensureLoaded;
 
 const { makeExecGate } = await import("./exec-gate.js");
+const { setExecAllowAll, isExecAllowAll, clearExecAllowAllForTests } = await import("./exec-session-allow.js");
 const busMod = await import("./agent-event-bus.js");
 const approvalBridgeMod = await import("./approval-bridge.js");
 
@@ -119,6 +120,95 @@ describe("makeExecGate — basic bash decisions", () => {
 		} as never);
 		assert.equal(r?.block, true);
 		assert.match(r?.reason ?? "", /is not pre-approved/);
+	});
+});
+
+describe("makeExecGate — session allow-all (point 4)", () => {
+	const SESSION = "agent:main:main";
+	const gateFor = (sessionKey: string) =>
+		makeExecGate({ ctxRef: { value: { sessionKey } } });
+
+	beforeEach(() => clearExecAllowAllForTests());
+
+	it("waives the approval PROMPT for an armed session (a would-be prompt now passes)", async () => {
+		setExecAllowAll(SESSION, true);
+		const r = await gateFor(SESSION)({
+			toolCall: { name: "bash", arguments: { command: "node oauth.mjs" } },
+		} as never);
+		assert.equal(r, undefined, "armed session should pass a prompt-decision command");
+	});
+
+	it("does NOT waive a hard-deny pattern even when armed", async () => {
+		setExecAllowAll(SESSION, true);
+		const r = await gateFor(SESSION)({
+			toolCall: { name: "bash", arguments: { command: "rm -rf /" } },
+		} as never);
+		assert.equal(r?.block, true);
+		assert.match(r?.reason ?? "", /hard-deny pattern/);
+	});
+
+	it("does NOT waive a workdir / env hijack even when armed", async () => {
+		setExecAllowAll(SESSION, true);
+		const wd = await gateFor(SESSION)({
+			toolCall: { name: "bash", arguments: { command: "ls", workdir: "/etc" } },
+		} as never);
+		assert.equal(wd?.block, true);
+		assert.match(wd?.reason ?? "", /override .* is not allowed/);
+		const env = await gateFor(SESSION)({
+			toolCall: { name: "bash", arguments: { command: "ls", env: { LD_PRELOAD: "/tmp/x" } } },
+		} as never);
+		assert.equal(env?.block, true);
+		assert.match(env?.reason ?? "", /env` override is not allowed/);
+	});
+
+	it("does NOT cascade to other sessions (sub-agents run distinct keys)", async () => {
+		setExecAllowAll(SESSION, true);
+		const child = await gateFor("agent:main:main:subagent:abc")({
+			toolCall: { name: "bash", arguments: { command: "node oauth.mjs" } },
+		} as never);
+		assert.equal(child?.block, true, "an un-armed (child) session still prompts");
+		assert.match(child?.reason ?? "", /is not pre-approved/);
+	});
+
+	it("disarming restores the prompt", async () => {
+		setExecAllowAll(SESSION, true);
+		setExecAllowAll(SESSION, false);
+		const r = await gateFor(SESSION)({
+			toolCall: { name: "bash", arguments: { command: "node oauth.mjs" } },
+		} as never);
+		assert.equal(r?.block, true);
+		assert.match(r?.reason ?? "", /is not pre-approved/);
+	});
+
+	it("the prompt's 'allow-session' decision allows the call AND arms the session", async () => {
+		// Operator picked [S] in the approval prompt. The gate must allow THIS
+		// call and arm allow-all so the NEXT command skips the prompt entirely.
+		approvalBridgeMod.setActiveApprovalBridge({
+			requestApproval: async () => ({ kind: "allow-session" as const }),
+			resolveApproval: () => true,
+			listPending: () => [],
+		});
+		try {
+			const first = await gateFor(SESSION)({
+				toolCall: { name: "bash", arguments: { command: "node oauth.mjs" } },
+			} as never);
+			assert.equal(first, undefined, "the call that chose allow-session is allowed");
+			assert.equal(isExecAllowAll(SESSION), true, "session is now armed");
+			// A SECOND command on the same session passes with NO bridge call.
+			approvalBridgeMod.setActiveApprovalBridge({
+				requestApproval: async () => {
+					throw new Error("bridge should not be consulted once armed");
+				},
+				resolveApproval: () => true,
+				listPending: () => [],
+			});
+			const second = await gateFor(SESSION)({
+				toolCall: { name: "bash", arguments: { command: "ls -la /tmp" } },
+			} as never);
+			assert.equal(second, undefined, "subsequent command skips the prompt");
+		} finally {
+			approvalBridgeMod.setActiveApprovalBridge(null);
+		}
 	});
 });
 

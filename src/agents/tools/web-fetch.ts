@@ -148,7 +148,7 @@ export function makeFetchUrlTool(opts: MakeFetchUrlToolOptions = {}): AnyBrigade
 		name: "fetch_url",
 		label: "fetch_url",
 		description:
-			"Fetch and extract readable content from a URL (HTML → markdown/text). Use for lightweight page access without browser automation.",
+			"Fetch and extract readable content from a URL (HTML → markdown/text). Use for lightweight page access without browser automation — best for static/server-rendered pages (articles, docs, READMEs). If the result comes back near-empty or blocked, escalate to the browser tool (navigate + snapshot) instead of switching to a different low-quality source.",
 		parameters: FetchUrlSchema,
 		ownerOnly: false,
 		displaySummary: "fetching URL",
@@ -235,6 +235,26 @@ export function makeFetchUrlTool(opts: MakeFetchUrlToolOptions = {}): AnyBrigade
 			if (!payload) {
 				// Built-in failed AND no provider available — surface the raw error.
 				throw rawError ?? new Error(`fetch_url: no result for ${url}`);
+			}
+
+			// Empty-but-200 (or Readability bailed) with nothing better available means
+			// the page is almost certainly JS-rendered or bot-walled — justdial-class
+			// directory sites are the canonical example: they 200 with a ~14-char shell
+			// that strips to nothing. Brigade already ships a real `browser` tool (system
+			// Chrome via Playwright) that renders these pages; the model just doesn't know
+			// to pivot unless we tell it. Attach an actionable warning + log at warn so the
+			// result no longer ships as a silent "ok" carrying an empty body.
+			const finalLooksEmpty =
+				payload.status !== undefined && payload.status < 400 && payload.rawLength < 200;
+			if (finalLooksEmpty || payload._fallbackPreferred === true) {
+				const hint = `This page returned little or no extractable text (rawLength=${payload.rawLength}) — it is most likely JavaScript-rendered or bot-walled. Use the "browser" tool (navigate + snapshot) to read the rendered page${opts.provider ? "" : ", or set FIRECRAWL_API_KEY for a server-side render fallback"}. If this URL is an aggregator/directory listing, prefer re-searching for the business's own website or reading its map listing instead of rendering the directory.`;
+				payload.warning = payload.warning ? `${payload.warning} ${hint}` : hint;
+				log.warn("web_fetch empty/blocked", {
+					url: redactUrlForDebugLog(url),
+					status: payload.status,
+					rawLength: payload.rawLength,
+					extractor: payload.extractor,
+				});
 			}
 
 			payload.tookMs = Date.now() - startedAt;

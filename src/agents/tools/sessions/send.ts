@@ -25,7 +25,10 @@ import crypto from "node:crypto";
 
 import { callGateway } from "../../gateway-call.js";
 import { nestedLane } from "../../../process/lanes.js";
-import { enqueueSystemEvent } from "../../session-inbox.js";
+import { requestHeartbeatNow } from "../../heartbeat-wake.js";
+import { enqueueSystemEvent, removeMatchingSystemEvent } from "../../session-inbox.js";
+import { getLastChannelForAgent } from "../../channels/last-channel.js";
+import { normalizeDeliveryContext } from "../../../utils/delivery-context.js";
 import {
 	checkSessionToolAccess,
 	describeSessionsSendTool,
@@ -41,6 +44,7 @@ import {
 // Otherwise the legacy error message stays untouched.
 import { buildOrgDeniedMessage } from "../../org/structured-errors.js";
 import { deriveOrgGraph } from "../../org/derive-graph.js";
+import { resolveSessionAccessPolicy } from "./resolve-access.js";
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 
 export interface SessionsSendToolArgs {
@@ -219,7 +223,7 @@ export function createSessionsSendTool(
 						error: "sessions_send forbidden: session access policy not configured",
 					});
 				}
-				const access = checkSessionToolAccess({
+				let access = checkSessionToolAccess({
 					action: "send",
 					requesterSessionKey: opts.agentSessionKey,
 					targetSessionKey: parsed.sessionKey,
@@ -227,6 +231,34 @@ export function createSessionsSendTool(
 					a2aPolicy: opts.a2aPolicy,
 					...(opts.spawnedKeys ? { spawnedKeys: opts.spawnedKeys } : {}),
 				});
+				// LIVE re-check (2026-06-11): the injected policy was frozen at
+				// run start. If the model just called `manage_access` to enable
+				// cross-agent messaging and is retrying THIS run, the frozen
+				// policy still says "denied". Re-resolve from CURRENT config and
+				// re-check before refusing — a mid-run enable then takes effect
+				// immediately (no gateway restart, which is what the model used
+				// to wrongly tell the operator). Deny-path only: the happy path
+				// keeps the injected policy untouched, and a re-check can only
+				// GRANT (after an enable), never widen a still-denying config.
+				if (!access.allowed && opts.agentSessionKey) {
+					try {
+						const freshCfg = (
+							require("../../../core/config.js") as { loadConfig: () => unknown }
+						).loadConfig();
+						const live = resolveSessionAccessPolicy(freshCfg);
+						const liveAccess = checkSessionToolAccess({
+							action: "send",
+							requesterSessionKey: opts.agentSessionKey,
+							targetSessionKey: parsed.sessionKey,
+							visibility: live.visibility,
+							a2aPolicy: live.a2aPolicy,
+							...(opts.spawnedKeys ? { spawnedKeys: opts.spawnedKeys } : {}),
+						});
+						if (liveAccess.allowed) access = liveAccess;
+					} catch {
+						/* keep the original denial on any resolve failure */
+					}
+				}
 				if (!access.allowed) {
 					// Stage C additive-gate: when cfg.org is present AND mode ===
 					// "derived", wrap the legacy denial message with the
@@ -266,15 +298,26 @@ export function createSessionsSendTool(
 			// Inject a system event into the target's inbox so the target's
 			// next prompt assembly sees the sender + carries the context tag.
 			// This is the same mechanism Step 12 drains on turn-start.
+			//
+			// The contract suffix exists because peers used to ANSWER LIKE
+			// HUMANS: "On it, let me hit the directories…" — and end the turn
+			// without doing anything. The peer must know the work happens IN
+			// this turn (tools included, minutes are fine) and the final
+			// message is the entire hand-off.
 			const senderRef = opts.agentSessionKey ?? "main";
-			enqueueSystemEvent(
-				`A2A from ${senderRef}: ${parsed.message}`,
-				{
-					sessionKey: parsed.sessionKey,
-					contextKey: `a2a:from:${senderRef}`,
-					trusted: true,
-				},
-			);
+			const a2aEventText =
+				`A2A from ${senderRef}: ${parsed.message}\n` +
+				`[A2A contract: do the requested work NOW, in this turn — use your tools; long ` +
+				`tool runs are fine. Your FINAL message is the entire hand-off: it must contain ` +
+				`the complete deliverable. Never end the turn with just an acknowledgement like ` +
+				`"on it" or a promise to follow up — there is no later turn unless the requester ` +
+				`sends again.]`;
+			const a2aEventContextKey = `a2a:from:${senderRef}`;
+			enqueueSystemEvent(a2aEventText, {
+				sessionKey: parsed.sessionKey,
+				contextKey: a2aEventContextKey,
+				trusted: true,
+			});
 
 			// Trigger the target's next turn via the per-caller nested lane so
 			// concurrent sends from different callers don't queue head-of-line
@@ -286,24 +329,40 @@ export function createSessionsSendTool(
 			// reply?" after the call completes. Mirrors the reference
 			// codebase's `waitForAgentRunAndReadUpdatedAssistantReply`.
 			const beforeReply = await readLatestAssistantReply(parsed.sessionKey);
-			// The gateway's `agent` method dispatches the peer's turn and
-			// awaits it — but Pi's session may flush the final assistant
-			// text AFTER the run resolves. We fire the call (no extra wait)
-			// then poll sessions.history for a NEW non-empty assistant text.
-			// Tool-call-heavy turns (web_search, fetch_url, browser) can
-			// take 30-60s before the final text lands; poll up to
-			// `timeoutSeconds` (default 90s) before falling back to
-			// "accepted" — the announce-delivery will still surface the
-			// reply on the parent's next turn via the inbox.
+			// Dispatch the peer's turn and HOLD the run promise. `wait: true`
+			// makes the gateway's agent handler await the run's SETTLED
+			// outcome before responding (the in-process caller otherwise
+			// resolves the moment the handler returns its fire-and-forget
+			// ack — which made every settle-gated branch below dead code and
+			// returned "completed" for runs that had just started). The old
+			// code additionally polled for the FIRST new assistant text,
+			// which returned intermediate progress messages ("On it, let me
+			// hit the directories…") from tool-heavy runs as if they were
+			// the final reply. Pattern now: wait for the run, THEN read the
+			// final reply (the reference codebase's run-wait contract).
+			//
+			// NOTE deliberately NO `timeout` param on the dispatch: the
+			// caller's wait window must never bound the PEER's run lifetime
+			// (reference contract — wait-timeout and run-kill are separate
+			// knobs; the dispatcher owns the run).
 			const timeoutSec =
 				parsed.timeoutSeconds !== undefined && parsed.timeoutSeconds > 0
 					? parsed.timeoutSeconds
 					: 90;
+			interface AgentWaitResponse {
+				ok?: boolean;
+				runId?: string;
+				error?: string;
+				reply?: string;
+				aborted?: boolean;
+				timedOut?: boolean;
+			}
+			let runSettled = false;
+			let runOutcome: AgentWaitResponse | undefined;
+			let rpcFailed: string | undefined;
+			let runPromise: Promise<void>;
 			try {
-				// Fire and forget the agent call — the gateway awaits the
-				// peer's run. We don't await this Promise; the polling loop
-				// below picks up the result as soon as the transcript flushes.
-				void callGateway({
+				runPromise = callGateway<AgentWaitResponse>({
 					method: "agent",
 					params: {
 						message: parsed.message,
@@ -312,13 +371,29 @@ export function createSessionsSendTool(
 						lane,
 						idempotencyKey,
 						spawnedBy: opts.agentSessionKey ?? "main",
-						timeout: timeoutSec,
+						wait: true,
 					},
-					timeoutMs: Math.max(10_000, timeoutSec * 1_000 + 5_000),
-				}).catch(() => {
-					/* failures surface via the polling-timeout path below */
-				});
+					// RPC ceiling for the HELD wait — generous so long peer
+					// work settles through it; its expiry does NOT abort the
+					// peer run (the dispatcher owns the run lifecycle).
+					timeoutMs: Math.max(timeoutSec * 1_000 + 5_000, 15 * 60 * 1_000),
+				}).then(
+					(res) => {
+						runSettled = true;
+						runOutcome = res ?? { ok: true };
+					},
+					(err) => {
+						// RPC-level failure (incl. the 15-min ceiling). The peer
+						// run may STILL be in flight — never report it finished.
+						runSettled = true;
+						rpcFailed = err instanceof Error ? err.message : String(err);
+					},
+				);
 			} catch (err) {
+				removeMatchingSystemEvent(parsed.sessionKey, {
+					text: a2aEventText,
+					contextKey: a2aEventContextKey,
+				});
 				return jsonToolResult({
 					status: "error",
 					sessionKey: parsed.sessionKey,
@@ -326,31 +401,160 @@ export function createSessionsSendTool(
 				});
 			}
 
-			// Poll for the peer's new assistant reply with exponential
-			// backoff. Returns as soon as a non-empty text block lands.
-			const newReply = await pollForNewReply({
-				sessionKey: parsed.sessionKey,
-				beforeReply,
-				timeoutMs: timeoutSec * 1_000,
-			});
-			if (newReply) {
+			// Wait for run-settle OR the caller's wait window, whichever first.
+			let raceTimer: ReturnType<typeof setTimeout> | undefined;
+			await Promise.race([
+				runPromise,
+				new Promise<void>((resolve) => {
+					raceTimer = setTimeout(resolve, timeoutSec * 1_000);
+					(raceTimer as { unref?: () => void }).unref?.();
+				}),
+			]);
+			if (raceTimer) clearTimeout(raceTimer);
+
+			if (runSettled) {
+				// Dispatch/run failures must SURFACE, not masquerade as
+				// success — and the attribution event enqueued above must be
+				// withdrawn or it ghosts into the peer's next unrelated turn.
+				if (rpcFailed !== undefined || runOutcome?.ok === false) {
+					removeMatchingSystemEvent(parsed.sessionKey, {
+						text: a2aEventText,
+						contextKey: a2aEventContextKey,
+					});
+					const detail = rpcFailed ?? runOutcome?.error ?? "peer dispatch failed";
+					return jsonToolResult({
+						status: "error",
+						sessionKey: parsed.sessionKey,
+						error: rpcFailed
+							? `gateway wait failed (${detail}) — the peer run MAY still be in flight; check sessions_history({sessionKey: "${parsed.sessionKey}"}) before re-sending.`
+							: detail,
+						idempotencyKey,
+					});
+				}
+				// Run finished inside the wait window. Prefer the settled
+				// outcome's own reply; Pi's session can flush the final text
+				// a beat after the run resolves, so fall back to a brief poll.
+				const direct =
+					typeof runOutcome?.reply === "string" &&
+					runOutcome.reply.trim().length > 0 &&
+					runOutcome.reply !== beforeReply
+						? runOutcome.reply
+						: undefined;
+				const newReply =
+					direct ??
+					(await pollForNewReply({
+						sessionKey: parsed.sessionKey,
+						beforeReply,
+						timeoutMs: 10_000,
+					}));
+				if (newReply) {
+					return jsonToolResult({
+						status: "ok",
+						sessionKey: parsed.sessionKey,
+						reply: newReply,
+						idempotencyKey,
+					});
+				}
 				return jsonToolResult({
 					status: "ok",
 					sessionKey: parsed.sessionKey,
-					reply: newReply,
 					idempotencyKey,
+					note:
+						"peer turn completed but produced no new text reply. " +
+						`Check sessions_history({sessionKey: "${parsed.sessionKey}", limit: 3}) before telling the user anything.`,
 				});
 			}
-			// Peer didn't produce a new text reply within the timeout window.
-			// Fall back to the accepted envelope; announce-delivery will
-			// surface the reply on the next turn via the parent inbox if it
-			// lands later.
+
+			// Peer is STILL WORKING past the wait window — true async hand-off.
+			// Attach the delivery now: when the run settles, the peer's final
+			// reply is pushed into the REQUESTER's session inbox and a
+			// heartbeat wake fires, so the requester's next (woken) turn
+			// relays the result to the user hands-free. Same inbox + wake
+			// spine that delivers cron reminders.
+			const requesterSessionKey = opts.agentSessionKey;
+			if (requesterSessionKey) {
+				void runPromise.then(async () => {
+					try {
+						// Honest classification of the settled outcome — the
+						// requester is never told "finished" for a run that
+						// failed or whose RPC ceiling expired mid-flight.
+						let eventText: string;
+						if (rpcFailed !== undefined) {
+							eventText =
+								`A2A: the wait on peer ${parsed.sessionKey} failed (${rpcFailed}); the peer ` +
+								`MAY still be working. Check sessions_history({sessionKey: "${parsed.sessionKey}", limit: 3}) ` +
+								`and tell the user honestly.`;
+						} else if (runOutcome?.ok === false) {
+							eventText =
+								`A2A: peer ${parsed.sessionKey} turn FAILED (${runOutcome?.error ?? "unknown error"}). ` +
+								`Tell the user the delegated work did not complete.`;
+						} else {
+							const direct =
+								typeof runOutcome?.reply === "string" &&
+								runOutcome.reply.trim().length > 0 &&
+								runOutcome.reply !== beforeReply
+									? runOutcome.reply
+									: undefined;
+							const finalReply =
+								direct ??
+								(await pollForNewReply({
+									sessionKey: parsed.sessionKey,
+									beforeReply,
+									timeoutMs: 15_000,
+								}));
+							eventText = finalReply
+								? `A2A reply from ${parsed.sessionKey}: ${finalReply}\n` +
+									`[The peer finished the delegated work — relay this result to the user NOW. Do not re-run the work.]`
+								: `A2A: peer ${parsed.sessionKey} finished the delegated turn but produced no text reply. ` +
+									`Check sessions_history({sessionKey: "${parsed.sessionKey}", limit: 3}) and tell the user honestly.`;
+						}
+						// P0-2: stamp the requester's CHANNEL on the event so the woken
+						// turn's relay reaches them where they actually are (WhatsApp /
+						// Slack), not just the TUI. The heartbeat dispatcher reads this
+						// deliveryContext and sends the reply out via the channel adapter
+						// (cron-announce-style). Resolved from the requester agent's last
+						// active channel; absent for pure-TUI requesters — then it stays
+						// TUI-only, exactly as before.
+						const requesterAgentId = resolveAgentIdFromSessionKey(requesterSessionKey);
+						const lastCh = requesterAgentId
+							? getLastChannelForAgent(requesterAgentId)
+							: undefined;
+						const deliveryContext = lastCh
+							? normalizeDeliveryContext({
+									channel: lastCh.channelId,
+									to: lastCh.conversationId,
+									accountId: lastCh.accountId,
+									threadId: lastCh.threadId,
+								})
+							: undefined;
+						enqueueSystemEvent(eventText, {
+							sessionKey: requesterSessionKey,
+							contextKey: `a2a:reply:${parsed.sessionKey}`,
+							trusted: true,
+							...(deliveryContext && deliveryContext.channel && deliveryContext.to
+								? { deliveryContext }
+								: {}),
+						});
+						requestHeartbeatNow({
+							reason: "a2a-reply",
+							...(requesterAgentId ? { agentId: requesterAgentId } : {}),
+							sessionKey: requesterSessionKey,
+						});
+					} catch {
+						/* best-effort delivery — the reply stays readable via sessions_history */
+					}
+				});
+			}
 			return jsonToolResult({
 				status: "accepted",
 				sessionKey: parsed.sessionKey,
-				delivery: { mode: "queued", lane },
+				delivery: { mode: "auto-deliver-on-finish", lane },
 				idempotencyKey,
-				note: `peer turn dispatched but no text reply within ${timeoutSec}s (tool-heavy or long task). The peer is still running; its reply will land in its own session transcript. To check: call sessions_history({sessionKey: "${parsed.sessionKey}", limit: 3}) on a subsequent turn. Do NOT claim a status to the user without re-checking.`,
+				note:
+					`peer is STILL WORKING (no reply within ${timeoutSec}s — tool-heavy or long task). ` +
+					`Its finished reply will be DELIVERED into your session automatically: you will see ` +
+					`"A2A reply from ${parsed.sessionKey}: …" on a later turn — relay it to the user then. ` +
+					`Right now: tell the user the work is in progress. Do NOT fabricate results and do NOT poll.`,
 			});
 		},
 	};

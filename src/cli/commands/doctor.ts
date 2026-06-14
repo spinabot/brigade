@@ -34,8 +34,9 @@ import { BRIGADE_DIR, loadConfig } from "../../core/config.js";
 import { loadBrigadeAuthStorage } from "../../core/auth-bridge.js";
 import { getTodayLogPath } from "../../core/event-logger.js";
 import { readApprovalsSummary } from "../../core/exec-approvals.js";
-import { probeGateway, readPidFile, isProcessAlive } from "../../core/gateway-probe.js";
+import { probeGateway, readPid, isProcessAlive } from "../../core/gateway-probe.js";
 import { findProvider, PROVIDERS } from "../../providers/catalog.js";
+import { readSentinel, sentinelExists } from "../../storage/sentinel.js";
 
 export interface DoctorCommandOptions {
 	json?: boolean;
@@ -68,6 +69,7 @@ export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise
 	checks.push(checkSkills());
 	checks.push(checkLogDirWritable());
 	checks.push(checkExecApprovals());
+	checks.push(await checkStorageMode());
 	checks.push(await checkGateway(opts));
 
 	if (opts.json) {
@@ -449,7 +451,7 @@ function checkLogDirWritable(): CheckResult {
 
 async function checkGateway(opts: DoctorCommandOptions): Promise<CheckResult> {
 	const probe = await probeGateway({ host: opts.host, port: opts.port });
-	const pid = readPidFile();
+	const pid = await readPid();
 	if (probe.reachable) {
 		return {
 			name: "gateway",
@@ -489,6 +491,89 @@ const GLYPH = {
 	warn: chalk.yellow("⚠"),
 	fail: chalk.red("✖"),
 } as const;
+
+/**
+ * Storage-mode check — reports the active mode (filesystem vs convex) from
+ * `~/.brigade/mode.sentinel`. For convex mode, probes the deployment URL so
+ * an operator who's run `brigade onboard` against a now-dead local backend
+ * gets a clear "convex is unreachable" warning instead of a cryptic boot
+ * failure later.
+ */
+async function checkStorageMode(): Promise<CheckResult> {
+	let sentinel;
+	try {
+		sentinel = readSentinel();
+	} catch (err) {
+		return {
+			name: "storage mode",
+			status: "fail",
+			message: `mode.sentinel is unreadable: ${(err as Error).message}`,
+			hint: "fix the file by hand or delete ~/.brigade/mode.sentinel then re-run `brigade onboard`",
+		};
+	}
+
+	if (!sentinel) {
+		const hasOnboarded = sentinelExists();
+		if (hasOnboarded) {
+			// Should be impossible — readSentinel returned undefined but
+			// the file exists. Treat as warn rather than crash.
+			return {
+				name: "storage mode",
+				status: "warn",
+				message: "mode.sentinel exists but didn't parse cleanly",
+			};
+		}
+		return {
+			name: "storage mode",
+			status: "ok",
+			message: "filesystem (default — no mode.sentinel pinned yet)",
+			hint: "run `brigade onboard` to pick filesystem vs convex explicitly",
+		};
+	}
+
+	if (sentinel.mode === "filesystem") {
+		return {
+			name: "storage mode",
+			status: "ok",
+			message: `filesystem · pinned ${sentinel.migratedAt ?? "?"}`,
+		};
+	}
+
+	// Convex mode — probe the URL.
+	const url = sentinel.convexUrl!;
+	try {
+		const controller = new AbortController();
+		const t = setTimeout(() => controller.abort(), 5_000);
+		const res = await fetch(`${url.replace(/\/+$/, "")}/instance_name`, { signal: controller.signal });
+		clearTimeout(t);
+		if (!res.ok) {
+			return {
+				name: "storage mode",
+				status: "fail",
+				message: `convex (${url}) — HTTP ${res.status}`,
+				hint: "ensure `npm run convex:dev` is running, or check the deployment URL",
+			};
+		}
+		const instance = (await res.text()).trim();
+		return {
+			name: "storage mode",
+			status: "ok",
+			message: `convex (${url}) · instance ${instance || "(unknown)"}`,
+		};
+	} catch (err) {
+		const msg = (err as Error)?.name === "AbortError" ? "timed out after 5s" : (err as Error).message;
+		const localHint =
+			url.includes("127.0.0.1") || url.includes("localhost")
+				? "start the local backend with `npm run convex:dev` in another terminal"
+				: "check network connectivity to the deployment URL";
+		return {
+			name: "storage mode",
+			status: "fail",
+			message: `convex (${url}) unreachable: ${msg}`,
+			hint: localHint,
+		};
+	}
+}
 
 function printChecksText(checks: CheckResult[]): void {
 	const lines: string[] = [];

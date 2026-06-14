@@ -449,10 +449,30 @@ const DEFAULT_TOOL_EXECUTION_TIMEOUT_MS = 60 * 1000;
 export function wrapToolExecutionTimeout(
 	tool: AnyBrigadeTool,
 	timeoutMs: number = DEFAULT_TOOL_EXECUTION_TIMEOUT_MS,
+	/**
+	 * Optional per-call budget resolver, consulted with the call's params at
+	 * execute time. Lets tools whose LEGITIMATE runtime depends on their
+	 * arguments (the spawn tools await children that run up to their own
+	 * `timeoutSeconds`) size the watchdog per call instead of being killed
+	 * by the blanket default. Invalid / missing return values fall back to
+	 * `timeoutMs`.
+	 */
+	resolveTimeoutMs?: (toolArgs: unknown) => number | undefined,
 ): AnyBrigadeTool {
 	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return tool;
 	const originalExecute = tool.execute.bind(tool);
 	const timedExecute: AnyBrigadeTool["execute"] = async (...args) => {
+		let effectiveTimeoutMs = timeoutMs;
+		if (resolveTimeoutMs) {
+			try {
+				const resolved = resolveTimeoutMs(args[1]);
+				if (typeof resolved === "number" && Number.isFinite(resolved) && resolved > 0) {
+					effectiveTimeoutMs = resolved;
+				}
+			} catch {
+				/* resolver failure → default budget */
+			}
+		}
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			return await Promise.race([
@@ -462,13 +482,13 @@ export function wrapToolExecutionTimeout(
 						reject(
 							new BrigadeToolTimeoutError(
 								`tool "${tool.name}" did not return within ${Math.round(
-									timeoutMs / 1000,
+									effectiveTimeoutMs / 1000,
 								)}s — ` +
 									`assume the call hung. Tell the operator and ask them ` +
 									`what they want to do; do NOT retry the same call back-to-back.`,
 							),
 						);
-					}, timeoutMs);
+					}, effectiveTimeoutMs);
 					if (typeof timer.unref === "function") timer.unref();
 				}),
 			]);

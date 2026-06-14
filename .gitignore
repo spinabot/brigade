@@ -28,8 +28,31 @@ coverage/
 # Local-only state (brigade writes here in dev)
 .brigade-local/
 
+# Convex local backend — binaries auto-downloaded by scripts/install-convex.mjs,
+# data is per-machine, types are auto-generated
+bin/convex-local-backend
+bin/convex-local-backend.exe
+bin/dashboard/
+bin/LICENSE.md
+bin/_backend.zip
+bin/_dashboard.zip
+.convex-data/
+.convex/
+.convex-tmp/
+convex/_generated/
+.agents/
+CLAUDE.md
+skills-lock.json
+
 # Misc
 test.txt
 
 # VSCode workspace files
 *.code-workspace
+
+# Compiled artifacts must never live next to the convex/ sources — the convex
+# CLI bundles every .ts AND .js it finds, so a stray tsc emit makes deploys
+# fail with "Two output files share the same path". (_generated/ is exempt —
+# its api.js/server.js are the CLI's own output.)
+convex/*.js
+convex/*.js.map

@@ -8,7 +8,7 @@
  *     `cfg.org` block (templates from `./org-cmd.templates.ts`) and
  *     open $EDITOR on the brigade.json so the operator can fine-tune.
  *   - `show` — print an ASCII tree of the current org. Reads
- *     `deriveOrgGraph(cfg)`. Returns exit 1 + helpful prefix when
+ *     `deriveOrgDisplayGraph(cfg)`. Returns exit 1 + helpful prefix when
  *     `cfg.org` is absent.
  *   - `explain <from> <to>` — print the derivation chain (or denial
  *     reason) for a directed edge. Uses the same a2a-adapter that
@@ -35,9 +35,10 @@
 import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 
+import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import { resolveConfigPath } from "../../config/paths.js";
 import { loadConfig, saveConfig } from "../../core/config.js";
-import { deriveOrgGraph } from "../../agents/org/derive-graph.js";
+import { deriveOrgDisplayGraph } from "../../agents/org/derive-graph.js";
 import { orgGraphAsA2APolicy } from "../../agents/org/a2a-adapter.js";
 import { lintOrgGraph } from "../../agents/org/lints.js";
 import {
@@ -222,7 +223,7 @@ export async function runOrgShow(opts: OrgShowOpts): Promise<number> {
   const cfg = loadConfig();
   let graph: OrgGraph | undefined;
   try {
-    graph = deriveOrgGraph(cfg);
+    graph = deriveOrgDisplayGraph(cfg);
   } catch (e) {
     if (e instanceof BrigadeOrgConfigError) {
       if (opts.json) {
@@ -307,7 +308,7 @@ export async function runOrgExplain(opts: OrgExplainOpts): Promise<number> {
   const cfg = loadConfig();
   let graph: OrgGraph | undefined;
   try {
-    graph = deriveOrgGraph(cfg);
+    graph = deriveOrgDisplayGraph(cfg);
   } catch (e) {
     if (e instanceof BrigadeOrgConfigError) {
       if (opts.json) {
@@ -328,7 +329,47 @@ export async function runOrgExplain(opts: OrgExplainOpts): Promise<number> {
     return 0;
   }
 
-  const policy = orgGraphAsA2APolicy(graph);
+  // Explicit mode: runtime allow/deny comes from the flat
+  // `session.agentToAgent.allow` matrix, NOT org edges — printing an
+  // edge-based ALLOWED/DENIED here would contradict what sessions_send
+  // actually does at runtime. Show the org SHAPE between the pair instead,
+  // clearly labelled as structure-only.
+  if (graph.mode === "explicit") {
+    const shapeEdges = graph.edges.filter((e) => e.from === opts.from && e.to === opts.to);
+    const note =
+      'a2a mode is "explicit" — runtime allow/deny comes from session.agentToAgent.allow; ' +
+      "the org edges below describe structure only.";
+    if (opts.json) {
+      emitJson(
+        {
+          status: "explicit-mode",
+          from: opts.from,
+          to: opts.to,
+          note,
+          orgShapeEdges: shapeEdges,
+        },
+        opts,
+      );
+    } else {
+      out(note, opts);
+      out(
+        `org shape ${opts.from} → ${opts.to}: ${shapeEdges.length > 0 ? "connected" : "not connected"}`,
+        opts,
+      );
+      for (const e of shapeEdges) {
+        out(`  reason: ${e.reason}${e.note ? ` (${e.note})` : ""}`, opts);
+      }
+    }
+    return 0;
+  }
+
+  // Mirror the runtime's orchestrator bypass (resolve-access.ts) so
+  // `org explain main <member>` reports what sessions_send actually does.
+  const orgA2a = (cfg as { org?: { a2a?: { restrictDefaultAgent?: unknown } } }).org?.a2a;
+  const policy = orgGraphAsA2APolicy(
+    graph,
+    orgA2a?.restrictDefaultAgent === true ? {} : { orchestratorId: resolveDefaultAgentId(cfg) },
+  );
   const allowed = policy.isAllowed(opts.from, opts.to);
   if (allowed) {
     const edges = graph.edges.filter((e) => e.from === opts.from && e.to === opts.to);
@@ -376,7 +417,7 @@ export async function runOrgDoctor(opts: OrgDoctorOpts): Promise<number> {
   const cfg = loadConfig();
   let graph: OrgGraph | undefined;
   try {
-    graph = deriveOrgGraph(cfg);
+    graph = deriveOrgDisplayGraph(cfg);
   } catch (e) {
     if (e instanceof BrigadeOrgConfigError) {
       if (opts.json) {

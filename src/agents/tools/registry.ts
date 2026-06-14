@@ -34,6 +34,12 @@ import { getActiveCronService } from "../../cron/active-service.js";
 import { makeAgentsListTool } from "./agents-list-tool.js";
 import { makeCronTool } from "./cron-tool.js";
 import { makeManageAgentTool } from "./manage-agent-tool.js";
+import { makeFindTool } from "./find-tool.js";
+import { makeGenerateImageTool } from "./generate-image-tool.js";
+import { makeManageAccessTool } from "./manage-access-tool.js";
+import { makeManageChannelAccessTool } from "./manage-channel-access-tool.js";
+import { makeManageProviderTool } from "./manage-provider-tool.js";
+import { makeOAuthAuthorizeTool } from "./oauth-authorize-tool.js";
 import { makeManageSkillTool } from "./manage-skill-tool.js";
 // Consolidated `org` tool — only registered when cfg.org is present
 // (gate is below). Replaces the prior two-tool surface
@@ -198,6 +204,11 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 			: {}),
 	};
 	const tools: AnyBrigadeTool[] = [
+		// find — Brigade-native glob search. Replaces Pi's fd-backed builtin,
+		// whose --glob --full-path mode matches nothing on Windows (see
+		// find-tool.ts). Same name + schema, so the model's call shapes and
+		// any cron `toolsAllow: ["find", …]` lists keep working.
+		makeFindTool({ cwd: opts.cwd }),
 		// recall routes through the capability (rich render for the default,
 		// minimal SDK render for plugins). Origin filter is applied inside
 		// the tool so peer + operator state stay isolated.
@@ -225,6 +236,42 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// tool, which resolves the right scope root (`agent` workspace OR
 		// `~/.brigade/skills/` managed) for the user.
 		makeManageSkillTool(opts.agentId !== undefined ? { requesterAgentId: opts.agentId } : {}),
+		// generate_image — first-class image generation via the operator's
+		// OpenRouter key. Exists so the model never reaches for bash/curl
+		// (key-through-shell, guessed model ids, guessed response shapes —
+		// a billed generation got silently dropped that way in production).
+		// Owner-gated: each call is billed.
+		makeGenerateImageTool(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		// manage_provider — owner-only credential + per-agent model surface.
+		// Exists so a pasted API key lands in the canonical 0600 credential
+		// store (never .env / workspace files / config / chat echoes) and so
+		// "agent X should run on openai/gpt-4o" is one grounded call that
+		// also seeds the key into that agent's own store.
+		makeManageProviderTool(
+			opts.agentId !== undefined ? { requesterAgentId: opts.agentId } : {},
+		),
+		// manage_access — owner-only agent-to-agent access control. The
+		// sanctioned path the path-write / config-write guards point to for
+		// changing session.sessionTools.visibility / session.agentToAgent /
+		// org.a2a.mode, so "let main message marketing-lead" is one validated
+		// call instead of a guard-refused hand-edit.
+		makeManageAccessTool(),
+		// manage_channel_access — owner-only channel GROUP access control: the
+		// sanctioned path for channels.<ch>.groupPolicy / groupAllowFrom /
+		// groupAllowJids / groupFollowUpWindowMs, so "let the crew answer in this
+		// group / stop making me tag you" is one validated call, not a hand-edit.
+		makeManageChannelAccessTool(),
+		// oauth_authorize — owner-only OAuth 2.0 authorization-code flow with a
+		// one-shot loopback callback. Exists so the model never hand-rolls an
+		// http listener in bash (the Gmail-OAuth flow fought EADDRINUSE +
+		// redirect-mismatch across six manual tries). Tokens land sealed in the
+		// agent's credential store; codes/tokens never echo.
+		makeOAuthAuthorizeTool({
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+			...(typeof opts.sessionContext?.key === "string" && opts.sessionContext.key.length > 0
+				? { sessionKey: opts.sessionContext.key }
+				: {}),
+		}),
 	];
 	// Consolidated org tool additive-gate: the single `org` tool is
 	// registered ONLY when cfg.org is present in the loaded config. When

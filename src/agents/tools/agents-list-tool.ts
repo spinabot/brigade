@@ -31,10 +31,11 @@
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { Type } from "typebox";
 
+import { resolveDefaultAgentId } from "../agent-scope.js";
 import { listAgentEntries } from "../../cli/commands/agents-config.js";
 import { loadConfig } from "../../core/config.js";
 import { orgGraphAsA2APolicy } from "../org/a2a-adapter.js";
-import { deriveOrgGraph } from "../org/derive-graph.js";
+import { deriveOrgDisplayGraph } from "../org/derive-graph.js";
 import { DEFAULT_AGENT_ID, normalizeAgentId } from "../routing/session-key.js";
 import { jsonResult } from "./common.js";
 import { createAgentToAgentPolicy } from "./sessions/shared.js";
@@ -130,9 +131,19 @@ export function makeAgentsListTool(
 				allow: a2aAllow,
 			});
 			if (orgCfg && orgCfg.a2a?.mode !== "explicit") {
-				const graph = deriveOrgGraph(cfg as never);
+				const graph = deriveOrgDisplayGraph(cfg as never);
 				if (graph) {
-					a2aPolicy = orgGraphAsA2APolicy(graph);
+					// Same orchestrator bypass as resolveSessionAccessPolicy —
+					// keep the canSend flags this tool REPORTS consistent with
+					// what sessions_send actually ENFORCES, or the model sees
+					// "canSend: true" rows it then can't message (or vice versa).
+					const restrict =
+						(orgCfg.a2a as { restrictDefaultAgent?: unknown } | undefined)
+							?.restrictDefaultAgent === true;
+					a2aPolicy = orgGraphAsA2APolicy(
+						graph,
+						restrict ? {} : { orchestratorId: resolveDefaultAgentId(cfg as never) },
+					);
 				}
 			}
 

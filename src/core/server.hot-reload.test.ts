@@ -24,10 +24,17 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { computeSeedDiff } from "./agent-runtime-persist.js";
+import {
+	__resetConfigCacheForTests,
+	onConfigCachePrimed,
+	primeConfigCache,
+} from "../storage/config-cache.js";
 
 let stateDir: string;
 let prevStateDir: string | undefined;
 let prevConfigPath: string | undefined;
+let prevMode: string | undefined;
+let prevConvexUrl: string | undefined;
 
 beforeEach(() => {
 	stateDir = mkdtempSync(join(tmpdir(), "brigade-hotreload-"));
@@ -35,6 +42,13 @@ beforeEach(() => {
 	prevConfigPath = process.env.BRIGADE_CONFIG_PATH;
 	process.env.BRIGADE_STATE_DIR = stateDir;
 	delete process.env.BRIGADE_CONFIG_PATH;
+	// Hermeticity: a stray BRIGADE_MODE/BRIGADE_CONVEX_URL in the dev shell
+	// would make peekConvexMode see convex (no context, no tmpdir sentinel)
+	// and the config writer fail closed. Same isolation as boot.test.ts.
+	prevMode = process.env.BRIGADE_MODE;
+	prevConvexUrl = process.env.BRIGADE_CONVEX_URL;
+	delete process.env.BRIGADE_MODE;
+	delete process.env.BRIGADE_CONVEX_URL;
 });
 
 afterEach(() => {
@@ -42,6 +56,10 @@ afterEach(() => {
 	else process.env.BRIGADE_STATE_DIR = prevStateDir;
 	if (prevConfigPath === undefined) delete process.env.BRIGADE_CONFIG_PATH;
 	else process.env.BRIGADE_CONFIG_PATH = prevConfigPath;
+	if (prevMode === undefined) delete process.env.BRIGADE_MODE;
+	else process.env.BRIGADE_MODE = prevMode;
+	if (prevConvexUrl === undefined) delete process.env.BRIGADE_CONVEX_URL;
+	else process.env.BRIGADE_CONVEX_URL = prevConvexUrl;
 	rmSync(stateDir, { recursive: true, force: true });
 });
 
@@ -135,6 +153,72 @@ function startMirroredWatcher(
 		awaitNext: () => nextPromise,
 	};
 }
+
+describe("H1 hot-reload: convex-mode config-cache prime notification", () => {
+	// Production gap (2026-06-12): a 20-agent org created mid-session updated
+	// the convex config row + cache, but the gateway's hot-reload trigger was
+	// fs.watch on brigade.json — which never fires in convex mode. The
+	// gateway kept serving `agents: main` only and `/agent <id>` /
+	// `brigade tui <id>` refused every new agent until restart. The fix:
+	// primeConfigCache (fired by every convex config write, local or remote)
+	// notifies subscribers; the server wires the SAME debounced re-seed body
+	// to that notification.
+	afterEach(() => {
+		__resetConfigCacheForTests();
+	});
+
+	it("a cache prime (= convex config write) notifies the subscribed listener", () => {
+		const events: number[] = [];
+		const unsub = onConfigCachePrimed(() => events.push(events.length));
+		try {
+			primeConfigCache({ agents: { main: {} } } as never);
+			assert.equal(events.length, 1, "first config write notifies");
+			// A mid-session agent add is just another config write → another prime.
+			primeConfigCache({ agents: { main: {}, scout: {} } } as never);
+			assert.equal(events.length, 2, "agent-add config write notifies again");
+		} finally {
+			unsub();
+		}
+	});
+
+	it("unsubscribe stops notifications; a throwing listener never breaks the prime", () => {
+		let fired = 0;
+		const unsubThrower = onConfigCachePrimed(() => {
+			throw new Error("boom");
+		});
+		const unsubCounter = onConfigCachePrimed(() => {
+			fired += 1;
+		});
+		// The thrower is swallowed; the counter still fires; the prime itself
+		// succeeds (the config write path must never be poisoned by a listener).
+		primeConfigCache({ agents: {} } as never);
+		assert.equal(fired, 1);
+		unsubCounter();
+		primeConfigCache({ agents: {} } as never);
+		assert.equal(fired, 1, "unsubscribed listener no longer fires");
+		unsubThrower();
+	});
+
+	it("the prime → computeSeedDiff chain surfaces the new agent (end-to-end shape)", () => {
+		const seededIds = new Set<string>(["main"]);
+		const added: string[] = [];
+		const unsub = onConfigCachePrimed(() => {
+			// Mirrors the server's reseed body: read fresh config → diff.
+			const cfg = { agents: { main: {}, "support-lead": {} } };
+			const diff = computeSeedDiff(seededIds, "main", cfg.agents);
+			for (const id of diff.addedCandidates) {
+				seededIds.add(id);
+				added.push(id);
+			}
+		});
+		try {
+			primeConfigCache({ agents: { main: {}, "support-lead": {} } } as never);
+			assert.deepEqual(added, ["support-lead"], "the exact production repro: support-lead becomes seedable");
+		} finally {
+			unsub();
+		}
+	});
+});
 
 describe("H1 hot-reload: real fs.watch round-trip", () => {
 	it("invokes the reload callback after a write (debounced)", async () => {

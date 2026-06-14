@@ -185,6 +185,44 @@ function candidateEntries(extensionsDir: string): string[] {
 // this avoids the filesystem walk. Cleared by `clearDiscoveryCache()` on reload.
 const discoveryCache = new Map<string, DiscoveredModule[]>();
 
+/**
+ * Public lister — returns the candidate sources under `extensionsDir` with
+ * each one's safety verdict, WITHOUT importing them. Useful for diagnostic
+ * surfaces (`brigade doctor`, the storage layer's listSources) that need
+ * to know what *would* load and whether the file passes the safety gate.
+ *
+ * Each entry's `safetyReason` is `null` when the candidate passed the
+ * POSIX safety gate; a non-null string surfaces the rejection reason.
+ */
+export function listExtensionSources(
+	extensionsDir: string,
+): ReadonlyArray<{ source: string; kind: "file" | "dir-index"; safetyReason: string | null }> {
+	const out: Array<{ source: string; kind: "file" | "dir-index"; safetyReason: string | null }> = [];
+	for (const source of candidateEntries(extensionsDir)) {
+		const safetyReason = checkPosixSafety(source, extensionsDir);
+		// `candidateEntries` returns the absolute path; for dir-style entries
+		// that path points at the chosen `dirEntry` (the dir's resolved entry
+		// file, e.g. `<dir>/index.js`). The shape lets the caller surface
+		// "module folder X resolved to file Y" diagnostics without us baking
+		// in the formatting.
+		let kind: "file" | "dir-index" = "file";
+		try {
+			const st = statSync(source);
+			if (st.isDirectory()) kind = "dir-index";
+		} catch {
+			// Already-stat'd by candidateEntries; if it's gone now treat as file.
+		}
+		out.push({ source, kind, safetyReason });
+	}
+	return out;
+}
+
+/** Does the extensions dir exist? Plain `fs.existsSync` lift so callers don't
+ *  need to re-derive the path. */
+export function extensionsRootExists(extensionsDir: string): boolean {
+	return existsSync(extensionsDir);
+}
+
 /** Drop the discovery cache so the next `discoverUserModules` re-scans (reload). */
 export function clearDiscoveryCache(): void {
 	discoveryCache.clear();

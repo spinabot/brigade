@@ -97,13 +97,14 @@ export async function extractMentions(
 	message: WAMessage["message"],
 	sock: WASocket | null,
 	authDir?: string,
+	accountId?: string,
 ): Promise<string[]> {
 	const ctx = findContextInfo(message);
 	if (!ctx) return [];
 	const raw = (ctx.mentionedJid as string[] | undefined) ?? [];
 	const out: string[] = [];
 	for (const jid of raw) {
-		const id = await resolveJidToE164(sock, jid, authDir);
+		const id = await resolveJidToE164(sock, jid, authDir, accountId);
 		if (id) out.push(id);
 	}
 	return [...new Set(out)];
@@ -135,6 +136,7 @@ export async function extractReplyContext(
 	message: WAMessage["message"],
 	sock: WASocket | null,
 	authDir?: string,
+	accountId?: string,
 ): Promise<InboundReplyContext | undefined> {
 	const ctx = findContextInfo(message);
 	if (!ctx) return undefined;
@@ -142,7 +144,7 @@ export async function extractReplyContext(
 	const participant = typeof ctx.participant === "string" ? ctx.participant : undefined;
 	const body = quotedTextOf(ctx.quotedMessage as Record<string, unknown> | undefined);
 	if (!stanzaId && !body && !participant) return undefined;
-	const fromE164 = participant ? await resolveJidToE164(sock, participant, authDir) : undefined;
+	const fromE164 = participant ? await resolveJidToE164(sock, participant, authDir, accountId) : undefined;
 	return {
 		messageId: stanzaId,
 		body: body ? body.slice(0, 280) : undefined, // truncate so LLM context isn't gobbled

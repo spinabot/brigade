@@ -104,16 +104,30 @@ const ORG_CFG = {
   session: { agentToAgent: { enabled: true, allow: ["*"] } },
 };
 
+let prevMode: string | undefined;
+let prevConvexUrl: string | undefined;
+
 beforeEach(() => {
   stateDir = mkdtempSync(join(tmpdir(), "brigade-org-tool-"));
   mkdirSync(join(stateDir, "agents"), { recursive: true });
   prevStateDir = process.env.BRIGADE_STATE_DIR;
   process.env.BRIGADE_STATE_DIR = stateDir;
+  // Hermeticity: a stray BRIGADE_MODE/BRIGADE_CONVEX_URL in the dev shell
+  // would make peekConvexMode see convex (no context, no tmpdir sentinel)
+  // and the config writer fail closed. Same isolation as boot.test.ts.
+  prevMode = process.env.BRIGADE_MODE;
+  prevConvexUrl = process.env.BRIGADE_CONVEX_URL;
+  delete process.env.BRIGADE_MODE;
+  delete process.env.BRIGADE_CONVEX_URL;
 });
 
 afterEach(() => {
   if (prevStateDir === undefined) delete process.env.BRIGADE_STATE_DIR;
   else process.env.BRIGADE_STATE_DIR = prevStateDir;
+  if (prevMode === undefined) delete process.env.BRIGADE_MODE;
+  else process.env.BRIGADE_MODE = prevMode;
+  if (prevConvexUrl === undefined) delete process.env.BRIGADE_CONVEX_URL;
+  else process.env.BRIGADE_CONVEX_URL = prevConvexUrl;
   rmSync(stateDir, { recursive: true, force: true });
   resetGatewayCallerForTests();
 });

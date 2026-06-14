@@ -25,10 +25,15 @@ import { ProcessTerminal, TUI } from "@mariozechner/pi-tui";
 import chalk from "chalk";
 import type { Command } from "commander";
 
-import { initAuthProfiles, upsertApiKeyProfile } from "../../auth/profiles.js";
-import { DEFAULT_AGENT_ID, resolveAuthProfilesPath } from "../../config/paths.js";
+import { initAuthProfiles, readProfiles, upsertApiKeyProfile } from "../../auth/profiles.js";
+import { DEFAULT_AGENT_ID, resolveModelsPath } from "../../config/paths.js";
 import { BRIGADE_DIR, loadConfig, saveConfig } from "../../core/config.js";
 import { EXIT_CONFIG_ERROR } from "../../protocol.js";
+import { bootRuntimeContext } from "../../storage/boot.js";
+import { flushAllPendingWrites } from "../../storage/flush.js";
+import { deleteSentinel, readSentinel, sentinelExists, writeSentinel, writeSentinelNow } from "../../storage/sentinel.js";
+import type { ModeSentinel } from "../../storage/runtime-context.js";
+import { pickStorageMode, type StorageModeResult } from "../../ui/onboard-storage-mode.js";
 import { runOnboarding } from "../../ui/onboarding.js";
 import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { applyOnboardingSessionDefaults, ONBOARDING_DEFAULT_DM_SCOPE } from "./onboard-config.js";
@@ -73,56 +78,139 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 	const tui = new TUI(new ProcessTerminal());
 	tui.start();
 
+	// Snapshot the PRE-RUN sentinel so ANY aborted run (Esc, error, backend
+	// connect failure, Ctrl+C) restores the machine's previous mode pin
+	// exactly. persistStorageMode below OVERWRITES a pre-existing pin with the
+	// new pick, so a delete-if-created rollback is not enough — a re-onboard
+	// that switched modes and then cancelled would silently flip the machine's
+	// mode (filesystem operator curiosity-picks convex, Escs out, next boot is
+	// an empty convex crew). A corrupt pre-run sentinel reads as "none";
+	// rollback then deletes — the same self-heal the old flow got by
+	// overwriting the corrupt file at the end.
+	let priorSentinel: ModeSentinel | undefined;
+	try {
+		priorSentinel = readSentinel();
+	} catch {
+		priorSentinel = undefined;
+	}
+	let onboardSettled = false;
+	const rollbackSentinel = (): void => {
+		if (onboardSettled) return;
+		try {
+			if (priorSentinel) writeSentinel(priorSentinel);
+			else deleteSentinel();
+		} catch {
+			// Best-effort — a stuck pin surfaces on the next `store mode show`.
+		}
+	};
+
 	// SIGINT during the wizard — clean exit, no half-written config (the
 	// wizard's saveConfig only fires on a completed flow).
 	const onSigint = (): void => {
 		tui.stop();
 		restoreTerminal();
-		process.exit(130);
+		// An interrupted run must not leave a half-configured mode pin (same
+		// rule as the cancel/error paths below); no-op after success.
+		rollbackSentinel();
+		// Once the convex context is up, a just-entered key rides a write-behind
+		// chain — drain it before exiting so Ctrl+C can't silently drop it. 2s
+		// safety net so a wedged flush never hangs the abort.
+		const t = setTimeout(() => process.exit(130), 2000);
+		t.unref?.();
+		void flushAllPendingWrites().finally(() => process.exit(130));
 	};
 	process.once("SIGINT", onSigint);
 
-	// Ensure the auth-profiles.json scaffold exists before the wizard runs —
-	// the bridge step at the end uses upsertApiKeyProfile which expects the
-	// file to already be present at mode 0600. Cheap idempotent call.
+	// ───────────────── Step 0 + runtime context (FIRST) ─────────────────
+	// Pick the storage mode, pin the sentinel, and boot the runtime context
+	// BEFORE any auth/config/model write. The wizard used to run end-to-end in
+	// filesystem mode and flip the sentinel LAST — so a convex pick wrote the
+	// provider key + config + web-search key PLAINTEXT under ~/.brigade and
+	// left the convex backend empty. Establishing the context here means every
+	// downstream upsertApiKeyProfile / saveConfig / models-catalog write
+	// dispatches sealed into convex (filesystem mode is byte-identical).
+	let storage: StorageModeResult;
+	try {
+		storage = await pickStorageMode(tui);
+	} catch (err) {
+		const m = (err as Error).message;
+		if (m === "storage-mode-revert-to-filesystem") {
+			storage = { mode: "filesystem" };
+		} else {
+			tui.stop();
+			restoreTerminal();
+			if (m === "onboarding-cancelled") {
+				console.error(chalk.dim("Onboarding cancelled — run `brigade onboard` again any time."));
+				return 0;
+			}
+			throw err;
+		}
+	}
+
+	// Pin the sentinel, then boot. In convex mode bootRuntimeContext runs the
+	// encryption-fingerprint check, installs the strict guard, and primes the
+	// config cache (without which readConfigOrInit throws). The pre-run pin was
+	// snapshotted above; every abort path below restores it via
+	// rollbackSentinel so no aborted run can leave the mode switched.
+	persistStorageMode(storage);
+	// persistStorageMode is warn-only by design; but a convex pick whose
+	// sentinel never landed would silently boot FILESYSTEM below (resolveMode
+	// finds no pin) and run the whole wizard in the wrong mode. Fail loudly
+	// instead — the warning above already printed the retry command.
+	if (storage.mode === "convex" && !sentinelExists()) {
+		tui.stop();
+		restoreTerminal();
+		return EXIT_CONFIG_ERROR;
+	}
+	try {
+		await bootRuntimeContext();
+	} catch (err) {
+		tui.stop();
+		restoreTerminal();
+		rollbackSentinel();
+		console.error(
+			chalk.red(`Onboarding failed — couldn't connect the storage backend: ${(err as Error).message}`),
+		);
+		if (storage.mode === "convex") {
+			console.error(
+				chalk.dim(`Make sure your backend is running at ${storage.convexUrl}, then re-run brigade onboard.`),
+			);
+		}
+		return EXIT_CONFIG_ERROR;
+	}
+
+	// Now mode-aware. Convex → initAuthProfiles primes empty in-memory caches
+	// (no disk files); filesystem → scaffolds auth-profiles.json at 0600 as
+	// before (the bridge's defensive upsert expects a readable profile store).
 	initAuthProfiles(DEFAULT_AGENT_ID);
 
-	// One-shot prune of any leftover `~/.brigade/auth.json` from a prior
-	// Brigade version that used Pi's `AuthStorage.create(<path>)` (which
-	// writes `{}` on construction and mirrors set() to disk). The wizard now
-	// uses `AuthStorage.inMemory()` so a fresh onboard never recreates this
-	// file — but stale ones from older builds keep showing up in `ls
-	// ~/.brigade/`, which surprised the user. The canonical layout has no
-	// `auth.json`, only `auth-profiles.json`. Best-effort delete; missing
-	// or unreadable file is fine.
+	// One-shot prune of any leftover `~/.brigade/auth.json` from a prior Brigade
+	// version (Pi's `AuthStorage.create(<path>)` wrote `{}` on construction and
+	// mirrored set() to disk). The wizard now uses `AuthStorage.inMemory()`, so
+	// a fresh onboard never recreates it — but stale copies surprised the user
+	// in `ls ~/.brigade/`. Best-effort async unlink. (The old `require("node:
+	// fs")` here was dead code — this module is ESM, so `require` threw and the
+	// prune never ran.)
 	try {
-		const fsSync = require("node:fs") as typeof import("node:fs");
-		const stalePath = `${BRIGADE_DIR}/auth.json`;
-		if (fsSync.existsSync(stalePath)) fsSync.unlinkSync(stalePath);
+		await fsAsync.unlink(`${BRIGADE_DIR}/auth.json`);
 	} catch {
-		/* best-effort */
+		/* missing / unreadable is fine */
 	}
 
 	// IN-MEMORY authStorage — never writes to disk. The wizard owns ALL
-	// persistence by writing directly to `~/.brigade/agents/<id>/agent/auth-profiles.json`
-	// (via `upsertApiKeyProfile` / `upsertApiKeyRefProfile`). Pi's
-	// `AuthStorage.create(path)` would write `{}` to `~/.brigade/auth.json`
-	// on construction AND mirror every `set()` to disk — that produced an
-	// orphaned `auth.json` file on every onboard run AND leaked the literal
-	// API key to a second on-disk location in ref mode. Brigade has no
-	// `auth.json` at all.
-	//
-	// `set()` in memory is still useful: it lets the wizard process see the
-	// key for the rest of the run (online validation already takes the key
-	// as a string, so it doesn't read authStorage; but `ModelRegistry` does
-	// when discovering provider models for the picker).
+	// persistence via `upsertApiKeyProfile` / `upsertApiKeyRefProfile`, which
+	// now dispatch into convex (sealed) because the context is live. `set()` in
+	// memory still lets the wizard process reuse the key for model discovery.
+	// The ModelRegistry is created AFTER the context so `resolveModelsPath`
+	// resolves to the convex OS-cache location, not ~/.brigade/models.json.
 	const authStorage = AuthStorage.inMemory();
-	const modelRegistry = ModelRegistry.create(authStorage, `${BRIGADE_DIR}/models.json`);
+	const modelRegistry = ModelRegistry.create(authStorage, resolveModelsPath(DEFAULT_AGENT_ID));
 
 	try {
 		const result = await runOnboarding(tui, authStorage, modelRegistry, {
 			noEnvDetect: opts.noEnvDetect,
 			secretInputMode: opts.secretInputMode,
+			storage,
 		});
 		tui.stop();
 		restoreTerminal();
@@ -147,13 +235,29 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 			authStorage,
 		});
 
+		// The sentinel was pinned + the context booted up front (so writes
+		// sealed into convex as they happened). Now drain the convex write-
+		// behind chains so the provider key, config, and models catalog are
+		// durably committed before we print "onboarded" and exit. No-op in
+		// filesystem mode (writes were synchronous).
+		await flushAllPendingWrites();
+		// Onboarding is durable — from here the NEW pin is the real state; a
+		// late Ctrl+C must not roll it back.
+		onboardSettled = true;
+
 		// Web-tools setup is now Step 4 of the Pi-TUI wizard above — runs
 		// inside `runOnboarding` against the same TUI, so its look matches
 		// the provider picker exactly. No post-wizard prompt here.
 
+		const modeLine =
+			result.storage.mode === "convex"
+				? `Storage:     ${chalk.bold("convex")} (${chalk.bold(result.storage.convexUrl)})`
+				: `Storage:     ${chalk.bold("filesystem")} (~/.brigade)`;
+
 		console.error(
 			chalk.dim(
 				`\n✓ onboarded — provider: ${chalk.bold(result.provider)} · model: ${chalk.bold(result.modelId)}\n` +
+					`${modeLine}\n` +
 					`Next: run ${chalk.bold("brigade gateway")} (then ${chalk.bold("brigade connect")} in a second terminal),\n` +
 					`      or ${chalk.bold("brigade")} for the in-process TUI.\n` +
 					`Web tools:   ${chalk.bold("brigade onboard web")} to (re-)pick a search backend.\n` +
@@ -171,12 +275,48 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 		// `runOnboarding` throws "onboarding-cancelled" when the user hits Esc
 		// on the provider picker — surface that as a friendly message, not a
 		// crash. Any other error propagates as a real failure.
+		//
+		// Either way, restore the PRE-RUN pin: the sentinel now lands BEFORE
+		// the wizard (so writes seal into the right backend), so an aborted
+		// run must not leave the machine pinned to a mode it never finished
+		// setting up — neither a fresh pin over an unconfigured backend NOR a
+		// silently switched mode on a cancelled re-onboard. Any rows already
+		// sealed into convex are harmless: idempotent, overwritten by the next
+		// successful onboard.
+		rollbackSentinel();
 		if (msg === "onboarding-cancelled") {
 			console.error(chalk.dim("Onboarding cancelled — run `brigade onboard` again any time."));
 			return 0;
 		}
 		console.error(chalk.red(`Onboarding failed: ${msg}`));
 		return 1;
+	}
+}
+
+/**
+ * Persist the storage-mode choice into `~/.brigade/mode.sentinel`. Idempotent —
+ * writes the sentinel regardless of whether it already existed (a re-onboard
+ * with the same answer is a no-op, a re-onboard that switches modes flips
+ * the pin). Doesn't migrate data; that's a separate `brigade store migrate`
+ * command.
+ *
+ * Failure here is non-fatal: the user has already burned wizard time, so we
+ * log a yellow warning and let them re-run `brigade store mode set <mode>`
+ * to retry.
+ */
+function persistStorageMode(storage: StorageModeResult): void {
+	try {
+		writeSentinelNow(storage.mode, {
+			...(storage.convexUrl !== undefined ? { convexUrl: storage.convexUrl } : {}),
+		});
+	} catch (err) {
+		process.stderr.write(
+			chalk.yellow(
+				`\nbrigade: warning — couldn't write ~/.brigade/mode.sentinel: ${(err as Error).message}\n` +
+					`  Retry with: brigade store mode set ${storage.mode}` +
+					(storage.convexUrl ? ` --convex-url ${storage.convexUrl}\n` : "\n"),
+			),
+		);
 	}
 }
 
@@ -210,18 +350,21 @@ async function bridgeOnboardingResultToBrigadeNative(args: {
 	// upsert), do a one-time mirror so the user isn't left without a credential.
 	// Any existing profile (literal `key` OR `keyRef`) is left untouched.
 	try {
-		const profilesPath = resolveAuthProfilesPath(DEFAULT_AGENT_ID);
 		let providerHasProfile = false;
 		try {
-			const raw = await fsAsync.readFile(profilesPath, "utf8");
-			const parsed = JSON.parse(raw) as {
-				profiles?: Record<string, { provider?: string; key?: string; keyRef?: unknown }>;
-			};
-			providerHasProfile = Object.values(parsed.profiles ?? {}).some(
-				(p) => p?.provider === args.provider && (p.key !== undefined || p.keyRef !== undefined),
+			// Mode-aware: in convex mode there is NO disk auth-profiles.json —
+			// readProfiles serves the in-memory cache (primed at boot / by the
+			// wizard's sealed upsert). A raw disk read would always miss in
+			// convex mode → a spurious "no profile" → redundant re-mirror.
+			const { profiles } = readProfiles(DEFAULT_AGENT_ID);
+			providerHasProfile = Object.values(profiles ?? {}).some(
+				(p) =>
+					(p as { provider?: string }).provider === args.provider &&
+					((p as { key?: string }).key !== undefined ||
+						(p as { keyRef?: unknown }).keyRef !== undefined),
 			);
 		} catch {
-			// No file yet or unreadable — fall through; the upsert below creates it.
+			// No profiles yet — fall through; the upsert below creates it.
 		}
 		if (!providerHasProfile) {
 			const key = await args.authStorage.getApiKey(args.provider);

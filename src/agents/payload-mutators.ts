@@ -9,15 +9,16 @@
 //     stale cache_control sweeps.
 //   • `streamFn` — Pi installs an auth-aware wrapper at session creation
 //     time; do NOT replace it (a Brigade-side memory captures the failure
-//     mode — every provider call breaks silently). For payload-shape
-//     mutations we'd need to wrap the wrapper, deferred until Pi exposes
-//     a `wrapStreamFn` factory or until the gateway moves provider calls
-//     out-of-process.
+//     mode — every provider call breaks silently). We COMPOSE on top of it
+//     instead (`wrapStreamFnWithPayloadMutations` below), which gives us both
+//     the outbound payload (`onPayload`) and the request `headers` field of
+//     Pi's `SimpleStreamOptions` — enough for payload-shape mutations AND
+//     OpenRouter app-attribution headers without any Pi fork.
 //
-// What ships here today: the safe mutations that fit `transformContext`'s
-// contract (must not throw, must return the original or a safe fallback).
-// Provider-payload mutations that need access to the outbound HTTP body
-// are documented but parked behind a feature flag until the wiring exists.
+// What ships here today: the safe message-level mutations that fit
+// `transformContext`'s contract (must not throw, must return the original or
+// a safe fallback), PLUS the streamFn-composed payload mutators and OpenRouter
+// attribution-header injection.
 
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { Api, Model, ThinkingLevel } from "@mariozechner/pi-ai";
@@ -382,6 +383,7 @@ export const PROVIDER_QUIRKS_PARKED = {
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 
 import { CACHE_BOUNDARY_MARKER } from "../system-prompt/cache-boundary.js";
+import { resolveOpenRouterAttributionHeaders } from "./provider-attribution.js";
 
 /* ─────────────────────────── 1. Strip stale thinking blocks ─────────────────────────── */
 
@@ -1034,8 +1036,24 @@ export function wrapStreamFnWithPayloadMutations(session: AgentSession): void {
 
   const wrapped: StreamFn = (model, context, options) => {
     const userOnPayload = options?.onPayload;
+    // OpenRouter app attribution: when (and only when) this request routes
+    // through OpenRouter, merge Brigade's HTTP-Referer / X-OpenRouter-Title
+    // headers into Pi's `SimpleStreamOptions.headers`. Caller-supplied headers
+    // win (matches OpenClaw's createOpenRouterWrapper precedence) so an
+    // explicit override is never clobbered. Non-OpenRouter providers get
+    // `undefined` back and are left untouched.
+    const attribution = resolveOpenRouterAttributionHeaders(model);
+    const callerHeaders =
+      options && typeof options.headers === "object" && options.headers
+        ? (options.headers as Record<string, string>)
+        : undefined;
+    const mergedHeaders =
+      attribution || callerHeaders
+        ? { ...(attribution ?? {}), ...(callerHeaders ?? {}) }
+        : undefined;
     const augmented = {
       ...(options ?? {}),
+      ...(mergedHeaders ? { headers: mergedHeaders } : {}),
       onPayload: async (payload: unknown, m: Model<Api>) => {
         const userResult = userOnPayload ? await userOnPayload(payload, m) : undefined;
         const next = userResult !== undefined ? userResult : payload;
@@ -1053,5 +1071,8 @@ export function wrapStreamFnWithPayloadMutations(session: AgentSession): void {
 type StreamFn = (
   model: Model<any>,
   context: unknown,
-  options?: { onPayload?: (payload: unknown, m: Model<any>) => unknown | Promise<unknown> } & Record<string, unknown>,
+  options?: {
+    onPayload?: (payload: unknown, m: Model<any>) => unknown | Promise<unknown>;
+    headers?: Record<string, string>;
+  } & Record<string, unknown>,
 ) => unknown;

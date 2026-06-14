@@ -120,3 +120,85 @@ export async function discoverCloudModelMeta(
 		return EMPTY;
 	}
 }
+
+/**
+ * A live model entry from a cloud catalog, shaped so it can be used DIRECTLY as
+ * a (loose) Pi `Model`: the onboarding picker's `describeModel` and the gateway's
+ * `modelToSummary` only read provider/id/name/contextWindow/reasoning/input/cost,
+ * all populated here. Lets UIs list models newer than Pi's bundled snapshot.
+ */
+export interface LiveCloudModel {
+	provider: string;
+	id: string;
+	name: string;
+	contextWindow?: number;
+	reasoning: boolean;
+	input: string[];
+	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+}
+
+const MODEL_LIST_TTL_MS = 5 * 60_000;
+let openRouterListCache: { at: number; models: LiveCloudModel[] } | null = null;
+
+/**
+ * The FULL live OpenRouter catalog (every served model id), so model pickers can
+ * show models newer than Pi's bundled snapshot (e.g. the latest Opus/GPT/Gemini).
+ * Keyless, cached 5 min, short timeout. Returns the last good cache (or `[]`) on
+ * ANY failure so callers degrade to the static catalog rather than erroring —
+ * never throws. Pricing → `cost.input` is per-Mtok (OpenRouter quotes per-token).
+ */
+export async function listOpenRouterModels(): Promise<LiveCloudModel[]> {
+	const now = Date.now();
+	if (openRouterListCache && now - openRouterListCache.at < MODEL_LIST_TTL_MS) {
+		return openRouterListCache.models;
+	}
+	try {
+		const body = (await fetchJson(OPENROUTER_MODELS_URL)) as
+			| { data?: Array<Record<string, unknown>> }
+			| null;
+		const list = body?.data;
+		if (!Array.isArray(list)) return openRouterListCache?.models ?? [];
+		const out: LiveCloudModel[] = [];
+		for (const entry of list) {
+			const id = typeof entry.id === "string" ? entry.id : undefined;
+			if (!id) continue;
+			const contextWindow =
+				typeof entry.context_length === "number" && entry.context_length > 0
+					? entry.context_length
+					: undefined;
+			const arch = entry.architecture as { input_modalities?: unknown } | undefined;
+			const modalities = Array.isArray(arch?.input_modalities) ? (arch?.input_modalities as unknown[]) : [];
+			const input = modalities.includes("image") ? ["text", "image"] : ["text"];
+			const supported = Array.isArray(entry.supported_parameters)
+				? (entry.supported_parameters as unknown[])
+				: [];
+			const reasoning = supported.includes("reasoning") || supported.includes("include_reasoning");
+			const pricing = entry.pricing as { prompt?: unknown; completion?: unknown } | undefined;
+			const inTok = pricing && typeof pricing.prompt === "string" ? Number.parseFloat(pricing.prompt) : Number.NaN;
+			const outTok =
+				pricing && typeof pricing.completion === "string" ? Number.parseFloat(pricing.completion) : Number.NaN;
+			const cost = Number.isFinite(inTok)
+				? {
+						input: inTok * 1_000_000,
+						output: Number.isFinite(outTok) ? outTok * 1_000_000 : 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+					}
+				: undefined;
+			const name = typeof entry.name === "string" && entry.name.length > 0 ? entry.name : id;
+			out.push({
+				provider: "openrouter",
+				id,
+				name,
+				...(contextWindow !== undefined ? { contextWindow } : {}),
+				reasoning,
+				input,
+				...(cost ? { cost } : {}),
+			});
+		}
+		openRouterListCache = { at: now, models: out };
+		return out;
+	} catch {
+		return openRouterListCache?.models ?? [];
+	}
+}

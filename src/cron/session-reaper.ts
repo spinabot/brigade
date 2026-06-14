@@ -30,6 +30,7 @@ import {
 	readSessionStore,
 } from "../sessions/session-store.js";
 import { resolveSessionTranscriptPath } from "../config/paths.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import type { SubsystemLogger } from "../logging/subsystem-logger.js";
 
 /** Default retention if `sessionRetention` is left as the string default. */
@@ -107,8 +108,22 @@ export async function reapIsolatedCronSessions(args: ReapSweepArgs): Promise<Rea
 		try {
 			const sessionIdStr = typeof entry.sessionId === "string" ? entry.sessionId : null;
 			if (sessionIdStr) {
-				const transcriptPath = resolveSessionTranscriptPath(agentId, sessionIdStr);
-				await fs.rm(transcriptPath, { force: true });
+				// Convex mode: the raw fs.rm below only removed the OS-cache
+				// JSONL — the transcript ROWS in the backend were never
+				// deleted, so every reaped cron session accumulated rows
+				// forever. Route through the store's deleteTranscript (its
+				// local impl does the unlink, so behaviour is identical in
+				// filesystem mode; the convex impl deletes the rows).
+				const rctx = tryGetRuntimeContext();
+				if (rctx?.mode === "convex") {
+					await rctx.store.messages.deleteTranscript(agentId, sessionIdStr);
+					// Best-effort: also drop the regenerable OS-cache JSONL.
+					const transcriptPath = resolveSessionTranscriptPath(agentId, sessionIdStr);
+					await fs.rm(transcriptPath, { force: true });
+				} else {
+					const transcriptPath = resolveSessionTranscriptPath(agentId, sessionIdStr);
+					await fs.rm(transcriptPath, { force: true });
+				}
 				transcriptsRemoved++;
 			}
 		} catch (err) {

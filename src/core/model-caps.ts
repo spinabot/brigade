@@ -95,6 +95,30 @@ export function isLikelyReasoningModelId(modelId: string): boolean {
 }
 
 /**
+ * Remap a thinking level across a MODEL SWITCH (or clamp a set-thinking request)
+ * so the operator's intent survives instead of resetting to the new model's
+ * initial default. Unlike `pickInitialThinkingLevel` (which ignores the current
+ * level), this PRESERVES the active level when the new model can honor it, and
+ * only adjusts when it can't — the difference between "switched model, kept
+ * thinking on high" and "switched model, silently dropped to off":
+ *   - new model can't reason             → "off"
+ *   - new model reasons, level is valid  → keep it (`high` stays `high`)
+ *   - level is "off" but the new model is reasoning-ONLY (rejects budget=0,
+ *     e.g. gemini-2.5/o-series/r1)        → "low" (so it isn't rejected)
+ *   - current level missing/invalid       → fall back to pickInitialThinkingLevel
+ */
+export function remapThinkingLevel(current: ThinkingLevel | undefined, target: Model<any>): ThinkingLevel {
+	if (current === undefined || !VALID_THINKING_LEVELS.has(current)) {
+		return pickInitialThinkingLevel(target);
+	}
+	const reasoningOnly = isLikelyReasoningModelId(modelIdOf(target));
+	const canReason = !!target.reasoning || reasoningOnly;
+	if (!canReason) return "off";
+	if (current === "off" && reasoningOnly) return "low";
+	return current;
+}
+
+/**
  * Short human description of a model's notable capabilities,
  * suitable for the chat header (e.g. "thinking · vision · 1M ctx · $1.25/Mtok").
  *

@@ -39,6 +39,7 @@ import {
 	maybeAttachReminderContext,
 	REMINDER_CONTEXT_MESSAGES_MAX,
 } from "../../cron/reminder-context.js";
+import { computeJobStaggerOffsetMs } from "../../cron/stagger.js";
 import {
 	add as cronAdd,
 	enqueueRun as cronEnqueueRun,
@@ -101,6 +102,28 @@ const CRON_RECOVERABLE_OBJECT_KEYS: ReadonlySet<string> = new Set([
 	"failureAlert",
 	...CRON_FLAT_PAYLOAD_KEYS,
 ]);
+
+/**
+ * Stringified-object recovery. Some model/provider stacks (observed with
+ * Sonnet via OpenRouter) JSON-encode a nested tool arg, so a perfectly valid
+ * `job` arrives as the STRING '{"name": …}'. The TypeBox schema can't reject
+ * it (`job`/`patch` are Any), and bouncing it with "parameter required"
+ * misleads the model into retrying the identical call. Parse a string that
+ * holds a JSON object; anything else passes through untouched.
+ */
+function coerceJsonObjectParam(value: unknown): unknown {
+	if (typeof value !== "string") return value;
+	const trimmed = value.trim();
+	if (!trimmed.startsWith("{")) return value;
+	try {
+		const parsed: unknown = JSON.parse(trimmed);
+		return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+			? parsed
+			: value;
+	} catch {
+		return value;
+	}
+}
 
 /**
  * Per-turn context the cron tool reads during `add` to auto-fill delivery
@@ -183,14 +206,20 @@ const CronToolParams = Type.Object({
 	job: Type.Optional(
 		Type.Any({
 			description:
-				"For `action: \"add\"` — the full `CronJobCreate` object " +
-				"(name, schedule, payload, sessionTarget, etc.).",
+				'REQUIRED for `action:"add"`. A nested JSON OBJECT — never a quoted/' +
+				"stringified object, never flat top-level fields. Shape: " +
+				'{"name":"<kebab-case>","schedule":{"kind":"in"|"at"|"every"|"cron",…},' +
+				'"payload":{"kind":"agentTurn","message":"…"} or {"kind":"systemEvent","text":"…"},' +
+				'"delivery"?,"sessionTarget"?}. Copy a TEMPLATE from the tool description ' +
+				"and fill only the ⟨slots⟩.",
 		}),
 	),
 	patch: Type.Optional(
 		Type.Any({
 			description:
-				"For `action: \"update\"` — partial fields to apply to the job.",
+				'REQUIRED for `action:"update"`. A nested JSON OBJECT (never a quoted/' +
+				"stringified object) holding only the fields to change, e.g. " +
+				'{"enabled":false} or {"schedule":{"kind":"every","everyMs":600000}}.',
 		}),
 	),
 	jobId: Type.Optional(
@@ -257,12 +286,44 @@ const CronToolParams = Type.Object({
 type CronToolDetails =
 	| { action: "status"; status: unknown }
 	| { action: "list"; result: unknown }
-	| { action: "add"; job: unknown; firesAtLocal?: string }
-	| { action: "update"; job: unknown; firesAtLocal?: string }
+	| { action: "add"; job: unknown; firesAtLocal?: string; staggerNote?: string }
+	| { action: "update"; job: unknown; firesAtLocal?: string; staggerNote?: string }
 	| { action: "remove"; removed: boolean; jobId: string }
 	| { action: "run"; jobId: string; mode: string; latestRun?: unknown }
 	| { action: "runs"; jobId: string; entries: unknown[] }
 	| { action: "wake"; mode: CronWakeMode };
+
+/**
+ * Result-side stagger surfacing for `add` / `update`. When the persisted
+ * job's schedule carries a non-zero `staggerMs`, the result includes a
+ * ready-to-say note so the model GROUNDS what it tells the operator instead
+ * of improvising. Observed in production without this: the model read
+ * `staggerMs: 300000` out of the raw job JSON and told the operator the
+ * offset is "random" (it's deterministic per job) and "can't be disabled"
+ * (it can — explicit `staggerMs: 0`). `firesAtLocal` already covers WHEN;
+ * this covers WHY and how to opt out, in language fit for a human.
+ */
+function staggerHint(job: {
+	id: string;
+	schedule: { kind: string; staggerMs?: number };
+}): { staggerNote?: string } {
+	if (job.schedule.kind !== "cron") return {};
+	const window = job.schedule.staggerMs;
+	if (typeof window !== "number" || window <= 0) return {};
+	const offsetSec = Math.round(computeJobStaggerOffsetMs(job.id, window) / 1000);
+	const mins = Math.floor(offsetSec / 60);
+	const secs = `${offsetSec % 60}`.padStart(2, "0");
+	return {
+		staggerNote:
+			`Heads-up to relay to the operator IN PLAIN LANGUAGE: this job fires ${mins}m${secs}s ` +
+			"after each scheduled slot (already included in firesAtLocal). That spread is an " +
+			"anti-pile-up default for on-the-hour schedules, it is the SAME offset every fire (not " +
+			"random), and it CAN be removed — if the operator wants the exact slot time, update the " +
+			"job's schedule with staggerMs: 0. Do not quote internal field names to the operator; " +
+			'say something like "I spread scheduled jobs by a few minutes so they don\'t pile up — ' +
+			'want it exactly on the hour?"',
+	};
+}
 
 /**
  * Build the `cron` tool. Caller is the registry — when the cron service is
@@ -300,6 +361,52 @@ export function makeCronTool(
 			"(modify), `run` (fire now), `status` (service snapshot), `wake` " +
 			"(inject system-event text into the main session). Operator-only — " +
 			"sub-agents can't touch this.\n\n" +
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+			"TEMPLATES — READ FIRST. Copy the matching template VERBATIM and fill\n" +
+			"only the ⟨slots⟩. `job` and `patch` are nested JSON OBJECTS — never a\n" +
+			"quoted/stringified object, never flat top-level fields.\n" +
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+			'T1 · One-shot, relative — "remind me in N minutes/hours":\n' +
+			'  {"action":"add","job":{"name":"⟨kebab-name⟩",\n' +
+			'    "schedule":{"kind":"in","inMinutes":⟨N⟩},\n' +
+			'    "payload":{"kind":"agentTurn","message":"⟨what to tell the operator at fire time⟩"}}}\n\n' +
+			'T2 · One-shot, clock time — "tomorrow at 9am" / "at 6:50":\n' +
+			'  {"action":"add","job":{"name":"⟨kebab-name⟩",\n' +
+			'    "schedule":{"kind":"at","at":"⟨ISO-8601 WITH offset, e.g. 2026-06-12T09:00:00+05:30⟩"},\n' +
+			'    "payload":{"kind":"agentTurn","message":"⟨…⟩"}}}\n\n' +
+			'T3 · Recurring interval — "every 30 minutes":\n' +
+			'  {"action":"add","job":{"name":"⟨kebab-name⟩",\n' +
+			'    "schedule":{"kind":"every","everyMs":⟨interval in ms⟩},\n' +
+			'    "payload":{"kind":"agentTurn","message":"⟨…⟩"}}}\n\n' +
+			'T4 · Calendar recurring — "daily at 9am" / "weekdays at 8":\n' +
+			'  {"action":"add","job":{"name":"⟨kebab-name⟩",\n' +
+			'    "schedule":{"kind":"cron","expr":"⟨0 9 * * *⟩","tz":"⟨Asia/Kolkata⟩","staggerMs":0},\n' +
+			'    "payload":{"kind":"agentTurn","message":"⟨…⟩"}}}\n' +
+			"  `\"staggerMs\":0` matters: top-of-hour expressions otherwise get an\n" +
+			"  automatic anti-stampede offset of up to 5 min (deterministic per job),\n" +
+			"  so a \"7 PM\" reminder would land at e.g. 7:04 EVERY day. When the\n" +
+			"  operator names an exact clock time, ALWAYS set `staggerMs: 0`; to fix\n" +
+			'  an existing late-firing job: {"action":"update","jobId":"⟨id⟩",\n' +
+			'  "patch":{"schedule":{"kind":"cron","expr":"⟨same⟩","tz":"⟨same⟩","staggerMs":0}}}\n\n' +
+			'T5 · Update / pause / resume an existing job:\n' +
+			'  {"action":"update","jobId":"⟨id from list/add⟩","patch":{"enabled":⟨true|false⟩}}\n\n' +
+			"DELIVERY SLOT — WHERE must the reminder arrive? Decide BEFORE adding:\n" +
+			"  • Same channel chat you're in (WhatsApp/Slack…)? Add NOTHING —\n" +
+			"    the reply auto-routes back to this chat.\n" +
+			"  • A channel you are NOT currently in (e.g. operator is in the TUI\n" +
+			'    and says "remind me ON WHATSAPP")? You MUST add\n' +
+			'    "delivery":{"mode":"announce","channel":"⟨id⟩","to":"⟨recipient-id⟩"}\n' +
+			"    — the cron service sends your run's reply text verbatim to that\n" +
+			"    chat when the run finishes. Write `message` as instructions to\n" +
+			"    produce the reminder text (the reply IS what gets delivered).\n" +
+			"  • NEVER instruct the scheduled run to call send_message itself —\n" +
+			"    unattended cron runs are BLOCKED from messaging tools by the\n" +
+			"    security gate; the delivery block is the sanctioned path.\n" +
+			"  • TUI-only nudge (no channel involved)? `systemEvent` + main — the\n" +
+			"    fire wakes your main session and you act on the text there.\n\n" +
+			"THE TWO MISTAKES THAT BREAK THE CALL:\n" +
+			'  ✗ "job": "{\\"name\\": …}"        — object wrapped in a STRING. Pass the object raw.\n' +
+			'  ✗ {"action":"add","name":…,…}   — job fields flattened to the top level.\n\n' +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"SCHEDULE KIND — pick by user intent:\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
@@ -348,8 +455,12 @@ export function makeCronTool(
 			"USE THIS for:\n" +
 			"  • \"daily at 9am\" / \"every Monday at 8am\" / \"first of the month\"\n" +
 			"  • Anything where the user names a specific clock time or weekday\n" +
-			"Shape: `{kind: \"cron\", expr: \"<5-field cron>\", tz: \"<IANA tz>\"}`\n" +
-			"5-field syntax: `minute hour day-of-month month day-of-week` (`* * * * *`).\n\n" +
+			"Shape: `{kind: \"cron\", expr: \"<5-field cron>\", tz: \"<IANA tz>\", staggerMs?: <ms>}`\n" +
+			"5-field syntax: `minute hour day-of-month month day-of-week` (`* * * * *`).\n" +
+			"STAGGER: minute-field `0` expressions default to `staggerMs: 300000` —\n" +
+			"an anti-stampede offset (up to 5 min, deterministic per job) added to\n" +
+			"every fire. Operator named an exact clock time? Set `staggerMs: 0` so\n" +
+			"it fires on the dot. Explicit values always win over the default.\n\n" +
 			"TIMEZONE RULE — CRITICAL:\n" +
 			"  - ALWAYS set `tz` to a full IANA zone name (e.g. `\"Asia/Kolkata\"` for IST,\n" +
 			"    `\"America/Los_Angeles\"` for PT, `\"Europe/London\"` for UK).\n" +
@@ -385,9 +496,12 @@ export function makeCronTool(
 			"  - `agentTurn`   — `{kind: \"agentTurn\", message: \"...\"}` (run a full\n" +
 			"    agent turn at fire time; default sessionTarget=\"isolated\"). Optional\n" +
 			"    `model`, `thinking`, `timeoutSeconds`, `toolsAllow`, `lightContext`.\n" +
-			"  - `systemEvent` — `{kind: \"systemEvent\", text: \"...\"}` (inject text\n" +
-			"    into the operator's main session at fire time; pairs with\n" +
-			"    sessionTarget=\"main\").\n\n" +
+			"  - `systemEvent` — `{kind: \"systemEvent\", text: \"...\"}` (wake the\n" +
+			"    operator's main session at fire time: the text arrives as a system\n" +
+			"    event and a turn starts so YOU act on it with full main-session\n" +
+			"    context. For \"nudge me / kick off work at time T\" — NOT for\n" +
+			"    delivering a message to a channel (that's `agentTurn` + `delivery`).\n" +
+			"    Pairs with sessionTarget=\"main\").\n\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"DELIVERY (`delivery`) — where the reply lands (agentTurn only):\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
@@ -419,8 +533,9 @@ export function makeCronTool(
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"  - `\"main\"`            — Run in the operator's primary session.\n" +
 			"                          REQUIRES `payload.kind: \"systemEvent\"`.\n" +
-			"                          Main-session crons enqueue system events\n" +
-			"                          for the next heartbeat to consume.\n" +
+			"                          The fire WAKES the main session: the event\n" +
+			"                          text starts a turn there (immediately with\n" +
+			"                          wakeMode \"now\", else within ≤30s).\n" +
 			"  - `\"isolated\"`        — Run in a fresh ephemeral session per fire.\n" +
 			"                          REQUIRES `payload.kind: \"agentTurn\"`.\n" +
 			"                          Isolated/current crons create background\n" +
@@ -470,26 +585,10 @@ export function makeCronTool(
 			"  - `sessionTarget: \"isolated\"` / `\"current\"` / `\"session:<id>\"` MUST\n" +
 			"    pair with `payload.kind: \"agentTurn\"`\n\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-			"WORKED EXAMPLES:\n" +
+			"WHEN A CALL FAILS:\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-			"User: \"remind me to drink water in 2 minutes\"\n" +
-			"  → {action: \"add\", job: {\n" +
-			"      name: \"water-reminder\",\n" +
-			"      schedule: {kind: \"in\", inMinutes: 2},\n" +
-			"      payload: {kind: \"agentTurn\", message: \"Remind the operator: drink water.\"}\n" +
-			"    }}\n\n" +
-			"User: \"ping me every 30 minutes to stretch\"\n" +
-			"  → {action: \"add\", job: {\n" +
-			"      name: \"stretch-ping\",\n" +
-			"      schedule: {kind: \"every\", everyMs: 1800000},\n" +
-			"      payload: {kind: \"agentTurn\", message: \"Remind the operator: take a stretch break.\"}\n" +
-			"    }}\n\n" +
-			"User: \"every weekday at 8am send a morning checklist\" (operator in IST)\n" +
-			"  → {action: \"add\", job: {\n" +
-			"      name: \"morning-checklist\",\n" +
-			"      schedule: {kind: \"cron\", expr: \"0 8 * * 1-5\", tz: \"Asia/Kolkata\"},\n" +
-			"      payload: {kind: \"agentTurn\", message: \"Render today's morning checklist.\"}\n" +
-			"    }}",
+			"  Do NOT retry the same arguments. Re-read the TEMPLATES section at\n" +
+			"  the top, pick the matching template, and rebuild the call from it.",
 		parameters: CronToolParams,
 		// NOTE: no blanket `ownerOnly: true`. The cron surface is gated per-
 		// action below so an approved channel peer (e.g. a WhatsApp DM the
@@ -696,6 +795,12 @@ export function makeCronTool(
 					// include only `name` or `enabled` would be silently hijacked
 					// into a bogus job.
 					const recParams = params as Record<string, unknown>;
+					// Stringified-object recovery: some model/provider stacks
+					// JSON-encode nested tool args (the job arrives as the STRING
+					// '{"name": …}'). The schema can't catch it (`job` is Any) and
+					// the old "`job` parameter required" reply misled the model
+					// into retrying the identical call. Parse it instead.
+					recParams.job = coerceJsonObjectParam(recParams.job);
 					const existingJob = recParams.job;
 					const jobIsEmptyObject =
 						typeof existingJob === "object" &&
@@ -724,7 +829,9 @@ export function makeCronTool(
 					const jobInput = recParams.job;
 					if (!jobInput || typeof jobInput !== "object") {
 						return failedTextResult(
-							"`job` parameter required for cron add",
+							"cron add needs `job` as an inline OBJECT (not a JSON string, not flat top-level fields). " +
+								'Example: {"action":"add","job":{"name":"gym-reminder","schedule":{"kind":"in","inMinutes":5},' +
+								'"payload":{"kind":"agentTurn","message":"…"}}}',
 							{ action, job: null } as never,
 						);
 					}
@@ -825,7 +932,12 @@ export function makeCronTool(
 							? { sessionContext: { sessionKey: agentSessionKey } }
 							: undefined,
 					);
-					return payloadTextResult({ action, job: created, firesAtLocal: describeFireTime(created.state.nextRunAtMs) });
+					return payloadTextResult({
+						action,
+						job: created,
+						firesAtLocal: describeFireTime(created.state.nextRunAtMs),
+						...staggerHint(created),
+					});
 				}
 				case "update": {
 					const jobId = readStringParam(params, "jobId", { required: true });
@@ -835,6 +947,8 @@ export function makeCronTool(
 					// patch), so any recoverable key found at top level is a
 					// valid synthetic patch.
 					const recParams = params as Record<string, unknown>;
+					// Stringified-object recovery — same provider quirk as `add`.
+					recParams.patch = coerceJsonObjectParam(recParams.patch);
 					const existingPatch = recParams.patch;
 					const patchIsEmptyObject =
 						typeof existingPatch === "object" &&
@@ -857,12 +971,18 @@ export function makeCronTool(
 					const patch = recParams.patch;
 					if (!patch || typeof patch !== "object") {
 						return failedTextResult(
-							"`patch` parameter required for cron update",
+							"cron update needs `patch` as an inline OBJECT (not a JSON string, not flat top-level fields). " +
+								'Example: {"action":"update","jobId":"…","patch":{"enabled":false}}',
 							{ action, job: null } as never,
 						);
 					}
 					const updated = await cronUpdate(state, jobId, patch as CronJobPatch);
-					return payloadTextResult({ action, job: updated, firesAtLocal: describeFireTime(updated.state.nextRunAtMs) });
+					return payloadTextResult({
+						action,
+						job: updated,
+						firesAtLocal: describeFireTime(updated.state.nextRunAtMs),
+						...staggerHint(updated),
+					});
 				}
 				case "remove": {
 					const jobId = readStringParam(params, "jobId", { required: true });

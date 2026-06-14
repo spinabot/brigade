@@ -222,9 +222,16 @@ export async function processHeartbeatWakeIntent(
 		if (inspect.length === 0) {
 			return skipped("session-busy");
 		}
-		// If events are queued the live turn will drain them anyway; still
-		// skip to avoid duplicate consumption.
-		return skipped("session-busy");
+		// Events are queued but a turn is already streaming. That turn will
+		// NOT pick them up — it drained its inbox prefix at ITS OWN start;
+		// events arriving mid-stream wait for a turn boundary. Returning the
+		// retryable reason makes the wake layer re-fire us on its 1s cooldown
+		// until the live turn ends, at which point the synthetic turn drains
+		// these events. The previous `session-busy` here silently DROPPED the
+		// wake (only `requests-in-flight` retries), so a cron reminder that
+		// fired while the operator's turn was streaming slept until the
+		// operator's next message.
+		return skipped("requests-in-flight");
 	}
 
 	// Audit 11 — lazy inbox consumption. We INSPECT (non-destructive peek

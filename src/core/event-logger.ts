@@ -20,7 +20,62 @@ import * as path from "node:path";
 
 import type { AgentSession, AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
+import type { BrigadeStore } from "../storage/store.js";
 import { BRIGADE_DIR } from "./config.js";
+
+/* ───────────────────── convex-mode batched sink ───────────────────── */
+// Pi fires 4-8 events per tool call — one mutation per event would be far
+// too chatty. Rows buffer here and drain in order; flush every 500 ms or
+// 100 rows, whichever first. Log rows are observability (loss-tolerant on
+// hard kill); the gateway shutdown drains the chain.
+
+const eventRowBuffer: Array<Record<string, unknown>> = [];
+let eventFlushChain: Promise<void> = Promise.resolve();
+let eventFlushTimer: ReturnType<typeof setTimeout> | undefined;
+const EVENT_FLUSH_MS = 500;
+const EVENT_FLUSH_MAX = 100;
+
+function enqueueSessionEventRow(store: BrigadeStore, row: Record<string, unknown>): void {
+	eventRowBuffer.push(row);
+	if (eventRowBuffer.length >= EVENT_FLUSH_MAX) {
+		void flushSessionEventRows(store);
+		return;
+	}
+	if (!eventFlushTimer) {
+		eventFlushTimer = setTimeout(() => {
+			eventFlushTimer = undefined;
+			void flushSessionEventRows(store);
+		}, EVENT_FLUSH_MS);
+		eventFlushTimer.unref?.();
+	}
+}
+
+function flushSessionEventRows(store: BrigadeStore): Promise<void> {
+	if (eventFlushTimer) {
+		clearTimeout(eventFlushTimer);
+		eventFlushTimer = undefined;
+	}
+	const rows = eventRowBuffer.splice(0, eventRowBuffer.length);
+	if (rows.length === 0) return eventFlushChain;
+	eventFlushChain = eventFlushChain
+		.then(async () => {
+			for (const row of rows) {
+				await store.logs.appendSessionEvent(row as never);
+			}
+		})
+		.catch(() => {
+			/* observability rows — drop on backend failure, never crash a turn */
+		});
+	return eventFlushChain;
+}
+
+/** Drained by the gateway on shutdown. */
+export async function awaitEventLogFlush(): Promise<void> {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") await flushSessionEventRows(rctx.store);
+	await eventFlushChain;
+}
 
 /** Directory we append to. Created lazily on first write. */
 const LOGS_DIR = path.join(BRIGADE_DIR, "logs");
@@ -73,11 +128,21 @@ export function attachEventLogger(session: AgentSession): () => void {
 	};
 
 	const writeEvent = (event: AgentSessionEvent): void => {
-		if (!ensureDir()) return;
 		// Build the row. Strip massive fields (full message contents repeated on
 		// every delta) — we want the log to be greppable, not a token-by-token
 		// replay. Tool calls, errors, retries, state changes are kept full.
 		const row = serializeForLog(event);
+
+		// Convex mode — batched write-behind to the sessionEvents table. This
+		// is the hottest log path in Brigade (4-8 events per tool call), so
+		// rows buffer and flush in batches; the chat never blocks on it.
+		const rctx = tryGetRuntimeContext();
+		if (rctx?.mode === "convex") {
+			enqueueSessionEventRow(rctx.store, row as Record<string, unknown>);
+			return;
+		}
+
+		if (!ensureDir()) return;
 		const filePath = todayFile();
 		// Periodically check file size and rotate before write to keep log
 		// files bounded. Cheap stat every N writes — checking on every write
@@ -204,6 +269,98 @@ function serializeForLog(event: AgentSessionEvent): Record<string, unknown> {
 /** Path of today's log file — useful for `/log` slash command later. */
 export function getTodayLogPath(): string {
 	return todayFile();
+}
+
+// ============================================================================
+// Public append + tail helpers (added in Phase 2 PR4 so the BrigadeStore
+// `LogStore` adapter can wrap event-logging through a typed seam instead of
+// only writing via `attachEventLogger`). The on-disk format is unchanged —
+// these helpers just expose the same JSONL pattern the existing subscribe
+// path uses.
+// ============================================================================
+
+/** Resolve which log file a day-anchored read should target. */
+function logPathFor(day: string | undefined): string {
+	if (!day) return todayFile();
+	// Defensive: only allow YYYY-MM-DD (8 digits with dashes). Anything else
+	// falls back to today so a malformed `day` arg can't escape the logs dir.
+	if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return todayFile();
+	return path.join(LOGS_DIR, `${day}.jsonl`);
+}
+
+/**
+ * Append a single event record to today's log JSONL. Same write path used
+ * by `attachEventLogger` (best-effort, swallowed on FS errors, rotated
+ * when the daily file exceeds the size cap).
+ *
+ * The record SHOULD carry at minimum `ts` (ISO 8601) + `type` (string), but
+ * we don't enforce — log readers tolerate missing fields and skip malformed
+ * lines individually.
+ */
+export function appendSessionEvent(record: Record<string, unknown>): void {
+	try {
+		if (!existsSync(LOGS_DIR)) mkdirSync(LOGS_DIR, { recursive: true });
+	} catch {
+		return; // dir unwritable — drop the line
+	}
+	const filePath = todayFile();
+	rotateIfTooLarge(filePath);
+	try {
+		appendFileSync(filePath, JSON.stringify(record) + "\n", "utf8");
+	} catch {
+		/* drop the line — never crash on a log write */
+	}
+}
+
+/**
+ * Tail-read JSONL records from a day's log file.
+ *
+ *   opts.day      — YYYY-MM-DD; default today
+ *   opts.maxBytes — only the LAST N bytes of the file are parsed (default 64 KiB)
+ *
+ * Returns the parsed records in file order (oldest-first within the tail
+ * slice). Malformed lines are skipped silently — one bad line never breaks
+ * the read.
+ */
+export function readSessionEventTail(opts: {
+	day?: string;
+	maxBytes?: number;
+} = {}): Record<string, unknown>[] {
+	const filePath = logPathFor(opts.day);
+	let stat;
+	try {
+		stat = statSync(filePath);
+	} catch {
+		return [];
+	}
+	const lookback = Math.max(1, opts.maxBytes ?? 64 * 1024);
+	const start = Math.max(0, stat.size - lookback);
+	let chunk: Buffer;
+	try {
+		const fs = require("node:fs") as typeof import("node:fs");
+		const fd = fs.openSync(filePath, "r");
+		try {
+			const len = stat.size - start;
+			chunk = Buffer.alloc(len);
+			fs.readSync(fd, chunk, 0, len, start);
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return [];
+	}
+	const out: Record<string, unknown>[] = [];
+	for (const raw of chunk.toString("utf8").split("\n")) {
+		const line = raw.trim();
+		if (!line) continue;
+		try {
+			out.push(JSON.parse(line) as Record<string, unknown>);
+		} catch {
+			// Malformed line — could be a truncated mid-write from a crash.
+			// Skip rather than poisoning the whole tail read.
+		}
+	}
+	return out;
 }
 
 /**

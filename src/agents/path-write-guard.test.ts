@@ -41,11 +41,73 @@ async function runGuard(toolName: string, args: Record<string, unknown>): Promis
 	return await guard(makeCtx(toolName, args));
 }
 
+/** Guard bound to a specific session cwd (the way the gateway wires it). */
+async function runGuardCwd(
+	cwd: string,
+	toolName: string,
+	args: Record<string, unknown>,
+): Promise<BeforeToolCallResult | undefined> {
+	const guard = makePathWriteGuard({ cwd });
+	return await guard(makeCtx(toolName, args));
+}
+
+describe("path-write guard — tilde + relative resolution (audit P0)", () => {
+	// The guard must resolve `~` and relative paths the SAME way Pi's tools do
+	// (tilde-expand, resolve against the SESSION cwd). 2026-06-11: the guard
+	// used bare path.resolve (gateway cwd, no tilde) so edit({path:
+	// "~/.brigade/brigade.json"}) and a workspace-relative "../brigade.json"
+	// hit the real config while the guard saw a non-matching path.
+	it("blocks edit with a `~`-relative path to brigade.json", async () => {
+		// expandTilde resolves ~ to os.homedir(); point STATE_DIR there so the
+		// tilde target lands on a real protected root.
+		const home = os.homedir();
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = path.join(home, ".brigade");
+		try {
+			const res = await runGuardCwd(
+				path.join(home, ".brigade", "agents", "main", "workspace"),
+				"edit",
+				{ path: "~/.brigade/brigade.json", old_string: "a", new_string: "b" },
+			);
+			assert.ok(res?.block, "tilde path to config must be blocked");
+		} finally {
+			process.env.BRIGADE_STATE_DIR = prev;
+		}
+	});
+
+	it("blocks a workspace-relative ../brigade.json escape", async () => {
+		// Session cwd = <state>/workspace; "../brigade.json" climbs to the config.
+		const sessionCwd = path.join(tmpRoot, "workspace");
+		const res = await runGuardCwd(sessionCwd, "edit", {
+			path: "../brigade.json",
+			old_string: "a",
+			new_string: "b",
+		});
+		assert.ok(res?.block, "relative escape to config must be blocked");
+		assert.match(res?.reason ?? "", /brigade-config/);
+	});
+
+	it("still ALLOWS a workspace-relative write that stays in the workspace", async () => {
+		const sessionCwd = path.join(tmpRoot, "agents", "main", "workspace");
+		const res = await runGuardCwd(sessionCwd, "write", {
+			path: "memory/note.md",
+			content: "x",
+		});
+		assert.equal(res, undefined, "in-workspace relative write must pass");
+	});
+});
+
 describe("path-write guard — protected roots", () => {
-	it("builds the three canonical protected roots from runtime paths", () => {
+	it("builds the canonical protected roots from runtime paths", () => {
 		const roots = buildProtectedRoots();
-		const ids = roots.map((r) => r.id).sort();
-		assert.deepEqual(ids, ["agent-internals", "brigade-config", "install-skills"]);
+		const ids = [...new Set(roots.map((r) => r.id))].sort();
+		assert.deepEqual(ids, [
+			"agent-internals",
+			"brigade-config",
+			"brigade-state",
+			"encryption-key",
+			"install-skills",
+		]);
 	});
 
 	it("refuses write to brigade.json", async () => {
@@ -56,12 +118,35 @@ describe("path-write guard — protected roots", () => {
 		assert.match(result?.reason ?? "", /manage_agent/);
 	});
 
-	it("refuses edit to brigade.json", async () => {
+	it("refuses edit to brigade.json — Pi's REAL `path` arg (production bypass regression)", async () => {
+		// 2026-06-11: the extractor read only `file_path`, Pi's edit schema
+		// sends `path` → every edit was silently allowed and the model edited
+		// the live config twice. This test pins the actual wire shape.
+		const target = path.join(tmpRoot, "brigade.json");
+		const result = await runGuard("edit", { path: target, old_string: "a", new_string: "b" });
+		assert.ok(result?.block, "edit with `path` must be blocked");
+		assert.match(result?.reason ?? "", /brigade-config/);
+	});
+
+	it("refuses edit to brigade.json — legacy `file_path` spelling still covered", async () => {
 		const target = path.join(tmpRoot, "brigade.json");
 		const result = await runGuard("edit", { file_path: target, old_string: "a", new_string: "b" });
 		assert.ok(result?.block);
 		assert.match(result?.reason ?? "", /brigade-config/);
 	});
+
+	for (const name of ["cron.json", "models.json", "exec-approvals.json", "mode.sentinel"]) {
+		it(`refuses write/edit to state file ${name}`, async () => {
+			const viaWrite = await runGuard("write", { path: path.join(tmpRoot, name), content: "x" });
+			assert.ok(viaWrite?.block, `${name} write must block`);
+			const viaEdit = await runGuard("edit", {
+				path: path.join(tmpRoot, name),
+				old_string: "a",
+				new_string: "b",
+			});
+			assert.ok(viaEdit?.block, `${name} edit must block`);
+		});
+	}
 
 	it("refuses write into install-dir skills/", async () => {
 		const target = path.join(tmpRoot, "install", "skills", "mathematician", "SKILL.md");

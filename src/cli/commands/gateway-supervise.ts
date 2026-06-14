@@ -28,8 +28,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import {
 	GATEWAY_HEARTBEAT_STALE_MS,
 	isProcessAlive,
-	readHeartbeatFile,
-	readPidFile,
+	readHeartbeat,
+	readPid,
 } from "../../core/gateway-probe.js";
 import { ensureGatewayRunning } from "../../core/gateway-spawn.js";
 
@@ -57,11 +57,13 @@ export interface SuperviseOptions {
  * no kill. Callers (loop mode, once mode, tests) decide what to DO
  * with the verdict.
  */
-export function checkGatewayHealth(opts: SuperviseOptions = {}): SuperviseDecision {
+export async function checkGatewayHealth(opts: SuperviseOptions = {}): Promise<SuperviseDecision> {
 	const now = (opts.nowMs ?? Date.now)();
 	const maxStale = opts.maxStaleMs ?? GATEWAY_HEARTBEAT_STALE_MS;
-	const pid = readPidFile(opts.pidPath);
-	const heartbeat = readHeartbeatFile(opts.heartbeatPath);
+	// Mode-aware: convex consults the gatewayCoord row; filesystem (or an
+	// explicit pathOverride from tests) reads the files.
+	const pid = await readPid(opts.pidPath);
+	const heartbeat = await readHeartbeat(opts.heartbeatPath);
 
 	if (pid === undefined) {
 		// No PID file means the gateway is not running OR shut down cleanly.
@@ -184,7 +186,7 @@ export async function runGatewaySupervise(opts: SuperviseRunOptions = {}): Promi
 	};
 
 	const cycle = async (): Promise<{ exitCode: number; acted: boolean }> => {
-		const decision = checkGatewayHealth(opts);
+		const decision = await checkGatewayHealth(opts);
 		if (decision.kind === "healthy") {
 			emit(`gateway healthy (pid ${decision.pid}, heartbeat age ${decision.ageMs}ms)`, "healthy", {
 				pid: decision.pid,

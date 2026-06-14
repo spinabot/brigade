@@ -13,10 +13,29 @@
  */
 
 import { strict as assert } from "node:assert";
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+// File-wide state-dir isolation. The per-test tempDir below covers the cron
+// STORE path, but the run-LOG writer resolves its own path via
+// resolveStateDir() — without this pin every dispatch in these tests appends
+// run JSONLs into the DEVELOPER'S real ~/.brigade/cron/runs/. Caught
+// 2026-06-12: a full suite run leaked 33 run files into a freshly-reset
+// operator state dir.
+let __stateDirTmp: string;
+let __prevStateDir: string | undefined;
+beforeEach(() => {
+	__stateDirTmp = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-cron-statedir-"));
+	__prevStateDir = process.env.BRIGADE_STATE_DIR;
+	process.env.BRIGADE_STATE_DIR = __stateDirTmp;
+});
+afterEach(() => {
+	if (__prevStateDir === undefined) delete process.env.BRIGADE_STATE_DIR;
+	else process.env.BRIGADE_STATE_DIR = __prevStateDir;
+	fs.rmSync(__stateDirTmp, { recursive: true, force: true });
+});
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import {

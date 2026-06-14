@@ -162,3 +162,26 @@ describe("orgGraphAsA2APolicy: derived A2A", () => {
     assert.equal(p.enabled, true);
   });
 });
+
+describe("deriveOrgDisplayGraph: explicit mode no longer blanks DISPLAY surfaces", () => {
+  // Production 2026-06-11: setting org.a2a.mode "explicit" (an A2A POLICY
+  // choice) made the connect banner / org.snapshot / org show report a
+  // full 4-tier hierarchy as "your crew is flat" — the model then rebuilt
+  // org data that was never missing. Display derivation now ignores the
+  // mode; policy derivation (deriveOrgGraph) keeps returning undefined.
+  it("policy variant stays undefined under explicit; display variant returns the graph", async () => {
+    const { deriveOrgDisplayGraph } = await import("./derive-graph.js");
+    const cfg: BrigadeConfig = {
+      agents: {
+        main: { org: { department: "exec", reportsTo: null } },
+        eng1: { org: { department: "eng", reportsTo: "main" } },
+      },
+      org: { topOrder: "main", a2a: { mode: "explicit" } },
+    };
+    assert.equal(deriveOrgGraph(cfg), undefined, "policy consumers fall back to the allow matrix");
+    const display = deriveOrgDisplayGraph(cfg);
+    assert.ok(display, "display consumers still see the hierarchy");
+    assert.equal(display.topOrder, "main");
+    assert.ok(display.members.eng1, "members present for rendering");
+  });
+});

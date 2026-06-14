@@ -141,6 +141,15 @@ export interface InboundMessage {
 	/** Media attachments saved to disk, when the inbound carried any. */
 	media?: InboundMediaAttachment[];
 	/**
+	 * DEFERRED media download — adapters that can detect attachments cheaply
+	 * pass this thunk INSTEAD of eagerly-downloaded `media`. The inbound
+	 * pipeline invokes it only AFTER the access-control gate admits the
+	 * sender, so a blocked stranger's group video is never fetched, sealed,
+	 * or archived. Adapters without a deferral path keep populating `media`
+	 * directly — both shapes are honoured.
+	 */
+	resolveMedia?: () => Promise<InboundMediaAttachment[]>;
+	/**
 	 * Discord guild id this message originated in. Populated by Discord
 	 * adapters; left undefined by every other channel. The 8-tier route
 	 * resolver uses `guildId` (with optional `memberRoleIds`) to pick the

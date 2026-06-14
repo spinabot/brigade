@@ -12,12 +12,11 @@
  * skipped — only Primitive #1's run loop needs that). Duplicating the small
  * surface here keeps the agent-loop module untouched per the lift-scope rule.
  */
-import * as fs from "node:fs";
-
 import { AuthStorage } from "@mariozechner/pi-coding-agent";
 
-import { DEFAULT_AGENT_ID, resolveAuthProfilesPath } from "../config/paths.js";
+import { DEFAULT_AGENT_ID } from "../config/paths.js";
 import { PROVIDERS } from "../providers/catalog.js";
+import { readProfiles } from "../auth/profiles.js";
 
 // Minimal shape we read from auth-profiles.json. Mirrors `AuthProfile` in
 // `src/auth/profiles.ts` but only the fields the credential-map build needs.
@@ -65,22 +64,23 @@ export function loadBrigadeAuthStorage(agentId: string = DEFAULT_AGENT_ID): unkn
 
 function readBrigadeCredentials(agentId: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  const profilesPath = resolveAuthProfilesPath(agentId);
-  if (fs.existsSync(profilesPath)) {
-    let parsed: ReadProfilesFile;
-    try {
-      parsed = JSON.parse(fs.readFileSync(profilesPath, "utf8")) as ReadProfilesFile;
-      for (const profile of Object.values(parsed.profiles ?? {})) {
-        if (!profile?.provider || profile.type !== "api_key") continue;
-        const resolvedKey = resolveProfileKey(profile);
-        if (!resolvedKey) continue;
-        // First-wins per provider — matches Primitive #1's no-cooldown path.
-        if (out[profile.provider] === undefined) {
-          out[profile.provider] = { type: "api_key", key: resolvedKey };
-        }
-      }
-    } catch {
-      // Fall through to env-backed bootstrap.
+  // Route through the mode-aware `readProfiles` choke point: filesystem mode
+  // reads auth-profiles.json, convex mode reads the in-process cache primed
+  // at boot from the sealed authProfiles table. Either way the bridge sees
+  // the same profiles the agent kernel does.
+  let parsed: ReadProfilesFile = {};
+  try {
+    parsed = readProfiles(agentId) as unknown as ReadProfilesFile;
+  } catch {
+    // Fall through to env-backed bootstrap.
+  }
+  for (const profile of Object.values(parsed.profiles ?? {})) {
+    if (!profile?.provider || profile.type !== "api_key") continue;
+    const resolvedKey = resolveProfileKey(profile);
+    if (!resolvedKey) continue;
+    // First-wins per provider — matches Primitive #1's no-cooldown path.
+    if (out[profile.provider] === undefined) {
+      out[profile.provider] = { type: "api_key", key: resolvedKey };
     }
   }
   // Env-backed bootstrap. If a user has ANTHROPIC_API_KEY (etc) exported

@@ -61,7 +61,7 @@ import {
   mutateConfigAtomic,
   type BrigadeConfig,
 } from "../../config/io.js";
-import { deriveOrgGraph } from "../org/derive-graph.js";
+import { deriveOrgDisplayGraph, deriveOrgGraph } from "../org/derive-graph.js";
 import {
   encodeDeliveryKindContextKey,
   isDeliveryKind,
@@ -223,6 +223,10 @@ export interface OrgDescribeResult {
   otherDepartments: string[];
   reachable: OrgDescribeReachableEntry[];
   notAMember?: true;
+  /** Present under a2a mode "explicit": `reachable` describes org STRUCTURE
+   *  only — runtime permissions come from the flat session.agentToAgent.allow
+   *  matrix, so a structurally-reachable peer may still be denied. */
+  note?: string;
 }
 
 export interface OrgShowResult {
@@ -424,7 +428,7 @@ function executeDescribe(
   requesterAgentId: string,
 ): AgentToolResult<OrgToolResult> {
   const cfg = loadConfig();
-  const graph = deriveOrgGraph(cfg as never);
+  const graph = deriveOrgDisplayGraph(cfg as never);
   if (!graph) {
     // Defensive: registry gate prevents the tool from surfacing when
     // cfg.org is absent. If a test / internal caller reaches here, emit
@@ -463,6 +467,13 @@ function executeDescribe(
     topOrder: graph.topOrder,
     otherDepartments,
     reachable,
+    ...(graph.mode === "explicit"
+      ? {
+          note:
+            'a2a mode is "explicit" — messaging permissions come from session.agentToAgent.allow; ' +
+            "`reachable` describes org structure only, not what sessions_send will allow.",
+        }
+      : {}),
   };
   return jsonResult(result) as AgentToolResult<OrgToolResult>;
 }
@@ -568,7 +579,7 @@ async function executeShow(
   const cfg = loadConfig() as {
     org?: { departmentHeads?: Record<string, string> };
   };
-  const graph = deriveOrgGraph(cfg as never);
+  const graph = deriveOrgDisplayGraph(cfg as never);
   if (!graph) {
     return jsonResult({
       ok: false,
@@ -929,7 +940,7 @@ async function executeInit(
     return jsonResult({
       ok: false,
       error:
-        "org.init: cfg.org already present — refusing to overwrite (edit brigade.json directly or use action='set')",
+        "org.init: cfg.org already present — refusing to overwrite. Use `org` action=\"set\" to adjust an agent's org block; for top-level org changes (topOrder, a2a.mode), tell the operator the exact brigade.json edit — the model cannot hand-edit config.",
     } satisfies OrgInitResult) as AgentToolResult<OrgToolResult>;
   }
 

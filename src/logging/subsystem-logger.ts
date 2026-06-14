@@ -23,7 +23,8 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-import { ensureDir, resolveLogsDir } from "../config/paths.js";
+import { ensureDir, resolveLogsDir, resolveStateDir } from "../config/paths.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal";
 
@@ -137,7 +138,114 @@ function emit(
 // silently strand the writer.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Convex-mode batched sink. Pre-context emits (the boot window before
+// bootRuntimeContext resolves) buffer in memory; the mode is peeked from
+// the sentinel/env DIRECTLY so a convex-mode boot never writes the log
+// file even before the context exists. Filesystem mode stays byte-
+// identical (immediate sync appendFileSync — today's behaviour).
+let modePeek: "filesystem" | "convex" | undefined;
+const convexRowBuffer: Array<Record<string, unknown>> = [];
+let convexLogFlushChain: Promise<void> = Promise.resolve();
+let convexLogFlushTimer: ReturnType<typeof setTimeout> | undefined;
+const CONVEX_LOG_FLUSH_MS = 1_000;
+const CONVEX_LOG_BUFFER_CAP = 5_000;
+
+function peekStorageMode(): "filesystem" | "convex" {
+  if (modePeek) return modePeek;
+  try {
+    const explicit = process.env.BRIGADE_MODE?.trim();
+    if (explicit === "convex" || explicit === "filesystem") {
+      modePeek = explicit;
+      return modePeek;
+    }
+    const sentinelPath = path.join(resolveStateDir(), "mode.sentinel");
+    if (fs.existsSync(sentinelPath)) {
+      const parsed = JSON.parse(fs.readFileSync(sentinelPath, "utf8")) as { mode?: string };
+      modePeek = parsed.mode === "convex" ? "convex" : "filesystem";
+      return modePeek;
+    }
+    if (process.env.BRIGADE_CONVEX_URL?.trim()) {
+      modePeek = "convex";
+      return modePeek;
+    }
+  } catch {
+    // Unreadable sentinel etc. — boot will throw a proper error; logs
+    // default to filesystem behaviour meanwhile.
+  }
+  modePeek = "filesystem";
+  return modePeek;
+}
+
+function scheduleConvexLogFlush(): void {
+  if (convexLogFlushTimer) return;
+  convexLogFlushTimer = setTimeout(() => {
+    convexLogFlushTimer = undefined;
+    void flushConvexLogRows();
+  }, CONVEX_LOG_FLUSH_MS);
+  convexLogFlushTimer.unref?.();
+}
+
+function flushConvexLogRows(): Promise<void> {
+  const ctx = tryGetRuntimeContext();
+  if (!ctx) {
+    // Store not ready yet — keep buffering (bounded); drain on next tick.
+    scheduleConvexLogFlush();
+    return convexLogFlushChain;
+  }
+  const rows = convexRowBuffer.splice(0, convexRowBuffer.length);
+  if (rows.length === 0) return convexLogFlushChain;
+  const store = ctx.store;
+  convexLogFlushChain = convexLogFlushChain
+    .then(async () => {
+      for (const row of rows) {
+        await store.logs.appendSubsystemRecord(row as never);
+      }
+    })
+    .catch(() => {
+      /* observability rows — never crash a turn for a log write */
+    });
+  return convexLogFlushChain;
+}
+
+/** Drained by the gateway on shutdown. */
+export async function awaitSubsystemLogFlush(): Promise<void> {
+  await flushConvexLogRows();
+  await convexLogFlushChain;
+}
+
+/** Test-only. */
+export function __resetSubsystemConvexSinkForTests(): void {
+  modePeek = undefined;
+  convexRowBuffer.length = 0;
+  convexLogFlushChain = Promise.resolve();
+  if (convexLogFlushTimer) {
+    clearTimeout(convexLogFlushTimer);
+    convexLogFlushTimer = undefined;
+  }
+}
+
 function writeFileLine(line: string): void {
+  if (peekStorageMode() === "convex") {
+    // Rows are structured JSON already (emit serialises before calling us).
+    // `emit` SPREADS the structured `fields` at the row's top level for the
+    // disk JSONL shape; the convex subsystemLog table instead carries them in
+    // a single `fields` column. Re-nest the non-standard keys here so the
+    // store adapter forwards them — otherwise every extra (jobId, error,
+    // counts, …) is silently dropped and the convex log is far less useful
+    // than the disk one.
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      const { time, level, subsystem, message, ...extras } = parsed;
+      const row: Record<string, unknown> = { time, level, subsystem, message };
+      if (Object.keys(extras).length > 0) row.fields = extras;
+      if (convexRowBuffer.length < CONVEX_LOG_BUFFER_CAP) convexRowBuffer.push(row);
+      scheduleConvexLogFlush();
+    } catch {
+      /* non-JSON line — drop; the stderr mirror already carried it */
+    }
+    return;
+  }
+
   if (suppressFileWrites) return;
   try {
     if (!logFilePathInitialised) {
@@ -374,4 +482,147 @@ export function __resetLoggerStateForTests(): void {
   logFilePath = null;
   logFilePathInitialised = false;
   suppressFileWrites = false;
+}
+
+// ============================================================================
+// Public append + read + prune helpers (added in Phase 2 PR4 so the
+// BrigadeStore `LogStore` adapter can read+write subsystem records through
+// a typed seam. The existing per-callsite logger API
+// (`createSubsystemLogger().info(...)`) keeps working unchanged.
+// ============================================================================
+
+/**
+ * Append a structured record directly to the daily log file. Same write
+ * path as the standard logger emit — honours the size cap, no-ops if the
+ * level filter would drop it.
+ *
+ * Record MUST contain `level` + `subsystem`; everything else is structured
+ * metadata that gets serialised verbatim.
+ */
+export function appendSubsystemRecord(record: {
+  level: LogLevel;
+  subsystem: string;
+  message: string;
+  time?: string;
+  fields?: Record<string, unknown>;
+}): void {
+  if (LEVEL_ORDER[record.level] < LEVEL_ORDER[activeLevel]) return;
+  const out = {
+    time: record.time ?? new Date().toISOString(),
+    level: record.level,
+    subsystem: sanitiseSubsystem(record.subsystem),
+    message: record.message,
+    ...(record.fields ? sanitiseFields(record.fields) : {}),
+  };
+  writeFileLine(safeStringify(out));
+  if (consoleEnabled) writeConsoleLine(record.level, record.subsystem, record.message, record.fields);
+}
+
+/**
+ * Read records from today's subsystem log file, optionally filtered by
+ * `level` / `subsystem` / `tail` byte budget. Malformed lines are skipped.
+ *
+ *   filter.level     — minimum LogLevel (records below the threshold are dropped)
+ *   filter.subsystem — exact-match string OR a prefix (when ending in "/")
+ *   filter.day       — YYYY-MM-DD; default today
+ *   filter.tailBytes — only parse the last N bytes (default 256 KiB)
+ *
+ * Returns records in file order (oldest-first within the tail slice).
+ */
+export function readSubsystemRecords(
+  filter: {
+    level?: LogLevel;
+    subsystem?: string;
+    day?: string;
+    tailBytes?: number;
+  } = {},
+): Array<{
+  time: string;
+  level: LogLevel;
+  subsystem: string;
+  message: string;
+  [field: string]: unknown;
+}> {
+  const dir = resolveLogsDir();
+  const file = filter.day && /^\d{4}-\d{2}-\d{2}$/.test(filter.day)
+    ? path.join(dir, `brigade-${filter.day}.log`)
+    : resolveLogFilePath(dir);
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    return [];
+  }
+  const tailBytes = Math.max(1, filter.tailBytes ?? 256 * 1024);
+  const start = Math.max(0, stat.size - tailBytes);
+  let chunk: Buffer;
+  try {
+    const fd = fs.openSync(file, "r");
+    try {
+      const len = stat.size - start;
+      chunk = Buffer.alloc(len);
+      fs.readSync(fd, chunk, 0, len, start);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return [];
+  }
+
+  const minRank = filter.level ? LEVEL_ORDER[filter.level] : 0;
+  const subFilter = filter.subsystem;
+  const wantPrefix = subFilter !== undefined && subFilter.endsWith("/");
+
+  const out: ReturnType<typeof readSubsystemRecords> = [];
+  for (const line of chunk.toString("utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let row: { level?: LogLevel; subsystem?: string; time?: string; message?: string; [k: string]: unknown };
+    try {
+      row = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!row.level || !row.subsystem || !row.time || row.message === undefined) continue;
+    if (filter.level && LEVEL_ORDER[row.level] < minRank) continue;
+    if (subFilter !== undefined) {
+      if (wantPrefix) {
+        if (!row.subsystem.startsWith(subFilter)) continue;
+      } else if (row.subsystem !== subFilter) continue;
+    }
+    out.push(row as ReturnType<typeof readSubsystemRecords>[number]);
+  }
+  return out;
+}
+
+/**
+ * Drop log files older than `olderThanMs`. Returns the count actually
+ * removed. The standard daily-roll prune already runs on the first emit
+ * of each process; this exposes the same logic for explicit cleanup
+ * (`brigade doctor --prune-logs`, store-level maintenance, tests).
+ */
+export function pruneSubsystemLogs(olderThanMs: number): { removed: number } {
+  const dir = resolveLogsDir();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return { removed: 0 };
+  }
+  const cutoff = Date.now() - olderThanMs;
+  let removed = 0;
+  for (const name of entries) {
+    if (!name.startsWith("brigade-") || !name.endsWith(".log")) continue;
+    const full = path.join(dir, name);
+    try {
+      const stat = fs.statSync(full);
+      if (stat.mtimeMs < cutoff) {
+        fs.rmSync(full, { force: true });
+        removed += 1;
+      }
+    } catch {
+      // Skip unreadable entries.
+    }
+  }
+  return { removed };
 }

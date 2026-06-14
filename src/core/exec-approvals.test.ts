@@ -14,10 +14,17 @@ const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-approvals-"));
 const originalHome = process.env.HOME;
 const originalUserProfile = process.env.USERPROFILE;
 const originalBrigadeHome = process.env.BRIGADE_HOME;
+const originalBrigadeStateDir = process.env.BRIGADE_STATE_DIR;
 
 process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome; // Windows-equivalent
 delete process.env.BRIGADE_HOME;
+// The hermetic suite runner (scripts/run-tests.mjs) pins BRIGADE_STATE_DIR
+// globally, which OUTRANKS the home redirect above in resolveStateDir().
+// This file's legacy-migration test plants files under tmpHome/.brigade, so
+// pin the state dir to the SAME location — the test stays faithful to its
+// original intent regardless of ambient env.
+process.env.BRIGADE_STATE_DIR = path.join(tmpHome, ".brigade");
 
 // Static import works now that HOME is set.
 const mod = await import("./exec-approvals.js");
@@ -30,6 +37,8 @@ before(() => {
 		else delete process.env.USERPROFILE;
 		if (originalBrigadeHome !== undefined) process.env.BRIGADE_HOME = originalBrigadeHome;
 		else delete process.env.BRIGADE_HOME;
+		if (originalBrigadeStateDir !== undefined) process.env.BRIGADE_STATE_DIR = originalBrigadeStateDir;
+		else delete process.env.BRIGADE_STATE_DIR;
 		try {
 			fs.rmSync(tmpHome, { recursive: true, force: true });
 		} catch {

@@ -62,6 +62,7 @@ import type { BeforeToolCallContext, BeforeToolCallResult } from "@mariozechner/
 
 import { BrigadeApprovalFileVersionError, decideApproval } from "../core/exec-approvals.js";
 import { emitAgentEvent } from "./agent-event-bus.js";
+import { isExecAllowAll, setExecAllowAll } from "./exec-session-allow.js";
 import {
 	applyApprovalDecision,
 	type ApprovalDecisionKind,
@@ -287,6 +288,17 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 			return { block: true, reason };
 		}
 
+		// Session allow-all (operator-armed via `/allow-all on`). Only a
+		// "prompt" decision can reach here — "allow" returned at the allowlist
+		// check above, "deny" returned in the hard-deny block, and the
+		// non-string / workdir / env refusals returned earlier. The
+		// config-write + path-write guards also ran BEFORE this gate in
+		// composeBrigadeBeforeToolCall. So allow-all ONLY ever waives the
+		// interactive prompt — it can never bypass a protective block. It's
+		// in-memory + per-session (clears on restart) and does NOT cascade to
+		// sub-agents (their gate checks distinct child session keys).
+		if (isExecAllowAll(ctxRef.value.sessionKey)) return undefined;
+
 		// "prompt" — operator hasn't allowlisted this command yet. If a
 		// gateway client is online (the WS bridge is registered), surface
 		// an inline approval prompt and route the operator's choice
@@ -300,6 +312,7 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 				"allow-once",
 				"allow-always",
 				"allow-pattern",
+				"allow-session",
 				"deny",
 			];
 			try {
@@ -329,6 +342,15 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 						`Tell the user what you wanted to run and ask again when they're back.`;
 					emitBlocked(name, reason);
 					return { block: true, reason };
+				}
+				// "allow-session" — operator chose "allow all this session" from the
+				// prompt. Arm the per-session bypass (so subsequent commands skip
+				// the prompt) AND allow THIS call. Same bounded surface as
+				// `/allow-all`: only the prompt is waived; hard-deny / workdir / env
+				// refusals + the config/path-write guards still apply.
+				if (decision.kind === "allow-session") {
+					setExecAllowAll(ctxRef.value.sessionKey, true);
+					return undefined;
 				}
 				const outcome = applyApprovalDecision({ command: cmd, decision, agentId: gateAgentId });
 				if (outcome === "allow") return undefined;

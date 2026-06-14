@@ -88,12 +88,41 @@ export interface ConnectCommandOptions {
 	port?: number;
 	/** Per-request timeout (ms). Default: 60_000 */
 	requestTimeoutMs?: number;
+	/**
+	 * Bind the TUI to this agent id at startup — equivalent to opening the
+	 * TUI and immediately running `/agent <id>`, but without the manual step.
+	 * Validated against the gateway's `agents.list` before the UI engages;
+	 * an unknown id exits with the available list (an unvalidated id would
+	 * silently fall back to the boot agent server-side, so the operator
+	 * would think they were talking to X while actually talking to main).
+	 */
+	agentId?: string;
 }
 
 export interface ConnectHandle {
 	/** Aborts the in-flight turn (true) or signals "no turn was running" (false). */
 	abort(): boolean;
 	close(): Promise<void>;
+}
+
+/**
+ * Should a `state` snapshot's `sessionKey` seed the connection-bound session?
+ *
+ * Yes when unbound (normal first-snapshot seed) or when the snapshot is for
+ * the SAME agent we're bound to. No when bound to a DIFFERENT agent than the
+ * snapshot — that's the `--agent X` cross-agent-session bug: the gateway's
+ * boot snapshot (agent `main`, session `agent:main:main`) must NOT seed the
+ * session for a connection bound to `marketing-lead`, or `withBinding` emits
+ * the incoherent pair `{agentId: marketing-lead, sessionKey: agent:main:main}`
+ * and the reply gets filtered to the wrong lane. Exported for regression
+ * testing of that exact decision.
+ */
+export function snapshotSessionSeedable(
+	boundAgentId: string | undefined,
+	snapAgentId: string | undefined,
+): boolean {
+	if (boundAgentId === undefined) return true;
+	return typeof snapAgentId === "string" && snapAgentId === boundAgentId;
 }
 
 /**
@@ -184,7 +213,34 @@ export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promi
 		process.exit(1);
 	}
 
-	chatHandle = await wireConnectUi(tui, client);
+	// Startup `--agent <id>` binding. Validate against the gateway's live
+	// agent list BEFORE engaging the UI — an unknown id would otherwise fall
+	// back to the boot agent server-side (getAgentRuntime), silently routing
+	// the operator's turns to `main` while they believe they're talking to X.
+	// Mirrors the in-TUI `/agent` validation. agents.list failure is lenient
+	// (bind anyway; the in-TUI /agent can correct) so a transient RPC hiccup
+	// doesn't block launch.
+	let initialAgentId: string | undefined;
+	if (opts.agentId) {
+		try {
+			const known = (await client.request("agents.list")) as AgentSummary[];
+			if (!known.some((a) => a.id === opts.agentId)) {
+				tui.stop();
+				restoreTerminal();
+				const available = known.map((a) => a.id).join(", ") || "(none)";
+				console.error(chalk.red(`✗ Unknown agent "${opts.agentId}".`));
+				console.error(chalk.dim(`  Available: ${available}`));
+				console.error(chalk.dim(`  (run \`brigade agents list\` to see them all)`));
+				process.exit(1);
+			}
+			initialAgentId = opts.agentId;
+		} catch {
+			// Lenient: bind anyway; `/agent` inside the TUI re-validates.
+			initialAgentId = opts.agentId;
+		}
+	}
+
+	chatHandle = await wireConnectUi(tui, client, initialAgentId);
 	return chatHandle;
 }
 
@@ -193,7 +249,11 @@ export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promi
  * tests can inject a pre-connected client without going through CLI flag
  * parsing or process.exit.
  */
-export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<ConnectHandle> {
+export async function wireConnectUi(
+	tui: TUI,
+	client: BrigadeClient,
+	initialAgentId?: string,
+): Promise<ConnectHandle> {
 	// Static (last-frame) wordmark — `brigade connect` is the chat surface
 	// just like `brigade chat`, so we want the same still rendering here. The
 	// looping clip is reserved for onboarding's one-time wow moment.
@@ -213,7 +273,11 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// working unchanged. The `/agent <id>` slash command rebinds the connection
 	// so subsequent prompt / abort / steer / set-model / set-thinking RPCs all
 	// target that agent without the operator having to repeat it every turn.
-	let boundAgentId: string | undefined = undefined;
+	// Seeded from `--agent <id>` when supplied (already validated against
+	// agents.list in runConnectCommand); otherwise filled from the first
+	// `state` snapshot. A pre-set value is preserved by the snapshot handler's
+	// `=== undefined` guard, so the startup binding sticks.
+	let boundAgentId: string | undefined = initialAgentId;
 	// Wave K — connection-bound session key. Lets the operator point this
 	// TUI at a per-peer session (e.g. a channel-routed turn under
 	// `agent:main:whatsapp:<jid>`) so abort / steer / compact / set-model
@@ -465,6 +529,21 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		{ name: "usage", description: "show token totals + estimated cost so far" },
 		{ name: "compact", description: "summarize older turns to free context" },
 		{
+			name: "allow-all",
+			description: "on|off — skip shell approval prompts this session (guards still apply)",
+			argumentHint: "<on|off>",
+		},
+		{
+			name: "grant-skill",
+			description: "preview/approve a skill's declared commands (--yes to apply)",
+			argumentHint: "<name> [--yes]",
+		},
+		{
+			name: "revoke-skill",
+			description: "remove a skill's granted commands from the allowlist",
+			argumentHint: "<name>",
+		},
+		{
 			name: "model",
 			description: "switch to another configured model (no arg = picker)",
 			argumentHint: "[<model-id>]",
@@ -606,6 +685,12 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 					`${subIndent}    ${brand.dim(`Pattern /${pat}/ saved to ~/.brigade/exec-approvals.json — any future command matching this regex runs without asking.`)}`,
 				].join("\n");
 			}
+			case "allow-session":
+				return [
+					`${subIndent}  ${brand.amber("⚠")} ${brand.amber("Allow all this session")} ${brand.dim("· running now…")}`,
+					cmd,
+					`${subIndent}    ${brand.dim("Shell commands run without asking for the rest of this session (safety guards still apply). /allow-all off to stop.")}`,
+				].join("\n");
 			case "deny":
 				return [
 					`${subIndent}  ${brand.error("✗")} ${brand.error("Denied")} ${brand.dim("· refused")}`,
@@ -688,7 +773,15 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// State snapshots from the gateway — every mutation pushes one.
 	client.on("state", (snap) => {
 		lastSnapshot = snap;
-		isAgentRunning = snap.isAgentRunning;
+		// `snap.isAgentRunning` is AGENT-wide — it goes true when ANY session
+		// of this agent has a turn running (a WhatsApp chat, spawned
+		// sub-agents, a cron run). Taking it as-is flipped THIS lane into
+		// steer mode while our own session was idle, so typed messages
+		// bounced with "nothing to steer" and were lost. Only the CLEARING
+		// direction is safe from the snapshot (it reconciles a missed
+		// agent_end after a disconnect); the lane's own agent_start /
+		// agent_end events own the upward direction.
+		if (!snap.isAgentRunning) isAgentRunning = false;
 		// Seed the connection-bound agent from the first snapshot the
 		// gateway pushes. The operator can override via `/agent <id>` —
 		// once set explicitly, snapshot updates no longer reset the binding.
@@ -698,7 +791,25 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		// Wave K — seed the connection-bound session key from the first
 		// snapshot. Once set explicitly via `/session <key>`, snapshot
 		// updates no longer reset it (mirrors boundAgentId semantics).
-		if (boundSessionKey === undefined && typeof snap.sessionKey === "string" && snap.sessionKey.length > 0) {
+		//
+		// --agent guard (2026-06-11): do NOT inherit a session key from a
+		// snapshot whose agent differs from the one we're explicitly bound to.
+		// On `brigade connect --agent marketing-lead`, the gateway's first
+		// (boot) snapshot is for `main` with sessionKey `agent:main:main`.
+		// Seeding that here made `withBinding` send the incoherent pair
+		// {agentId: "marketing-lead", sessionKey: "agent:main:main"} — the
+		// turn routed to main's session and the off-lane / subscription filter
+		// dropped the reply (first message landed on main, "fixed" itself only
+		// once a marketing-lead snapshot arrived). Leaving boundSessionKey
+		// undefined lets the gateway resolve the bound agent's OWN default
+		// session from agentId alone. Once a snapshot for the bound agent
+		// arrives, the match passes and the real session key seeds normally.
+		if (
+			boundSessionKey === undefined &&
+			typeof snap.sessionKey === "string" &&
+			snap.sessionKey.length > 0 &&
+			snapshotSessionSeedable(boundAgentId, snap.agentId)
+		) {
 			boundSessionKey = snap.sessionKey;
 		}
 		// Wave N3 (bug #3) — fire the initial subscription as soon as we
@@ -1103,7 +1214,9 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			(snap) => {
 				if (!snap) return;
 				lastSnapshot = snap;
-				isAgentRunning = snap.isAgentRunning;
+				// Same one-way rule as the `state` handler: the agent-wide flag
+				// may only CLEAR our lane's busy state, never set it.
+				if (!snap.isAgentRunning) isAgentRunning = false;
 				// If the gateway says no turn is in flight, then any tool
 				// indicators we still hold are stale (their `tool_execution_end`
 				// landed while we were disconnected). Mark each one as
@@ -1150,6 +1263,9 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 						`- ${chalk.bold("/model <id>")} — switch to a configured model on the gateway\n` +
 						`- ${chalk.bold("/thinking <level>")} — set reasoning effort (off|minimal|low|medium|high|xhigh)\n` +
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
+						`- ${chalk.bold("/allow-all <on|off>")} — skip shell-approval prompts for this session (safety guards still apply)\n` +
+						`- ${chalk.bold("/grant-skill <name> [--yes]")} — preview/approve a skill's declared commands so the agent runs them without asking\n` +
+						`- ${chalk.bold("/revoke-skill <name>")} — remove a skill's granted commands\n` +
 						`- ${chalk.bold("/abort")} — stop the in-flight turn\n` +
 						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
 						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's thinking blocks before replies (default: off)\n` +
@@ -1599,6 +1715,23 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				);
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
+				if (msg.includes("nothing to steer")) {
+					// Stale busy flag — our lane has no live turn (it ended a beat
+					// ago, or the busy signal came from another session before the
+					// one-way snapshot rule existed). The operator's message must
+					// never be lost: clear the flag and send it as a normal prompt.
+					isAgentRunning = false;
+					insertBeforeEditor(
+						new Markdown(`${brand.user("you")}  ${trimmed}`, 1, 0, markdownTheme),
+					);
+					try {
+						await client.request("prompt", withBinding({ text: trimmed }), { timeoutMs: 0 });
+					} catch (err2) {
+						const msg2 = err2 instanceof Error ? err2.message : String(err2);
+						insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg2)}`, 0, 0));
+					}
+					return;
+				}
 				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
 			}
 			return;
@@ -1616,6 +1749,193 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				const msg = err instanceof Error ? err.message : String(err);
 				insertBeforeEditor(
 					new Text(`  ${brand.error("✗")} ${brand.error(`Compaction failed: ${msg}`)}`, 0, 0),
+				);
+			}
+			return;
+		}
+
+		// /allow-all <on|off> — arm/disarm session-scoped exec approval bypass.
+		// Skips the shell-approval PROMPT for this session only; it can't bypass
+		// the config/path-write guards or hard-deny patterns, and clears on
+		// gateway restart.
+		if (trimmed === "/allow-all" || trimmed.startsWith("/allow-all ")) {
+			editor.setText("");
+			const arg =
+				trimmed === "/allow-all" ? "" : trimmed.slice("/allow-all ".length).trim().toLowerCase();
+			if (arg !== "on" && arg !== "off") {
+				insertBeforeEditor(
+					new Markdown(
+						`${brand.dim("usage: /allow-all on|off")}\n` +
+							`Skips the shell-approval prompt for THIS session. It can't bypass the safety ` +
+							`guards (writes to brigade.json / encryption.key / auth, hard-deny patterns), ` +
+							`doesn't affect sub-agents, and clears on gateway restart.`,
+						1,
+						0,
+						markdownTheme,
+					),
+				);
+				return;
+			}
+			const enabled = arg === "on";
+			try {
+				const res = (await client.request("exec-allow-all", { ...withBinding(), enabled })) as
+					| { sessionKey?: string; enabled?: boolean }
+					| undefined;
+				insertBeforeEditor(
+					new Text(
+						enabled
+							? `  ${brand.amber("⚠")} ${brand.dim(`allow-all ON for ${res?.sessionKey ?? "this session"} — shell commands run without asking (safety guards still apply). /allow-all off to disarm.`)}`
+							: `  ${brand.amber("✓")} ${brand.dim("allow-all OFF — shell commands prompt for approval again.")}`,
+						0,
+						0,
+					),
+				);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(`allow-all failed: ${msg}`)}`, 0, 0),
+				);
+			}
+			return;
+		}
+
+		// /grant-skill <name> [--yes] — preview (default) or apply a skill's
+		// command grant. Preview shows the commands the skill declares; --yes
+		// pre-approves them so the agent runs its own skill without prompting.
+		// The grant is a SNAPSHOT — editing the skill later can't widen it.
+		if (trimmed === "/grant-skill" || trimmed.startsWith("/grant-skill ")) {
+			editor.setText("");
+			const rest = trimmed === "/grant-skill" ? "" : trimmed.slice("/grant-skill ".length).trim();
+			const apply = /(^|\s)(--yes|-y)(\s|$)/.test(rest);
+			const name = rest.replace(/(^|\s)(--yes|-y)(\s|$)/g, " ").trim();
+			if (!name) {
+				insertBeforeEditor(
+					new Markdown(
+						`${brand.dim("usage: /grant-skill <name> [--yes]")}\n` +
+							`Preview the shell commands a skill declares; add ${chalk.bold("--yes")} to pre-approve ` +
+							`them for this agent so it stops asking. A grant is a snapshot — editing the skill ` +
+							`later won't widen it. Revoke with /revoke-skill.`,
+						1,
+						0,
+						markdownTheme,
+					),
+				);
+				return;
+			}
+			try {
+				const res = (await client.request("exec-grant-skill", {
+					...withBinding(),
+					skillName: name,
+					apply,
+				})) as {
+					found?: boolean;
+					skill?: string;
+					emptyManifest?: boolean;
+					applied?: boolean;
+					manifest?: { commands: string[]; patterns: string[] };
+					granted?: { commands: string[]; patterns: string[] };
+					refused?: string[];
+				};
+				if (!res?.found) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.error("✗")} ${brand.error(`No skill named "${name}" is visible to this agent.`)}`,
+							0,
+							0,
+						),
+					);
+					return;
+				}
+				if (res.emptyManifest) {
+					insertBeforeEditor(
+						new Markdown(
+							`${brand.dim(`Skill "${res.skill}" declares no commands to grant.`)}\n` +
+								`Add a ${chalk.bold("commands:")} / ${chalk.bold("command-patterns:")} block to its SKILL.md ` +
+								`frontmatter, then re-run.`,
+							1,
+							0,
+							markdownTheme,
+						),
+					);
+					return;
+				}
+				const manifest = res.manifest ?? { commands: [], patterns: [] };
+				const lines = [
+					...manifest.commands.map((c) => `  • ${c}`),
+					...manifest.patterns.map((p) => `  ~ /${p}/`),
+				].join("\n");
+				if (res.applied) {
+					const granted = res.granted ?? { commands: [], patterns: [] };
+					const n = granted.commands.length + granted.patterns.length;
+					const refused =
+						res.refused && res.refused.length > 0
+							? `\n${brand.amber("refused (hard-deny):")} ${res.refused.join(", ")}`
+							: "";
+					insertBeforeEditor(
+						new Markdown(
+							`${brand.amber("✓")} Granted ${n} command(s) from ${chalk.bold(res.skill ?? name)} — ` +
+								`the agent can now run them without prompting.\n${lines}${refused}\n` +
+								`${brand.dim(`Revoke with /revoke-skill ${res.skill ?? name}`)}`,
+							1,
+							0,
+							markdownTheme,
+						),
+					);
+				} else {
+					insertBeforeEditor(
+						new Markdown(
+							`${chalk.bold(res.skill ?? name)} declares these commands:\n${lines}\n\n` +
+								`${brand.dim(`Approve them with: /grant-skill ${res.skill ?? name} --yes`)}`,
+							1,
+							0,
+							markdownTheme,
+						),
+					);
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(`grant-skill failed: ${msg}`)}`, 0, 0),
+				);
+			}
+			return;
+		}
+
+		// /revoke-skill <name> — remove a skill's granted commands from the allowlist.
+		if (trimmed === "/revoke-skill" || trimmed.startsWith("/revoke-skill ")) {
+			editor.setText("");
+			const name = trimmed === "/revoke-skill" ? "" : trimmed.slice("/revoke-skill ".length).trim();
+			if (!name) {
+				insertBeforeEditor(new Markdown(`${brand.dim("usage: /revoke-skill <name>")}`, 1, 0, markdownTheme));
+				return;
+			}
+			try {
+				const res = (await client.request("exec-grant-skill", {
+					...withBinding(),
+					skillName: name,
+					revoke: true,
+				})) as { found?: boolean; skill?: string; removed?: number };
+				if (!res?.found) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.error("✗")} ${brand.error(`No skill named "${name}" is visible to this agent.`)}`,
+							0,
+							0,
+						),
+					);
+					return;
+				}
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.amber("✓")} ${brand.dim(`Revoked ${res.removed ?? 0} approval(s) from skill "${res.skill ?? name}".`)}`,
+						0,
+						0,
+					),
+				);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(`revoke-skill failed: ${msg}`)}`, 0, 0),
 				);
 			}
 			return;

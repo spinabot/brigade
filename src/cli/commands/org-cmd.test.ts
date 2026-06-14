@@ -247,3 +247,27 @@ describe("brigade org doctor", () => {
     assert.ok(out.warnings.some((w) => w.code === "ORG_EXTRA_ALLOW_NO_OP"));
   });
 });
+
+describe("brigade org explain — explicit mode (audit P1 fix)", () => {
+	// Under a2a mode "explicit" runtime allow/deny comes from the flat
+	// session.agentToAgent.allow matrix; explain must NOT print edge-based
+	// ALLOWED/DENIED verdicts that contradict sessions_send. It shows org
+	// SHAPE, clearly labelled.
+	it("prints the structure-only note instead of an ALLOWED verdict", async () => {
+		writeCfg({
+			agents: {
+				main: { org: { department: "exec", reportsTo: null } },
+				eng1: { org: { department: "eng", reportsTo: "main" } },
+			},
+			org: { topOrder: "main", a2a: { mode: "explicit" } },
+		});
+		const cap = capture();
+		const code = await runOrgExplain({ from: "eng1", to: "main", capture: cap });
+		assert.equal(code, 0);
+		const out = cap.stdout.join("\n");
+		assert.match(out, /runtime allow\/deny comes from session\.agentToAgent\.allow/);
+		assert.match(out, /org shape eng1 → main: connected/);
+		assert.doesNotMatch(out, /: ALLOWED/);
+		assert.doesNotMatch(out, /: DENIED/);
+	});
+});

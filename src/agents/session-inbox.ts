@@ -36,6 +36,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { resolveAgentDir } from "../config/paths.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
@@ -161,7 +162,32 @@ function ensureInboxDir(filePath: string): void {
 	}
 }
 
+// Convex mode: the in-memory `queues` Map remains the working store (the
+// per-turn drains read it synchronously); these helpers mirror to the
+// sessionInboxEvents table for cross-restart durability instead of writing
+// JSONL under ~/.brigade. Fire-and-forget on a serial chain — a failed
+// mirror never blocks event delivery (the in-memory copy is authoritative
+// within a gateway lifetime).
+let inboxMirrorChain: Promise<void> = Promise.resolve();
+function inConvexMode(): boolean {
+	return tryGetRuntimeContext()?.mode === "convex";
+}
+function enqueueInboxMirror(work: () => Promise<unknown>): void {
+	inboxMirrorChain = inboxMirrorChain.then(work).then(
+		() => {},
+		(err) => log.warn("inbox convex mirror failed", { error: (err as Error)?.message }),
+	);
+}
+export function awaitInboxMirrorFlush(): Promise<void> {
+	return inboxMirrorChain;
+}
+
 function appendEventToDisk(sessionKey: string, event: SystemEvent): void {
+	if (inConvexMode()) {
+		const store = tryGetRuntimeContext()!.store;
+		enqueueInboxMirror(() => store.messages.inboxEnqueue(sessionKey, event));
+		return;
+	}
 	if (isPersistDisabled()) return;
 	try {
 		const filePath = resolveInboxFilePath(sessionKey);
@@ -176,6 +202,11 @@ function appendEventToDisk(sessionKey: string, event: SystemEvent): void {
 }
 
 function truncateInboxFile(sessionKey: string): void {
+	if (inConvexMode()) {
+		const store = tryGetRuntimeContext()!.store;
+		enqueueInboxMirror(() => store.messages.inboxDrain(sessionKey));
+		return;
+	}
 	if (isPersistDisabled()) return;
 	try {
 		const filePath = resolveInboxFilePath(sessionKey);
@@ -189,6 +220,17 @@ function truncateInboxFile(sessionKey: string): void {
 }
 
 function rewriteInboxFile(sessionKey: string, events: readonly SystemEvent[]): void {
+	if (inConvexMode()) {
+		// Replace semantics (cap-overflow path): drain then re-enqueue the
+		// kept tail. The in-memory cap already applied, so `events` is small.
+		const store = tryGetRuntimeContext()!.store;
+		const kept = events.map(cloneSystemEvent);
+		enqueueInboxMirror(async () => {
+			await store.messages.inboxDrain(sessionKey);
+			for (const e of kept) await store.messages.inboxEnqueue(sessionKey, e);
+		});
+		return;
+	}
 	if (isPersistDisabled()) return;
 	try {
 		const filePath = resolveInboxFilePath(sessionKey);
@@ -430,6 +472,48 @@ export function peekSystemEvents(sessionKey: string): string[] {
 export function hasSystemEvents(sessionKey: string): boolean {
 	hydrateFromDiskIfNeeded(requireSessionKey(sessionKey));
 	return (getSessionQueue(sessionKey)?.queue.length ?? 0) > 0;
+}
+
+/**
+ * Remove the FIRST queued event matching `text` + `contextKey` exactly,
+ * wherever it sits in the queue. Returns true when one was removed.
+ *
+ * Exists for producers that enqueue an event BEFORE a dispatch that can
+ * fail (sessions_send enqueues the A2A attribution event, then dispatches
+ * the peer turn): on a failed dispatch the event must be withdrawn or it
+ * ghosts into the peer's NEXT unrelated turn ("A2A from X: …" acted on
+ * hours later). `consumeSystemEventEntries` can't do this — it only
+ * removes exact queue PREFIXES (its drain contract).
+ */
+export function removeMatchingSystemEvent(
+	sessionKey: string,
+	match: { text: string; contextKey?: string },
+): boolean {
+	const key = requireSessionKey(sessionKey);
+	hydrateFromDiskIfNeeded(key);
+	const entry = getSessionQueue(key);
+	if (!entry || entry.queue.length === 0) return false;
+	const idx = entry.queue.findIndex(
+		(e) =>
+			e.text === match.text &&
+			(match.contextKey === undefined || e.contextKey === match.contextKey),
+	);
+	if (idx < 0) return false;
+	entry.queue.splice(idx, 1);
+	if (entry.queue.length === 0) {
+		entry.lastText = null;
+		entry.lastContextKey = null;
+		queues.delete(key);
+		truncateInboxFile(key);
+	} else {
+		const newest = entry.queue[entry.queue.length - 1];
+		if (newest) {
+			entry.lastText = newest.text;
+			entry.lastContextKey = newest.contextKey ?? null;
+		}
+		rewriteInboxFile(key, entry.queue);
+	}
+	return true;
 }
 
 /**

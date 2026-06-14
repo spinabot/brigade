@@ -131,6 +131,15 @@ export interface AssembleArgs {
   channels?: {
     /** Channel ids currently started + ready to send. */
     started: readonly string[];
+    /** Linked self-account per started channel (adapter `selfId()`), when
+     *  connected. For personal channels (WhatsApp) the linked account IS
+     *  the operator's own number — surfaced so "send me a text" resolves
+     *  without the model asking the operator for a number it already has.
+     *  Digits-only E.164 for WhatsApp; channel-native id elsewhere. */
+    linked?: ReadonlyArray<{
+      channelId: string;
+      selfId: string;
+    }>;
     /** Channels that started but are currently in a degraded state (logged-
      *  out, disconnected, etc.). Surfaced in the `## Messaging` block so
      *  the model warns the operator BEFORE picking one — without this, the
@@ -774,6 +783,16 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     lines.push(
       `You can message the operator (or anyone they ask you to) on: ${channelList}.`,
     );
+    // Linked self-accounts — for personal channels the linked account IS
+    // the operator. Without this line the model asks "what's your number?"
+    // for a number the adapter already knows.
+    if (args.channels.linked && args.channels.linked.length > 0) {
+      for (const l of args.channels.linked) {
+        lines.push(
+          `- ${l.channelId} is linked to the operator's own account: \`${l.selfId}\`. "Text me" / "send me a message" means \`send_message({channel: "${l.channelId}", to: "${l.selfId}", text})\` — never ask the operator for their number on a linked channel.`,
+        );
+      }
+    }
     lines.push("- To send now: `send_message`. From a channel-routed turn, just pass `{text}` — it replies in place. Otherwise pass `{channel, to, text}`.");
     lines.push("- To send later (\"in 2 minutes\", \"daily at 9am\"): `cron` with a future `at` / cron schedule — it routes through the same channel at fire time.");
     lines.push("- Never use `bash` / curl to send messages. Always go through `send_message` or `cron`.");

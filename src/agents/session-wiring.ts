@@ -22,6 +22,9 @@
 
 import type { ChannelApprovalRoute } from "./channels/approval-router.js";
 import type { MemoryCapability } from "./extensions/types.js";
+import { DEFAULT_SUBAGENT_TIMEOUT_SECONDS } from "./subagent-policy.js";
+import { makeCmdIsmGuard } from "./cmd-ism-guard.js";
+import { makeConfigWriteGuard } from "./config-write-guard.js";
 import { makeExecGate } from "./exec-gate.js";
 import { makePathWriteGuard } from "./path-write-guard.js";
 import type { SessionContext } from "./session-context.js";
@@ -31,8 +34,17 @@ import { wrapOwnerOnlyToolExecution, wrapToolExecutionTimeout } from "./tools/co
 import { createBrigadeTools } from "./tools/registry.js";
 import type { AnyBrigadeTool } from "./tools/types.js";
 
-/** Pi built-in tools Brigade enables by name (vs Pi's default 4). */
-const BUILTIN_TOOL_NAMES = ["read", "write", "edit", "bash", "grep", "find", "ls"] as const;
+/**
+ * Pi built-in tools Brigade enables by name (vs Pi's default 4).
+ *
+ * `find` is deliberately ABSENT: Pi's builtin shells out to `fd`, whose
+ * `--glob --full-path` mode (used for any pattern containing `/`) matches
+ * nothing on Windows — every `**`-style search silently returned "No files
+ * found" on real trees. Brigade registers its own walker-based `find` (same
+ * name, same schema) via the tool registry instead — see
+ * `tools/find-tool.ts` for the full forensic note.
+ */
+const BUILTIN_TOOL_NAMES = ["read", "write", "edit", "bash", "grep", "ls"] as const;
 
 export interface BrigadeToolset {
 	/** Pi built-in tool names (passed to Pi's `tools` allowlist). */
@@ -164,9 +176,45 @@ export function assembleBrigadeToolset(opts: {
 	// never resolves (e.g. a runaway file lock, a hung dependency) can't
 	// wedge the agent loop forever — the model gets a `BrigadeToolTimeoutError`
 	// after ~60s and can tell the operator instead of spinning indefinitely.
-	const wrappedCustomTools = rawCustomTools.map((t) =>
-		wrapToolExecutionTimeout(wrapOwnerOnlyToolExecution(t, senderIsOwner)),
-	);
+	//
+	// EXCEPTION — the spawn tools AWAIT their children by contract
+	// (Primitive #6: result-as-tool-result), and each child may legitimately
+	// run up to its own `timeoutSeconds` (default 300s). The blanket 60s
+	// watchdog was killing every longer fan-out with a misleading "assume
+	// the call hung" while the children kept running and later announced via
+	// the completion bridge (observed in production 2026-06-11). Their budget
+	// is sized per call: the call's own per-child timeout + dispatch/settle
+	// slack — children run concurrently, so the max child budget bounds the
+	// whole call.
+	const wrappedCustomTools = rawCustomTools.map((t) => {
+		const ownerWrapped = wrapOwnerOnlyToolExecution(t, senderIsOwner);
+		if (t.name === "spawn_agent" || t.name === "spawn_agents") {
+			return wrapToolExecutionTimeout(ownerWrapped, undefined, resolveSpawnToolTimeoutMs);
+		}
+		// Image generation runs 1-2 minutes per call (the tool bounds its own
+		// HTTP requests at 150s) — the 60s blanket budget would kill every
+		// legitimate generation.
+		if (t.name === "generate_image") {
+			return wrapToolExecutionTimeout(ownerWrapped, 200_000);
+		}
+		// sessions_send WAITS for the peer's run up to its own
+		// `timeoutSeconds` (default 90s) + a 10s final-text flush poll — the
+		// blanket 60s watchdog killed every legitimate wait mid-flight
+		// (tool_end ✗ while the peer was still working; observed in
+		// production 2026-06-12, same class as the spawn-tool kill). Budget
+		// per call: the call's own wait window + flush + slack.
+		if (t.name === "sessions_send") {
+			return wrapToolExecutionTimeout(ownerWrapped, undefined, resolveSessionsSendTimeoutMs);
+		}
+		// oauth_authorize `await` blocks until the operator clicks the link —
+		// up to its own `waitSeconds` (default 240). The blanket 60s watchdog
+		// would kill that legitimate wait; size the budget from the call's
+		// waitSeconds + slack (same pattern as spawn / sessions_send).
+		if (t.name === "oauth_authorize") {
+			return wrapToolExecutionTimeout(ownerWrapped, undefined, resolveOAuthAuthorizeTimeoutMs);
+		}
+		return wrapToolExecutionTimeout(ownerWrapped);
+	});
 	// Per-job toolsAllow filter (cron). When omitted, every tool flows
 	// through. When supplied, only the named tools survive — both for the
 	// custom-tool array AND for the builtinToolNames allowlist below.
@@ -188,6 +236,71 @@ export function assembleBrigadeToolset(opts: {
 			subAgents: brigadeToolNames.includes("spawn_agent"),
 		},
 	};
+}
+
+/**
+ * Per-call watchdog budget for the spawn tools. The call's own
+ * `timeoutSeconds` (per child, children run concurrently) bounds the
+ * legitimate runtime; 30s of slack covers dispatch + settle + announce.
+ * Exported for tests.
+ */
+export function resolveSpawnToolTimeoutMs(toolArgs: unknown): number {
+	const bag = toolArgs as
+		| { timeoutSeconds?: unknown; tasks?: ReadonlyArray<{ timeoutSeconds?: unknown }> }
+		| undefined;
+	const readPositive = (v: unknown): number | undefined =>
+		typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+	// spawn_agent carries a TOP-LEVEL timeoutSeconds; spawn_agents carries it
+	// PER-TASK (tasks[].timeoutSeconds). Children run concurrently, so the
+	// call's legitimate runtime is bounded by the SLOWEST child — take the max
+	// across whichever shape is present. Audit P1 (F4, 2026-06-11): reading
+	// only the top-level field left every spawn_agents call on the 300s
+	// default, so a per-task timeout above 300s was still watchdog-killed at
+	// 330s while the child ran on — the exact bug this budget existed to fix.
+	let perChildSeconds = readPositive(bag?.timeoutSeconds);
+	if (Array.isArray(bag?.tasks)) {
+		for (const task of bag.tasks) {
+			const t = readPositive(task?.timeoutSeconds);
+			if (t !== undefined && (perChildSeconds === undefined || t > perChildSeconds)) {
+				perChildSeconds = t;
+			}
+		}
+	}
+	return (perChildSeconds ?? DEFAULT_SUBAGENT_TIMEOUT_SECONDS) * 1000 + 30_000;
+}
+
+/**
+ * Per-call watchdog budget for `sessions_send`. The tool's legitimate
+ * runtime = its own wait window (`timeoutSeconds`, default 90s — the
+ * settle race in send.ts) + the 10s final-text flush poll + slack for
+ * dispatch/history reads. Without this, the blanket 60s watchdog killed
+ * every wait longer than a minute while the peer kept working.
+ * Exported for tests.
+ */
+export function resolveSessionsSendTimeoutMs(toolArgs: unknown): number {
+	const bag = toolArgs as { timeoutSeconds?: unknown } | undefined;
+	const waitSeconds =
+		typeof bag?.timeoutSeconds === "number" &&
+		Number.isFinite(bag.timeoutSeconds) &&
+		bag.timeoutSeconds > 0
+			? bag.timeoutSeconds
+			: 90;
+	return waitSeconds * 1000 + 10_000 + 30_000;
+}
+
+/**
+ * Per-call watchdog budget for `oauth_authorize`. The `await` action blocks
+ * until the operator clicks the authorization link — up to its own
+ * `waitSeconds` (default 240). `start` / `cancel` are fast but harmlessly
+ * inherit the same generous budget. Exported for tests.
+ */
+export function resolveOAuthAuthorizeTimeoutMs(toolArgs: unknown): number {
+	const bag = toolArgs as { waitSeconds?: unknown } | undefined;
+	const waitSeconds =
+		typeof bag?.waitSeconds === "number" && Number.isFinite(bag.waitSeconds) && bag.waitSeconds > 0
+			? bag.waitSeconds
+			: 240;
+	return waitSeconds * 1000 + 20_000;
 }
 
 /** Live correlation-id bag the guards read for `tool-blocked` bus events. */
@@ -229,7 +342,7 @@ export interface ComposeGuardsOptions {
 /**
  * Compose Brigade's canonical `beforeToolCall` chain. Order, fixed:
  *
- *   decodeArgs → unknown-tool guard → path-write guard → loop detector → exec-gate → userHook
+ *   decodeArgs → unknown-tool guard → path-write guard → cmd-ism guard → loop detector → exec-gate → userHook
  *
  * - **decodeArgs** (optional): provider arg cleanup before anything reads them.
  * - **unknown-tool guard**: refuse hallucinated names + malformed args.
@@ -239,6 +352,9 @@ export interface ComposeGuardsOptions {
  *   the right tool (`manage_skill` / `manage_agent`). Strict gate ahead
  *   of the loop detector + exec-gate — those are downstream of "is the
  *   destination even legal".
+ * - **cmd-ism guard**: refuse bash commands that redirect into a reserved
+ *   DOS device name (`2>nul` etc.) — in the POSIX shell those create a
+ *   real `nul` file that Windows then cannot delete.
  * - **loop detector**: block a model stuck repeating the same call.
  * - **exec-gate**: bash/exec/shell/sh approval + workdir/env refusal.
  * - **userHook** (optional): operator policy, only if nothing blocked.
@@ -250,7 +366,14 @@ export function composeBrigadeBeforeToolCall(
 	opts: ComposeGuardsOptions,
 ): BrigadeBeforeToolCallHook {
 	const nameGuard = makeUnknownToolGuard(opts.enabledToolNames);
-	const pathGuard = makePathWriteGuard();
+	// Thread the SESSION cwd so the guard resolves relative / `~` paths the
+	// SAME way Pi's write/edit/bash tools do (audit P0 F-guards, 2026-06-11).
+	// Without this the guard resolved against the gateway process.cwd() and a
+	// model could reach the real config via `edit({path:"~/.brigade/brigade.json"})`
+	// or a workspace-relative `../brigade.json`.
+	const pathGuard = makePathWriteGuard({ cwd: opts.displayCwd });
+	const cmdIsmGuard = makeCmdIsmGuard();
+	const configWriteGuard = makeConfigWriteGuard();
 	const loopDetector = makeToolLoopDetector({ ctxRef: opts.gateCtxRef });
 	const execGate = makeExecGate({ ctxRef: opts.gateCtxRef, displayCwd: opts.displayCwd });
 	return async (ctx, signal) => {
@@ -266,6 +389,12 @@ export function composeBrigadeBeforeToolCall(
 		if (named?.block) return named;
 		const pathBlock = await pathGuard(ctx, signal);
 		if (pathBlock?.block) return pathBlock;
+		const cmdIsm = await cmdIsmGuard(ctx, signal);
+		if (cmdIsm?.block) return cmdIsm;
+		// Config-write boundary BEFORE the exec-gate, so the operator is never
+		// asked to approve a shell mutation of Brigade's own state files.
+		const cfgWrite = await configWriteGuard(ctx, signal);
+		if (cfgWrite?.block) return cfgWrite;
 		const loop = await loopDetector(ctx, signal);
 		if (loop?.block) return loop;
 		const gate = await execGate(ctx, signal);

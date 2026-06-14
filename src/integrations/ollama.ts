@@ -15,6 +15,9 @@
  */
 
 import * as fs from "node:fs/promises";
+import path from "node:path";
+
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
 const DEFAULT_BASE_URL = "http://localhost:11434";
 const TIMEOUT_MS = 5000;
@@ -192,7 +195,26 @@ export async function writeOllamaToModelsJson(
 		models: modelDefs,
 	};
 
+	// In convex mode resolveModelsPath routes to the OS cache dir, which may
+	// not exist yet on a fresh machine (boot only mkdirs it when a "models"
+	// blob already exists to materialise) — a bare write would ENOENT inside
+	// the wizard's retry loop, making Ollama unpickable. Filesystem mode:
+	// ~/.brigade always exists by this point, so this is a no-op.
+	await fs.mkdir(path.dirname(modelsJsonPath), { recursive: true });
 	await fs.writeFile(modelsJsonPath, JSON.stringify(existing, null, 2), "utf8");
+
+	// Convex mode — the file just written lives in the OS cache (resolveModelsPath
+	// routed it there) and is a regenerable mirror; the durable copy is the
+	// sealed "models" blob. Push it so a fresh machine re-materialises the
+	// catalog at boot.
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		await rctx.store.auth
+			.writeAuthFileBlob("main", "models" as never, existing as Record<string, unknown>)
+			.catch((err: Error) => {
+				console.error(`brigade: models catalog write to convex failed — ${err.message}`);
+			});
+	}
 }
 
 /**

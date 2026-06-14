@@ -57,6 +57,7 @@ import { getActiveChannelManager } from "../channels/active-manager.js";
 import type { ChannelApprovalRoute } from "../channels/approval-router.js";
 import type { OutboundMedia } from "../extensions/types.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { failedTextResult, payloadTextResult, readStringParam } from "./common.js";
 import type { BrigadeTool } from "./types.js";
 
@@ -541,6 +542,42 @@ export function makeSendMediaTool(
 				path: filePath,
 				captionPreview: caption?.slice(0, 80),
 			});
+
+			// Convex mode — background durability copy of what was sent. The
+			// send already completed from the local file (zero added latency);
+			// the mirror is fire-and-forget and ordered BEFORE the
+			// deleteAfterSend unlink below reads can't race it because we
+			// capture the bytes first.
+			const rctx = tryGetRuntimeContext();
+			if (rctx?.mode === "convex") {
+				try {
+					const sentBytes = await fsp.readFile(filePath);
+					const store = rctx.store;
+					void store.channels
+						.putInboundMedia({
+							channelId: channel,
+							...(resolvedAccountId !== undefined
+								? { accountId: resolvedAccountId }
+								: {}),
+							messageId: `out-${Date.now().toString(36)}-${path
+								.basename(filePath)
+								.replace(/[^a-z0-9_.-]/gi, "_")
+								.slice(0, 40)}`,
+							index: 0,
+							mimeType: mimeType ?? "application/octet-stream",
+							bytes: sentBytes,
+						})
+						.catch((err: Error) => {
+							log.warn("send_media: convex mirror failed (send unaffected)", {
+								filePath,
+								error: err.message,
+							});
+						});
+				} catch {
+					// Could not re-read the file for mirroring — send already
+					// succeeded; skip the mirror.
+				}
+			}
 
 			// Belt-and-suspenders cleanup. The producer (org-tool on a
 			// channel-routed turn) registers its PNG in the transient

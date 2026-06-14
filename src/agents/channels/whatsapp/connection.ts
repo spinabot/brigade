@@ -24,11 +24,13 @@ import { join as joinPath } from "node:path";
 
 import type { ConnectionState, WAMessage, WASocket } from "@whiskeysockets/baileys";
 
+import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
 import { createDedupeCache } from "../dedupe.js";
 import { chunkText } from "./chunk.js";
+import { lookupLidReverseSync, useConvexAuthState } from "./convex-auth-state.js";
 import { markdownToWhatsApp } from "./format.js";
 import { extractMentions, extractReplyContext } from "./inbound-extras.js";
-import { downloadInboundMedia } from "./media.js";
+import { downloadInboundMedia, hasInboundMedia } from "./media.js";
 
 /** A normalized inbound WhatsApp message (text and/or media). */
 export interface WaInboundText {
@@ -72,13 +74,26 @@ export interface WaInboundText {
 	replyTo?: import("../../extensions/types.js").InboundReplyContext;
 	/** Media attachments saved to disk under ~/.brigade/channels/whatsapp/media. */
 	media?: import("../../extensions/types.js").InboundMediaAttachment[];
+	/**
+	 * DEFERRED media download. The socket layer no longer downloads media
+	 * eagerly — a stranger's group video used to be fetched from WhatsApp,
+	 * sealed, and archived into the backend BEFORE the access-control gate
+	 * dropped the message (storage bloat + privacy hole: anyone in any group
+	 * with the operator could fill the database). The pipeline invokes this
+	 * ONLY after the gate admits the sender.
+	 */
+	resolveMedia?: () => Promise<import("../../extensions/types.js").InboundMediaAttachment[]>;
 	/** Raw Baileys message (for adapters that need more). */
 	raw: WAMessage;
 }
 
 export interface ConnectWhatsAppArgs {
-	/** Directory holding the multi-file auth state (creds + signal keys). */
+	/** Directory holding the multi-file auth state (creds + signal keys).
+	 *  Filesystem mode only — convex mode ignores it (auth rides the
+	 *  whatsappAuthCreds/whatsappAuthKeys tables). */
 	authDir: string;
+	/** Account namespace for the convex auth tables. Defaults to "default". */
+	accountId?: string;
 	/** Baileys log level — quiet unless the operator asked for verbose. */
 	verbose?: boolean;
 	/** Called with the QR string whenever WhatsApp wants the device linked. */
@@ -240,8 +255,22 @@ interface LidLookup {
  * async because the runtime lookup is async. Returns null when the file is
  * absent, unreadable, or carries a null/empty value.
  */
-function readLidReverseMappingSync(authDir: string | null | undefined, lidDigits: string): string | null {
-	if (!authDir || !lidDigits) return null;
+function readLidReverseMappingSync(
+	authDir: string | null | undefined,
+	lidDigits: string,
+	accountId: string = "default",
+): string | null {
+	if (!lidDigits) return null;
+	// Convex mode — the lid-mapping keys live in the keystore; the
+	// auth-state module mirrors reverse entries for exactly this sync read.
+	// The mirror is keyed by accountId, so the lookup MUST use the same
+	// accountId the auth-state was loaded with (not a hardcoded "default",
+	// which silently misses for any non-default WhatsApp account → inbound
+	// LID-form senders get dropped).
+	if (tryGetRuntimeContext()?.mode === "convex") {
+		return lookupLidReverseSync(accountId, lidDigits);
+	}
+	if (!authDir) return null;
 	// Best-effort filesystem read — gated by a quick exists check so the
 	// happy-path "no mapping yet" branch doesn't spam the disk.
 	try {
@@ -284,6 +313,7 @@ export async function resolveJidToE164(
 	sock: WASocket | null,
 	jid: string | null | undefined,
 	authDir?: string,
+	accountId?: string,
 ): Promise<string | null> {
 	if (!jid) return null;
 	const direct = jid.match(WA_PHONE_JID_RE);
@@ -295,7 +325,7 @@ export async function resolveJidToE164(
 	// these the moment it sees a LID's phone translation, so right after a
 	// fresh link they're available even while the in-memory `lidMapping` is
 	// still warming up.
-	const fromDisk = readLidReverseMappingSync(authDir, lidDigits);
+	const fromDisk = readLidReverseMappingSync(authDir, lidDigits, accountId);
 	if (fromDisk) return fromDisk;
 	// Then: runtime lookup. Some Baileys builds expose
 	// `signalRepository.lidMapping`; older / partially-initialized sockets
@@ -340,13 +370,14 @@ export async function resolveSenderIdentity(
 	sock: WASocket | null,
 	jid: string | null | undefined,
 	authDir?: string,
+	accountId?: string,
 ): Promise<{ id: string; e164?: string; lid?: string } | null> {
 	if (!jid) return null;
 	// Capture the LID alias whenever the sender came in via one — even when it
 	// DID map to a phone number — so the access-control gate can match on either
 	// the number or the LID (mirrors the reference codebase's identity overlap).
 	const lid = WA_LID_JID_RE.test(jid) ? (normalizeDeviceScopedJid(jid) ?? undefined) : undefined;
-	const e164 = await resolveJidToE164(sock, jid, authDir);
+	const e164 = await resolveJidToE164(sock, jid, authDir, accountId);
 	if (e164) return { id: e164, e164, ...(lid ? { lid } : {}) };
 	const normalized = normalizeDeviceScopedJid(jid) ?? jid;
 	if (!normalized) return null;
@@ -593,7 +624,38 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 		child: () => baileysLogger,
 	};
 
-	const { state, saveCreds } = await useMultiFileAuthState(args.authDir);
+	// Auth state — mode dispatch. Filesystem: Baileys' own multi-file dir
+	// (~900 small files under the channel state dir). Convex: the
+	// whatsappAuthCreds/whatsappAuthKeys tables via useConvexAuthState — no
+	// auth files on disk; key material is sealed before it leaves the
+	// process; pre-hydrated in one query so Signal-path key reads never pay
+	// a network round-trip.
+	const rctxForAuth = tryGetRuntimeContext();
+	// One accountId for the whole connection: the auth-state load, the
+	// LID-reverse mirror lookups, and (convex) the close() flush all key off
+	// it. Hardcoding "default" downstream silently breaks any non-default
+	// WhatsApp account.
+	const connectionAccountId = args.accountId ?? "default";
+	let state: Awaited<ReturnType<typeof useMultiFileAuthState>>["state"];
+	let saveCreds: () => Promise<void>;
+	// Convex-mode: the auth-state queues key writes write-behind. Capture its
+	// flush so close() can drain it — otherwise a fresh pair's keys can be
+	// lost when the link command exits right after a successful connect.
+	let convexAuthFlush: (() => Promise<void>) | undefined;
+	if (rctxForAuth?.mode === "convex") {
+		const convexAuth = await useConvexAuthState(rctxForAuth.store, connectionAccountId, {
+			initAuthCreds: baileys.initAuthCreds as never,
+			BufferJSON: baileys.BufferJSON as never,
+			proto: baileys.proto as never,
+		});
+		state = convexAuth.state as never;
+		saveCreds = convexAuth.saveCreds;
+		convexAuthFlush = convexAuth.flush;
+	} else {
+		const multiFile = await useMultiFileAuthState(args.authDir);
+		state = multiFile.state;
+		saveCreds = multiFile.saveCreds;
+	}
 	const { version } = await fetchLatestBaileysVersion();
 
 	let sock: WASocket | null = null;
@@ -1202,7 +1264,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 							// chat than to spam a contact with a pairing card).
 							if (!isGroup) {
 								const selfPhone = canonicalWhatsAppId(sock?.user?.id);
-								const chatPhone = await resolveJidToE164(sock, jid, args.authDir);
+								const chatPhone = await resolveJidToE164(sock, jid, args.authDir, connectionAccountId);
 								const isSelfChat = !!(selfPhone && chatPhone && selfPhone === chatPhone);
 								if (!isSelfChat) {
 									args.log("dropped operator outbound DM (fromMe, not self-chat)", {
@@ -1225,19 +1287,27 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 							| WAMessage["message"]
 							| undefined;
 						const text = extractText(m.message, normalizeMessageContent as (x: unknown) => unknown).trim();
-						// Download any attached media so the agent gets paths it can read.
-						const media =
-							normalized && msgId
-								? await downloadInboundMedia({
-										content: normalized,
-										msgId,
-										downloadMediaMessage: baileys.downloadMediaMessage as never,
-										rawMessage: m,
-										log: args.log,
-									})
-								: [];
+						// Media download is DEFERRED. Only a cheap envelope probe runs
+						// here; the actual download (bytes from WhatsApp + seal +
+						// backend archive) happens via `resolveMedia` AFTER the
+						// pipeline's access-control gate admits the sender. Eager
+						// download meant any stranger in any group could push videos
+						// into the operator's storage even though the message itself
+						// was dropped by policy.
+						const hasMedia = !!(normalized && msgId) && hasInboundMedia(normalized);
+						const resolveMedia =
+							hasMedia && normalized && msgId
+								? () =>
+										downloadInboundMedia({
+											content: normalized,
+											msgId,
+											downloadMediaMessage: baileys.downloadMediaMessage as never,
+											rawMessage: m,
+											log: args.log,
+										})
+								: undefined;
 						// Drop the message entirely only if there's no text AND no media.
-						if (!text && media.length === 0) return;
+						if (!text && !hasMedia) return;
 						// Sender resolution. For DMs the chat jid itself is the sender;
 						// for groups the per-message `participant` carries the speaker.
 						// We resolve to a STABLE identity that NEVER drops a usable
@@ -1249,7 +1319,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						const rawParticipant = m.key.participant?.trim();
 						const senderJid =
 							isGroup && rawParticipant && rawParticipant.length > 0 ? rawParticipant : jid;
-						const senderIdentity = await resolveSenderIdentity(sock, senderJid, args.authDir);
+						const senderIdentity = await resolveSenderIdentity(sock, senderJid, args.authDir, connectionAccountId);
 						if (!senderIdentity) {
 							args.log("inbound dropped — empty/unusable sender jid", {
 								jid,
@@ -1263,9 +1333,11 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						// pulled here so the manager can gate group activation cleanly and
 						// the LLM gets the "user replied to X" context for free. Async
 						// because LID mentions need the same resolver above.
-						const mentions = normalized ? await extractMentions(normalized, sock, args.authDir) : [];
+						const mentions = normalized
+							? await extractMentions(normalized, sock, args.authDir, connectionAccountId)
+							: [];
 						const replyTo = normalized
-							? await extractReplyContext(normalized, sock, args.authDir)
+							? await extractReplyContext(normalized, sock, args.authDir, connectionAccountId)
 							: undefined;
 						// Baileys' `messageTimestamp` is in seconds (Long or number).
 						// Normalize to epoch ms; the manager uses this to decide
@@ -1290,7 +1362,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 							chatType: isGroup ? "group" : "direct",
 							mentions: mentions.length > 0 ? mentions : undefined,
 							replyTo,
-							media: media.length > 0 ? media : undefined,
+							...(resolveMedia ? { resolveMedia } : {}),
 							raw: m,
 						});
 					} catch (err) {
@@ -1594,6 +1666,11 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			sock = null;
 			// Let a final creds write flush so the link survives a restart.
 			await pendingCredsSave.catch(() => {});
+			// Convex mode: drain the auth-state's write-behind key queue so a
+			// just-completed pair (or any keys written right before close) lands
+			// in the backend. Without this, a `brigade channels link` that exits
+			// immediately after connect can lose the freshly-negotiated keys.
+			if (convexAuthFlush) await convexAuthFlush().catch(() => {});
 		},
 	};
 }
