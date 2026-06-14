@@ -33,6 +33,9 @@ const originalUserProfile = process.env.USERPROFILE;
 process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 delete process.env.BRIGADE_HOME;
+// Neutralize a shell-exported Composio key so the exact tool-count assertions
+// (baseline, no-Composio surface) don't flake on machines that have it set.
+delete process.env.COMPOSIO_API_KEY;
 
 const {
 	BrigadeToolAuthorizationError,

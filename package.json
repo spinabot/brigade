@@ -130,6 +130,7 @@
     "node": ">=22.12"
   },
   "dependencies": {
+    "@composio/core": "^0.10.0",
     "@mariozechner/pi-coding-agent": "0.73.1",
     "@mariozechner/pi-tui": "0.73.1",
     "@mozilla/readability": "^0.6.0",

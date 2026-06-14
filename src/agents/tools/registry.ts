@@ -38,6 +38,7 @@ import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
 import { makeManageAccessTool } from "./manage-access-tool.js";
 import { makeManageChannelAccessTool } from "./manage-channel-access-tool.js";
+import { isComposioConfigured, makeComposioTool } from "./composio-tool.js";
 import { makeManageProviderTool } from "./manage-provider-tool.js";
 import { makeOAuthAuthorizeTool } from "./oauth-authorize-tool.js";
 import { makeManageSkillTool } from "./manage-skill-tool.js";
@@ -486,6 +487,12 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 				: {}),
 		});
 		tools.push(...sessionsTools);
+	}
+	// composio — owner-only universal app connector (Composio, 1,000+ apps).
+	// Mounted ONLY when a Composio API key is configured, so the default
+	// install (and the tool-enumeration tests) see no extra tool.
+	if (isComposioConfigured()) {
+		tools.push(makeComposioTool());
 	}
 	return tools;
 }
