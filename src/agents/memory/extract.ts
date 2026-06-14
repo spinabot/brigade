@@ -28,6 +28,7 @@ import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { pickInitialThinkingLevel } from "../../core/model-caps.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { applyPersonaOverrideToSession } from "../../system-prompt/pi-injection.js";
+import { wrapStreamFnWithPayloadMutations } from "../payload-mutators.js";
 import { FactStore, MEMORY_SEGMENTS, type MemorySegment } from "./records.js";
 
 const log = createSubsystemLogger("memory/extract");
@@ -368,6 +369,13 @@ export function makeIsolatedLlm(
 				resourceLoader: new DefaultResourceLoader({ cwd: args.workspaceDir, agentDir: args.agentDir }),
 			} as never);
 			if (!session) return "";
+			// Isolated sweeps create their OWN Pi session, so they miss the
+			// streamFn wrap the main agent-loop installs — without this, the
+			// extraction's OpenRouter call leaks Pi's default "pi" / pi.dev
+			// attribution (and skips the payload mutators) instead of reporting
+			// as Brigade. Wrap here too so EVERY OpenRouter request Brigade makes
+			// is attributed to Brigade.
+			wrapStreamFnWithPayloadMutations(session as AgentSession);
 			applyPersonaOverrideToSession(session as AgentSession, systemPrompt);
 			// Race the LLM call against a wall-clock timeout. On timeout we
 			// call `session.abort()` (Pi cancels the in-flight stream) and

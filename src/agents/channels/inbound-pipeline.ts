@@ -61,6 +61,14 @@ interface ChannelAccessConfig {
 	groupPolicy?: string;
 	allowFrom?: string[];
 	groupAllowFrom?: string[];
+	/** Group room ids (…@g.us JIDs) the crew is fully active in — responds there
+	 *  WITHOUT an @-mention, any sender. Empty by default. `*` = every group. */
+	groupAllowJids?: string[];
+	/** Active-conversation follow-up window (ms). After a member addresses the
+	 *  crew (mention / reply-to-bot), their untagged follow-ups within this window
+	 *  keep counting as addressed — so they don't re-tag every message. 0/unset =
+	 *  off (strict per-message tagging, today's behavior). */
+	groupFollowUpWindowMs?: number;
 	debounceMs?: number;
 }
 
@@ -84,6 +92,25 @@ function resolveGroupPolicy(cfg: BrigadeConfig, channelId: string): DmPolicy {
 
 function configIds(list: string[] | undefined): string[] {
 	return (list ?? []).map((x) => String(x).trim()).filter(Boolean);
+}
+
+// Group follow-up window: once a member addresses the crew (mention / reply-to-
+// bot) in a group, their untagged follow-ups within the configured window keep
+// counting as addressed, so they don't re-tag every message. Keyed per
+// (channel, account, group, speaker); in-memory + crudely capped.
+const groupFollowUpAt = new Map<string, number>();
+const GROUP_FOLLOWUP_MAX_KEYS = 5000;
+function groupFollowUpKey(channel: string, account: string | undefined, group: string, speaker: string): string {
+	return `${channel}::${account || "*"}::${group}::${speaker}`;
+}
+function withinGroupFollowUp(key: string, windowMs: number): boolean {
+	if (windowMs <= 0) return false;
+	const at = groupFollowUpAt.get(key);
+	return at !== undefined && Date.now() - at < windowMs;
+}
+function stampGroupFollowUp(key: string): void {
+	if (groupFollowUpAt.size > GROUP_FOLLOWUP_MAX_KEYS) groupFollowUpAt.clear();
+	groupFollowUpAt.set(key, Date.now());
 }
 
 /** Classify the underlying error into a recipient-facing reply line. */
@@ -361,9 +388,24 @@ export async function runChannelInboundPipeline(
 		const groupAllowFrom = [
 			...new Set([...readGroupAllowFrom(adapter.id, aclAccountId), ...configIds(cfgEntry.groupAllowFrom)]),
 		];
+		// Per-group full-trust list (respond untagged in these groups). Config-only.
+		const groupAllowJids = configIds(cfgEntry.groupAllowJids);
 		const selfId = adapter.selfId?.();
 		const mentioned = !!(selfId && msg.mentions?.includes(selfId));
 		const senderIsOwner = !!(selfId && selfId.trim() === msg.from.trim());
+		// "Addressed" superset for groups: mention OR a reply/quote to one of the
+		// bot's OWN messages OR within the active follow-up window for this speaker.
+		// Lets a member tag once / reply to the bot and keep the thread going
+		// untagged (window is config-gated; 0 = strict per-message tagging).
+		const groupFollowUpWindowMs =
+			typeof cfgEntry.groupFollowUpWindowMs === "number" && cfgEntry.groupFollowUpWindowMs > 0
+				? cfgEntry.groupFollowUpWindowMs
+				: 0;
+		const fuKey = groupFollowUpKey(adapter.id, aclAccountId, msg.conversationId, msg.from);
+		const isReplyToBot = !!(selfId && msg.replyTo?.from && selfId.trim() === msg.replyTo.from.trim());
+		const addressed = isGroup
+			? mentioned || isReplyToBot || withinGroupFollowUp(fuKey, groupFollowUpWindowMs)
+			: mentioned;
 		const decision = evaluateAccess({
 			policy: dmPolicy,
 			groupPolicy,
@@ -372,14 +414,23 @@ export async function runChannelInboundPipeline(
 			selfId,
 			allowFrom,
 			groupAllowFrom,
+			groupAllowJids,
+			groupId: msg.conversationId,
 			isGroup,
 			mentioned,
+			addressed,
 		});
+		// Keep the active-conversation window alive on every admitted group turn,
+		// so an ongoing back-and-forth doesn't require re-tagging.
+		if (isGroup && decision.kind === "allow") stampGroupFollowUp(fuKey);
 		if (decision.kind === "block") {
 			log.info("inbound dropped by policy", {
 				channel: adapter.id,
 				sender: msg.from,
 				reason: decision.reason,
+				// Surface the group room id on group drops so the operator can copy it
+				// into `channels.<ch>.groupAllowJids` to make the crew live there.
+				...(isGroup ? { group: msg.conversationId } : {}),
 			});
 			return;
 		}

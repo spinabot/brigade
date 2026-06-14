@@ -37,6 +37,7 @@ import { makeManageAgentTool } from "./manage-agent-tool.js";
 import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
 import { makeManageAccessTool } from "./manage-access-tool.js";
+import { makeManageChannelAccessTool } from "./manage-channel-access-tool.js";
 import { makeManageProviderTool } from "./manage-provider-tool.js";
 import { makeOAuthAuthorizeTool } from "./oauth-authorize-tool.js";
 import { makeManageSkillTool } from "./manage-skill-tool.js";
@@ -255,6 +256,11 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// org.a2a.mode, so "let main message marketing-lead" is one validated
 		// call instead of a guard-refused hand-edit.
 		makeManageAccessTool(),
+		// manage_channel_access — owner-only channel GROUP access control: the
+		// sanctioned path for channels.<ch>.groupPolicy / groupAllowFrom /
+		// groupAllowJids / groupFollowUpWindowMs, so "let the crew answer in this
+		// group / stop making me tag you" is one validated call, not a hand-edit.
+		makeManageChannelAccessTool(),
 		// oauth_authorize — owner-only OAuth 2.0 authorization-code flow with a
 		// one-shot loopback callback. Exists so the model never hand-rolls an
 		// http listener in bash (the Gmail-OAuth flow fought EADDRINUSE +

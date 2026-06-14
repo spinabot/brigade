@@ -35,6 +35,7 @@ import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
 import { pickStorageMode, type StorageModeResult } from "./onboard-storage-mode.js";
 import { SearchableSelectList } from "./searchable-select.js";
+import { listOpenRouterModels } from "../integrations/provider-discovery.js";
 
 export interface OnboardingResult {
 	provider: string;
@@ -54,14 +55,35 @@ export interface OnboardingResult {
  * the dynamic registry — that way both code paths produce the same `Model<any>[]`
  * shape that the picker expects.
  */
-function getProviderModels(modelRegistry: ModelRegistry, providerId: string): Array<Model<any>> {
+async function getProviderModels(modelRegistry: ModelRegistry, providerId: string): Promise<Array<Model<any>>> {
+	const staticModels: Array<Model<any>> = (() => {
+		try {
+			const fromCatalog = getModels(providerId as KnownProvider) as Array<Model<any>>;
+			if (fromCatalog && fromCatalog.length > 0) return fromCatalog;
+		} catch {
+			/* unknown provider — fall through */
+		}
+		return modelRegistry.getAll().filter((m) => m.provider === providerId) as Array<Model<any>>;
+	})();
+
+	// Live-merge OpenRouter's CURRENT catalog so models newer than Pi's bundled
+	// snapshot (e.g. the latest Opus/GPT/Gemini) show up in the picker. Best-
+	// effort, cached, short timeout — on ANY failure we keep the static list so
+	// offline onboarding still works. Static/catalogued entries win (richer
+	// metadata); live-only ids are appended.
+	if (providerId !== "openrouter") return staticModels;
 	try {
-		const fromCatalog = getModels(providerId as KnownProvider) as Array<Model<any>>;
-		if (fromCatalog && fromCatalog.length > 0) return fromCatalog;
+		const live = await listOpenRouterModels();
+		if (live.length === 0) return staticModels;
+		const seen = new Set(staticModels.map((m) => m.id));
+		const merged = [...staticModels];
+		for (const lm of live) {
+			if (!seen.has(lm.id)) merged.push(lm as unknown as Model<any>);
+		}
+		return merged;
 	} catch {
-		/* unknown provider — fall through */
+		return staticModels;
 	}
-	return modelRegistry.getAll().filter((m) => m.provider === providerId) as Array<Model<any>>;
 }
 
 export interface OnboardingOptions {
@@ -713,7 +735,7 @@ async function ensureLocalOllama(
 }
 
 async function pickModel(tui: TUI, modelRegistry: ModelRegistry, providerId: string): Promise<"back" | { modelId: string }> {
-	const models = getProviderModels(modelRegistry, providerId);
+	const models = await getProviderModels(modelRegistry, providerId);
 
 	if (models.length === 0) {
 		tui.addChild(new Text(brand.dim("  Type the model name you'd like to use, then press Enter. Esc to go back."), 0, 0));

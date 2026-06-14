@@ -78,6 +78,7 @@ import { createPluginChannelManagerFacade } from "../agents/channels/plugin-chan
 import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
+import { listOpenRouterModels } from "../integrations/provider-discovery.js";
 import { switchModelMidTurn as piSwitchModelMidTurn } from "../agents/mid-turn-switch.js";
 import { onAgentEvent } from "../agents/agent-event-bus.js";
 import {
@@ -226,7 +227,7 @@ function persistDefaultModel(cfg: Config, provider: string, modelId: string): Co
 }
 import { type ConsoleStream } from "./console-stream.js";
 import { attachEventLogger, getTodayLogPath } from "./event-logger.js";
-import { pickInitialThinkingLevel, readPersistedThinkingLevel } from "./model-caps.js";
+import { pickInitialThinkingLevel, readPersistedThinkingLevel, remapThinkingLevel } from "./model-caps.js";
 import { getBuildInfo } from "../version.js";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { extractIdentityName, isIdentityNameUnset } from "./system-prompt.js";
@@ -2249,7 +2250,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					provider: p.provider,
 					modelId: p.modelId,
 					model: target,
-					thinkingLevel: pickInitialThinkingLevel(target),
+					// Preserve the operator's thinking level across the switch (clamp
+					// only if the new model can't honor it) instead of resetting it.
+					thinkingLevel: remapThinkingLevel(getAgentRuntime(targetAgentId).thinkingLevel, target),
 				});
 				// Boot agent's set-model also refreshes the snapshot's cached
 				// thinking caps (since the snapshot mirrors the boot agent).
@@ -2361,7 +2364,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					provider: p.provider,
 					modelId: p.modelId,
 					model: target,
-					thinkingLevel: pickInitialThinkingLevel(target),
+					// Preserve the operator's thinking level across the switch (clamp
+					// only if the new model can't honor it) instead of resetting it.
+					thinkingLevel: remapThinkingLevel(getAgentRuntime(targetAgentId).thinkingLevel, target),
 				});
 				if (targetAgentId === agentId) {
 					cachedSupportsThinking = !!target.reasoning;
@@ -2411,11 +2416,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					throw err;
 				}
 				const cur = getAgentRuntime(targetAgentId);
+				// Clamp the requested level against what THIS agent's model can do —
+				// e.g. `high` on a non-reasoning model → off; `off` on a reasoning-
+				// only model → low — so we never persist a level the model rejects.
+				const effective = remapThinkingLevel(p.level as ThinkingLevel, cur.model);
 				// Mutate only the target agent's thinking level. The next turn
 				// for that agent reads it back; other agents' turns are unaffected.
 				perAgentRuntime.set(targetAgentId, {
 					...cur,
-					thinkingLevel: p.level as ThinkingLevel,
+					thinkingLevel: effective,
 				});
 				// If a turn is live for this agent's selected session, push the
 				// level into the in-flight session so it takes effect immediately.
@@ -2425,7 +2434,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const liveSession = liveSessionsByKey.get(targetKey);
 				if (liveSession) {
 					try {
-						liveSession.setThinkingLevel(p.level as never);
+						liveSession.setThinkingLevel(effective as never);
 					} catch {
 						/* clamp / unsupported — snapshot still reflects intent */
 					}
@@ -2446,7 +2455,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 							agentsMap[targetAgentId] && typeof agentsMap[targetAgentId] === "object"
 								? (agentsMap[targetAgentId] as Record<string, unknown>)
 								: {};
-						agentsMap[targetAgentId] = { ...prevEntry, thinking: p.level };
+						agentsMap[targetAgentId] = { ...prevEntry, thinking: effective };
 						(next as Record<string, unknown>).agents = agentsMap;
 						return next as unknown as typeof cur2;
 					});
@@ -2562,7 +2571,27 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				} as unknown as ResponseFor[M];
 			}
 			case "list-models": {
-				const models = modelRegistry.getAvailable().map((m: Model<any>) => modelToSummary(m));
+				const registryModels = modelRegistry.getAvailable() as Array<Model<any>>;
+				// Live-merge OpenRouter's CURRENT catalog (only when OpenRouter is
+				// configured) so `/model` lists models newer than Pi's bundled
+				// snapshot. Best-effort + cached + short timeout; on any failure the
+				// registry list stands alone. Registry entries win (richer metadata).
+				let merged: Array<Model<any>> = registryModels;
+				if (registryModels.some((m) => m.provider === "openrouter")) {
+					try {
+						const live = await listOpenRouterModels();
+						if (live.length > 0) {
+							const seen = new Set(registryModels.map((m) => m.id));
+							merged = [...registryModels];
+							for (const lm of live) {
+								if (!seen.has(lm.id)) merged.push(lm as unknown as Model<any>);
+							}
+						}
+					} catch {
+						/* keep the registry list */
+					}
+				}
+				const models = merged.map((m: Model<any>) => modelToSummary(m));
 				return models as ResponseFor[M];
 			}
 			case "refresh-models": {
