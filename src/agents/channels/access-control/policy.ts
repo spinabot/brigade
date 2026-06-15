@@ -138,11 +138,15 @@ export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
 				: { kind: "block", reason: "group:open-without-mention" };
 		}
 		// `allowlist` or `pairing` (degraded): only approved senders, only when
-		// the bot is addressed. Operator (self) is treated as implicitly
-		// allow-listed here — they don't need to add themselves — but they
-		// STILL need to mention the bot to be heard. A `*` in the list is
-		// a wildcard and matches everyone (still mention-gated below).
-		const senderAllowed = isSelf || isOnAllowList(args.senderId, allow, args.senderLid);
+		// the bot is addressed. The operator (self) is NOT implicitly allow-listed
+		// in groups — to be heard, the operator must opt the group in via
+		// `groupAllowJids` (full-trust, handled above) OR appear on the group
+		// allow-from list, exactly like any other sender. A group the operator
+		// has NOT opted in stays silent even to the operator's OWN messages and
+		// self-tags — a self-tag is just a mention of the operator's own number
+		// (which IS the bot's id) and must never become a summon backdoor. A `*`
+		// in the list is a wildcard and matches everyone (still mention-gated below).
+		const senderAllowed = isOnAllowList(args.senderId, allow, args.senderLid);
 		if (!senderAllowed) return { kind: "block", reason: "group:not-allowlisted" };
 		return addressed
 			? {

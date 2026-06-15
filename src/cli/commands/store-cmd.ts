@@ -221,6 +221,7 @@ function describeResetSummary(s: ConvexInstanceSummary): string {
 		`${n(s.counts.cronJobs)} scheduled jobs`,
 		`${n(s.counts.personas)} persona files`,
 	];
+	if (s.hasActivity) parts.push("session & log history");
 	if (s.whatsappLinked) parts.push("a linked WhatsApp");
 	return parts.join(" · ");
 }

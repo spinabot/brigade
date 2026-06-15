@@ -22,6 +22,9 @@ export interface ConvexInstanceSummary {
 	hasData: boolean;
 	createdAtMs: number | null;
 	counts: { memories: number; sessions: number; cronJobs: number; personas: number };
+	/** True when high-volume session/log/run tables hold rows (presence-probed,
+	 *  not counted). Optional for back-compat with older summary shapes. */
+	hasActivity?: boolean;
 	whatsappLinked: boolean;
 	storedKeyFingerprint: string | null;
 }
@@ -41,40 +44,71 @@ export async function inspectConvexInstance(
 
 /**
  * Erase EVERY Brigade row (and spilled File-Storage object) in the backend.
- * Pages per table so big instances (thousands of cron runs / session events)
- * stay under Convex's per-mutation limits. Returns the total rows deleted.
+ *
+ * Kicks off a SERVER-SIDE self-scheduling reset (`resetStart`) — one worker per
+ * table, each deleting small batches and rescheduling itself until its table is
+ * drained — then polls `resetStatus` until every table reports done. Scales to
+ * any size: deletion never crosses the wire per page and never runs as one
+ * mega-mutation that could time out. Returns the total rows deleted;
+ * `onProgress(table, deletedSoFar)` fires as each table advances. Throws if the
+ * reset makes NO progress for `stallTimeoutMs` (a backend worker died) rather
+ * than polling forever.
  */
 export async function resetConvexInstance(
 	url: string,
 	opts: {
 		onProgress?: (table: string, deletedSoFar: number) => void;
 		clientOverride?: AdminClient;
+		pollMs?: number;
+		stallTimeoutMs?: number;
 	} = {},
 ): Promise<{ deletedTotal: number }> {
 	const client = opts.clientOverride ?? clientFor(url);
-	const tables = (await client.query(api.admin.listResettableTables, {})) as string[];
-	const PAGE = 200;
+	const pollMs = opts.pollMs ?? 400;
+	const stallTimeoutMs = opts.stallTimeoutMs ?? 30_000;
+	const runId = `reset-${Date.now()}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+
+	await client.mutation(api.admin.resetStart, { runId });
+
+	const perTable = new Map<string, number>();
 	let deletedTotal = 0;
-	for (const table of tables) {
-		let deletedForTable = 0;
-		// Loop until the table reports `done`. A page can come back SHORT without
-		// being drained (the server caps each batch by bytes read, not just row
-		// count, so large-row tables clear a handful at a time) — so we trust the
-		// explicit `done` flag, never the batch size, and stop if a batch deletes
-		// nothing (defensive against an unexpected stall).
-		for (;;) {
-			const { deleted, done } = (await client.mutation(api.admin.resetPage, {
-				table,
-				limit: PAGE,
-			})) as { deleted: number; done?: boolean };
-			deletedForTable += deleted;
-			deletedTotal += deleted;
-			if (done || deleted === 0) break;
-			opts.onProgress?.(table, deletedForTable);
+	let lastProgressAt = Date.now();
+	for (;;) {
+		const status = (await client.query(api.admin.resetStatus, { runId })) as {
+			done: boolean;
+			deletedTotal: number;
+			tables: Array<{ table: string; deleted: number; done: boolean }>;
+		} | null;
+		if (status) {
+			for (const t of status.tables) {
+				const prev = perTable.get(t.table) ?? 0;
+				if (t.deleted > prev) {
+					perTable.set(t.table, t.deleted);
+					opts.onProgress?.(t.table, t.deleted);
+				}
+			}
+			if (status.deletedTotal > deletedTotal) {
+				deletedTotal = status.deletedTotal;
+				lastProgressAt = Date.now();
+			}
+			if (status.done) return { deletedTotal };
 		}
-		if (deletedForTable > 0) opts.onProgress?.(table, deletedForTable);
+		// A worker that exceeded a transaction limit is killed by Convex and can't
+		// reschedule itself, so its table would never reach `done`. Surface that as
+		// a clear error after a no-progress window instead of polling forever.
+		if (Date.now() - lastProgressAt > stallTimeoutMs) {
+			throw new Error(
+				`reset stalled: no progress for ${Math.round(stallTimeoutMs / 1000)}s ` +
+					`(${deletedTotal} rows deleted) — a backend worker likely failed; check convex logs`,
+			);
+		}
+		await delay(pollMs);
 	}
-	return { deletedTotal };
+}
+
+/** Minimal sleep for the poll loop. */
+function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**

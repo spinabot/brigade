@@ -47,6 +47,9 @@ skills-lock.json
 # Misc
 test.txt
 
+# Packaging artifacts (npm pack / publish output)
+*.tgz
+
 # VSCode workspace files
 *.code-workspace
 
@@ -56,3 +59,8 @@ test.txt
 # its api.js/server.js are the CLI's own output.)
 convex/*.js
 convex/*.js.map
+# …and the matching declaration emits (tsc writes these next to the sources too;
+# they're regenerated every build, so tracking them just creates autocrlf/EOL
+# churn — see the .js rule above). _generated/ stays exempt (handled above).
+convex/*.d.ts
+convex/*.d.ts.map

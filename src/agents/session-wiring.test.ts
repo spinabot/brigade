@@ -11,6 +11,9 @@ const originalUserProfile = process.env.USERPROFILE;
 process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 delete process.env.BRIGADE_HOME;
+// Neutralize a shell-exported Composio key so the exact tool-count assertions
+// (baseline, no-Composio surface) don't flake on machines that have it set.
+delete process.env.COMPOSIO_API_KEY;
 
 const { assembleBrigadeToolset, composeBrigadeBeforeToolCall, resolveSpawnToolTimeoutMs } =
 	await import("./session-wiring.js");
@@ -55,13 +58,14 @@ after(() => {
 });
 
 describe("assembleBrigadeToolset", () => {
-	it("returns 6 builtins + 12 brigade tools (find/generate_image/manage_provider/manage_access/manage_channel_access/oauth_authorize + 3 memory + agents_list + manage_agent + manage_skill) = 18 enabled names", () => {
+	it("returns 6 builtins + 13 brigade tools (composio/find/generate_image/manage_provider/manage_access/manage_channel_access/oauth_authorize + 3 memory + agents_list + manage_agent + manage_skill) = 19 enabled names", () => {
 		// `find` moved from the Pi builtin list to a Brigade-native custom tool
 		// (fd's --glob --full-path matches nothing on Windows — see find-tool.ts).
 		const ts = assembleBrigadeToolset({ workspaceDir: workspace, agentId: "main", cwd: workspace });
 		assert.deepEqual(ts.builtinToolNames, ["read", "write", "edit", "bash", "grep", "ls"]);
 		assert.deepEqual(ts.brigadeToolNames.sort(), [
 			"agents_list",
+			"composio",
 			"find",
 			"generate_image",
 			"manage_access",
@@ -74,8 +78,8 @@ describe("assembleBrigadeToolset", () => {
 			"recall_memory",
 			"write_memory",
 		]);
-		assert.equal(ts.enabledToolNames.length, 18);
-		assert.equal(ts.customTools.length, 12);
+		assert.equal(ts.enabledToolNames.length, 19);
+		assert.equal(ts.customTools.length, 13);
 	});
 
 	it("derives capabilities.memory=true when recall_memory present", () => {

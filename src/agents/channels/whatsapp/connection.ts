@@ -1251,9 +1251,12 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						//            inbound; the bot responds.
 						//
 						//       (b3) GROUP: fall through so policy.ts can apply the
-						//            standard group rules (mention required even for
-						//            the operator). policy.ts blocks operator-without-
-						//            mention with reason `group:self-without-mention`.
+						//            standard group rules. The operator is NOT auto-
+						//            allowed in groups — a group the operator hasn't
+						//            opted in (via `groupAllowJids`, or by being on the
+						//            group allow-from list) is dropped with reason
+						//            `group:not-allowlisted`, even for the operator's
+						//            own messages and self-tags.
 						if (m.key.fromMe) {
 							// (a) — known echo of our own outbound.
 							if (!msgId || outboundDedupe.peek(outboundKey(jid, msgId))) return;

@@ -178,35 +178,84 @@ describe("classifyInstanceState (onboarding restore-or-fresh routing)", () => {
 	});
 });
 
-describe("resetConvexInstance (paginated erase loop)", () => {
-	it("loops each table until a short page and sums the deletions", async () => {
-		// Fake backend: two tables with 450 and 10 rows; PAGE is 200, so the
-		// first table needs 3 pages (200+200+50) and the second one (10).
-		const remaining: Record<string, number> = { big: 450, small: 10 };
-		const calls: Array<{ table: string; limit: number }> = [];
+describe("resetConvexInstance (server-scheduled erase)", () => {
+	it("kicks off the reset and polls status, summing deletions and reporting per-table progress", async () => {
+		// Simulated backend: the server-side workers drain each table over time;
+		// every resetStatus poll advances each not-yet-done table by one batch.
+		const tables = [
+			{ table: "big", total: 450, deleted: 0 },
+			{ table: "small", total: 10, deleted: 0 },
+		];
+		let started = false;
+		let startCalls = 0;
 		const client = {
 			async query() {
-				return ["big", "small"];
+				// resetStatus — null until the run has been started.
+				if (!started) return null;
+				for (const t of tables) t.deleted = Math.min(t.total, t.deleted + 200);
+				const deletedTotal = tables.reduce((s, t) => s + t.deleted, 0);
+				const tablesDone = tables.filter((t) => t.deleted >= t.total).length;
+				return {
+					done: tablesDone >= tables.length,
+					deletedTotal,
+					tablesTotal: tables.length,
+					tablesDone,
+					tables: tables.map((t) => ({
+						table: t.table,
+						deleted: t.deleted,
+						done: t.deleted >= t.total,
+					})),
+					updatedAt: 1,
+				};
 			},
 			async mutation(_ref: unknown, args: Record<string, unknown>) {
-				const table = String(args.table);
-				const limit = Number(args.limit);
-				calls.push({ table, limit });
-				const take = Math.min(remaining[table] ?? 0, limit);
-				remaining[table] = (remaining[table] ?? 0) - take;
-				return { deleted: take, done: (remaining[table] ?? 0) === 0 };
+				// resetStart
+				started = true;
+				startCalls += 1;
+				return { runId: String(args.runId), tablesTotal: tables.length };
 			},
 		};
+		const progress: Array<{ table: string; n: number }> = [];
 		const { deletedTotal } = await resetConvexInstance("http://fake", {
 			clientOverride: client,
+			pollMs: 0,
+			onProgress: (table, n) => progress.push({ table, n }),
 		});
 		assert.equal(deletedTotal, 460);
-		assert.equal(remaining.big, 0);
-		assert.equal(remaining.small, 0);
-		// 3 pages for big + 1 for small.
-		assert.deepEqual(
-			calls.map((c) => c.table),
-			["big", "big", "big", "small"],
+		assert.equal(startCalls, 1); // started exactly once, then polled
+		// big drains over 3 polls (200 → 400 → 450); small in 1 (10).
+		assert.ok(progress.some((p) => p.table === "big" && p.n === 450));
+		assert.ok(progress.some((p) => p.table === "small" && p.n === 10));
+	});
+
+	it("throws when the reset stalls (a worker died) instead of polling forever", async () => {
+		// Status never advances — a worker was killed mid-table and can't
+		// reschedule. The client must give up after the stall window, not hang.
+		let started = false;
+		const client = {
+			async query() {
+				if (!started) return null;
+				return {
+					done: false,
+					deletedTotal: 0,
+					tablesTotal: 1,
+					tablesDone: 0,
+					tables: [{ table: "big", deleted: 0, done: false }],
+					updatedAt: 1,
+				};
+			},
+			async mutation() {
+				started = true;
+				return {};
+			},
+		};
+		await assert.rejects(
+			resetConvexInstance("http://fake", {
+				clientOverride: client,
+				pollMs: 0,
+				stallTimeoutMs: 5,
+			}),
+			/stalled/,
 		);
 	});
 });

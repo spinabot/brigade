@@ -521,6 +521,20 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_key", ["key"]),
 
+  // Tracks an in-flight server-side factory reset (one row per table per run).
+  // Deliberately NOT in admin.ts RESETTABLE_TABLES so a reset never erases its
+  // own progress. `resetStart` seeds these, self-scheduling `resetWorker`s patch
+  // them, and `resetStatus` aggregates them for the polling client.
+  resetProgress: defineTable({
+    runId: v.string(),
+    table: v.string(),
+    deleted: v.number(),
+    done: v.boolean(),
+    updatedAt: v.number(),
+  })
+    .index("by_run", ["runId"])
+    .index("by_run_table", ["runId", "table"]),
+
   whatsappAuthCreds: defineTable({
     ownerId: v.string(),
     accountId: v.string(),

@@ -46,13 +46,13 @@ describe("evaluateAccess", () => {
 		}
 	});
 
-	/* ── self-in-GROUP: must follow mention rules (not auto-allowed) ── */
+	/* ── self-in-GROUP: default-deny — the operator is NOT auto-allowed ── */
 
-	it("self in a GROUP with no mention is BLOCKED (operator typing in a group must not summon Brigade)", () => {
-		// The bug: previously self bypassed everything. Now the operator's
-		// own messages in a group room follow the same allow-from + mention
-		// rules — otherwise every line the operator types in a group chat
-		// triggers a turn.
+	it("self in a non-allowlisted GROUP is BLOCKED (operator typing in a group must not summon Brigade)", () => {
+		// The operator (self) is NOT implicitly allow-listed in groups. A group
+		// the operator hasn't opted in — via groupAllowJids (full-trust) or by
+		// appearing on the group allow-from list — stays silent, even to the
+		// operator's own messages. Reason is `not-allowlisted`: the GROUP isn't in.
 		const r = evaluateAccess({
 			policy: "pairing",
 			groupPolicy: "allowlist",
@@ -64,10 +64,13 @@ describe("evaluateAccess", () => {
 			groupAllowFrom: [],
 		});
 		assert.equal(r.kind, "block");
-		assert.match(String(r.reason), /^group:self-without-mention$/);
+		assert.match(String(r.reason), /^group:not-allowlisted$/);
 	});
 
-	it("self in a GROUP WITH a mention is allowed (operator opted in by tagging the bot)", () => {
+	it("self in a non-allowlisted GROUP is BLOCKED even WITH a self-tag (tagging your own number is not a backdoor)", () => {
+		// A self-tag is just a mention of the operator's own number — which IS the
+		// bot's id. It must NOT let the operator summon Brigade in a group they
+		// haven't allowlisted. Same `not-allowlisted` block as an untagged message.
 		const r = evaluateAccess({
 			policy: "pairing",
 			groupPolicy: "allowlist",
@@ -78,16 +81,31 @@ describe("evaluateAccess", () => {
 			allowFrom: [],
 			groupAllowFrom: [],
 		});
-		assert.equal(r.kind, "allow");
-		assert.match(String(r.reason), /^group:self\+mention$/);
+		assert.equal(r.kind, "block");
+		assert.match(String(r.reason), /^group:not-allowlisted$/);
 	});
 
-	it("self in a group is implicitly allow-listed (no need to add own number to groupAllowFrom)", () => {
-		// Operator's own number doesn't need to be on the explicit
-		// groupAllowFrom list for them to "qualify" — they're implicitly
-		// allowed by virtue of being self. They still need to mention the
-		// bot to actually be heard, but they shouldn't get a
-		// "not-allowlisted" block for being THE owner.
+	it("self is NOT implicitly allow-listed in a group — another sender being listed doesn't help the operator", () => {
+		// The operator's own number is NOT auto-qualified in groups. With the
+		// group off groupAllowJids and someone ELSE on groupAllowFrom, the operator
+		// gets the same `not-allowlisted` block as anyone uninvited.
+		const r = evaluateAccess({
+			policy: "pairing",
+			groupPolicy: "allowlist",
+			senderId: "+15551234567",
+			selfId: "+15551234567",
+			isGroup: true,
+			mentioned: true,
+			allowFrom: [],
+			groupAllowFrom: ["+19998887777"], // someone else, not the operator
+		});
+		assert.equal(r.kind, "block");
+		assert.match(String(r.reason), /^group:not-allowlisted$/);
+	});
+
+	/* ── the operator's two opt-in paths still work ── */
+
+	it("self in a JID-allowlisted group is allowed untagged (the operator's group opt-in)", () => {
 		const r = evaluateAccess({
 			policy: "pairing",
 			groupPolicy: "allowlist",
@@ -96,11 +114,27 @@ describe("evaluateAccess", () => {
 			isGroup: true,
 			mentioned: false,
 			allowFrom: [],
-			groupAllowFrom: ["+19998887777"], // someone else, not the operator
+			groupAllowFrom: [],
+			groupId: "120363000000000000@g.us",
+			groupAllowJids: ["120363000000000000@g.us"],
 		});
-		// Result: block, but the REASON is "without-mention", not "not-allowlisted".
-		assert.equal(r.kind, "block");
-		assert.match(String(r.reason), /^group:self-without-mention$/);
+		assert.equal(r.kind, "allow");
+		assert.match(String(r.reason), /^group:jid-allowlisted$/);
+	});
+
+	it("self ON the group allow-from list + mention is allowed (the explicit-sender opt-in)", () => {
+		const r = evaluateAccess({
+			policy: "pairing",
+			groupPolicy: "allowlist",
+			senderId: "+15551234567",
+			selfId: "+15551234567",
+			isGroup: true,
+			mentioned: true,
+			allowFrom: [],
+			groupAllowFrom: ["+15551234567"], // operator explicitly listed
+		});
+		assert.equal(r.kind, "allow");
+		assert.match(String(r.reason), /^group:self\+mention$/);
 	});
 
 	it("self in a `open` group still requires a mention (matches general open-group rule)", () => {

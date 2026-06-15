@@ -583,7 +583,18 @@ async function confirmAndErase(
 	tui.requestRender();
 	let deletedTotal = 0;
 	try {
-		const result = await resetConvexInstance(url);
+		const perTable = new Map<string, number>();
+		const result = await resetConvexInstance(url, {
+			onProgress: (table, deletedSoFar) => {
+				perTable.set(table, deletedSoFar);
+				let total = 0;
+				for (const v of perTable.values()) total += v;
+				loader.setMessage(
+					`Erasing the previous Brigade… ${total.toLocaleString()} records cleared · ${table}`,
+				);
+				tui.requestRender();
+			},
+		});
 		deletedTotal = result.deletedTotal;
 	} finally {
 		tui.removeChild(loader);
@@ -609,6 +620,7 @@ function describeSummary(s: ConvexInstanceSummary): string {
 	parts.push(`${n(s.counts.memories)} memories`);
 	parts.push(`${n(s.counts.sessions)} sessions`);
 	parts.push(`${n(s.counts.cronJobs)} scheduled jobs`);
+	if (s.hasActivity) parts.push("session & log history");
 	if (s.whatsappLinked) parts.push("WhatsApp linked");
 	const created = s.createdAtMs ? new Date(s.createdAtMs).toLocaleDateString() : undefined;
 	return `${parts.join(" · ")}${created ? ` · created ${created}` : ""}`;

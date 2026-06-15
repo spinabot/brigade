@@ -20,7 +20,7 @@ import * as path from "node:path";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { makeIsolatedLlm, type MakeExtractionLlmArgs } from "./extract.js";
-import { FactStore } from "./records.js";
+import { FactStore, type MemoryRecord } from "./records.js";
 
 const log = createSubsystemLogger("memory/consolidate");
 
@@ -65,11 +65,27 @@ export interface ConsolidationResult {
 	considered: number;
 }
 
+/** Origin-isolation bucket key. Owner (and legacy/undefined-origin) facts share
+ *  one bucket; each channel peer (channelId+conversationId+sessionKey) is its
+ *  OWN bucket — so a consolidation LLM call never mixes origins. */
+function originBucketKey(r: MemoryRecord): string {
+	const o = (r as { createdBy?: { kind?: string; channelId?: string; conversationId?: string; sessionKey?: string } })
+		.createdBy;
+	if (!o || o.kind !== "channel") return "owner";
+	return `channel:${o.channelId ?? ""}:${o.conversationId ?? ""}:${o.sessionKey ?? ""}`;
+}
+
 /**
  * Run one consolidation pass: read active facts, ask the LLM which to archive,
  * validate the ids (only archive ones that actually exist + are active, and
  * never let it archive ALL of them via a runaway response), apply. LLM injected
  * for testability. No-op below `minFacts`.
+ *
+ * ORIGIN ISOLATION: facts are bucketed by origin and consolidated SEPARATELY —
+ * the owner and each channel peer get their own LLM call. A single cross-origin
+ * prompt would (a) expose one peer's private content to another's consolidation
+ * and (b) let one origin's facts drive another's archival — both break the
+ * `MemoryRecordOrigin` isolation invariant. One call per origin with >= minFacts.
  */
 export async function runConsolidation(args: {
 	workspaceDir: string;
@@ -79,34 +95,48 @@ export async function runConsolidation(args: {
 	const store = new FactStore(args.workspaceDir);
 	const active = store.list(); // active-only
 	const min = args.minFacts ?? MIN_FACTS_TO_CONSOLIDATE;
-	if (active.length < min) return { ran: false, archived: 0, considered: active.length };
 
-	const block = active
-		.map((f) => `[${f.memoryId}] (${f.segment}, importance ${f.importance.toFixed(2)}) ${f.content}`)
-		.join("\n");
-	let reply = "";
-	try {
-		reply = await args.llm(block);
-	} catch (err) {
-		log.warn("consolidation llm failed", {
-			error: err instanceof Error ? err.message : String(err),
-		});
-		return { ran: false, archived: 0, considered: active.length };
+	const buckets = new Map<string, MemoryRecord[]>();
+	for (const f of active) {
+		const key = originBucketKey(f);
+		const arr = buckets.get(key);
+		if (arr) arr.push(f);
+		else buckets.set(key, [f]);
 	}
-	const requested = parseConsolidationArchive(reply);
-	const activeIds = new Set(active.map((f) => f.memoryId));
-	let toArchive = requested.filter((id) => activeIds.has(id));
-	// Safety: never archive EVERYTHING (a runaway model emptying the store).
-	if (toArchive.length >= active.length) {
-		log.warn("consolidation tried to archive all facts — refusing", {
-			requested: toArchive.length,
-			active: active.length,
-		});
-		toArchive = [];
+
+	let ran = false;
+	let archived = 0;
+	for (const bucket of buckets.values()) {
+		if (bucket.length < min) continue; // too few in this origin to be worth a call
+		const block = bucket
+			.map((f) => `[${f.memoryId}] (${f.segment}, importance ${f.importance.toFixed(2)}) ${f.content}`)
+			.join("\n");
+		let reply = "";
+		try {
+			reply = await args.llm(block);
+		} catch (err) {
+			log.warn("consolidation llm failed", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+			continue;
+		}
+		ran = true;
+		const requested = parseConsolidationArchive(reply);
+		const bucketIds = new Set(bucket.map((f) => f.memoryId));
+		let toArchive = requested.filter((id) => bucketIds.has(id));
+		// Safety: never archive EVERYTHING in an origin (a runaway model emptying it).
+		if (toArchive.length >= bucket.length) {
+			log.warn("consolidation tried to archive all facts in an origin — refusing", {
+				requested: toArchive.length,
+				active: bucket.length,
+			});
+			toArchive = [];
+		}
+		if (toArchive.length > 0) store.setLifecycle(toArchive, "archived");
+		archived += toArchive.length;
+		log.info("consolidation sweep (origin)", { considered: bucket.length, archived: toArchive.length });
 	}
-	if (toArchive.length > 0) store.setLifecycle(toArchive, "archived");
-	log.info("consolidation sweep", { considered: active.length, archived: toArchive.length });
-	return { ran: true, archived: toArchive.length, considered: active.length };
+	return { ran, archived, considered: active.length };
 }
 
 /* ───────────────────────── throttle ───────────────────────── */

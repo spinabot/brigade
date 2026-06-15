@@ -38,6 +38,7 @@ import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
 import { makeManageAccessTool } from "./manage-access-tool.js";
 import { makeManageChannelAccessTool } from "./manage-channel-access-tool.js";
+import { makeComposioTool } from "./composio-tool.js";
 import { makeManageProviderTool } from "./manage-provider-tool.js";
 import { makeOAuthAuthorizeTool } from "./oauth-authorize-tool.js";
 import { makeManageSkillTool } from "./manage-skill-tool.js";
@@ -261,6 +262,16 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// groupAllowJids / groupFollowUpWindowMs, so "let the crew answer in this
 		// group / stop making me tag you" is one validated call, not a hand-edit.
 		makeManageChannelAccessTool(),
+		// composio — owner-only universal app connector (Composio, 1,000+ apps).
+		// Always mounted (like oauth_authorize) so the crew is always aware it
+		// can connect apps; set-key seals the operator's Composio key, then
+		// connect/search/execute. Inert (reports "no key") until set-key.
+		makeComposioTool({
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+			...(typeof opts.sessionContext?.key === "string" && opts.sessionContext.key.length > 0
+				? { sessionKey: opts.sessionContext.key }
+				: {}),
+		}),
 		// oauth_authorize — owner-only OAuth 2.0 authorization-code flow with a
 		// one-shot loopback callback. Exists so the model never hand-rolls an
 		// http listener in bash (the Gmail-OAuth flow fought EADDRINUSE +

@@ -33,6 +33,9 @@ const originalUserProfile = process.env.USERPROFILE;
 process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 delete process.env.BRIGADE_HOME;
+// Neutralize a shell-exported Composio key so the exact tool-count assertions
+// (baseline, no-Composio surface) don't flake on machines that have it set.
+delete process.env.COMPOSIO_API_KEY;
 
 const {
 	BrigadeToolAuthorizationError,
@@ -198,7 +201,7 @@ describe("assembleBrigadeToolset — senderIsOwner gating", () => {
 			// would be (the wrapper short-circuits in owner mode).
 			assert.equal(typeof tool.execute, "function");
 		}
-		assert.equal(ts.customTools.length, 12); // find + generate_image + manage_provider + manage_access + manage_channel_access + oauth_authorize + recall + read_memory + write_memory + agents_list + manage_agent + manage_skill
+		assert.equal(ts.customTools.length, 13); // composio + find + generate_image + manage_provider + manage_access + manage_channel_access + oauth_authorize + recall + read_memory + write_memory + agents_list + manage_agent + manage_skill
 	});
 
 	it("senderIsOwner: false wraps any ownerOnly tool so it refuses execute", async () => {
@@ -217,11 +220,12 @@ describe("assembleBrigadeToolset — senderIsOwner gating", () => {
 			cwd: workspace,
 			senderIsOwner: false,
 		});
-		assert.equal(ts.customTools.length, 12);
+		assert.equal(ts.customTools.length, 13);
 		// brigadeToolNames mirror customTools.name — wrapping must NOT change
 		// the visible name surface.
 		assert.deepEqual(ts.brigadeToolNames.sort(), [
 			"agents_list",
+			"composio",
 			"find",
 			"generate_image",
 			"manage_access",

@@ -90,6 +90,46 @@ describe("runConsolidation", () => {
 		assert.equal(res.ran, false);
 		assert.equal(store.list().length, 6);
 	});
+
+	it("consolidates each ORIGIN in isolation — no prompt mixes origins, no cross-origin archive", async () => {
+		const store = new FactStore(dir);
+		const ownerIds: string[] = [];
+		const chanIds: string[] = [];
+		for (let i = 0; i < 6; i++) {
+			ownerIds.push(store.write({ content: `Owner fact ${i} about topic ${i}.`, segment: "knowledge" }).memoryId);
+		}
+		const chanOrigin = { kind: "channel" as const, channelId: "whatsapp", conversationId: "grp1", sessionKey: "s1" };
+		for (let i = 0; i < 6; i++) {
+			chanIds.push(
+				store.write({ content: `Channel fact ${i} about topic ${i}.`, segment: "knowledge", createdBy: chanOrigin })
+					.memoryId,
+			);
+		}
+		const firstOwnerId = ownerIds[0];
+		assert.ok(firstOwnerId);
+		const blocks: string[] = [];
+		// The LLM always tries to archive an OWNER id, regardless of which bucket it sees.
+		const llm = async (block: string) => {
+			blocks.push(block);
+			return `{"archive":["${firstOwnerId}"]}`;
+		};
+		const res = await runConsolidation({ workspaceDir: dir, llm });
+
+		// Two origin buckets (owner + one channel), each >= minFacts → exactly two ISOLATED calls.
+		assert.equal(blocks.length, 2, "one LLM call per origin — never a single merged cross-origin prompt");
+		for (const b of blocks) {
+			const sawOwner = ownerIds.some((id) => b.includes(id));
+			const sawChannel = chanIds.some((id) => b.includes(id));
+			assert.ok(!(sawOwner && sawChannel), "a consolidation prompt must never contain two origins at once");
+		}
+		// Owner id archived by the owner bucket; the channel call returning that same
+		// owner id archives NOTHING (cross-origin archive is blocked by bucket scoping).
+		assert.equal(res.archived, 1);
+		assert.ok(store.list({ lifecycle: "archived" }).map((r) => r.memoryId).includes(firstOwnerId));
+		for (const id of chanIds) {
+			assert.ok(store.list().map((r) => r.memoryId).includes(id), "channel facts untouched by owner consolidation");
+		}
+	});
 });
 
 describe("consolidation throttle", () => {
