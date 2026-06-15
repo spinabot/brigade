@@ -47,6 +47,9 @@ skills-lock.json
 # Misc
 test.txt
 
+# Packaging artifacts (npm pack / publish output)
+*.tgz
+
 # VSCode workspace files
 *.code-workspace
 
