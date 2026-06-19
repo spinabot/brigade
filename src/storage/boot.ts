@@ -196,13 +196,16 @@ async function hydrateFactsCaches(
 	store: BrigadeStore,
 	cfg: Record<string, unknown>,
 ): Promise<void> {
-	const { primeFactsCache } = await import("./facts-cache.js");
+	const { primeFactsCache, canonicalWorkspaceId } = await import("./facts-cache.js");
 	const agents = cfg.agents as Record<string, unknown> | undefined;
 	const ids = new Set<string>(["main"]);
 	if (agents && typeof agents === "object") {
 		for (const key of Object.keys(agents)) {
 			if (key === "defaults" || !key.trim()) continue;
-			ids.add(key.trim());
+			// CANONICAL key — must match the runtime FactStore's path-derived key (which
+			// `resolveAgentWorkspaceDir` lowercases), or the runtime read misses this
+			// boot-primed cache and the agent reads empty memory forever.
+			ids.add(canonicalWorkspaceId(key));
 		}
 	}
 	await Promise.all(

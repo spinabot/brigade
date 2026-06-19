@@ -38,7 +38,7 @@ describe("self-review loop — distils a transcript into attributed memory", () 
 
 	const owner: MemoryRecordOrigin = { kind: "owner" };
 
-	it("persists proposed facts, attributed as extraction + scoped to origin", async () => {
+	it("persists proposed facts as extraction-confined evidence, scoped to origin", async () => {
 		const store = new FactStore(dir);
 		const reviewer: Reviewer = async () => ({
 			facts: [
@@ -52,6 +52,10 @@ describe("self-review loop — distils a transcript into attributed memory", () 
 		assert.equal(all.length, 2);
 		assert.ok(all.every((r) => r.sourceType === "extraction"), "attributed as extraction (review-distilled)");
 		assert.ok(all.every((r) => r.createdBy?.kind === "owner"), "scoped to the turn's origin");
+		// SECURITY: the reviewer distils an attacker-influenceable transcript, so its
+		// proposed `preference`/`identity` are CONFINED to descriptive `knowledge` —
+		// laundered content can't pose as the operator's authoritative self-model.
+		assert.ok(all.every((r) => r.segment === "knowledge"), "protected segments confined to knowledge evidence");
 		assert.match(res.summary, /learned 2 fact/);
 	});
 

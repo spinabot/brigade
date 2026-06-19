@@ -40,13 +40,27 @@ import type { MemoryRecord, MemorySegment, MemorySourceType } from "./records.js
  *   - `compaction` — a context-window SUMMARY the model produced; lossy and
  *     model-authored, so it must not be able to overwrite what the owner
  *     actually said (per the build-plan write-gate spec).
- * Everything else (undefined/legacy, user_instruction, owner_message,
- * channel_message, extraction, dream) is trusted by this gate.
+ *   - `extraction` — facts a reviewer/distiller LLM DISTILLED from a transcript.
+ *     The transcript is attacker-influenceable (a pasted document, a peer's
+ *     message, a tool result quoted back), so a distilled "the user prefers X"
+ *     is laundered third-party content, NOT a direct owner statement. Confining
+ *     it here closes the indirect-prompt-injection path: untrusted text → the
+ *     post-turn / self-review distiller → an authoritative owner fact. Extraction
+ *     still authors DESCRIPTIVE segments freely (knowledge/context/...) — it is
+ *     evidence, down-weighted at recall, not the operator's self-model.
+ *
+ * `dream` is deliberately NOT here: the dream pass operates on facts that are
+ * ALREADY in the store (and so already passed this gate) — it promotes /
+ * consolidates / evicts them; it does not INGEST raw transcript content, so it
+ * is not a laundering entry point. `channel_message` is also trusted-but-isolated
+ * (see below). Everything else (undefined/legacy, user_instruction,
+ * owner_message) is the operator speaking directly.
  */
 const UNTRUSTED_SOURCES: ReadonlySet<MemorySourceType> = new Set<MemorySourceType>([
 	"tool_output",
 	"retrieved_document",
 	"compaction",
+	"extraction",
 ]);
 
 /**
@@ -75,6 +89,29 @@ export function isUntrustedSource(source: MemorySourceType | undefined): boolean
  *  and are assumed owner-authored). */
 export function isTrustedTarget(source: MemorySourceType | undefined): boolean {
 	return !isUntrustedSource(source);
+}
+
+/** True when `segment` is an authoritative (owner-only) segment — the ones an
+ *  untrusted source is barred from authoring (Rule 1). */
+export function isProtectedSegment(segment: MemorySegment): boolean {
+	return PROTECTED_SEGMENTS.has(segment);
+}
+
+/**
+ * Confine an untrusted-source fact to what the gate permits, WITHOUT dropping
+ * it: an untrusted source can't author a protected segment, so its content is
+ * routed to descriptive `knowledge` (kept as evidence, trust-down-weighted at
+ * recall) instead of being lost. Trusted sources and already-descriptive
+ * segments pass through unchanged. Used by the extraction sites (post-turn
+ * sweep + self-review) so a distiller proposing `preference` lands a `knowledge`
+ * fact rather than throwing a {@link WriteGateError}; the gate itself remains
+ * the hard backstop for any path that writes a protected segment directly.
+ */
+export function confineUntrustedSegment(
+	source: MemorySourceType | undefined,
+	segment: MemorySegment,
+): MemorySegment {
+	return isUntrustedSource(source) && isProtectedSegment(segment) ? "knowledge" : segment;
 }
 
 export type WriteGateVerdict = { allow: true } | { allow: false; reason: string };

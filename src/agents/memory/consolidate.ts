@@ -20,7 +20,7 @@ import * as path from "node:path";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { makeIsolatedLlm, type MakeExtractionLlmArgs } from "./extract.js";
-import { FactStore, type MemoryRecord } from "./records.js";
+import { FactStore, originBucketKey, type MemoryRecord } from "./records.js";
 
 const log = createSubsystemLogger("memory/consolidate");
 
@@ -64,16 +64,9 @@ export interface ConsolidationResult {
 	archived: number;
 	considered: number;
 }
-
-/** Origin-isolation bucket key. Owner (and legacy/undefined-origin) facts share
- *  one bucket; each channel peer (channelId+conversationId+sessionKey) is its
- *  OWN bucket — so a consolidation LLM call never mixes origins. */
-function originBucketKey(r: MemoryRecord): string {
-	const o = (r as { createdBy?: { kind?: string; channelId?: string; conversationId?: string; sessionKey?: string } })
-		.createdBy;
-	if (!o || o.kind !== "channel") return "owner";
-	return `channel:${o.channelId ?? ""}:${o.conversationId ?? ""}:${o.sessionKey ?? ""}`;
-}
+// Origin-isolation bucket key is the CANONICAL one from records.ts (injective +
+// accountId-aware) — a local copy previously drifted (unescaped ':' join could
+// collide two distinct channel origins into one consolidation bucket).
 
 /**
  * Run one consolidation pass: read active facts, ask the LLM which to archive,
@@ -147,6 +140,13 @@ function statePath(workspaceDir: string): string {
 
 // Convex-mode throttle cache. A miss reads "eligible" once; the stamp lands
 // both here and in the backend so subsequent ticks throttle normally.
+// KNOWN LIMITATION (convex multi-agent, tracked): this stamp AND the backend SPI
+// (getConsolidateLastRunAt / markConsolidateRunAt) are NOT keyed per workspace, so with
+// ≥2 convex agents one agent's run throttles the others (non-primary agents under-
+// consolidate). The complete fix threads a workspaceId through the SPI (mirroring the
+// per-session extract cursor) + the convex schema. Filesystem mode is already
+// per-workspace (the state file is under activeWorkspaceDir), so this only bites
+// convex + multi-agent — deferred over a deep SPI/schema change at low blast radius.
 let convexLastRunAt: number | undefined;
 
 /** Test-only. */

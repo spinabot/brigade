@@ -67,15 +67,23 @@ export function ndcgAtK(retrievedIds: readonly string[], relevantIds: readonly s
 	const gold = new Set(relevantIds);
 	if (gold.size === 0) return Number.NaN;
 	const cut = Math.max(0, k);
-	let dcg = 0;
-	let rank = 0;
+	// Dedup FIRST (keep first occurrence), THEN take the top-k DISTINCT results, so
+	// "k" consistently means k distinct retrieved ids and the discount is each id's
+	// position in the deduped ranking. This is textbook position-based DCG with no
+	// ambiguity: a repeat neither wastes a raw top-k slot (depressing the score) nor
+	// compresses later ranks (inflating it) — the two failure modes of cutting raw
+	// positions while ranking only distinct ids.
 	const seen = new Set<string>();
-	for (let i = 0; i < Math.min(cut, retrievedIds.length); i++) {
-		const id = retrievedIds[i]!;
-		if (seen.has(id)) continue; // dedup: a repeated id earns its discount once
+	const distinct: string[] = [];
+	for (const id of retrievedIds) {
+		if (seen.has(id)) continue;
 		seen.add(id);
-		rank += 1;
-		if (gold.has(id)) dcg += 1 / Math.log2(rank + 1);
+		distinct.push(id);
+		if (distinct.length >= cut) break;
+	}
+	let dcg = 0;
+	for (let i = 0; i < distinct.length; i++) {
+		if (gold.has(distinct[i]!)) dcg += 1 / Math.log2(i + 2); // 0-based i ⇒ 1-based rank i+1
 	}
 	const idealHits = Math.min(cut, gold.size);
 	let idcg = 0;
@@ -95,7 +103,10 @@ export function percentile(values: readonly number[], p: number): number {
 	return sorted[rank - 1]!;
 }
 
-/** Arithmetic mean, ignoring non-finite (NaN) entries. 0 if nothing finite. */
+/** Arithmetic mean, ignoring non-finite (NaN) entries. Returns 0 when NOTHING is
+ *  finite (an all-abstention run) — a SENTINEL, not a measured 0%. Callers/gates
+ *  that branch on the value MUST also check the count of scored cases (the harness
+ *  reports `nScored`) to tell "no scorable cases" from a genuine zero. */
 export function meanIgnoringNaN(values: readonly number[]): number {
 	let sum = 0;
 	let n = 0;

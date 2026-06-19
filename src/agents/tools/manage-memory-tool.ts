@@ -7,6 +7,7 @@
 // workspace exactly like the rest of the memory path — so it works in both
 // filesystem and convex modes.
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { Type } from "typebox";
@@ -17,6 +18,26 @@ import { applyRetention, exportMemory, inspect, purge } from "../memory/governan
 import { FactStore, type MemoryRecordOrigin } from "../memory/records.js";
 import { applyProposal, approve, type Proposal, proposeFromTelemetry, revertProposal } from "../memory/self-improve.js";
 import { writeVault } from "../memory/vault.js";
+
+const OWNER_ORIGIN = { kind: "owner" } as const;
+
+/**
+ * After a destructive shred (purge / retention) in FILESYSTEM mode, re-render + prune
+ * the markdown vault so the shredded fact's PLAINTEXT note can't linger on disk — the
+ * integrity counterpart to the crypto-shred. No-op when the vault was never created, or
+ * in convex mode (no disk vault). Best-effort: a vault write failure must not fail the
+ * shred that already succeeded (a stale note is the lesser problem, surfaced on next render).
+ */
+function repruneVaultAfterShred(workspaceDir: string, store: FactStore): void {
+	if (tryGetRuntimeContext()?.mode === "convex") return;
+	const dir = path.join(workspaceDir, "memory-vault");
+	if (!fs.existsSync(dir)) return;
+	try {
+		writeVault(dir, store.listForVault(OWNER_ORIGIN), { prune: true });
+	} catch {
+		/* best-effort */
+	}
+}
 
 import { jsonResult } from "./common.js";
 import type { AgentToolResult, BrigadeTool } from "./types.js";
@@ -99,6 +120,7 @@ export function makeManageMemoryTool(workspaceDir: string): BrigadeTool<typeof P
 				case "purge": {
 					if (!args.memory_id) return result({ action: "purge", ok: false, message: "memory_id is required for purge." });
 					const r = purge(store, args.memory_id);
+					if (r.purged.length > 0) repruneVaultAfterShred(workspaceDir, store);
 					return result({
 						action: "purge",
 						ok: r.purged.length > 0,
@@ -127,12 +149,25 @@ export function makeManageMemoryTool(workspaceDir: string): BrigadeTool<typeof P
 				}
 				case "export": {
 					const facts = exportMemory(store, { origin: OWNER });
+					const activeCount = facts.filter((f) => f.lifecycle === "active").length;
 					return result({
 						action: "export",
 						ok: true,
 						count: facts.length,
-						facts: facts.map((f) => ({ id: f.memoryId, content: f.content, segment: f.segment, status: f.status ?? "asserted" })),
-						message: `Exported ${facts.length} fact(s).`,
+						activeCount,
+						facts: facts.map((f) => ({
+							id: f.memoryId,
+							content: f.content,
+							segment: f.segment,
+							status: f.status ?? "asserted",
+							// lifecycle distinguishes a LIVE fact from SUPERSEDED history — without
+							// it, archived facts render identically to active ones, so "show my
+							// memory" looks cluttered with stale beliefs that recall never returns.
+							lifecycle: f.lifecycle,
+						})),
+						message:
+							`Exported ${facts.length} fact(s): ${activeCount} active, ` +
+							`${facts.length - activeCount} superseded/archived (history — NOT returned by recall).`,
 					});
 				}
 				case "retention": {
@@ -140,6 +175,7 @@ export function makeManageMemoryTool(workspaceDir: string): BrigadeTool<typeof P
 						return result({ action: "retention", ok: false, message: "ttl_days (>= 1) is required for retention." });
 					}
 					const r = applyRetention(store, { ttlMs: args.ttl_days * 86_400_000, origin: OWNER });
+					if (r.purged.length > 0) repruneVaultAfterShred(workspaceDir, store);
 					return result({
 						action: "retention",
 						ok: true,
@@ -160,9 +196,10 @@ export function makeManageMemoryTool(workspaceDir: string): BrigadeTool<typeof P
 						});
 					}
 					const dir = path.join(workspaceDir, "memory-vault");
-					const records = store.list({ origin: OWNER });
-					// prune: this is the full owner set, so a stale note = a purged/evicted
-					// fact — remove it so no shredded content lingers as plaintext.
+					// Active PLUS restorable-archived (retracted/decayed): a reversibly-
+					// retracted fact's note — and the operator's hand-pinned edits on it —
+					// must survive the prune (only a hard-purged fact's note is removed).
+					const records = store.listForVault(OWNER);
 					const w = writeVault(dir, records, { prune: true });
 					return result({
 						action: "vault",

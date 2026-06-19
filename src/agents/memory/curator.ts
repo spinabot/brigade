@@ -64,9 +64,10 @@ export function runCurator(
 	let vaultWritten: number | undefined;
 	const changed = confirmed + consolidated + evicted > 0;
 	if (opts.vaultDir && changed && tryGetRuntimeContext()?.mode !== "convex") {
-		// Full owner set + prune: evicted/purged facts' notes are removed (no stale
-		// plaintext after a shred), and human-pinned edits on survivors are kept.
-		vaultWritten = writeVault(opts.vaultDir, store.list({ origin: { kind: "owner" } }), { prune: true }).written;
+		// Active + restorable-archived + prune: a purged/superseded fact's note is removed
+		// (no stale plaintext after a shred), while a reversibly-retracted fact's note and
+		// its human-pinned edits are kept (listForVault), and survivors' edits are merged.
+		vaultWritten = writeVault(opts.vaultDir, store.listForVault({ kind: "owner" }), { prune: true }).written;
 	}
 
 	return {

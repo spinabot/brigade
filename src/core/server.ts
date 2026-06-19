@@ -957,6 +957,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 * the operator notices missing memory updates.
 	 */
 	const extractingSince = new Map<string, number>();
+	// Per-sweep token: the watchdog can force-clear a stuck flag, after which a NEW
+	// sweep may start — without a token, the OLD (still-running) sweep's finally{} would
+	// then delete the NEW sweep's flag, letting a 3rd start, and so on (cascading
+	// concurrent sweeps + cursor churn). A sweep only clears its flag if its token is
+	// still the current one.
+	const extractingToken = new Map<string, number>();
+	let extractTokenSeq = 0;
 	const extractionStuckBufferMs = 30_000;
 
 	const armExtractTimer = (): void => {
@@ -990,6 +997,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					);
 					extractingAgents.delete(agentId);
 					extractingSince.delete(agentId);
+					extractingToken.delete(agentId);
 				}
 			}
 		}
@@ -1022,6 +1030,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				}
 				extractingAgents.add(targetAgentId);
 				extractingSince.set(targetAgentId, Date.now());
+				const sweepToken = ++extractTokenSeq;
+				extractingToken.set(targetAgentId, sweepToken);
 				try {
 					const workspaceDir = resolveAgentWorkspaceDir(targetAgentId);
 					const agentDir = resolveAgentDir(targetAgentId);
@@ -1090,8 +1100,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						}`,
 					);
 				} finally {
-					extractingAgents.delete(targetAgentId);
-					extractingSince.delete(targetAgentId);
+					// Only clear the flag if THIS sweep still owns it. If the watchdog
+					// force-cleared us and a newer sweep took over, leave the newer sweep's
+					// flag intact rather than deleting it out from under it (which would let
+					// a third sweep start concurrently).
+					if (extractingToken.get(targetAgentId) === sweepToken) {
+						extractingAgents.delete(targetAgentId);
+						extractingSince.delete(targetAgentId);
+						extractingToken.delete(targetAgentId);
+					}
 				}
 			}),
 		);

@@ -33,6 +33,7 @@
     "clean": "node -e \"import('node:fs').then(fs => fs.rmSync('dist', { recursive: true, force: true }))\"",
     "prepack": "npm run build",
     "test": "node scripts/run-tests.mjs",
+    "bench": "npx tsx --test src/agents/memory/eval/comparison.test.ts src/agents/memory/eval/gold-hard.test.ts src/agents/memory/eval/gold-parity.test.ts src/agents/memory/eval/asr-bench.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "brigade": "node brigade.mjs",
     "start": "node scripts/run-brigade.mjs",

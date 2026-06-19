@@ -58,8 +58,20 @@ export function runDecayGc(workspaceDir: string, now: number = Date.now()): Deca
 	for (const r of active) {
 		if (r.tier === "permanent") continue;
 		const score = effectiveScore(r, now);
-		if (score < PRUNE_THRESHOLD) toPrune.push(r.memoryId);
-		else if (score < ARCHIVE_THRESHOLD && r.tier !== "long") toArchive.push(r.memoryId);
+		// Long-tier (identity/preference/correction/relationship/project) is the DURABLE
+		// tier: decay may at most ARCHIVE it (kept, recoverable via reactivate), NEVER
+		// hard-prune it — so it stays active down to the prune floor, then ARCHIVES rather
+		// than pruning. (Previously the `!== "long"` guard sat ONLY on the archive branch,
+		// so a long fact skipped the archived grace state and jumped active → pruned — the
+		// MORE durable tier ended up LESS recoverable, since reactivate() restores only
+		// archived.) Short/context facts age out fully: active → archived → pruned.
+		if (r.tier === "long") {
+			if (score < PRUNE_THRESHOLD) toArchive.push(r.memoryId);
+		} else if (score < PRUNE_THRESHOLD) {
+			toPrune.push(r.memoryId);
+		} else if (score < ARCHIVE_THRESHOLD) {
+			toArchive.push(r.memoryId);
+		}
 	}
 	if (toPrune.length > 0) store.setLifecycle(toPrune, "pruned");
 	if (toArchive.length > 0) store.setLifecycle(toArchive, "archived");

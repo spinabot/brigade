@@ -5,7 +5,14 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { FactStore } from "./records.js";
-import { WriteGateError, evaluateWriteGate, isUntrustedSource, isTrustedTarget } from "./write-gate.js";
+import {
+	WriteGateError,
+	confineUntrustedSegment,
+	evaluateWriteGate,
+	isProtectedSegment,
+	isTrustedTarget,
+	isUntrustedSource,
+} from "./write-gate.js";
 
 /**
  * The write-gate (Tideline Step 12) — memory-poisoning guard. Proves the pure
@@ -20,11 +27,11 @@ describe("write-gate policy — pure", () => {
 		assert.equal(isUntrustedSource("tool_output"), true);
 		assert.equal(isUntrustedSource("retrieved_document"), true);
 		assert.equal(isUntrustedSource("compaction"), true); // model-authored summary — can't override owner
+		assert.equal(isUntrustedSource("extraction"), true); // distilled from an attacker-influenceable transcript — confined
 		assert.equal(isUntrustedSource("owner_message"), false);
 		assert.equal(isUntrustedSource("user_instruction"), false);
 		assert.equal(isUntrustedSource("channel_message"), false); // origin-isolated, not gated here
-		assert.equal(isUntrustedSource("extraction"), false);
-		assert.equal(isUntrustedSource("dream"), false); // model-authored reflection — trusted by this gate
+		assert.equal(isUntrustedSource("dream"), false); // reshapes already-gated facts (no raw ingest) — trusted by this gate
 		assert.equal(isUntrustedSource(undefined), false); // legacy / owner-authored
 		// A target is trusted exactly when it isn't untrusted (undefined ⇒ trusted).
 		assert.equal(isTrustedTarget(undefined), true);
@@ -88,6 +95,38 @@ describe("write-gate policy — pure", () => {
 			supersedeTargets: [{ memoryId: "owned", sourceType: "owner_message" }],
 		});
 		assert.equal(v.allow, false);
+	});
+
+	it("LAUNDERING — an `extraction` (distiller) source is confined exactly like other untrusted sources", () => {
+		// Rule 1: a distilled "the user prefers X" can't author the self-model.
+		for (const segment of ["identity", "preference", "correction"] as const) {
+			assert.equal(
+				evaluateWriteGate({ sourceType: "extraction", segment, supersedeTargets: [] }).allow,
+				false,
+				`extraction → ${segment} must be blocked (the indirect-injection laundering path)`,
+			);
+		}
+		// Rule 2: it may not supersede an owner fact via a descriptive segment either.
+		assert.equal(
+			evaluateWriteGate({
+				sourceType: "extraction",
+				segment: "knowledge",
+				supersedeTargets: [{ memoryId: "owned", sourceType: undefined }],
+			}).allow,
+			false,
+		);
+		// But it MAY contribute descriptive evidence (no supersede) — confined, not banned.
+		assert.deepEqual(
+			evaluateWriteGate({ sourceType: "extraction", segment: "knowledge", supersedeTargets: [] }),
+			{ allow: true },
+		);
+		// confineUntrustedSegment routes a protected proposal to knowledge (kept as evidence),
+		// and leaves a trusted source / descriptive segment untouched.
+		assert.equal(confineUntrustedSegment("extraction", "preference"), "knowledge");
+		assert.equal(confineUntrustedSegment("extraction", "context"), "context");
+		assert.equal(confineUntrustedSegment(undefined, "preference"), "preference");
+		assert.equal(isProtectedSegment("identity"), true);
+		assert.equal(isProtectedSegment("knowledge"), false);
 	});
 });
 

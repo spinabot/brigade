@@ -94,41 +94,45 @@ describe("subjectKey attribute slots — single-valued auto-supersede", () => {
 	});
 });
 
-describe("correction-segment auto-supersede — the robust everyday path (no slot, no id)", () => {
-	it("a `correction` write supersedes same-subject same-origin priors WITHOUT a subjectKey or id", () => {
+describe("supersede — slot-based is reliable; a slot-less correction safely COEXISTS (no content gamble)", () => {
+	it("a slot-less correction does NOT archive the prior by content overlap (the data-loss-safe behavior)", () => {
 		const store = new FactStore(dir);
 		const fri = store.write({ content: "User deploys on Fridays", segment: "preference", createdBy: owner });
 		const mon = store.write({ content: "User deploys on Mondays", segment: "correction", createdBy: owner });
-		// the Mondays correction supersedes the Fridays preference (cross-segment, by content overlap)
-		assert.equal(store.readAll().find((r) => r.memoryId === fri.memoryId)?.lifecycle, "archived", "prior belief archived by a plain correction");
+		// A correction WITHOUT a subjectKey no longer auto-supersedes by content overlap:
+		// no lexical threshold separates a same-subject value change from a DIFFERENT-subject
+		// one (both ≈0.5), so the old gate silently archived still-true facts. Both now
+		// coexist; recall surfaces the freshest first and the dream consolidates near-dupes.
+		assert.equal(store.readAll().find((r) => r.memoryId === fri.memoryId)?.lifecycle, "active", "prior survives a slot-less correction — no data loss");
+		assert.equal(mon.lifecycle, "active");
+		assert.equal(store.list({ origin: owner }).length, 2, "both coexist (freshest wins at recall)");
+	});
+
+	it("a correction WITH a subjectKey reliably supersedes the same-slot prior (the supported auto-replace)", () => {
+		const store = new FactStore(dir);
+		const fri = store.write({ content: "User deploys on Fridays", segment: "preference", subjectKey: "deploy_day", createdBy: owner });
+		const mon = store.write({ content: "User deploys on Mondays", segment: "correction", subjectKey: "deploy_day", createdBy: owner });
+		assert.equal(store.readAll().find((r) => r.memoryId === fri.memoryId)?.lifecycle, "archived", "same-slot prior archived");
 		assert.equal(mon.lifecycle, "active");
 		assert.ok(mon.links?.some((l) => l.kind === "contradicts" && l.target === fri.memoryId), "contradicts link recorded");
-		// a SECOND correction collapses the chain — no pile-up
-		store.write({ content: "User deploys on Wednesdays", segment: "correction", createdBy: owner });
+		// a SECOND same-slot write collapses the chain — no pile-up
+		store.write({ content: "User deploys on Wednesdays", segment: "correction", subjectKey: "deploy_day", createdBy: owner });
 		const active = store.list({ origin: owner });
-		assert.equal(active.length, 1, "only the latest correction stays active (the pile collapses)");
+		assert.equal(active.length, 1, "only the latest same-slot value stays active");
 		assert.match(active[0]!.content, /Wednesdays/);
 	});
 
-	it("a correction does NOT touch UNRELATED facts (low subject overlap)", () => {
-		const store = new FactStore(dir);
-		const pet = store.write({ content: "I have a dog named Biscuit", segment: "identity", createdBy: owner });
-		store.write({ content: "I deploy on Mondays", segment: "correction", createdBy: owner });
-		assert.equal(store.readAll().find((r) => r.memoryId === pet.memoryId)?.lifecycle, "active", "an unrelated fact survives a correction");
-	});
-
-	it("ADDITIVE facts under non-correction segments coexist even at high overlap (the cat doesn't kill the dog)", () => {
+	it("ADDITIVE facts (no slot) coexist even at high overlap (the cat doesn't kill the dog)", () => {
 		const store = new FactStore(dir);
 		store.write({ content: "I have a dog named Biscuit", segment: "relationship", createdBy: owner });
 		store.write({ content: "I have a cat named Whiskers", segment: "relationship", createdBy: owner });
-		// relationship (not correction) + no slot ⇒ NEVER auto-superseded, despite ~0.5 token overlap
-		assert.equal(store.list({ origin: owner }).length, 2, "both pets survive — additive segments are never auto-superseded");
+		assert.equal(store.list({ origin: owner }).length, 2, "both pets survive — slot-less facts are never auto-superseded");
 	});
 
-	it("a peer's correction does NOT supersede the owner's same-subject fact (origin-isolated)", () => {
+	it("a peer's correction does NOT supersede the owner's same-SLOT fact (origin-isolated)", () => {
 		const store = new FactStore(dir);
-		const ownerFact = store.write({ content: "I deploy on Fridays", segment: "preference", createdBy: owner });
-		store.write({ content: "I deploy on Sundays", segment: "correction", createdBy: peer });
-		assert.equal(store.readAll().find((r) => r.memoryId === ownerFact.memoryId)?.lifecycle, "active", "a peer correction can't archive the owner's belief");
+		const ownerFact = store.write({ content: "I deploy on Fridays", segment: "preference", subjectKey: "deploy_day", createdBy: owner });
+		store.write({ content: "I deploy on Sundays", segment: "correction", subjectKey: "deploy_day", createdBy: peer });
+		assert.equal(store.readAll().find((r) => r.memoryId === ownerFact.memoryId)?.lifecycle, "active", "a peer can't archive the owner's belief even on the same slot");
 	});
 });

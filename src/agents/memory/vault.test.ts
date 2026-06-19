@@ -89,15 +89,20 @@ describe("vault — 3-way merge (human edits survive a dream pass)", () => {
 });
 
 describe("vault — prune (no plaintext lingers after a crypto-shred)", () => {
-	it("prune removes the note of a fact no longer in the set; without prune it lingers", () => {
-		// Render two facts, then re-render with only one (the other was purged).
-		writeVault(dir, [rec("keep1", "I deploy on Fridays"), rec("gone2", "secret to be shredded")], { prune: true });
-		assert.ok(fs.existsSync(path.join(dir, "keep1.md")) && fs.existsSync(path.join(dir, "gone2.md")), "both rendered");
+	it("prune removes a stale SYSTEM note but NEVER a human-authored note", () => {
+		// Production memoryIds are always `mem_<base36>_<rand>`; prune only touches that shape.
+		const keep = "mem_keep1_a1b2c3";
+		const gone = "mem_gone2_d4e5f6";
+		writeVault(dir, [rec(keep, "I deploy on Fridays"), rec(gone, "secret to be shredded")], { prune: true });
+		assert.ok(fs.existsSync(path.join(dir, `${keep}.md`)) && fs.existsSync(path.join(dir, `${gone}.md`)), "both rendered");
+		// A human's OWN vault note (a Map-of-Content / index) must survive the prune.
+		fs.writeFileSync(path.join(dir, "Index.md"), "# My memory map\n", "utf8");
 
-		const result = writeVault(dir, [rec("keep1", "I deploy on Fridays")], { prune: true });
-		assert.equal(result.pruned, 1, "the purged fact's note was pruned");
-		assert.ok(fs.existsSync(path.join(dir, "keep1.md")), "the surviving fact's note stays");
-		assert.ok(!fs.existsSync(path.join(dir, "gone2.md")), "the purged fact's PLAINTEXT note is gone");
+		const result = writeVault(dir, [rec(keep, "I deploy on Fridays")], { prune: true });
+		assert.equal(result.pruned, 1, "the purged fact's system note was pruned");
+		assert.ok(fs.existsSync(path.join(dir, `${keep}.md`)), "the surviving fact's note stays");
+		assert.ok(!fs.existsSync(path.join(dir, `${gone}.md`)), "the purged fact's PLAINTEXT note is gone");
+		assert.ok(fs.existsSync(path.join(dir, "Index.md")), "a human-authored note is never pruned");
 	});
 
 	it("WITHOUT prune (the default) a stale note is left untouched — preserving prior behaviour", () => {

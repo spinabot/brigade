@@ -11,11 +11,12 @@ import { FactStore, type MemoryRecordOrigin } from "./records.js";
 
 /**
  * Convex HYBRID lane integration (Tideline v2). Proves the runtime path:
- * in convex mode `FactStore.write` runs embed-on-write (stores a 256-dim vector,
+ * `FactStore.write` runs embed-on-write in BOTH modes (storing a 256-dim vector,
  * which Convex's `by_embedding` vectorIndex ANN-serves at scale), and
- * `searchHybrid` fuses BM25 ⊕ vector to recover a paraphrase BM25 misses — while
- * filesystem mode pays NO vector tax (no embed-on-write). No live backend: the
- * boot-hydrated cache is the seam, same as dual-mode-recall.test.ts.
+ * `searchHybrid` fuses BM25 ⊕ vector to recover a paraphrase BM25 misses —
+ * IDENTICALLY in fs and convex mode (the cross-mode-parity guarantee; fs cosine-
+ * scans the same vectors in-app). No live backend: the boot-hydrated cache is the
+ * seam, same as dual-mode-recall.test.ts.
  */
 
 const owner: MemoryRecordOrigin = { kind: "owner" };

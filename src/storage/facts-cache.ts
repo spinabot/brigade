@@ -19,15 +19,35 @@ import type { BrigadeStore } from "./store.js";
 
 const _byWorkspace = new Map<string, MemoryRecord[]>();
 let _flushChain: Promise<void> = Promise.resolve();
+/** PER-WORKSPACE count of facts-flush batches that FAILED (after retries). A caller that
+ *  needs the write durable before acting (the extraction cursor) snapshots ITS workspace's
+ *  count, awaits the flush, and checks for an increase — so it never advances past facts
+ *  that didn't reach the backend. Keyed per workspace so one agent's failing flush can't
+ *  falsely stall a DIFFERENT, healthy agent's cursor (the chain is shared; the blame is not). */
+const _flushErrorCount = new Map<string, number>();
+export function factsFlushErrorCount(workspaceId: string): number {
+	return _flushErrorCount.get(workspaceId) ?? 0;
+}
 
-/** "main" for the top-level workspace; the agent id for
- *  `agents/<id>/workspace`-shaped dirs. */
+/** Canonical, case-STABLE workspace key. The convex cache is shared between the BOOT
+ *  hydration (keyed off the config agent id) and the runtime FactStore (keyed off the
+ *  on-disk path, which `resolveAgentWorkspaceDir` LOWERCASES). If the two disagree on
+ *  case, every convex read misses the boot-primed cache → silent memory amnesia. So
+ *  BOTH sides funnel the key through this one lowercasing rule. */
+export function canonicalWorkspaceId(id: string): string {
+	return id.trim().toLowerCase();
+}
+
+/** "main" for the top-level workspace; the canonicalised agent id for
+ *  `agents/<id>/workspace`-shaped dirs. NOTE: a `cfg.agents.<id>.workspace` OVERRIDE
+ *  pointing outside that shape can't be id-resolved from the path alone and collapses
+ *  to "main" — passing the canonical agent id explicitly is the full fix (future). */
 export function workspaceIdFromDir(workspaceDir: string): string {
 	const parts = path.resolve(workspaceDir).split(path.sep);
 	const i = parts.lastIndexOf("agents");
 	if (i >= 0 && i + 2 < parts.length && parts[i + 2] === "workspace") {
 		const id = parts[i + 1];
-		if (id && id.trim().length > 0) return id;
+		if (id && id.trim().length > 0) return canonicalWorkspaceId(id);
 	}
 	return "main";
 }
@@ -67,9 +87,24 @@ export function writeThroughFactsCache(
 
 	_flushChain = _flushChain
 		.then(async () => {
-			for (const op of ops) await op();
+			for (const op of ops) {
+				let lastErr: unknown;
+				// Bounded retry — a transient convex blip (network, backend restart, rate
+				// limit) must not silently DROP a durable fact. 3 attempts, then give up.
+				for (let attempt = 0; attempt < 3; attempt++) {
+					try {
+						await op();
+						lastErr = undefined;
+						break;
+					} catch (e) {
+						lastErr = e;
+					}
+				}
+				if (lastErr) throw lastErr;
+			}
 		})
 		.catch((err) => {
+			_flushErrorCount.set(workspaceId, (_flushErrorCount.get(workspaceId) ?? 0) + 1);
 			console.error(
 				`brigade: memory facts write to convex failed (workspace ${workspaceId}) — ${(err as Error).message}`,
 			);
@@ -85,4 +120,5 @@ export function awaitFactsFlush(): Promise<void> {
 export function __resetFactsCacheForTests(): void {
 	_byWorkspace.clear();
 	_flushChain = Promise.resolve();
+	_flushErrorCount.clear();
 }

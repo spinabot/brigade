@@ -125,8 +125,13 @@ export function recallWithGraph(
 	// degree-normalized and hop-decayed.
 	const lexRank = new Map<string, number>();
 	const vecRank = new Map<string, number>();
-	seed.forEach((s, i) => {
-		lexRank.set(s.record.memoryId, s.lexRank ?? i + 1);
+	seed.forEach((s) => {
+		// LEXICAL lane: ONLY actual BM25 primaries (recallHybrid sets `lexRank` for
+		// primaries alone). A vector-RECOVERY fact — one BM25 MISSED — has lexRank
+		// undefined; it must NOT be injected into the lexical lane via a positional
+		// fallback (the old `?? i + 1`), or it gets double-counted (lexical ⊕ vector) and
+		// can out-rank a genuine lexical hit. It scores only in the vector lane below.
+		if (s.lexRank !== undefined) lexRank.set(s.record.memoryId, s.lexRank);
 		if (s.vecRank !== undefined) vecRank.set(s.record.memoryId, s.vecRank);
 	});
 

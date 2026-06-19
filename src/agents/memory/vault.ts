@@ -32,6 +32,9 @@ function yamlValue(v: string): string {
 
 function renderFrontmatter(r: MemoryRecord): string {
 	const lines = ["---", `id: ${yamlValue(r.memoryId)}`, `segment: ${r.segment}`, `tier: ${r.tier}`];
+	// Mark non-active (retracted/archived) notes so the vault distinguishes a live fact
+	// from restorable history rather than rendering them identically.
+	if (r.lifecycle && r.lifecycle !== "active") lines.push(`lifecycle: ${r.lifecycle}`);
 	if (r.status) lines.push(`status: ${r.status}`);
 	if (r.subjectKey) lines.push(`subject: ${yamlValue(r.subjectKey)}`);
 	if (typeof r.confidence === "number") lines.push(`confidence: ${r.confidence}`);
@@ -49,36 +52,61 @@ export function renderNote(r: MemoryRecord): string {
 	return `${renderFrontmatter(r)}\n\n${r.content}\n\n${PIN_OPEN}\n\n${PIN_CLOSE}\n`;
 }
 
+/** Index of the LAST line that is EXACTLY `marker` (after trim), or -1. */
+function lastMarkerLine(lines: string[], marker: string): number {
+	for (let i = lines.length - 1; i >= 0; i--) if (lines[i]!.trim() === marker) return i;
+	return -1;
+}
+
 /**
- * Extract the pinned region's INNER text. Anchored to the note TAIL: uses the
- * LAST `%% pinned %%` (so a marker smuggled into the fact body can't hijack the
- * region), and if the close marker is missing/mangled, captures OPEN→EOF rather
- * than silently discarding the human's edits. `undefined` when no open marker.
+ * Extract the pinned region's INNER text. LINE-ANCHORED: the open marker is the
+ * LAST line that is exactly `%% pinned %%`, the close is the first subsequent line
+ * exactly `%% /pinned %%` — so a marker token embedded MID-LINE in the human's own
+ * prose (or in a fact body that discusses the `%%` comment syntax) is NOT treated as
+ * a delimiter and cannot truncate/hijack the region. Missing close → captures
+ * OPEN→EOF rather than discarding edits. `undefined` when there is no open-marker line.
  */
 export function extractPinned(md: string): string | undefined {
-	const o = md.lastIndexOf(PIN_OPEN);
-	if (o === -1) return undefined;
-	const after = md.slice(o + PIN_OPEN.length);
-	const c = after.indexOf(PIN_CLOSE);
-	return c === -1 ? after : after.slice(0, c);
+	const lines = md.split("\n");
+	const open = lastMarkerLine(lines, PIN_OPEN);
+	if (open === -1) return undefined;
+	let close = lines.length;
+	for (let i = open + 1; i < lines.length; i++) {
+		if (lines[i]!.trim() === PIN_CLOSE) {
+			close = i;
+			break;
+		}
+	}
+	return lines.slice(open + 1, close).join("\n");
 }
 
 /**
  * 3-way merge: take the `proposed` render but splice the EXISTING note's pinned
- * region back in, so a human edit survives a re-render. Tail-anchored (matches
+ * region back in, so a human edit survives a re-render. Line-anchored (matches
  * extractPinned). No existing note / no pin region → `proposed` unchanged.
  */
 export function mergeNote(existing: string | undefined, proposed: string): string {
 	if (!existing) return proposed;
 	const pinned = extractPinned(existing);
 	if (pinned === undefined) return proposed;
-	const o = proposed.lastIndexOf(PIN_OPEN);
-	if (o === -1) return proposed;
-	const afterStart = o + PIN_OPEN.length;
-	const cRel = proposed.slice(afterStart).indexOf(PIN_CLOSE);
-	const cAbs = cRel === -1 ? proposed.length : afterStart + cRel;
-	return proposed.slice(0, afterStart) + pinned + proposed.slice(cAbs);
+	const lines = proposed.split("\n");
+	const open = lastMarkerLine(lines, PIN_OPEN);
+	if (open === -1) return proposed;
+	let close = lines.length;
+	for (let i = open + 1; i < lines.length; i++) {
+		if (lines[i]!.trim() === PIN_CLOSE) {
+			close = i;
+			break;
+		}
+	}
+	const tail = close < lines.length ? lines.slice(close) : [];
+	return [...lines.slice(0, open + 1), ...pinned.split("\n"), ...tail].join("\n");
 }
+
+/** Shape of a SYSTEM-written fact note (`mem_<base36>_<rand>.md`, plus the optional
+ *  sha1 disambiguation suffix). Prune only deletes files matching this — a human's
+ *  own vault notes (Index/MOC/daily/links) are never the system's to remove. */
+const SYSTEM_NOTE_RE = /^mem_[0-9a-z]+_[0-9a-z]+(-[0-9a-f]{8})?\.md$/;
 
 function noteFileName(memoryId: string): string {
 	const safe = memoryId.replace(/[^A-Za-z0-9_-]/g, "_");
@@ -142,7 +170,12 @@ export function writeVault(
 		entries = [];
 	}
 	for (const f of entries) {
-		if (f.endsWith(".md") && !keep.has(f)) {
+		// Only prune SYSTEM-named fact notes that are no longer current. A human's own
+		// notes in the vault (an Index/Map-of-Content, a daily note) are NOT system fact
+		// notes, so they're left alone — deleting them would contradict the whole
+		// editable-Obsidian-vault premise (the prune exists to stop a shredded fact's
+		// note lingering as plaintext, not to police the user's folder).
+		if (SYSTEM_NOTE_RE.test(f) && !keep.has(f)) {
 			try {
 				fs.rmSync(path.join(dir, f));
 				pruned++;

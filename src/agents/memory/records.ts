@@ -26,7 +26,7 @@ import {
 	writeThroughFactsCache,
 } from "../../storage/facts-cache.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
-import { bm25Score, type ScoreBreakdown } from "./scoring.js";
+import { bm25Score, type ScoreBreakdown, tokenize } from "./scoring.js";
 import { evaluateWriteGate, isTrustedTarget, isUntrustedSource, WriteGateError } from "./write-gate.js";
 import type { MemoryLink } from "./links.js";
 import { MemoryEventLog, type MemoryEvent } from "./event-log.js";
@@ -64,6 +64,22 @@ export type MemorySourceType =
 	| "compaction"
 	| "extraction"
 	| "dream";
+
+/** Runtime list of every {@link MemorySourceType} — for validating
+ *  externally-loaded data (e.g. the real-data gold path, where a typo'd source
+ *  would otherwise be silently treated as TRUSTED by the write-gate). The
+ *  `satisfies` clause makes a typo/extra value a COMPILE error; keep in sync with
+ *  the type above if a source is ever added. */
+export const MEMORY_SOURCE_TYPES = [
+	"user_instruction",
+	"owner_message",
+	"channel_message",
+	"tool_output",
+	"retrieved_document",
+	"compaction",
+	"extraction",
+	"dream",
+] as const satisfies readonly MemorySourceType[];
 
 /**
  * Epistemic state of a fact — distinct from {@link MemoryLifecycle} (which is
@@ -211,21 +227,14 @@ export const MAX_FACT_CONTENT_CHARS = 1000;
  * different facts about the same topic) are kept separate.
  */
 export const DEDUP_SIMILARITY = 0.85;
-/** Content-overlap floor for a `correction`-segment write to auto-supersede a
- *  same-origin same-SUBJECT prior fact (no slot/id needed). Lower than dedup
- *  (a correction changes the VALUE, so it won't be near-identical) but high
- *  enough that only same-subject facts match — "deploys on Thursdays" supersedes
- *  "deploys on Fridays" (≈0.6), never an unrelated fact. */
-export const CORRECTION_SUPERSEDE_SIMILARITY = 0.5;
 
-/** Lowercased alphanumeric token SET of a fact's content (for dedup). */
+/** CONTENT-token SET of a fact (for dedup + slot-restate detection). Uses the
+ *  SAME stopword-stripping tokenizer as recall (scoring.ts `tokenize`) so similarity
+ *  is measured on MEANINGFUL tokens, not sentence scaffolding — a shared frame like
+ *  "the user prefers to use the …" must not inflate overlap (it was inflating it to
+ *  the point of wrongly superseding unrelated facts). One tokenizer, one basis. */
 function tokenSet(content: string): Set<string> {
-	return new Set(
-		content
-			.toLowerCase()
-			.split(/[^a-z0-9]+/)
-			.filter((t) => t.length > 0),
-	);
+	return new Set(tokenize(content));
 }
 
 /** Normalize an attribute SLOT key: lowercase, non-alphanumeric runs → "_",
@@ -272,7 +281,11 @@ export function resolveRecordOrigin(
 export function originBucketKey(r: Pick<MemoryRecord, "createdBy">): string {
 	const o = resolveRecordOrigin(r.createdBy);
 	if (o.kind !== "channel") return "owner";
-	return `channel:${o.channelId ?? ""}:${o.conversationId ?? ""}:${o.sessionKey ?? ""}`;
+	// JSON-encode the tuple so a ':' INSIDE a component (a WhatsApp JID conversationId,
+	// the ':'-structured sessionKey) can't shift the delimiter and collide two DISTINCT
+	// origins into ONE bucket (a cross-principal merge in dream/consolidate). accountId
+	// is in the key so two operator accounts of the same channel stay distinct origins.
+	return `channel:${JSON.stringify([o.channelId ?? "", o.accountId ?? "", o.conversationId ?? "", o.sessionKey ?? ""])}`;
 }
 
 /** Two origins are the same when both fields-by-fields match. */
@@ -288,6 +301,7 @@ export function sameOrigin(
 	const channelB = resolvedB as Extract<MemoryRecordOrigin, { kind: "channel" }>;
 	return (
 		channelA.channelId === channelB.channelId &&
+		(channelA.accountId ?? "") === (channelB.accountId ?? "") &&
 		channelA.conversationId === channelB.conversationId &&
 		channelA.sessionKey === channelB.sessionKey
 	);
@@ -384,11 +398,17 @@ export interface ListFilter {
  */
 export class FactStore {
 	private readonly file: string;
+	/** Injectable wall-clock. Defaults to `Date.now`; the eval pins it (e.g. `() => 0`)
+	 *  so write-time `createdAt` AND score-time `now` share ONE deterministic clock —
+	 *  otherwise decay over the (load-dependent) gap between seeding and recall makes
+	 *  the hybrid/decay lanes non-reproducible. Production passes nothing → `Date.now`. */
+	private readonly clock: () => number;
 
 	private eventLogCache?: MemoryEventLog;
 
-	constructor(workspaceDir: string) {
+	constructor(workspaceDir: string, opts: { now?: () => number } = {}) {
 		this.file = path.join(workspaceDir, FACTS_RELATIVE_PATH);
+		this.clock = opts.now ?? (() => Date.now());
 	}
 
 	/** Absolute path to the JSONL file (for diagnostics). */
@@ -430,7 +450,27 @@ export class FactStore {
 			const wsId = workspaceIdFromDir(path.dirname(path.dirname(this.file)));
 			const cached = getCachedFacts(wsId);
 			if (cached) return structuredClone(cached);
+			// MISS SELF-HEAL: a workspace that wasn't boot-hydrated (a key mismatch, an
+			// agent added AFTER boot, or a hydration race) would otherwise read EMPTY
+			// forever. Prime [] for this synchronous read, but kick off a one-shot backfill
+			// so the NEXT read serves the real rows instead of permanent amnesia. Guarded
+			// (a fake store may omit the method). Best-effort.
 			primeFactsCache(wsId, []);
+			if (typeof rctx.store.memory.listAllFactRecordsRaw === "function") {
+				void rctx.store.memory
+					.listAllFactRecordsRaw(wsId)
+					.then((records) => {
+						if (records.length === 0) return;
+						// MERGE, don't clobber: a write that landed DURING the fetch must not be
+						// lost (priming the fetched rows over it would drop it), and the
+						// pre-existing rows must not be lost either. Backfilled rows fill the
+						// cache; any locally-written row WINS on memoryId conflict.
+						const byId = new Map((records as unknown as MemoryRecord[]).map((r) => [r.memoryId, r]));
+						for (const local of getCachedFacts(wsId) ?? []) byId.set(local.memoryId, local);
+						primeFactsCache(wsId, [...byId.values()]);
+					})
+					.catch(() => {});
+			}
 			return [];
 		}
 
@@ -475,7 +515,7 @@ export class FactStore {
 	 */
 	write(fact: NewFact): MemoryRecord {
 		const defaults = SEGMENT_DEFAULTS[fact.segment] ?? SEGMENT_DEFAULTS.context;
-		const now = Date.now();
+		const now = this.clock();
 		const record: MemoryRecord = {
 			memoryId: makeMemoryId(),
 			content: fact.content.trim().slice(0, MAX_FACT_CONTENT_CHARS),
@@ -536,30 +576,30 @@ export class FactStore {
 		}
 
 		// SUPERSEDE the prior belief(s) this write replaces — WITHOUT relying on the
-		// model recalling ids. Two triggers, both SAME-origin, soft-archive (bi-temporal
-		// close + `contradicts` link), history kept:
-		//   (a) an explicit attribute SLOT (subjectKey) → supersede same-slot values
-		//       (precise; segment-independent — a `correction` supersedes a `preference`).
-		//   (b) a `correction`-segment write with NO slot → supersede same-SUBJECT active
-		//       facts (content overlap ≥ CORRECTION_SUPERSEDE_SIMILARITY). The correction
-		//       SEGMENT is the model's replace-intent signal (it reliably uses it); the
-		//       overlap gate keeps it to the same subject. ADDITIVE facts (pets, skills)
-		//       are written under other segments, so they are never corrections and never
-		//       auto-superseded here — that's the single-valued-vs-additive safety line.
-		// A near-identical prior (restated, not changed) is reinforced, not churned.
-		// An UNTRUSTED source can't archive a TRUSTED prior (the write-gate override guard).
+		// model recalling ids. Trigger: an explicit attribute SLOT (subjectKey) →
+		// supersede same-slot, same-origin values (precise; segment-independent — a
+		// `correction` supersedes a `preference`). Soft-archive (bi-temporal close +
+		// `contradicts`/`transition` link), history kept. A near-identical prior
+		// (restated, not changed) is reinforced, not churned. An UNTRUSTED source can't
+		// archive a TRUSTED prior (the write-gate override guard).
+		//
+		// We deliberately do NOT auto-supersede by CONTENT overlap: a slot-less
+		// `correction` shares a sentence frame with unrelated facts, and (MEASURED) no
+		// overlap threshold separates a same-subject value change ("deploys Fridays"→
+		// "Mondays", ≈0.5) from a DIFFERENT-subject one ("dark theme editor"→"light
+		// theme terminal", ≈0.5) — they fully overlap, so the old content gate silently
+		// archived still-true facts (data loss). A slot-less correction now COEXISTS
+		// with the prior (freshest wins at recall; dream consolidates near-duplicates);
+		// to auto-replace a single-valued attribute, the writer sets a `subjectKey`.
 		const slotSuperseded: string[] = [];
-		const supersedeByContent = !record.subjectKey && record.segment === "correction";
-		if ((record.subjectKey || supersedeByContent) && !record.supersedes) {
+		if (record.subjectKey && !record.supersedes) {
 			const incoming = tokenSet(record.content);
 			const priors = all.filter(
 				(r) =>
 					r.lifecycle === "active" &&
 					r.memoryId !== record.memoryId &&
 					sameOrigin(r.createdBy, record.createdBy) &&
-					(record.subjectKey
-						? r.subjectKey === record.subjectKey
-						: jaccard(incoming, tokenSet(r.content)) >= CORRECTION_SUPERSEDE_SIMILARITY),
+					r.subjectKey === record.subjectKey,
 			);
 			// Same write-gate guard as the archive loop + dedup below: an
 			// UNTRUSTED source must not reinforce (bump importance / refresh
@@ -615,7 +655,7 @@ export class FactStore {
 		// another peer's identical note (which would cross-pollinate
 		// session-scoped state). Different-origin facts stay separate even if
 		// the text matches.
-		if (!record.supersedes && !record.subjectKey && !supersedeByContent) {
+		if (!record.supersedes && !record.subjectKey) {
 			const incoming = tokenSet(record.content);
 			const dup = all.find(
 				(r) =>
@@ -662,10 +702,21 @@ export class FactStore {
 		}
 
 		// Archive superseded records (corrections/updates overwrite prior beliefs).
+		// ORIGIN GUARD: a principal may only supersede ITS OWN facts. Without this, a
+		// channel peer's write_memory({supersedes:[ownerFactId]}) would archive the
+		// OWNER's fact (cross-origin data loss + recall blackout) — the write-gate's
+		// supersede rule doesn't catch it because a peer tool write carries no sourceType.
+		// Mirrors the sameOrigin guard the subjectKey + dedup paths already enforce;
+		// a cross-origin supersede id is silently ignored.
 		if (record.supersedes) {
 			const dead = new Set(record.supersedes);
 			for (const r of all) {
-				if (dead.has(r.memoryId) && r.lifecycle === "active") r.lifecycle = "archived";
+				if (dead.has(r.memoryId) && r.lifecycle === "active" && sameOrigin(r.createdBy, record.createdBy)) {
+					r.lifecycle = "archived";
+					// Bi-temporal close — match the auto-supersede path: a superseded belief
+					// stopped being valid NOW, so the history records WHEN.
+					r.validTo = now;
+				}
 			}
 		}
 		all.push(record);
@@ -700,7 +751,7 @@ export class FactStore {
 		// inside the scorer): the origin filter is mandatory on every tool-facing
 		// recall. `undefined` origin = the maintenance default (whole store) —
 		// tool callers always pass an explicit filter.
-		const now = Date.now();
+		const now = this.clock();
 		// Active + origin + still-valid (bi-temporal valid-time): a fact whose
 		// `validTo` has passed is excluded from recall independent of lifecycle, so
 		// a future-dated expiry written ahead of time stops surfacing on its own.
@@ -723,20 +774,23 @@ export class FactStore {
 	}
 
 	/**
-	 * Hybrid recall (Tideline v2, convex lane) — BM25 ⊕ vector (cosine over each
-	 * record's `embedding`), RRF-fused via `recallHybrid`. The vector lane only
-	 * contributes for records that carry an embedding (populated on write in
-	 * CONVEX mode; Convex's `by_embedding` vectorIndex serves the ANN at scale —
-	 * this in-app cosine is the identical ranking over the hydrated cache). In fs
-	 * mode there are no embeddings, so it gracefully degrades to pure BM25. Same
-	 * active+origin candidate filter + reinforcement semantics as `search`.
+	 * Hybrid recall (Tideline v2) — BM25 ⊕ vector (cosine over each record's
+	 * `embedding`), fused via `recallHybrid`. Embeddings are populated on write in
+	 * BOTH modes (see embed-on-write in `write`), so the vector lane contributes
+	 * IDENTICALLY in fs and convex mode — that's the cross-mode-parity guarantee.
+	 * Convex additionally ANN-serves the SAME vectors via the built-in
+	 * `by_embedding` vectorIndex at scale; this in-app cosine is the identical
+	 * ranking over the hydrated cache. A record misses the vector lane only if its
+	 * embedder threw on write (graceful BM25-only for that fact) or it predates
+	 * embed-on-write (legacy). Same active+origin candidate filter + reinforcement
+	 * semantics as `search`.
 	 */
 	searchHybrid(
 		query: string,
 		opts: { limit?: number; markAccessed?: boolean; origin?: RecordOriginFilter } = {},
 	): Array<MemoryRecord & { score: number }> {
 		const limit = opts.limit && opts.limit > 0 ? opts.limit : 8;
-		const now = Date.now();
+		const now = this.clock();
 		const candidates = this.readAll().filter(
 			(r) =>
 				r.lifecycle === "active" &&
@@ -779,7 +833,7 @@ export class FactStore {
 		opts: { limit?: number; origin?: RecordOriginFilter } = {},
 	): Array<MemoryRecord & { score: number; breakdown: ScoreBreakdown }> {
 		const limit = opts.limit && opts.limit > 0 ? opts.limit : 8;
-		const now = Date.now();
+		const now = this.clock();
 		const candidates = this.readAll().filter(
 			(r) =>
 				r.lifecycle === "active" &&
@@ -893,11 +947,48 @@ export class FactStore {
 		const all = this.readAll();
 		const rec = all.find((r) => r.memoryId === id);
 		if (!rec || rec.lifecycle !== "archived") return undefined;
+		// Only restore a RETRACTED or decayed fact — NOT one SUPERSEDED or CONSOLIDATED
+		// away. A superseded/consolidated record is the TARGET of a contradicts/transition
+		// edge from an ACTIVE successor; resurrecting it would put two contradictory
+		// beliefs live at once (breaking the single-value invariant — exactly what the
+		// supersede mechanism exists to prevent). A pure retract / decay leaves no such
+		// incoming edge, so it stays restorable.
+		const supersededByActive = all.some(
+			(r) =>
+				r.lifecycle === "active" &&
+				(r.links ?? []).some((l) => (l.kind === "contradicts" || l.kind === "transition") && l.target === id),
+		);
+		if (supersededByActive) return undefined;
+		// Belt-and-suspenders for the single-valued-slot invariant: if a same-origin fact
+		// now occupies this subjectKey, restoring would create two live values — refuse.
+		if (
+			rec.subjectKey &&
+			all.some((r) => r.lifecycle === "active" && r.subjectKey === rec.subjectKey && sameOrigin(r.createdBy, rec.createdBy))
+		)
+			return undefined;
 		rec.lifecycle = "active";
 		rec.validTo = undefined;
 		this.writeAll(all);
 		this.emit({ at: opts.now ?? Date.now(), kind: "reinforced", memoryId: id, segment: rec.segment });
 		return rec;
+	}
+
+	/**
+	 * Records whose VAULT note must be preserved: every ACTIVE fact PLUS any ARCHIVED
+	 * fact that is still RESTORABLE — i.e. retracted/decayed, NOT superseded/consolidated
+	 * by an active successor (same edge test as {@link reactivate}). The vault prune
+	 * deletes notes outside this set, so a reversibly-retracted fact — and the operator's
+	 * hand-pinned edits on it — survives a re-render; only a hard-purged fact's note
+	 * (gone from the store entirely) is removed.
+	 */
+	listForVault(origin?: RecordOriginFilter): MemoryRecord[] {
+		const all = this.readAll().filter((r) => origin === undefined || recordMatchesOriginFilter(r, origin));
+		const supersededByActive = new Set<string>(
+			all
+				.filter((r) => r.lifecycle === "active")
+				.flatMap((r) => (r.links ?? []).filter((l) => l.kind === "contradicts" || l.kind === "transition").map((l) => l.target)),
+		);
+		return all.filter((r) => r.lifecycle === "active" || (r.lifecycle === "archived" && !supersededByActive.has(r.memoryId)));
 	}
 
 	/**

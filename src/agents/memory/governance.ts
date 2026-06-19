@@ -76,23 +76,25 @@ export function applyRetention(
 	const keepConfirmed = opts.keepConfirmed ?? true;
 	const all = store.readAll();
 	const inOrigin = (r: MemoryRecord): boolean => opts.origin === undefined || recordMatchesOriginFilter(r, opts.origin);
-	// ORIGIN SCOPE: only facts in `origin` are eligible to expire. Without this an
-	// owner-invoked retention would purge channel peers' facts wholesale (a cross-
-	// principal breach). Omitted ⇒ whole store (the internal/admin default).
-	const expired = all
-		.filter(inOrigin)
-		.filter((r) => now - r.createdAt > opts.ttlMs)
-		.filter((r) => !(keepConfirmed && r.status === "confirmed"))
-		.map((r) => r.memoryId);
+	// A fact is PURGE-ELIGIBLE only when it is in-origin AND older than the TTL AND not
+	// a kept-confirmed belief. ORIGIN SCOPE: without it an owner-invoked retention would
+	// purge channel peers' facts wholesale (a cross-principal breach). Omitted ⇒ whole
+	// store (the internal/admin default).
+	const eligible = (r: MemoryRecord): boolean =>
+		inOrigin(r) && now - r.createdAt > opts.ttlMs && !(keepConfirmed && r.status === "confirmed");
+	const expired = all.filter(eligible).map((r) => r.memoryId);
 	if (expired.length === 0) return { purged: [] };
-	// Cascade along source_pointers, but BOUND IT TO THE SAME ORIGIN: unlike the
-	// direct purge action (global "no zombies"), retention must never reach across
-	// principals — a peer fact that happens to cite an expired owner fact must NOT
-	// be purged by an owner-scoped retention. (Omitted origin ⇒ unbounded.)
+	// Cascade along source_pointers — but re-apply the SAME eligibility to every cascade
+	// member, NOT just origin. Otherwise a same-origin fact that merely CITES an expired
+	// seed is hard-purged even when it is itself CONFIRMED or WITHIN the TTL, silently
+	// breaking the keepConfirmed guarantee and the age contract (a brand-new fact that
+	// cited an old source would be destroyed). We keep the "no orphaned derivations"
+	// intent only among facts that are THEMSELVES expirable; a confirmed/young deriver is
+	// preserved (a kept orphan beats irreversibly shredding a still-valid belief).
 	const byId = new Map(all.map((r) => [r.memoryId, r]));
 	const bounded = [...cascadeFrom(all, expired)].filter((id) => {
 		const r = byId.get(id);
-		return r !== undefined && inOrigin(r);
+		return r !== undefined && eligible(r);
 	});
 	if (bounded.length === 0) return { purged: [] };
 	return { purged: store.purge(bounded) };

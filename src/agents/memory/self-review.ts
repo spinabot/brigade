@@ -16,6 +16,7 @@
 
 import { MEMORY_SEGMENTS } from "./records.js";
 import type { MemoryRecord, MemoryRecordOrigin, MemorySegment, NewFact } from "./records.js";
+import { confineUntrustedSegment } from "./write-gate.js";
 
 /** Cadence trigger — fire a review every `interval` turns (default cadence ~10).
  *  `0` disables. The caller owns the per-session counter; this is the pure rule. */
@@ -120,20 +121,25 @@ export async function runSelfReview(args: {
 			!MEMORY_SEGMENTS.includes(f.segment as MemorySegment)
 		)
 			continue;
+		// The reviewer distils an attacker-influenceable transcript, so its writes
+		// are the write-gate's CONFINED `extraction` tier: route a protected segment
+		// to descriptive `knowledge`, and DROP any proposed supersede (an untrusted
+		// distillation may not overwrite an owner fact — it lands as a fresh evidence
+		// fact instead of being gate-rejected and silently lost).
+		const segment = confineUntrustedSegment("extraction", f.segment as MemorySegment);
 		try {
 			records.push(
 				args.store.write({
 					content: f.content,
-					segment: f.segment,
+					segment,
 					sourceType: "extraction",
 					...(f.importance !== undefined ? { importance: f.importance } : {}),
-					...(f.supersedes && f.supersedes.length > 0 ? { supersedes: f.supersedes } : {}),
 					...(args.origin !== undefined ? { createdBy: args.origin } : {}),
 				}),
 			);
 		} catch {
-			// An `extraction` write never trips the write-gate, so this only
-			// catches an unexpected fs/embedder failure — skipped, best-effort.
+			// Best-effort: protected segments are pre-confined and supersedes dropped,
+			// so the gate no longer throws here — only an unexpected fs/embedder error.
 		}
 	}
 	return {

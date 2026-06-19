@@ -340,7 +340,16 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 	// passes the candidate tool array through it. The two spawn tools share
 	// the same depth gate — if the model can't spawn one child, it can't
 	// spawn five either.
-	if (opts.subagentContext) {
+	//
+	// OWNER GATE (security): a sub-agent currently runs with OWNER privileges
+	// (subagent-runner hardcodes senderIsOwner:true and does not thread the parent's
+	// channel origin), so a NON-owner channel peer turn must not be offered spawn at
+	// all — else a peer could induce the model to delegate, and the owner-privileged
+	// child would read the operator's private memory + author trusted owner facts
+	// (cross-origin isolation + write-gate bypass). Owner turns (true) and trusted
+	// internal pathways (undefined) keep spawn. (A confined peer→sub-agent that
+	// inherits the peer's origin is a future enhancement; until then, deny.)
+	if (opts.subagentContext && opts.senderIsOwner !== false) {
 		const spawnAgentTool = makeSpawnAgentTool({
 			parentSessionKey: opts.subagentContext.parentSessionKey,
 			parentAgentId: opts.agentId,

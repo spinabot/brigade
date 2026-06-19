@@ -21,9 +21,13 @@ import type { RecallCapability } from "./harness.js";
 
 /**
  * **Linear-scan floor** — the OLD crude term-overlap (`linearScanScore`),
- * applied directly over the store's active + origin-matching records. This is
- * the baseline any real index must beat; it is deliberately decoupled from
- * `FactStore.search` (now BM25) so it stays the floor.
+ * applied directly over the store's active + origin-matching records. This is the
+ * baseline the SERVED recall path (the trust-weighted hybrid) must beat — gold-hard
+ * asserts exactly that. NOTE: the intermediate BM25×effectiveScore lane (no trust)
+ * is NOT guaranteed to beat it — on an adversarial poison set the crude overlap can
+ * edge out decay/importance modulation, which is precisely why TRUST (the hybrid) is
+ * what `recall()` serves, not bare BM25×eff. Deliberately decoupled from
+ * `FactStore.search` (now BM25) so it stays a fixed floor.
  */
 export function linearScanCapability(store: FactStore, origin?: RecordOriginFilter): RecallCapability {
 	return {
@@ -111,13 +115,6 @@ export function hybridRecallCapability(store: FactStore, origin?: RecordOriginFi
 }
 
 /**
- * **Full-context oracle** — returns ALL active (origin-filtered) facts,
- * ignoring the query. The recall ceiling + honesty check: an index that claims
- * to beat "just stuff everything into context" on recall is suspect; the index
- * earns its keep on PRECISION / ranking / abstention / latency at scale (the
- * oracle has perfect recall but answers every abstention query wrongly).
- */
-/**
  * **Graph-augmented recall** (Step 20) — the gated spreading-activation walk
  * over the store's active + origin-filtered records. `forceWalk` is ON for the
  * eval lane so the multi-hop benefit is measurable on a multi-hop gold set (the
@@ -142,6 +139,22 @@ export function graphRecallCapability(store: FactStore, origin?: RecordOriginFil
 	};
 }
 
+/**
+ * **Full-context dump** (the "no-retrieval" baseline) — returns ALL active
+ * (origin-filtered) facts, IGNORING the query, in insertion order (no ranking —
+ * that's the point). Models "just stuff everything into the prompt".
+ *
+ * Reading its recall@k HONESTLY: at k ≥ corpus it includes everything → recall =
+ * 1.0 (it never LOSES a fact — see the k≥corpus test). Below that, a context
+ * BUDGET forces a choice of which k facts to include; un-ranked, it takes the
+ * first-k-written, so a low recall@k is a TRUNCATION artifact, NOT a recall
+ * deficiency — the gap to the index is exactly "ranking fills a bounded budget
+ * with RELEVANT facts; dumping can't". Its genuine, non-tautological cost vs the
+ * index is ABSTENTION: it returns facts even on a no-answer query (a
+ * hallucination feed), where the index stays silent. So it is compared on
+ * abstention + budget-bounded recall — never headlined as a recall rival the
+ * index "beats".
+ */
 export function oracleCapability(store: FactStore, origin?: RecordOriginFilter): RecallCapability {
 	return {
 		async search(_query, opts) {

@@ -26,10 +26,12 @@ import type { AgentSession } from "@mariozechner/pi-coding-agent";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { pickInitialThinkingLevel } from "../../core/model-caps.js";
+import { awaitFactsFlush, factsFlushErrorCount, workspaceIdFromDir } from "../../storage/facts-cache.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { applyPersonaOverrideToSession } from "../../system-prompt/pi-injection.js";
 import { wrapStreamFnWithPayloadMutations } from "../payload-mutators.js";
 import { FactStore, MEMORY_SEGMENTS, type MemoryRecordOrigin, type MemorySegment, type MemorySourceType } from "./records.js";
+import { confineUntrustedSegment } from "./write-gate.js";
 
 const log = createSubsystemLogger("memory/extract");
 
@@ -61,35 +63,71 @@ export interface ExtractedFact {
 	corrects?: string;
 }
 
+/** ALL top-level BALANCED `{...}` objects in `text`, in order (string-aware: braces
+ *  inside JSON strings don't count). Replaces a greedy first-to-LAST `{...}` match that
+ *  grabbed any trailing brace block AND a single-object scan that let a LEADING stray
+ *  object (`{}`, a reasoning artifact) shadow the real `{"facts":[…]}` after it — both
+ *  failure modes returned [] and advanced the cursor past un-distilled facts. */
+function balancedObjects(text: string): string[] {
+	const out: string[] = [];
+	let depth = 0;
+	let inStr = false;
+	let esc = false;
+	let start = -1;
+	for (let i = 0; i < text.length; i++) {
+		const c = text[i];
+		if (inStr) {
+			if (esc) esc = false;
+			else if (c === "\\") esc = true;
+			else if (c === '"') inStr = false;
+			continue;
+		}
+		if (c === '"') inStr = true;
+		else if (c === "{") {
+			if (depth === 0) start = i;
+			depth++;
+		} else if (c === "}" && depth > 0) {
+			depth--;
+			if (depth === 0 && start >= 0) {
+				out.push(text.slice(start, i + 1));
+				start = -1;
+			}
+		}
+	}
+	return out;
+}
+
 /**
- * Parse the extraction model's reply into facts. Robust to prose-wrapped
- * JSON (grabs the first `{...}` block via a permissive regex). Never throws.
+ * Parse the extraction model's reply into facts. Robust to prose-wrapped JSON, a
+ * trailing brace block, AND a leading stray object: scans every top-level balanced
+ * `{...}` and uses the FIRST that actually carries a `facts` array. Never throws.
  */
 export function parseExtractedFacts(text: string): ExtractedFact[] {
 	if (!text) return [];
-	const match = text.match(/\{[\s\S]*\}/);
-	if (!match) return [];
-	let parsed: { facts?: unknown };
-	try {
-		parsed = JSON.parse(match[0]) as { facts?: unknown };
-	} catch {
-		return [];
+	for (const block of balancedObjects(text)) {
+		let parsed: { facts?: unknown };
+		try {
+			parsed = JSON.parse(block) as { facts?: unknown };
+		} catch {
+			continue;
+		}
+		if (!Array.isArray(parsed.facts)) continue;
+		const out: ExtractedFact[] = [];
+		for (const raw of parsed.facts) {
+			if (!raw || typeof raw !== "object") continue;
+			const f = raw as Record<string, unknown>;
+			if (typeof f.content !== "string" || f.content.trim().length === 0) continue;
+			if (typeof f.segment !== "string") continue;
+			out.push({
+				content: f.content.trim(),
+				segment: f.segment,
+				importance: typeof f.importance === "number" ? f.importance : undefined,
+				corrects: typeof f.corrects === "string" ? f.corrects : undefined,
+			});
+		}
+		return out;
 	}
-	if (!Array.isArray(parsed.facts)) return [];
-	const out: ExtractedFact[] = [];
-	for (const raw of parsed.facts) {
-		if (!raw || typeof raw !== "object") continue;
-		const f = raw as Record<string, unknown>;
-		if (typeof f.content !== "string" || f.content.trim().length === 0) continue;
-		if (typeof f.segment !== "string") continue;
-		out.push({
-			content: f.content.trim(),
-			segment: f.segment,
-			importance: typeof f.importance === "number" ? f.importance : undefined,
-			corrects: typeof f.corrects === "string" ? f.corrects : undefined,
-		});
-	}
-	return out;
+	return [];
 }
 
 /**
@@ -105,25 +143,35 @@ export function storeExtractedFacts(
 ): number {
 	if (facts.length === 0) return 0;
 	const store = new FactStore(workspaceDir);
+	// Auto-extraction is NEVER a direct owner statement — it is a distiller LLM's
+	// reading of an attacker-influenceable transcript. Tag it `extraction` (the
+	// write-gate's CONFINED tier) by default so a laundered "the user prefers X"
+	// can't become an authoritative owner fact or supersede one. The ORIGIN
+	// (owner vs channel) carries recall ISOLATION independently. An explicit
+	// caller-supplied sourceType still wins (e.g. a future trusted distiller).
+	const sourceType: MemorySourceType = opts.sourceType ?? "extraction";
 	let stored = 0;
 	for (const f of facts) {
 		if (!MEMORY_SEGMENTS.includes(f.segment as MemorySegment)) continue;
+		// Confine rather than drop: an untrusted distillation proposing a
+		// protected segment (preference/identity/correction) lands as a descriptive
+		// `knowledge` evidence fact (kept, but down-weighted at recall and unable to
+		// pose as the operator's self-model). The write-gate is the hard backstop.
+		const segment = confineUntrustedSegment(sourceType, f.segment as MemorySegment);
 		store.write({
 			content: f.content,
-			segment: f.segment as MemorySegment,
+			segment,
 			...(f.importance !== undefined ? { importance: f.importance } : {}),
 			...(sourceTurn ? { sourceTurn } : {}),
-			// ORIGIN + sourceType — the security-critical stamp. Peer-derived
-			// extraction MUST carry the turn's CHANNEL origin (isolated by the origin
-			// filter) so it can't surface as the operator's own ground truth, and an
-			// honest sourceType so the write-gate sees it for what it is. Left
-			// undefined, a write resolves to OWNER origin and skips the gate — the
-			// poisoned-inbox breach. Owner-turn extraction passes the owner origin.
+			// ORIGIN — the isolation stamp. Peer-derived extraction MUST carry the
+			// turn's CHANNEL origin (isolated by the origin filter) so it can't
+			// surface as the operator's own ground truth; owner-turn extraction
+			// passes the owner origin. Left undefined, a write resolves to OWNER.
 			...(opts.origin ? { createdBy: opts.origin } : {}),
-			...(opts.sourceType ? { sourceType: opts.sourceType } : {}),
-			// `corrects` only belongs on a correction; a misbehaving model
-			// could attach it to any segment, so we drop it elsewhere.
-			...(f.corrects && f.segment === "correction" ? { metadata: { corrects: f.corrects } } : {}),
+			sourceType,
+			// `corrects` only belongs on a correction that SURVIVED confinement
+			// (a trusted source's correction); a confined→knowledge fact drops it.
+			...(f.corrects && segment === "correction" ? { metadata: { corrects: f.corrects } } : {}),
 		});
 		stored += 1;
 	}
@@ -251,13 +299,25 @@ export interface SweepResult {
  */
 export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> {
 	const total = args.messages.length;
-	const from = Math.min(getCursor(args.workspaceDir, args.sessionId), total);
+	const storedCursor = getCursor(args.workspaceDir, args.sessionId);
+	// COMPACTION GUARD: the cursor is a raw index into `session.messages`, but Pi can
+	// REPLACE the history with a shorter summary (pre-emptive compaction at ~85% context
+	// — exactly the long, fact-rich sessions extraction matters most for). A stored
+	// cursor BEYOND the current length means that happened: re-scan from 0 so the
+	// post-compaction turns are still distilled (write-time dedup absorbs any repeats)
+	// instead of clamping to `total`, producing an empty slice, and permanently skipping
+	// every turn until the message count climbs back above the stale cursor.
+	const compacted = storedCursor > total;
+	const from = compacted ? 0 : storedCursor;
 	const fresh = args.messages.slice(from);
 	const minNew = args.minNewMessages ?? 2;
 	const conversation = flattenConversation(fresh);
 	// Need at least one real exchange worth of text.
 	if (fresh.length < minNew || conversation.trim().length === 0) {
-		return { ran: false, stored: 0, processedTo: from };
+		// Correct a stale post-compaction cursor even when there's too little to distill,
+		// so it stops pointing past the (shrunken) transcript end on every later sweep.
+		if (compacted) writeCursor(args.workspaceDir, args.sessionId, total);
+		return { ran: false, stored: 0, processedTo: compacted ? total : from };
 	}
 	let reply = "";
 	try {
@@ -270,10 +330,22 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 		return { ran: false, stored: 0, processedTo: from };
 	}
 	const facts = parseExtractedFacts(reply);
+	const wsId = workspaceIdFromDir(args.workspaceDir);
+	const errorsBefore = factsFlushErrorCount(wsId);
 	const stored = storeExtractedFacts(args.workspaceDir, facts, args.sessionId, {
 		...(args.origin ? { origin: args.origin } : {}),
 		...(args.sourceType ? { sourceType: args.sourceType } : {}),
 	});
+	// CURSOR DURABILITY: in convex mode the facts write is enqueued ASYNC (the flush
+	// chain); advancing the cursor before it lands would SKIP those turns forever if the
+	// flush fails. Await the flush and only advance if it didn't error — otherwise leave
+	// the cursor put so the next sweep re-distils (idempotent; write-time dedup absorbs
+	// the repeat). In fs mode the chain is empty, so this awaits nothing and never trips.
+	await awaitFactsFlush();
+	if (factsFlushErrorCount(wsId) > errorsBefore) {
+		log.warn("extraction facts flush failed; cursor NOT advanced (next sweep retries)", { sessionId: args.sessionId });
+		return { ran: false, stored: 0, processedTo: from };
+	}
 	// Advance the cursor past everything we just considered (even if 0 stored —
 	// re-distilling the same turns would only waste calls).
 	writeCursor(args.workspaceDir, args.sessionId, total);

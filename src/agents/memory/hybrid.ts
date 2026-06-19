@@ -79,7 +79,9 @@ export function recallHybrid(
 	opts: { limit?: number; minSim?: number; mmrLambda?: number } = {},
 ): HybridScored[] {
 	const limit = opts.limit && opts.limit > 0 ? opts.limit : 8;
-	const minSim = opts.minSim ?? DEFAULT_MIN_SIM;
+	// Per-embedder recovery floor: an explicit opt wins; else the embedder's own
+	// recommended floor (a noisy model-free HRR sets a HIGH one); else the default.
+	const minSim = opts.minSim ?? embedder.minSim ?? DEFAULT_MIN_SIM;
 	const lambda = opts.mmrLambda ?? DEFAULT_MMR_LAMBDA;
 	if (candidates.length === 0) return [];
 

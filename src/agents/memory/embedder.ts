@@ -26,6 +26,13 @@ export interface Embedder {
 	readonly id: string;
 	/** Vector dimensionality — MUST equal the convex `by_embedding` vectorIndex `dimensions`. */
 	readonly dims: number;
+	/**
+	 * Recommended recovery-lane cosine floor for THIS embedder — the hybrid uses
+	 * `opts.minSim ?? embedder.minSim ?? 0.3`. A noisy model-free embedder needs a
+	 * HIGHER floor than a learned one (its unrelated-text cosine is not ~0), so it
+	 * sets this; a clean learned embedder omits it and inherits the 0.3 default.
+	 */
+	readonly minSim?: number;
 	/** Embed a batch of texts → one unit vector each (same order). */
 	embed(texts: string[]): number[][] | Promise<number[][]>;
 }
@@ -119,9 +126,25 @@ export function cosine(a: readonly number[], b: readonly number[]): number {
  * learned model (a local embedding model, or a hosted embeddings API), which
  * plugs into this same {@link Embedder} seam (async) when wanted.
  */
+/** Max cached phase atoms before FIFO eviction — bounds the singleton embedder's
+ *  memory in a long-running gateway (atoms recompute cheaply + deterministically). */
+const ATOM_CACHE_CAP = 50_000;
+
 export class HrrEmbedder implements Embedder {
 	readonly id: string;
 	readonly dims: number;
+	// NB: HrrEmbedder deliberately does NOT set `minSim` (inherits the hybrid's 0.3
+	// default). Why: its short-text cosine on UNRELATED pairs is NOT ~0 (the "near-
+	// orthogonal" ideal holds only for long text) — on a small corpus it reaches the
+	// low-0.3s — and its genuine MORPHOLOGICAL recovery (the inflection match BM25
+	// misses, e.g. query "deploy" → fact "deploys") lands in that SAME low band once a
+	// short query is scored against a full fact's content. So no fixed floor cleanly
+	// separates signal from noise model-free: raising minSim to suppress the
+	// abstention false-positives also cut real recall — VERIFIED, it broke the
+	// "deploy"→"deploys" recall in src/agents/tools/memory-tools.test.ts. The clean
+	// separation (and thus a useful per-embedder `minSim`) arrives with a LEARNED
+	// embedder (v2), which sets it via the seam below. Exact cosines are corpus- and
+	// regime-dependent — do NOT hard-code them; re-measure against the real embedder.
 	private readonly atomCache = new Map<string, Float64Array>();
 
 	constructor(private readonly phases: number = 128) {
@@ -148,6 +171,14 @@ export class HrrEmbedder implements Embedder {
 				out[filled++] = (u16 * (2 * Math.PI)) / 65536;
 			}
 			round++;
+		}
+		// Bound the cache so the process-lifetime singleton embedder (used on EVERY
+		// write + EVERY recall query, with the raw inbound message as the query) doesn't
+		// grow without limit in the long-running gateway. Atoms are a pure deterministic
+		// function of the feature, so an evicted one just recomputes cheaply on a miss.
+		if (this.atomCache.size >= ATOM_CACHE_CAP) {
+			const oldest = this.atomCache.keys().next().value;
+			if (oldest !== undefined) this.atomCache.delete(oldest); // FIFO evict
 		}
 		this.atomCache.set(feat, out);
 		return out;

@@ -30,6 +30,7 @@ import {
 	type MemoryStatus,
 	type RecordOriginFilter,
 } from "./records.js";
+import { isTrustedTarget } from "./write-gate.js";
 
 const DAY_MS = 86_400_000;
 
@@ -83,9 +84,20 @@ export function runDream(store: FactStore, opts: DreamOpts = {}): DreamResult {
 	//    subject was CORRECTED ≥ confirmCount times (archived same-subject,
 	//    same-origin predecessors). So both "said X three times" and "revised the
 	//    value over three corrections, now settled" promote the current belief.
+	// GENUINE corrections only: a same-slot supersede stamps the NEW fact with
+	// contradicts/transition edges pointing at the prior it replaced, so an archived
+	// predecessor that is the TARGET of such an edge was genuinely corrected. Decay,
+	// eviction, and consolidation ALSO archive (without those edges) — counting them
+	// would falsely CONFIRM a once-asserted belief whose slot merely churned via decay.
+	const supersededTargets = new Set<string>();
+	for (const a of store.readAll()) {
+		for (const l of a.links ?? []) {
+			if (l.kind === "contradicts" || l.kind === "transition") supersededTargets.add(l.target);
+		}
+	}
 	const correctionDepth = new Map<string, number>();
 	for (const a of store.readAll()) {
-		if (a.lifecycle === "active" || !a.subjectKey) continue;
+		if (a.lifecycle === "active" || !a.subjectKey || !supersededTargets.has(a.memoryId)) continue;
 		const k = JSON.stringify([originBucketKey(a), a.subjectKey]);
 		correctionDepth.set(k, (correctionDepth.get(k) ?? 0) + 1);
 	}
@@ -123,8 +135,21 @@ export function runDream(store: FactStore, opts: DreamOpts = {}): DreamResult {
 			const a = byId.get(e.from);
 			const b = byId.get(e.to);
 			if (!a || !b) continue;
-			const [keep, drop] = effectiveScore(a, now) >= effectiveScore(b, now) ? [a, b] : [b, a];
-			// Don't dissolve a second confirmed belief into another — both are load-bearing.
+			// Keeper precedence, each dominating the next: (1) TRUST — an untrusted fact
+			// must NEVER supersede a trusted owner-authored one (write-gate Rule 2: the
+			// write path enforces it, so the dream must too — else attacker-influenceable
+			// content archives an owner belief); (2) CONFIRMED — a confirmed belief
+			// outranks a non-confirmed near-duplicate; (3) effectiveScore.
+			const trust = (r: MemoryRecord): number => (isTrustedTarget(r.sourceType) ? 1 : 0);
+			const conf = (r: MemoryRecord): number => (r.status === "confirmed" ? 1 : 0);
+			const aWins =
+				trust(a) !== trust(b)
+					? trust(a) > trust(b)
+					: conf(a) !== conf(b)
+						? conf(a) > conf(b)
+						: effectiveScore(a, now) >= effectiveScore(b, now);
+			const [keep, drop] = aWins ? [a, b] : [b, a];
+			// Don't dissolve one confirmed belief into ANOTHER — both are load-bearing.
 			if (keep.status === "confirmed" && drop.status === "confirmed") continue;
 			store.invalidate(drop.memoryId, { supersededBy: keep.memoryId, now });
 			merged.add(drop.memoryId);

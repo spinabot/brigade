@@ -56,7 +56,7 @@ describe("parseExtractedFacts", () => {
 });
 
 describe("storeExtractedFacts", () => {
-	it("stores valid segments + skips unknown ones + stamps corrects", () => {
+	it("confines an untrusted distillation (correction→knowledge, no corrects), keeps descriptive, skips unknown", () => {
 		const n = storeExtractedFacts(
 			dir,
 			[
@@ -66,13 +66,21 @@ describe("storeExtractedFacts", () => {
 			],
 			"turn-1",
 		);
-		assert.equal(n, 2); // correction + project; nonsense skipped
+		assert.equal(n, 2); // confined-correction (→knowledge) + project; nonsense skipped
 		const store = new FactStore(dir);
 		const all = store.list();
 		assert.equal(all.length, 2);
-		const correction = all.find((r) => r.segment === "correction");
-		assert.equal(correction?.metadata?.corrects, "pnpm");
-		assert.equal(correction?.sourceTurn, "turn-1");
+		// Auto-extraction defaults to the `extraction` (untrusted) tier, so a proposed
+		// `correction` is CONFINED to descriptive `knowledge` — it can't author the
+		// operator's self-model — and its `corrects` is dropped (it's evidence, not authority).
+		assert.equal(all.find((r) => r.segment === "correction"), undefined, "no extraction-authored correction");
+		const confined = all.find((r) => r.content.startsWith("User uses pnpm"));
+		assert.equal(confined?.segment, "knowledge");
+		assert.equal(confined?.metadata?.corrects, undefined);
+		assert.equal(confined?.sourceType, "extraction");
+		assert.equal(confined?.sourceTurn, "turn-1");
+		// The descriptive project fact passes through unchanged.
+		assert.equal(all.find((r) => r.segment === "project")?.content, "Deploys Fridays.");
 	});
 
 	it("stamps a CHANNEL origin + sourceType so peer-derived facts are ISOLATED, not owner-scoped (poisoned-inbox guard)", () => {

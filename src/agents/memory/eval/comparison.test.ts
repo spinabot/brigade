@@ -30,7 +30,7 @@ afterEach(() => {
 
 describe("Step 8 — BM25 (FactStore.search) vs the linear floor", () => {
 	it("recall@k and MRR: BM25 ≥ the floor on the synthetic gold", async () => {
-		const store = new FactStore(dir);
+		const store = new FactStore(dir, { now: () => 0 }); // pinned clock → decay-deterministic (see gold-hard.test.ts)
 		const cases = seedGold(store, SYNTHETIC_GOLD);
 		// Small cutoff so ranking (not just retrieval) is in play — though on this
 		// clean synthetic gold every lane ranks the relevant facts perfectly, so the
@@ -70,43 +70,67 @@ describe("Step 8 — BM25 (FactStore.search) vs the linear floor", () => {
 		);
 	});
 
-	it("states the crossover: the index beats the full-context oracle at every realistic budget", async () => {
-		const store = new FactStore(dir);
+	it("budget-bounded recall: ranking fills a small context budget; the un-ranked full-context dump truncates", async () => {
+		const store = new FactStore(dir, { now: () => 0 }); // pinned clock → decay-deterministic (see gold-hard.test.ts)
 		const cases = seedGold(store, SYNTHETIC_GOLD);
-		// The oracle stuffs EVERYTHING into context — perfect recall only once the
-		// budget k reaches the corpus size; below that it dilutes the top-k with
-		// irrelevant facts. The index's job is to win at realistic budgets.
+		// Under a context BUDGET (k < corpus) you must CHOOSE which k facts to include.
+		// Ranked retrieval fills the budget with RELEVANT facts; the un-ranked dump
+		// takes the first-k-written and wastes the budget. This is a STRUCTURAL property
+		// (a relevance-ranked retriever necessarily recalls@k ≥ an insertion-order dump
+		// under a budget), so it is a NON-REGRESSION check, NOT a surprising empirical
+		// win — the dump never LOSES a fact (next test), it just can't prioritise under
+		// a budget. We therefore report the numbers but do not headline a "win".
 		const budgets = [1, 3, 5];
-		const crossover: string[] = [];
+		const rows: string[] = [];
 		for (const k of budgets) {
 			const idx = await runRecallEval(defaultRecallCapability(store), cases, { k, clock: () => 0 });
 			const orc = await runRecallEval(oracleCapability(store), cases, { k, clock: () => 0 });
-			crossover.push(`k=${k}: index recall@k=${(idx.recallAtK * 100).toFixed(0)}% vs oracle=${(orc.recallAtK * 100).toFixed(0)}%`);
+			rows.push(`k=${k}: index recall@k=${(idx.recallAtK * 100).toFixed(0)}% vs un-ranked dump=${(orc.recallAtK * 100).toFixed(0)}%`);
 			assert.ok(
 				idx.recallAtK >= orc.recallAtK - 1e-9,
-				`at k=${k} the index (${idx.recallAtK.toFixed(3)}) should be ≥ the full-context oracle (${orc.recallAtK.toFixed(3)})`,
+				`at k=${k} ranked retrieval (${idx.recallAtK.toFixed(3)}) should fill the budget ≥ the un-ranked dump (${orc.recallAtK.toFixed(3)})`,
 			);
 		}
-		console.log(`\n[crossover — index vs full-context oracle]\n  ${crossover.join("\n  ")}`);
+		console.log(`\n[budget-bounded recall — ranking vs un-ranked full-context dump]\n  ${rows.join("\n  ")}`);
 		console.log(
-			"  → On the synthetic gold the index beats the full-context oracle at every realistic budget (k≤5);\n" +
-				"    they converge only when k reaches the corpus size (oracle = perfect recall by stuffing everything).\n" +
-				"    The true hybrid-vs-oracle crossover on REAL data is the v2 measurement (vectors deferred per 0.2).",
+			"  → At a context budget (k<corpus) ranking fills it with relevant facts; un-ranked dumping truncates.\n" +
+				"    This is WHY retrieval matters at scale — a structural property, not a recall rivalry: at k≥corpus\n" +
+				"    both include everything (next test), and the dump's real deficiency is abstention (test below).",
 		);
 	});
 
-	it("at k ≥ corpus the oracle reaches the recall ceiling (1.0), BM25 ≤ it", async () => {
-		const store = new FactStore(dir);
+	it("at k ≥ corpus the full-context dump reaches the recall ceiling (1.0) — it never LOSES a fact; index ≤ it", async () => {
+		const store = new FactStore(dir, { now: () => 0 }); // pinned clock → decay-deterministic (see gold-hard.test.ts)
 		const cases = seedGold(store, SYNTHETIC_GOLD);
 		const K = 20; // ≥ active corpus size
 		const bm25 = await runRecallEval(defaultRecallCapability(store), cases, { k: K, clock: () => 0 });
 		const oracle = await runRecallEval(oracleCapability(store), cases, { k: K, clock: () => 0 });
-		assert.ok(Math.abs(oracle.recallAtK - 1) < 1e-9, "oracle returns everything → perfect recall at large k");
-		assert.ok(oracle.recallAtK >= bm25.recallAtK - 1e-9, "oracle is the recall ceiling");
+		// The HONEST full-context number: with the whole corpus in budget, the dump
+		// recalls everything (1.0). This is the number that matters — the index does
+		// NOT beat full-context ON RECALL; it matches the ceiling while adding ranking
+		// (above) and abstention (below).
+		assert.ok(Math.abs(oracle.recallAtK - 1) < 1e-9, "full-context dump returns everything → perfect recall at large k");
+		assert.ok(oracle.recallAtK >= bm25.recallAtK - 1e-9, "the dump is the recall ceiling; the index does not exceed it");
+	});
+
+	it("the full-context dump CANNOT abstain — the index's real (non-tautological) qualitative win", async () => {
+		const store = new FactStore(dir, { now: () => 0 }); // pinned clock → decay-deterministic (see gold-hard.test.ts)
+		const cases = seedGold(store, SYNTHETIC_GOLD);
+		const K = 3;
+		const idx = await runRecallEval(defaultRecallCapability(store), cases, { k: K, clock: () => 0 });
+		const orc = await runRecallEval(oracleCapability(store), cases, { k: K, clock: () => 0 });
+		// The dump returns facts for EVERY query, including the no-answer ones → an
+		// abstention violation on each (a hallucination feed). The index returns nothing
+		// when nothing lexically matches. THIS — not recall — is the qualitative gap.
+		assert.ok(orc.abstentionViolations > 0, "the full-context dump answers no-answer queries (it cannot abstain)");
+		assert.equal(idx.abstentionViolations, 0, "the index abstains on no-answer queries");
+		console.log(
+			`\n[abstention — the dump can't say "I don't know"]\n  index violations=${idx.abstentionViolations} vs un-ranked dump=${orc.abstentionViolations} (of ${cases.filter((c) => c.relevantIds.length === 0).length} no-answer cases)`,
+		);
 	});
 
 	it("multi-signal hybrid (what recall() serves) does not REGRESS recall@k vs pure BM25", async () => {
-		const store = new FactStore(dir);
+		const store = new FactStore(dir, { now: () => 0 }); // pinned clock → decay-deterministic (see gold-hard.test.ts)
 		const cases = seedGold(store, SYNTHETIC_GOLD); // embed-on-write populates HRR vectors
 		const K = 3;
 		const bm25 = await runRecallEval(defaultRecallCapability(store), cases, { k: K, clock: () => 0 });

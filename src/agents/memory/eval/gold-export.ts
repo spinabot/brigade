@@ -43,6 +43,11 @@ export function exportGoldScaffold(store: FactStore, opts: { maxCases?: number }
 		segment: r.segment,
 		importance: r.importance,
 		...(r.createdBy !== undefined ? { createdBy: r.createdBy } : {}),
+		// Carry sourceType through — without it an untrusted real fact (tool_output /
+		// retrieved_document / extraction / …) would scaffold as a TRUSTED one
+		// (undefined ⇒ trusted at the write-gate), silently mislabeling the poison
+		// lane the operator is trying to capture.
+		...(r.sourceType !== undefined ? { sourceType: r.sourceType } : {}),
 	}));
 	const limit = opts.maxCases !== undefined && opts.maxCases >= 0 ? opts.maxCases : records.length;
 	const cases: GoldCase[] = records.slice(0, limit).map((r, i) => {
