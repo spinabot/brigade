@@ -36,6 +36,13 @@ describe("parseConsolidationArchive", () => {
 		assert.deepEqual(parseConsolidationArchive('{"other":1}'), []);
 		assert.deepEqual(parseConsolidationArchive(""), []);
 	});
+	it("survives brace-bearing prose + a leading stray object (balanced-object scan)", () => {
+		// A greedy first-to-last `{...}` match would span both brace groups and fail;
+		// a leading `{}` would shadow the real payload. The balanced-object scan takes
+		// the FIRST object that actually carries an `archive` array.
+		assert.deepEqual(parseConsolidationArchive('My analysis: {a few notes}. Result: {"archive":["mem_x"]}'), ["mem_x"]);
+		assert.deepEqual(parseConsolidationArchive('{} {"archive":["mem_y"]}'), ["mem_y"]);
+	});
 });
 
 function seed(store: FactStore, n: number): string[] {
@@ -54,8 +61,16 @@ describe("runConsolidation", () => {
 		const res = await runConsolidation({ workspaceDir: dir, llm });
 		assert.equal(res.ran, true);
 		assert.equal(res.archived, 2); // the bogus id is ignored
-		assert.equal(store.list().length, 4);
-		assert.equal(store.list({ lifecycle: "archived" }).length, 2);
+		// Exact active set: the 4 facts NOT asked to be archived (ids[0,2,4,5]).
+		assert.deepEqual(
+			store.list().map((r) => r.memoryId).sort(),
+			[ids[0], ids[2], ids[4], ids[5]].sort(),
+		);
+		// Exact archived set: only the two ids the LLM nominated (ids[1] and ids[3]).
+		assert.deepEqual(
+			store.list({ lifecycle: "archived" }).map((r) => r.memoryId).sort(),
+			[ids[1], ids[3]].sort(),
+		);
 	});
 
 	it("is a no-op below the minimum fact count (no LLM call)", async () => {
@@ -89,6 +104,49 @@ describe("runConsolidation", () => {
 		const res = await runConsolidation({ workspaceDir: dir, llm });
 		assert.equal(res.ran, false);
 		assert.equal(store.list().length, 6);
+	});
+
+	// RICHNESS GUARD (Fix 2 + 3) — the bug: the LLM, with no notion of metadata
+	// richness, archived the subject-bearing identity/preference ORIGINALS and kept
+	// their reworded subject-less knowledge twins (the vault graph then lost the
+	// hub-anchoring subjectKeys). The guard must redirect each such archive to the
+	// POORER twin so the richest record always survives — even though the LLM named
+	// the rich one. Reproduces the operator's exact real-data evidence (3 of 5 facts).
+	it("redirects an LLM archive away from the RICHER twin — the subject-bearing original survives", async () => {
+		const owner = { kind: "owner" as const };
+		const store = new FactStore(dir);
+		// 5 rich taught facts (identity/preference + subjectKey).
+		const rich = {
+			veg: store.write({ content: "User is vegetarian — no meat or fish", segment: "identity", subjectKey: "diet", createdBy: owner }).memoryId,
+			peanut: store.write({ content: "User has a peanut allergy", segment: "identity", subjectKey: "peanut_allergy", createdBy: owner }).memoryId,
+			dark: store.write({ content: "User prefers dark mode", segment: "preference", subjectKey: "ui_theme", createdBy: owner }).memoryId,
+			loc: store.write({ content: "User lives in Hyderabad", segment: "identity", subjectKey: "location", createdBy: owner }).memoryId,
+			deploy: store.write({ content: "User deploys on Fridays", segment: "preference", subjectKey: "deploy_day", createdBy: owner }).memoryId,
+		};
+		// 3 reworded extraction churn copies (knowledge, no subjectKey) — for veg/peanut/dark.
+		const churn = {
+			veg: store.write({ content: "The user is vegetarian and does not eat meat or fish", segment: "knowledge", sourceType: "extraction", createdBy: owner }).memoryId,
+			peanut: store.write({ content: "The user is allergic to peanuts", segment: "knowledge", sourceType: "extraction", createdBy: owner }).memoryId,
+			dark: store.write({ content: "The user prefers the dark theme", segment: "knowledge", sourceType: "extraction", createdBy: owner }).memoryId,
+		};
+		// The model (wrongly) nominates the RICH originals for archival.
+		const llm = async () => JSON.stringify({ archive: [rich.veg, rich.peanut, rich.dark] });
+		const res = await runConsolidation({ workspaceDir: dir, llm, minFacts: 1 });
+		assert.equal(res.archived, 3, "three records archived — but the POORER twins, not the rich originals");
+
+		const byId = new Map(store.readAll().map((r) => [r.memoryId, r]));
+		// Every rich subject-bearing original stays ACTIVE.
+		for (const id of Object.values(rich)) {
+			assert.equal(byId.get(id)!.lifecycle, "active", "rich subject-bearing original survives");
+		}
+		// Every churn copy is archived instead.
+		for (const id of Object.values(churn)) {
+			assert.equal(byId.get(id)!.lifecycle, "archived", "the subject-less churn twin is the one archived");
+		}
+		// The surviving veg fact still carries its subjectKey + identity segment (not isolated).
+		const veg = byId.get(rich.veg)!;
+		assert.equal(veg.subjectKey, "diet");
+		assert.equal(veg.segment, "identity");
 	});
 
 	it("consolidates each ORIGIN in isolation — no prompt mixes origins, no cross-origin archive", async () => {
@@ -125,10 +183,16 @@ describe("runConsolidation", () => {
 		// Owner id archived by the owner bucket; the channel call returning that same
 		// owner id archives NOTHING (cross-origin archive is blocked by bucket scoping).
 		assert.equal(res.archived, 1);
-		assert.ok(store.list({ lifecycle: "archived" }).map((r) => r.memoryId).includes(firstOwnerId));
-		for (const id of chanIds) {
-			assert.ok(store.list().map((r) => r.memoryId).includes(id), "channel facts untouched by owner consolidation");
-		}
+		// Exact archived set: only the one owner fact the owner-bucket's LLM call nominated.
+		assert.deepEqual(
+			store.list({ lifecycle: "archived" }).map((r) => r.memoryId),
+			[firstOwnerId],
+		);
+		// All 6 channel facts must still be active — none was archivable by the owner bucket.
+		assert.deepEqual(
+			store.list().map((r) => r.memoryId).sort(),
+			[...ownerIds.filter((id) => id !== firstOwnerId), ...chanIds].sort(),
+		);
 	});
 });
 

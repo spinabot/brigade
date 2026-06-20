@@ -61,7 +61,18 @@ export function memoryMcpTools(tide: Tideline, opts: MemoryMcpOpts): McpTool[] {
 	const renderHits = (hits: Array<{ segment: string; content: string }>): string =>
 		wrapUntrustedDataBlock({
 			label: "memory",
-			text: hits.map((h) => `- [${h.segment}] ${escapeMarkup(sanitizeForPromptLiteral(h.content))}`).join("\n"),
+			text: hits
+				.map((h) => {
+					// Recall-time content scan FIRST (mirrors tide.context() + auto-recall):
+					// a fact carrying an injection/exfil/C2 payload is surfaced as a
+					// non-actionable [BLOCKED] line, never its raw text. Markup-escape stays
+					// the always-on second layer for everything else.
+					const threats = tide.scanThreats(h.content);
+					return threats.length > 0
+						? `- [${h.segment}] [BLOCKED] this fact matched threat pattern(s): ${threats.join(", ")} — omitted`
+						: `- [${h.segment}] ${escapeMarkup(sanitizeForPromptLiteral(h.content))}`;
+				})
+				.join("\n"),
 		});
 
 	return [

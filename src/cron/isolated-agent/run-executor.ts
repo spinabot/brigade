@@ -22,16 +22,19 @@
  *     → stable per-name (preserves history across fires).
  */
 
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
+import { resolveAgentWorkspaceDir } from "../../config/paths.js";
 import { readConfigOrInit, type BrigadeConfig } from "../../config/io.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
+import { redactSensitiveText } from "../../logging/redact.js";
 import { extractSessionTargetId, isSessionTargetWithId } from "../session-target.js";
 import type {
 	CronIsolatedRunArgs,
 	CronIsolatedRunOutcome,
 } from "../service/state.js";
-import type { CronJob, CronPayloadAgentTurn } from "../types.js";
+import type { CronJob, CronPayloadAgentTurn, CronPayloadScript } from "../types.js";
 
 const log = createSubsystemLogger("cron/run-executor");
 
@@ -224,4 +227,149 @@ function classifyAgentRunError(message: string): "permanent" | undefined {
 	if (m.includes("model not found")) return "permanent";
 	if (m.includes("no such agent")) return "permanent";
 	return undefined;
+}
+
+/* ───────────────────────── script payload (cost-saver) ───────────────────────── */
+
+const SCRIPT_OUTPUT_CAP_BYTES = 64 * 1024;
+
+interface ShellResult {
+	stdout: string;
+	stderr: string;
+	code: number;
+	timedOut: boolean;
+}
+
+/** Run a shell command, bounded by time + output size. Never rejects — a spawn
+ *  error resolves as a non-zero exit. The command is OWNER-authored (script cron
+ *  jobs are owner-only), so a shell is acceptable here, like a crontab line. */
+function runShellCommand(
+	command: string,
+	opts: { cwd: string; timeoutMs: number; signal?: AbortSignal },
+): Promise<ShellResult> {
+	return new Promise((resolve) => {
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		let settled = false;
+		const child = spawn(command, { cwd: opts.cwd, shell: true });
+		const finish = (code: number): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			opts.signal?.removeEventListener?.("abort", onAbort);
+			resolve({ stdout, stderr, code, timedOut });
+		};
+		const onAbort = (): void => {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				/* already gone */
+			}
+		};
+		const timer = setTimeout(() => {
+			timedOut = true;
+			onAbort();
+			finish(124);
+		}, opts.timeoutMs);
+		timer.unref?.();
+		opts.signal?.addEventListener?.("abort", onAbort, { once: true });
+		child.stdout?.on("data", (d: Buffer) => {
+			if (stdout.length < SCRIPT_OUTPUT_CAP_BYTES) stdout += d.toString("utf8");
+		});
+		child.stderr?.on("data", (d: Buffer) => {
+			if (stderr.length < SCRIPT_OUTPUT_CAP_BYTES) stderr += d.toString("utf8");
+		});
+		child.on("error", (e: Error) => {
+			stderr += String(e?.message ?? e);
+			finish(1);
+		});
+		child.on("close", (code: number | null) => finish(code ?? 0));
+	});
+}
+
+/** The script can opt OUT of waking the agent at runtime: a final stdout line
+ *  `{"wakeAgent":false}` means "nothing to act on — don't spend a model turn". */
+function scriptRequestsNoWake(stdout: string): boolean {
+	const lines = stdout.trimEnd().split("\n");
+	const last = lines[lines.length - 1]?.trim();
+	if (!last || !last.startsWith("{")) return false;
+	try {
+		return (JSON.parse(last) as { wakeAgent?: unknown }).wakeAgent === false;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Execute a `script` cron job. By default delivers the command's stdout with NO
+ * model turn (zero tokens — the cost saver). When `wakeAgent` is set AND the
+ * script didn't veto it AND there's output, runs an agent turn with the stdout
+ * injected. OWNER-ONLY at the execution boundary (defense-in-depth; createJob
+ * also rejects channel-origin script jobs).
+ */
+export async function executeCronScriptRun(
+	args: CronIsolatedRunArgs,
+): Promise<CronIsolatedRunOutcome> {
+	const { job, abortSignal } = args;
+	if (job.payload.kind !== "script") {
+		return { status: "error", error: "executeCronScriptRun called with non-script payload" };
+	}
+	if (job.createdBy && job.createdBy.kind !== "owner") {
+		return { status: "error", error: "script cron jobs are owner-only", errorKind: "permanent" };
+	}
+	const payload = job.payload as CronPayloadScript;
+	const agentId = job.agentId ?? DEFAULT_AGENT_ID;
+	const cwd = payload.cwd && payload.cwd.trim() ? payload.cwd : resolveAgentWorkspaceDir(agentId);
+	const timeoutMs = (payload.timeoutSeconds && payload.timeoutSeconds > 0 ? payload.timeoutSeconds : 60) * 1000;
+	log.info("cron script starting", { jobId: job.id, name: job.name, cwd, timeoutMs, wakeAgent: payload.wakeAgent === true });
+
+	const res = await runShellCommand(payload.command, {
+		cwd,
+		timeoutMs,
+		...(abortSignal ? { signal: abortSignal } : {}),
+	});
+
+	const wake = payload.wakeAgent === true && !scriptRequestsNoWake(res.stdout) && res.stdout.trim() !== "";
+	if (!wake) {
+		// NO MODEL TURN — deliver the script output directly. Zero tokens.
+		if (res.timedOut) return { status: "error", error: `script timed out after ${timeoutMs}ms` };
+		if (res.code !== 0) {
+			// Redact BOTH streams at the source so the downstream run-log +
+			// failure-alert never carry a token / key / phone number. Include a
+			// bounded stdout slice alongside stderr — many scripts log their
+			// diagnostics to stdout, so a bare `script exited N` is useless when
+			// the watchdog itself breaks.
+			const errStderr = redactSensitiveText(res.stderr).slice(0, 200);
+			const errStdout = redactSensitiveText(res.stdout).slice(0, 200);
+			return {
+				status: "error",
+				error: `script exited ${res.code}${errStderr ? `: ${errStderr}` : ""}${errStdout ? `; stdout: ${errStdout}` : ""}`,
+			};
+		}
+		// Redact stdout before it becomes the run outcome — the summary flows
+		// verbatim to the persistent run-log AND (for announce-delivery jobs) to
+		// a chat channel, so secrets must be scrubbed at the source.
+		return { status: "ok", summary: summariseReply(redactSensitiveText(res.stdout) || "(no output)") };
+	}
+
+	// WAKE — run an agent turn over the script's output via the existing path.
+	const derived: CronPayloadAgentTurn = {
+		kind: "agentTurn",
+		// Redact the injected stdout — when the wake agent's reply summarises or
+		// echoes the script output it would otherwise carry secrets onward to the
+		// run-log + announce sinks, so scrub at the source here too.
+		message: `${payload.agentMessage?.trim() || "React to this scheduled script's output."}\n\n## Script Output\n\`\`\`\n${redactSensitiveText(res.stdout).slice(0, 8000)}\n\`\`\``,
+		...(payload.timeoutSeconds ? { timeoutSeconds: payload.timeoutSeconds } : {}),
+	};
+	return executeCronAgentRun({ ...args, job: { ...job, payload: derived } });
+}
+
+/** Dispatch an isolated/session cron run by payload kind (the timer's
+ *  `runIsolatedAgentJob` dep points here). */
+export async function executeCronIsolatedRun(
+	args: CronIsolatedRunArgs,
+): Promise<CronIsolatedRunOutcome> {
+	if (args.job.payload.kind === "script") return executeCronScriptRun(args);
+	return executeCronAgentRun(args);
 }

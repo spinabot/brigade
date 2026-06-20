@@ -38,6 +38,8 @@ import type {
 	CronWakeParams,
 } from "./core/server-methods/cron.js";
 import type { OrgSnapshotResult } from "./protocol/methods.js";
+import type { MemoryGraphExport } from "./agents/memory/graph-export.js";
+import type { MemoryQueryResult } from "./agents/memory/query.js";
 
 /* ─────────────────────────── frame types ─────────────────────────── */
 
@@ -128,6 +130,12 @@ export type RequestMethod =
 	| "refresh-models"
 	/** Get the current state snapshot on demand. Reply: SessionStateSnapshot. */
 	| "get-state"
+	/** Memory Graph dashboard data — nodes + typed edges + topic clusters + stats.
+	 *  Reply: MemoryGraphExport. */
+	| "memory-graph"
+	/** Operator memory inspection — list / search / inspect / stats.
+	 *  Reply: MemoryQueryResult. */
+	| "memory-query"
 	/**
 	 * Request a graceful shutdown of the gateway. The server acks the request,
 	 * runs its full cleanup chain (close clients, unwind Pi session, clear PID
@@ -303,6 +311,24 @@ export interface RequestParams {
 	"list-models": void;
 	"refresh-models": void;
 	"get-state": void;
+	"memory-graph": {
+		/** Agent whose memory graph is exported; defaults to the boot agent. */
+		agentId?: string;
+		/** Cap the node set returned for the viz (top-importance first). Default 250. */
+		maxNodes?: number;
+	};
+	"memory-query": {
+		/** Agent whose memory is queried; defaults to the boot agent. */
+		agentId?: string;
+		/** What to fetch: recent facts, a token search, one fact, or counts. */
+		action: "list" | "search" | "inspect" | "stats";
+		/** Search terms for action="search". */
+		query?: string;
+		/** Target memoryId for action="inspect". */
+		memoryId?: string;
+		/** Cap returned facts (list/search). Default 20, max 100. */
+		limit?: number;
+	};
 	shutdown: void;
 	subscribe: {
 		/** Subscribe to events tagged with this agentId. */
@@ -360,6 +386,8 @@ export interface ResponseFor {
 	"list-models": ModelSummary[];
 	"refresh-models": void;
 	"get-state": SessionStateSnapshot;
+	"memory-graph": MemoryGraphExport;
+	"memory-query": MemoryQueryResult;
 	shutdown: void;
 	subscribe: void;
 	unsubscribe: void;

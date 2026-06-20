@@ -246,6 +246,16 @@ export default defineSchema({
     lastRunAt: v.number(),
   }).index("by_workspace", ["workspaceId"]),
 
+  // Append-only memory AUDIT trail (the convex-mode provenance log; fs mode uses
+  // events.jsonl). `data` is the full MemoryEvent JSON-serialized (loose by-kind
+  // shape); `at`/`kind` are surfaced for ordering + filtering.
+  memoryEvents: defineTable({
+    workspaceId: v.string(),
+    at: v.number(),
+    kind: v.string(),
+    data: v.string(),
+  }).index("by_workspace_at", ["workspaceId", "at"]),
+
   // ===========================================================================
   // 4 & 5. SESSIONS + MESSAGES  (REPORT 2)
   // ===========================================================================

@@ -17,7 +17,6 @@
  * debounced trigger (see server.ts).
  */
 
-import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -34,6 +33,44 @@ import { FactStore, MEMORY_SEGMENTS, type MemoryRecordOrigin, type MemorySegment
 import { confineUntrustedSegment } from "./write-gate.js";
 
 const log = createSubsystemLogger("memory/extract");
+
+/* ───────────────────────── pre-compaction extraction hook ───────────────────────── */
+
+/** Args for the pre-compaction hook — the turns about to be replaced by a summary. */
+export interface PreCompactionExtractionArgs {
+	agentId: string;
+	sessionId: string;
+	/** Snapshot of the session messages about to be compacted away. */
+	messages: unknown[];
+	/** The turn's memory origin (owner vs channel) — preserves Tideline isolation. */
+	origin: MemoryRecordOrigin;
+}
+
+let preCompactionHook: ((args: PreCompactionExtractionArgs) => Promise<void>) | undefined;
+
+/**
+ * Register (or clear, with `undefined`) the hook that distils the about-to-be-
+ * compacted history. The gateway wires this at boot to a bounded extraction over
+ * the passed messages; unset elsewhere (tests, sub-agents) → a no-op. This closes
+ * the window where a fact lives ONLY in turns the compactor is about to swap for a
+ * summary — post-turn extraction + the reactive compaction guard catch the rest.
+ */
+export function setPreCompactionExtractionHook(
+	fn: ((args: PreCompactionExtractionArgs) => Promise<void>) | undefined,
+): void {
+	preCompactionHook = fn;
+}
+
+/**
+ * Fire the pre-compaction hook (if registered) over the caller's message SNAPSHOT —
+ * FIRE-AND-FORGET so compaction proceeds without turn latency and without racing
+ * the history replace (the snapshot is the hook's own immutable copy). Best-effort.
+ */
+export function runPreCompactionExtraction(args: PreCompactionExtractionArgs): void {
+	const fn = preCompactionHook;
+	if (!fn) return;
+	void Promise.resolve(fn(args)).catch(() => {});
+}
 
 /** Cursor store — tracks how many transcript messages we've already distilled. */
 const CURSOR_RELATIVE_PATH = path.join("memory", ".dreams", "extract-cursor.json");
@@ -68,7 +105,7 @@ export interface ExtractedFact {
  *  grabbed any trailing brace block AND a single-object scan that let a LEADING stray
  *  object (`{}`, a reasoning artifact) shadow the real `{"facts":[…]}` after it — both
  *  failure modes returned [] and advanced the cursor past un-distilled facts. */
-function balancedObjects(text: string): string[] {
+export function balancedObjects(text: string): string[] {
 	const out: string[] = [];
 	let depth = 0;
 	let inStr = false;
@@ -98,36 +135,63 @@ function balancedObjects(text: string): string[] {
 }
 
 /**
- * Parse the extraction model's reply into facts. Robust to prose-wrapped JSON, a
- * trailing brace block, AND a leading stray object: scans every top-level balanced
- * `{...}` and uses the FIRST that actually carries a `facts` array. Never throws.
+ * Parse the extraction model's reply AND report whether the model returned a valid
+ * reply ENVELOPE. Robust to prose-wrapped JSON, a trailing brace block, AND a
+ * leading stray object: scans every top-level balanced `{...}` and uses the FIRST
+ * that carries a `facts` array. Never throws.
+ *
+ * `parsedJson` is the load-bearing signal for cursor safety. It is TRUE only when
+ * the model returned a recognizable ENVELOPE — an object with a `facts` array
+ * (possibly empty), OR an empty object `{}` ("nothing to remember"). Both safely
+ * advance the cursor. It is FALSE for: an empty / truncated / non-JSON reply, AND
+ * for a MALFORMED-but-parseable reply that is NOT an envelope — a keyed object with
+ * no `facts` array (`{foo: 1}`, or a bare fact object `{content, segment}` from a
+ * model that dropped the envelope), or a top-level array `[{...}]` (whose inner
+ * objects parse but carry no `facts` key). Those latter cases may carry real,
+ * un-distilled content, so advancing past them would lose it forever — the caller
+ * (`runExtractionSweep`) HOLDS the cursor when FALSE and the next sweep retries.
  */
-export function parseExtractedFacts(text: string): ExtractedFact[] {
-	if (!text) return [];
+export function parseExtractionReply(text: string): { facts: ExtractedFact[]; parsedJson: boolean } {
+	if (!text) return { facts: [], parsedJson: false };
+	let sawEnvelope = false; // a structured "nothing to extract" — an empty object {}
 	for (const block of balancedObjects(text)) {
-		let parsed: { facts?: unknown };
+		let parsed: Record<string, unknown>;
 		try {
-			parsed = JSON.parse(block) as { facts?: unknown };
+			parsed = JSON.parse(block) as Record<string, unknown>;
 		} catch {
 			continue;
 		}
-		if (!Array.isArray(parsed.facts)) continue;
-		const out: ExtractedFact[] = [];
-		for (const raw of parsed.facts) {
-			if (!raw || typeof raw !== "object") continue;
-			const f = raw as Record<string, unknown>;
-			if (typeof f.content !== "string" || f.content.trim().length === 0) continue;
-			if (typeof f.segment !== "string") continue;
-			out.push({
-				content: f.content.trim(),
-				segment: f.segment,
-				importance: typeof f.importance === "number" ? f.importance : undefined,
-				corrects: typeof f.corrects === "string" ? f.corrects : undefined,
-			});
+		if (Array.isArray((parsed as { facts?: unknown }).facts)) {
+			const out: ExtractedFact[] = [];
+			for (const raw of (parsed as { facts: unknown[] }).facts) {
+				if (!raw || typeof raw !== "object") continue;
+				const f = raw as Record<string, unknown>;
+				if (typeof f.content !== "string" || f.content.trim().length === 0) continue;
+				if (typeof f.segment !== "string") continue;
+				out.push({
+					content: f.content.trim(),
+					segment: f.segment,
+					importance: typeof f.importance === "number" ? f.importance : undefined,
+					corrects: typeof f.corrects === "string" ? f.corrects : undefined,
+				});
+			}
+			return { facts: out, parsedJson: true };
 		}
-		return out;
+		// An EMPTY object {} is a structured "nothing to extract" — safe to advance.
+		// A NON-empty object lacking a `facts` array (e.g. `{foo:1}`, or a bare fact
+		// object the model emitted without the envelope, or the inner object of a
+		// top-level `[{...}]` array) is MALFORMED and may carry un-distilled content,
+		// so it is NOT an envelope: leave `sawEnvelope` false ⇒ the caller HOLDS.
+		if (parsed !== null && typeof parsed === "object" && Object.keys(parsed).length === 0) sawEnvelope = true;
 	}
-	return [];
+	return { facts: [], parsedJson: sawEnvelope };
+}
+
+/** Parse the extraction model's reply into facts (back-compat thin wrapper —
+ *  drops the `parsedJson` signal; use {@link parseExtractionReply} when the
+ *  malformed-reply-vs-genuinely-empty distinction matters). Never throws. */
+export function parseExtractedFacts(text: string): ExtractedFact[] {
+	return parseExtractionReply(text).facts;
 }
 
 /**
@@ -150,30 +214,59 @@ export function storeExtractedFacts(
 	// (owner vs channel) carries recall ISOLATION independently. An explicit
 	// caller-supplied sourceType still wins (e.g. a future trusted distiller).
 	const sourceType: MemorySourceType = opts.sourceType ?? "extraction";
+	const origin = opts.origin;
 	let stored = 0;
 	for (const f of facts) {
 		if (!MEMORY_SEGMENTS.includes(f.segment as MemorySegment)) continue;
+		// IDEMPOTENCY (Fix 1): the distiller re-reads the SAME transcript turns the
+		// operator may have already taught via `write_memory`, and a reworded copy
+		// (segment `knowledge`, NO subjectKey) slips past write-time dedup's strict
+		// near-exact bar — piling a subject-less churn twin beside the rich original,
+		// which consolidation can then archive in place of the real one. So before
+		// creating anything, check whether an equivalent active same-origin fact
+		// already exists; if it does, REINFORCE it (more durable) and SKIP the new
+		// row — re-seeing a known fact is a no-op, not a duplicate. (`supersedes`/
+		// `corrects` distillations are NOT idempotency-skipped: those intend to
+		// replace a prior belief, handled by the write path.)
+		if (!f.corrects) {
+			const known = store.findEquivalentActive(f.content, origin);
+			if (known) {
+				store.reinforce(known.memoryId, { minConfidence: known.confidence });
+				continue;
+			}
+		}
 		// Confine rather than drop: an untrusted distillation proposing a
 		// protected segment (preference/identity/correction) lands as a descriptive
 		// `knowledge` evidence fact (kept, but down-weighted at recall and unable to
 		// pose as the operator's self-model). The write-gate is the hard backstop.
 		const segment = confineUntrustedSegment(sourceType, f.segment as MemorySegment);
-		store.write({
-			content: f.content,
-			segment,
-			...(f.importance !== undefined ? { importance: f.importance } : {}),
-			...(sourceTurn ? { sourceTurn } : {}),
-			// ORIGIN — the isolation stamp. Peer-derived extraction MUST carry the
-			// turn's CHANNEL origin (isolated by the origin filter) so it can't
-			// surface as the operator's own ground truth; owner-turn extraction
-			// passes the owner origin. Left undefined, a write resolves to OWNER.
-			...(opts.origin ? { createdBy: opts.origin } : {}),
-			sourceType,
-			// `corrects` only belongs on a correction that SURVIVED confinement
-			// (a trusted source's correction); a confined→knowledge fact drops it.
-			...(f.corrects && segment === "correction" ? { metadata: { corrects: f.corrects } } : {}),
-		});
-		stored += 1;
+		try {
+			store.write({
+				content: f.content,
+				segment,
+				...(f.importance !== undefined ? { importance: f.importance } : {}),
+				...(sourceTurn ? { sourceTurn } : {}),
+				// ORIGIN — the isolation stamp. Peer-derived extraction MUST carry the
+				// turn's CHANNEL origin (isolated by the origin filter) so it can't
+				// surface as the operator's own ground truth; owner-turn extraction
+				// passes the owner origin. Left undefined, a write resolves to OWNER.
+				...(opts.origin ? { createdBy: opts.origin } : {}),
+				sourceType,
+				// `corrects` only belongs on a correction that SURVIVED confinement
+				// (a trusted source's correction); a confined→knowledge fact drops it.
+				...(f.corrects && segment === "correction" ? { metadata: { corrects: f.corrects } } : {}),
+			});
+			stored += 1;
+		} catch (err) {
+			// A BLOCKED write — the provenance write-gate (WriteGateError) or the
+			// content threat-scan (MemoryThreatError) rejected this distilled fact.
+			// Drop only THIS fact; the rest of the batch is independent and proceeds
+			// (aborting the loop would lose the clean facts too). Anything else is an
+			// unexpected fault — re-throw so it isn't silently swallowed.
+			const name = err instanceof Error ? err.name : "";
+			if (name === "MemoryThreatError" || name === "WriteGateError") continue;
+			throw err;
+		}
 	}
 	return stored;
 }
@@ -236,9 +329,22 @@ function writeCursor(workspaceDir: string, sessionId: string, processedCount: nu
 	file.cursors[sessionId] = processedCount;
 	const p = cursorPath(workspaceDir);
 	fs.mkdirSync(path.dirname(p), { recursive: true });
-	const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;
-	fs.writeFileSync(tmp, JSON.stringify(file), "utf8");
-	fs.renameSync(tmp, p);
+	const tmp = `${p}.tmp-${process.pid}-${Date.now().toString(36)}`;
+	try {
+		fs.writeFileSync(tmp, JSON.stringify(file), "utf8");
+		fs.renameSync(tmp, p);
+	} catch (err) {
+		// Best-effort cleanup of the orphan tmp on any error before the
+		// rename — leaving stale `.tmp-…` files under .dreams/ would be
+		// visible noise on subsequent `ls` / git status. Re-throw after
+		// cleanup so the caller's existing best-effort logging still fires.
+		try {
+			fs.rmSync(tmp, { force: true });
+		} catch {
+			// best-effort orphan-tmp cleanup
+		}
+		throw err;
+	}
 }
 
 export function getCursor(workspaceDir: string, sessionId: string): number {
@@ -329,7 +435,20 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 		});
 		return { ran: false, stored: 0, processedTo: from };
 	}
-	const facts = parseExtractedFacts(reply);
+	const { facts, parsedJson } = parseExtractionReply(reply);
+	// ZERO-FACT GUARD: an empty / truncated / non-JSON reply (a transient distiller
+	// hiccup) is NOT the same as the model returning a structured "nothing to extract"
+	// (`{}` or `{facts: []}`). Advancing the cursor on the former would skip these
+	// turns FOREVER. Hold the cursor and let the next sweep retry (idempotent;
+	// write-time dedup absorbs any repeat). A structured empty reply (parsedJson=true,
+	// facts=[]) falls through and advances as before — re-distilling it wastes calls.
+	if (!parsedJson) {
+		log.warn("extraction reply was not parseable JSON; cursor NOT advanced (next sweep retries)", {
+			sessionId: args.sessionId,
+			replyChars: reply.length,
+		});
+		return { ran: false, stored: 0, processedTo: from };
+	}
 	const wsId = workspaceIdFromDir(args.workspaceDir);
 	const errorsBefore = factsFlushErrorCount(wsId);
 	const stored = storeExtractedFacts(args.workspaceDir, facts, args.sessionId, {
@@ -441,10 +560,9 @@ export function makeIsolatedLlm(
 	args: MakeExtractionLlmArgs,
 ): (input: string) => Promise<string> {
 	return async (input: string): Promise<string> => {
-		// Throwaway transcript — deleted right after the call in the old shape,
-		// so writing it to disk at all was pure waste. `inMemory()` skips ALL
-		// persistence (both modes); convex mode additionally needs this so the
-		// isolated sweep writes nothing under ~/.brigade.
+		// `inMemory()` skips ALL persistence (both modes) — the isolated sweep
+		// never touches disk. Convex mode additionally needs this so the sweep
+		// writes nothing under ~/.brigade.
 		const sessionManager = SessionManager.inMemory(args.workspaceDir);
 		try {
 			const { session } = await createAgentSession({

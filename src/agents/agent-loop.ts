@@ -75,6 +75,8 @@ import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { cleanProviderError } from "../core/model-caps.js";
 import { resolveModelNeverMiss } from "./model-resolution.js";
 import { buildAutoRecallBlock, resolveAutoRecallOrigin } from "./memory/auto-recall.js";
+import { runPreCompactionExtraction } from "./memory/extract.js";
+import type { MemoryRecordOrigin } from "./memory/records.js";
 import { resolveActiveMemoryCapability } from "./memory/plugin-runtime.js";
 import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import {
@@ -1397,12 +1399,41 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // turn and discovering mid-flight that we've blown the window. The
   // estimator is rough (chars/4) but conservative — better to compact
   // a turn early than fail mid-stream.
+  //
+  // The estimate must reflect the FULL request, not just the transcript:
+  // the pinned persona prompt (state.systemPrompt — a SEPARATE field Pi
+  // reads at request time, NOT in session.messages) and the about-to-be-
+  // sent user message both consume window on every request. Omitting them
+  // biases the estimate low by the fixed persona cost present on each
+  // request, so the 85% trigger fires LATE and the turn is likelier to
+  // fall through to Pi's mid-stream auto-compaction. Thread both in so the
+  // decision sees the true pre-prompt fill.
   await maybeTriggerCompaction({
     session: session as AgentSession,
     model: model as { contextWindow?: number } | unknown,
     agentId,
     sessionId: resolved.sessionId,
+    // The pinned persona prompt — empty string when the workspace is empty
+    // (the assembler returns "" and applyPersonaOverrideToSession is skipped),
+    // which contributes 0 to the estimate.
+    systemPrompt: personaPrompt,
+    // The incoming user message (with any drained prefixes) that prompt()
+    // will send below; maybeTriggerCompaction runs BEFORE that send.
+    incomingMessage: scrubbedMessage,
+    ...(recallOrigin ? { origin: recallOrigin } : {}),
   });
+
+  // Snapshot the transcript length immediately before the FIRST prompt of
+  // this turn. Used by the max_tokens continuation path below: every settled
+  // run (initial + each continuation) pushes a NEW assistant message into
+  // session.messages, so a capped answer split across N continuations lands
+  // as N distinct segments — NOT restatements. extractLastAssistantText
+  // returns only the most-recent segment, which would silently drop the
+  // truncated head + every middle segment. We instead concatenate every
+  // assistant message produced from this index forward (see `reply` below).
+  // Captured once here — before runWithRetry, which may re-invoke the
+  // attempt closure on transient failures — so retries don't move it.
+  const messageCountBeforeTurn = (session as AgentSession).messages.length;
 
   await runWithRetry({
     ctx: { provider: args.provider, model: args.modelId },
@@ -1503,7 +1534,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
                   runId,
                   agentId,
                   sessionKey: resolved.sessionKey,
-                  reason: reason as "empty" | "reasoning-only" | "planning-only",
+                  reason,
                 });
               },
             },
@@ -1606,7 +1637,18 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // long-lived leak in the gateway's process.
   detachPiForwarder();
 
-  const reply = extractLastAssistantText(session as AgentSession);
+  // Build the user-facing reply. Zero-continuation fast path: the whole
+  // answer is the single last assistant message. When the model hit its
+  // output cap and we drove one or more continuations, the answer is split
+  // across the assistant messages produced THIS turn (the truncated head +
+  // each continuation segment) — concatenate them so callers (channels,
+  // dispatcher, server) receive the COMPLETE response, not just the last
+  // segment. messageCountBeforeTurn is the transcript length captured before
+  // the first prompt, so the join starts at this turn's first new message.
+  const reply =
+    continuations > 0
+      ? joinAssistantTextFrom(session as AgentSession, messageCountBeforeTurn)
+      : extractLastAssistantText(session as AgentSession);
 
   // After-turn lifecycle:
   //
@@ -2125,6 +2167,27 @@ function extractLastAssistantText(session: AgentSession): string {
   return "";
 }
 
+// Concatenate the text of every assistant message from `fromIndex` forward.
+// Used by the max_tokens continuation path: a capped reply driven across N
+// continuations lands as N separate assistant messages (each prompt() runs a
+// fresh agent loop that pushes a new message), so the complete answer is the
+// JOIN of those segments — not the last one. flattenAssistantContent already
+// keeps only text blocks, so interleaved tool_use blocks don't pollute the
+// concatenation. Segments are joined with a blank line so a hard wrap between
+// two segments doesn't fuse the last word of one onto the first of the next.
+function joinAssistantTextFrom(session: AgentSession, fromIndex: number): string {
+  const messages = session.messages;
+  const start = Math.max(0, fromIndex);
+  const parts: string[] = [];
+  for (let i = start; i < messages.length; i++) {
+    const m = messages[i] as { role?: string; content?: unknown };
+    if (m?.role !== "assistant") continue;
+    const text = flattenAssistantContent(m.content);
+    if (text.length > 0) parts.push(text);
+  }
+  return parts.join("\n\n");
+}
+
 function flattenAssistantContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -2233,6 +2296,17 @@ async function maybeTriggerCompaction(args: {
   model: { contextWindow?: number } | unknown;
   agentId: string;
   sessionId: string;
+  /** Turn's memory origin — when set, the about-to-be-compacted history is distilled
+   *  first (pre-compaction extraction). Undefined for an unidentified peer → skip. */
+  origin?: MemoryRecordOrigin;
+  /** The pinned persona/system prompt. It lives in state.systemPrompt (a field
+   *  Pi reads at request time), NOT in session.messages, yet it consumes window
+   *  on every request — so it MUST be in the estimate or the trigger fires late.
+   *  Empty/undefined contributes nothing. */
+  systemPrompt?: string;
+  /** The user message about to be sent this turn (prompt() runs AFTER this
+   *  check), folded in so the estimate reflects the true pre-prompt fill. */
+  incomingMessage?: string;
 }): Promise<void> {
   const contextWindow = (args.model as { contextWindow?: number })?.contextWindow;
   if (!contextWindow || !Number.isFinite(contextWindow) || contextWindow <= 0) {
@@ -2240,7 +2314,17 @@ async function maybeTriggerCompaction(args: {
     // fallback if usage actually overflows.
     return;
   }
-  const estimatedTokens = estimateUsageTokens(args.session.messages);
+  // Estimate the FULL request: the transcript PLUS the pinned system prompt
+  // PLUS the about-to-be-sent user message. The latter two are absent from
+  // session.messages but present on every request, so folding them in keeps
+  // the 0.85 trigger from firing systematically late (and falling through to
+  // Pi's mid-stream auto-compaction). Same chars/APPROX_CHARS_PER_TOKEN
+  // heuristic estimateUsageTokens uses, so the units line up.
+  const prePromptChars =
+    (args.systemPrompt?.length ?? 0) + (args.incomingMessage?.length ?? 0);
+  const estimatedTokens =
+    estimateUsageTokens(args.session.messages) +
+    Math.ceil(prePromptChars / APPROX_CHARS_PER_TOKEN);
   const decision = evaluateCompactionDecision({
     contextWindowTokens: contextWindow,
     estimatedUsageTokens: estimatedTokens,
@@ -2272,6 +2356,18 @@ async function maybeTriggerCompaction(args: {
         sessionId: args.sessionId,
       });
       return;
+    }
+    // PRE-COMPACTION extraction — distil the about-to-be-replaced history NOW so a
+    // fact living ONLY in these turns isn't lost when compact() swaps them for a
+    // summary. Fire-and-forget over a SNAPSHOT (no turn latency, no race with the
+    // replace). Skipped when origin is undefined (unidentified peer → fail closed).
+    if (args.origin) {
+      runPreCompactionExtraction({
+        agentId: args.agentId,
+        sessionId: args.sessionId,
+        messages: [...args.session.messages],
+        origin: args.origin,
+      });
     }
     await compactor.call(args.session);
     log.info("pre-emptive compaction completed", {

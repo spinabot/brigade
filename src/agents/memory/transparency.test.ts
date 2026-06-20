@@ -41,8 +41,8 @@ describe("recall transparency — scoreBreakdown", () => {
 
 	it("opt-in: no breakdown by default (hot path stays lean)", () => {
 		const ss = bm25Score(records, "coffee sugar", NOW);
-		// Guard: the assertion must not pass vacuously on an empty result set.
-		assert.ok(ss.length > 0, "scorer returned at least one hit");
+		// Guard: only the "coffee" record matches "coffee"/"sugar"; exactly 1 hit expected.
+		assert.equal(ss.length, 1, "exactly one record matches 'coffee sugar'");
 		for (const s of ss) {
 			assert.equal(s.breakdown, undefined);
 		}
@@ -50,7 +50,8 @@ describe("recall transparency — scoreBreakdown", () => {
 
 	it("breakdown reconciles exactly: score = bm25 × modulator, modulator = 0.5 + 0.5·effective", () => {
 		const scored = bm25Score(records, "tabs spaces coding", NOW, { breakdown: true });
-		assert.ok(scored.length > 0);
+		// Only the "editor" record matches all three query terms; exactly 1 hit.
+		assert.equal(scored.length, 1);
 		// Cross-check breakdown.bm25 against an unmodulated run (`modulate: false`
 		// pins modulator = 1, so score === raw BM25). This isolates the MODULATOR,
 		// not the BM25 accumulator — both runs share the same Okapi math — so it
@@ -71,12 +72,13 @@ describe("recall transparency — scoreBreakdown", () => {
 			assert.ok(raw !== undefined, "record present in unmodulated run");
 			assert.ok(Math.abs(b.bm25 - raw) < 1e-12, "breakdown.bm25 === unmodulated score");
 			assert.ok(Math.abs(b.modulator - (0.5 + 0.5 * b.effective)) < 1e-12, "modulator = 0.5 + 0.5·effective");
-			// Modulator is damped into [0.5, 1]; bm25 is positive (record matched).
-			assert.ok(b.modulator >= 0.5 && b.modulator <= 1, "modulator in [0.5, 1]");
+			// Modulator for the "editor" record: effectiveScore = importance = 0.7 (accessed at NOW,
+			// zero elapsed time, so no decay), giving 0.5 + 0.5 * 0.7 = 0.85 exactly.
+			assert.equal(b.modulator, 0.85, "modulator = 0.5 + 0.5 × importance(0.7) = 0.85");
 			assert.ok(b.bm25 > 0, "bm25 positive for a matched record");
-			// matchedTerms are real query terms, and at least one matched.
+			// matchedTerms are real query terms; "editor" content contains all 3 query tokens.
 			const qterms = new Set(tokenize("tabs spaces coding"));
-			assert.ok(b.matchedTerms.length > 0, "at least one matched term");
+			assert.equal(b.matchedTerms.length, 3, "all 3 query terms matched in the editor record");
 			for (const t of b.matchedTerms) assert.ok(qterms.has(t), `${t} is a query term`);
 		}
 	});
@@ -129,7 +131,8 @@ describe("FactStore.explainRecall — passive diagnostic surface", () => {
 		const store = new FactStore(dir);
 		store.write({ content: "Beta Labs is headquartered in Berlin", segment: "knowledge" });
 		const hits = store.explainRecall("Beta Labs Berlin");
-		assert.ok(hits.length > 0);
+		// Exactly one record was written and it matches all query tokens.
+		assert.equal(hits.length, 1);
 		const top = hits[0];
 		assert.ok(top);
 		assert.ok(top.breakdown.bm25 > 0);

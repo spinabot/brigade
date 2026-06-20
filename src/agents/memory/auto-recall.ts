@@ -25,7 +25,8 @@
 
 import type { MemoryCapability } from "../extensions/types.js";
 import { wrapUntrustedDataBlock } from "../../system-prompt/sanitize.js";
-import { recallWithGraph } from "./graph-recall.js";
+import { scanForThreats } from "../../security/injection-patterns.js";
+import { recallWithGraphAsync } from "./graph-recall.js";
 import { isDefaultMemoryCapability } from "./plugin-runtime.js";
 import { FactStore, type MemoryRecordOrigin, type RecordOriginFilter } from "./records.js";
 
@@ -108,7 +109,7 @@ export function buildAutoRecallBlock(
 		...(opts.origin !== undefined ? { origin: opts.origin } : {}),
 	});
 	if (hits.length === 0) return undefined;
-	const facts = hits.map((f) => `- [${f.segment}] ${f.content}`).join("\n");
+	const facts = hits.map((f) => renderRecalledFact(f.segment, f.content)).join("\n");
 	return renderBlock(facts);
 }
 
@@ -133,9 +134,11 @@ async function buildBlockFromCapability(
 		// `active` ⇒ passive (no decay reinforcement), matching markAccessed:false.
 		const store = capability.factStore;
 		const active = store.list(opts.origin !== undefined ? { origin: opts.origin } : {});
-		const hits = recallWithGraph(active, query, { limit: MAX_AUTO_RECALL_FACTS });
+		// Async so a LEARNED (async) embedder embeds the query for true-synonymy
+		// recall; the sync HRR default awaits a no-op → identical result.
+		const hits = await recallWithGraphAsync(active, query, { limit: MAX_AUTO_RECALL_FACTS });
 		if (hits.length === 0) return undefined;
-		const facts = hits.map((h) => `- [${h.record.segment}] ${h.record.content}`).join("\n");
+		const facts = hits.map((h) => renderRecalledFact(h.record.segment, h.record.content)).join("\n");
 		return renderBlock(facts);
 	}
 	// Plugin backends scope per-origin via the SDK `search` sessionKey (the
@@ -151,8 +154,25 @@ async function buildBlockFromCapability(
 	});
 	if (hits.length === 0) return undefined;
 	// Plugin backend — we don't know segments, so surface source + content.
-	const facts = hits.map((h) => `- [${h.source}] ${h.content}`).join("\n");
+	const facts = hits.map((h) => renderRecalledFact(h.source, h.content)).join("\n");
 	return renderBlock(facts);
+}
+
+/**
+ * Render ONE recalled fact as a bullet — or, if its content carries an
+ * injection/exfil/C2 payload, a non-actionable `[BLOCKED]` placeholder. The raw
+ * fact stays in the store (the owner can inspect/remove it via recall_memory);
+ * we only keep the payload out of the model's pre-turn context. CONTENT-layer
+ * defense-in-depth UNDER the provenance write-gate: catches a payload that rode a
+ * permitted (knowledge) write or owner-pasted attacker text the gate can't see —
+ * AND legacy facts written before write-time scanning existed.
+ */
+function renderRecalledFact(label: string, content: string): string {
+	const threats = scanForThreats(content, "strict");
+	if (threats.length > 0) {
+		return `- [BLOCKED] a recalled ${label} fact matched threat pattern(s): ${threats.join(", ")} — omitted from context; use recall_memory to inspect or remove it`;
+	}
+	return `- [${label}] ${content}`;
 }
 
 function renderBlock(facts: string): string {

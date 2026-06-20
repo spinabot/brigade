@@ -77,15 +77,15 @@ describe("origin isolation — the shared recall origin-filter (FactStore.search
 
 		const ownerHits = store.search("secret project alpha", { origin: owner, markAccessed: false });
 		assert.equal(ownerHits.length, 1, "owner sees exactly one record");
-		assert.match(ownerHits[0]!.content, /owner note/);
+		assert.equal(ownerHits[0]!.content, "secret project alpha — owner note");
 
 		const aHits = store.search("secret project alpha", { origin: chanA, markAccessed: false });
 		assert.equal(aHits.length, 1, "channel A sees exactly one record");
-		assert.match(aHits[0]!.content, /channelA note/);
+		assert.equal(aHits[0]!.content, "secret project alpha — channelA note");
 
 		const bHits = store.search("secret project alpha", { origin: chanB, markAccessed: false });
 		assert.equal(bHits.length, 1, "channel B sees exactly one record");
-		assert.match(bHits[0]!.content, /channelB note/);
+		assert.equal(bHits[0]!.content, "secret project alpha — channelB note");
 	});
 
 	it("a channel peer NEVER recalls an owner fact, even on an exact term match", () => {
@@ -120,7 +120,7 @@ describe("origin isolation — the shared recall origin-filter (FactStore.search
 		// recall() → searchHybrid (the live auto-recall / recall_memory path).
 		const ownerRecall = store.recall("secret project alpha", { origin: owner, markAccessed: false });
 		assert.equal(ownerRecall.length, 1, "recall(): owner sees exactly its own");
-		assert.match(ownerRecall[0]!.content, /owner note/);
+		assert.equal(ownerRecall[0]!.content, "secret project alpha — owner note");
 		assert.equal(
 			store.recall("secret project alpha", { origin: chanB, markAccessed: false }).length,
 			0,
@@ -130,7 +130,7 @@ describe("origin isolation — the shared recall origin-filter (FactStore.search
 		// searchHybrid directly.
 		const aHybrid = store.searchHybrid("secret project alpha", { origin: chanA, markAccessed: false });
 		assert.equal(aHybrid.length, 1, "searchHybrid(): channel A sees exactly its own");
-		assert.match(aHybrid[0]!.content, /channelA note/);
+		assert.equal(aHybrid[0]!.content, "secret project alpha — channelA note");
 
 		// explainRecall (transparency surface).
 		assert.equal(store.explainRecall("secret project alpha", { origin: owner }).length, 1, "explainRecall(): owner-only");

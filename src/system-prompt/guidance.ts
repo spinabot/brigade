@@ -46,8 +46,9 @@ Format every reply as \`<think>...</think>\` followed by your visible answer. Th
  *
  *   - Anthropic Claude with extended thinking → SDK manages thinking blocks
  *     out-of-band; injecting <think> tags would conflict.
- *   - OpenAI o1 / o3 reasoning models → reasoning is internal; the API
- *     hides it. Adding tags has no effect or causes confusion.
+ *   - OpenAI o-series reasoning models (o1 / o3 / o4 / future oN) → reasoning
+ *     is internal; the API hides it. Adding tags has no effect or causes
+ *     confusion.
  *
  * Aggregator-prefix tolerant: matches `claude-*`, `anthropic/claude-*`, and
  * `openrouter/anthropic/claude-*` via the leading anchor `(?:^|/)`.
@@ -62,8 +63,10 @@ export function shouldUseReasoningFormat(
 	if (id.length === 0) return false;
 	// Anthropic Claude — native extended thinking via SDK.
 	if (/(?:^|\/)claude(?:[-_]|$)/.test(id)) return false;
-	// OpenAI o1 / o3 — native internal reasoning.
-	if (/(?:^|\/)o[13](?:[-_]|$)/.test(id)) return false;
+	// OpenAI o-series (o1 / o3 / o4 / future oN) — native internal reasoning.
+	// `o[1-9]\d*` requires `o`+digit so it won't over-match non-reasoning gpt
+	// ids, but it covers o4-mini and any later oN that the old `o[13]` missed.
+	if (/(?:^|\/)o[1-9]\d*(?:[-_.:]|$)/.test(id)) return false;
 	return true;
 }
 
@@ -99,8 +102,8 @@ Always confirm the timezone explicitly when stating a time (e.g. "next at 4:46 P
  * The block is short (~14 lines) so the always-on cost is small; the failure
  * mode without it is the model not knowing the org concept exists at all.
  *
- * Inspired by Paperclip's framing ("if OpenClaw is an employee, Paperclip
- * is the company") but adapted for Brigade's opt-in personal-AI-crew model.
+ * An employee-vs-company framing (an assistant is the "employee",
+ * the org layer the "company") — adapted for Brigade's opt-in personal-AI-crew model.
  * When the `## Org` block is rendered above (cfg.org is set), this block's
  * "you're in org mode" branch applies; otherwise the "ask before activating"
  * branch applies.
@@ -153,6 +156,8 @@ export const SKILLS_GUIDANCE = `## Skills
 Before replying to anything non-trivial, scan the available skills listed below. If one applies — even partially — read its file (the path in its <location>) and follow its instructions. Skills contain specialised knowledge: API endpoints, proven workflows, the user's preferred conventions.
 
 Load a skill's file (and any reference files it points to) with the \`read\` tool — never with \`bash\` (\`cat\` / \`type\` / \`Get-Content\`). \`read\`, \`grep\`, \`ls\` and \`find\` are always open; \`bash\` triggers an operator approval prompt for EVERY command, so reaching for the shell to read a file you could just \`read\` is pure friction.
+
+A skill may carry support files next to its SKILL.md — \`references/\` (deep knowledge), \`templates/\` (copyable starters), \`scripts/\` (runnable checks). When the body points to one by relative path (e.g. \`see references/api.md\`), resolve it against the skill's directory — the folder holding its SKILL.md, from its <location> — and \`read\` that path on demand. These keep the always-loaded SKILL.md lean, so pull them in only when the task needs them. To add one to a skill you maintain, call \`manage_skill({ action: "write_file", … })\` — never hand-write into a skills directory.
 
 Err on the side of loading. It's better to have context you don't need than to miss critical steps. Skills also encode HOW the user wants tasks done in this environment, not just what to do.
 
@@ -331,7 +336,7 @@ export function pickModelFamilyGuidance(modelId: string | undefined): string | n
 	// OpenAI family — strongest tendency to plan without acting + identify as
 	// ChatGPT. The trailing class also accepts a digit / colon so Ollama-style
 	// ids (`gpt-oss:20b`) match, not just cloud `gpt-4o`.
-	if (/(?:^|\/)(?:gpt|codex|o[13])(?:\d|[-_.:]|$)/.test(id)) {
+	if (/(?:^|\/)(?:gpt|codex|o[1-9]\d*)(?:\d|[-_.:]|$)/.test(id)) {
 		return OPENAI_FAMILY_GUIDANCE;
 	}
 	// Google family — identifies as Gemini/Gemma; benefits from absolute paths

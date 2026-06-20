@@ -97,6 +97,32 @@ const TICK_SKEW_THRESHOLD_MS = 60_000;
  * to.
  */
 const DEFAULT_EXECUTION_TIMEOUT_MS = 60_000;
+/**
+ * Wall-clock cap on the announce-delivery network send.
+ *
+ * The post-run result-apply runs under the per-instance lock (store
+ * consistency — see `runDueJob`). The announce dispatcher
+ * (`deps.deliverCronAnnounce`) is the one piece of that section that does
+ * NETWORK I/O: it hands the model's reply to a channel adapter's outbound
+ * (a WhatsApp socket send, a Slack/Telegram HTTP POST). A health pre-flight
+ * gate on the dispatcher side fast-refuses an adapter that's known-down, but
+ * `health()` is a cached best-effort probe — it does not guarantee an
+ * in-flight send completes. A send that passes the gate and then stalls
+ * mid-flight (an HTTP POST that never responds, a socket whose cached health
+ * bool went stale) would pin the per-instance lock for the full stall and
+ * block every concurrent `cron add` / `cron list` / `cron update` queued on
+ * the same instance — a smaller instance of exactly the anti-pattern the
+ * "model call stays OUTSIDE the lock" design (see `onTimer` Phase A/B) was
+ * built to avoid.
+ *
+ * 8 seconds is far above a healthy channel send's round-trip (sub-second for
+ * a WhatsApp/Slack outbound) while capping the worst-case lock-hold so a
+ * stalled adapter can't wedge the cron store. On timeout the send is treated
+ * as a non-delivery — the awareness fallback still fires and
+ * `lastDeliveryStatus` / `lastDeliveryError` record the stall, identical to
+ * the dispatcher returning `false`.
+ */
+const ANNOUNCE_DISPATCH_TIMEOUT_MS = 8_000;
 
 /** Compute the minimum next-fire across all enabled jobs. `undefined` = no work pending. */
 export function nextWakeAtMs(state: CronServiceState): number | undefined {
@@ -542,6 +568,11 @@ interface CronAnnounceDeliveryResult {
  * suffix. When `delivery.bestEffort === true`, delivery errors are
  * additionally muted from the diagnostic log (the operator opted in to
  * "fire and forget" semantics; don't spam the log).
+ *
+ * The channel send is bounded by `ANNOUNCE_DISPATCH_TIMEOUT_MS` — this
+ * runs under the caller's per-instance lock, so a stalled adapter must
+ * not pin that lock indefinitely. A timed-out send is reported as a
+ * non-delivery (the awareness fallback still fires), never as a hang.
  */
 async function maybeDeliverAnnounce(
 	state: CronServiceState,
@@ -594,7 +625,13 @@ async function maybeDeliverAnnounce(
 	let lastError: string | undefined;
 	if (dispatcher && channel && to) {
 		try {
-			delivered = await dispatcher({
+			// Bound the network send so a health-passing-but-stalled adapter
+			// can't pin the per-instance lock (this whole block runs under it
+			// in `runDueJob`). On timeout we treat the send as a non-delivery —
+			// `timedOut` flips `lastError` to a stall message below and the
+			// awareness fallback + `lastDeliveryStatus` write still run, exactly
+			// as they do when the dispatcher returns `false`.
+			const dispatch = dispatcher({
 				job,
 				text: channelText,
 				channel,
@@ -602,7 +639,36 @@ async function maybeDeliverAnnounce(
 				...(resolvedAccountId ? { accountId: resolvedAccountId } : {}),
 				...(resolvedThreadId ? { threadId: resolvedThreadId } : {}),
 			});
-			if (!delivered) {
+			let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+			let timedOut = false;
+			const timeoutGuard = new Promise<false>((resolve) => {
+				timeoutHandle = setTimeout(() => {
+					timedOut = true;
+					resolve(false);
+				}, ANNOUNCE_DISPATCH_TIMEOUT_MS);
+				if (typeof timeoutHandle.unref === "function") timeoutHandle.unref();
+			});
+			try {
+				delivered = await Promise.race([dispatch, timeoutGuard]);
+			} finally {
+				if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+			}
+			if (timedOut) {
+				delivered = false;
+				lastError = `channel "${channel}" delivery timed out after ${ANNOUNCE_DISPATCH_TIMEOUT_MS}ms (adapter accepted the send but never completed)`;
+				// Swallow the still-pending dispatch's eventual settle so a late
+				// rejection doesn't surface as an unhandled rejection after the
+				// lock has already been released.
+				void Promise.resolve(dispatch).catch(() => undefined);
+				if (!bestEffort) {
+					state.deps.log.warn("cron announce dispatch timed out", {
+						jobId: job.id,
+						channel,
+						to,
+						timeoutMs: ANNOUNCE_DISPATCH_TIMEOUT_MS,
+					});
+				}
+			} else if (!delivered) {
 				lastError = `channel "${channel}" dispatcher refused delivery (adapter not started, or recipient rejected)`;
 				if (!bestEffort) {
 					state.deps.log.warn("cron announce dispatcher returned false", {
@@ -788,9 +854,10 @@ async function executeJobCore(
 		}
 	}
 
-	// Isolated / session:* — delegate to the agent runner.
-	if (job.payload.kind !== "agentTurn") {
-		return { status: "error", error: "invariant violated: isolated target without agentTurn payload" };
+	// Isolated / session:* — delegate to the agent runner (handles agentTurn AND
+	// script payloads; the executor dispatches by kind).
+	if (job.payload.kind !== "agentTurn" && job.payload.kind !== "script") {
+		return { status: "error", error: "invariant violated: isolated target without agentTurn/script payload" };
 	}
 	const runner = state.deps.runIsolatedAgentJob;
 	if (!runner) {
@@ -799,10 +866,12 @@ async function executeJobCore(
 	return runner({ job, runAtMs, abortSignal });
 }
 
-/** Per-job timeout resolution. */
+/** Per-job timeout resolution. Both agentTurn and script carry `timeoutSeconds`. */
 function resolveJobTimeoutMs(job: CronJob): number {
-	if (job.payload.kind !== "agentTurn") return DEFAULT_EXECUTION_TIMEOUT_MS;
-	const p = job.payload as CronPayloadAgentTurn;
+	if (job.payload.kind !== "agentTurn" && job.payload.kind !== "script") {
+		return DEFAULT_EXECUTION_TIMEOUT_MS;
+	}
+	const p = job.payload as { timeoutSeconds?: number };
 	if (typeof p.timeoutSeconds === "number" && p.timeoutSeconds > 0) {
 		return p.timeoutSeconds * 1000;
 	}

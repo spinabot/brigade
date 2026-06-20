@@ -40,6 +40,7 @@ describe("links substrate — typed edges between facts", () => {
 			{ memoryId: "r4", links: [{ kind: "supports", target: "other" }] },
 		] as unknown as MemoryRecord[];
 		const back = backlinksTo(recs, "r2");
+		assert.equal(back.length, 2);
 		assert.deepEqual(new Set(back.map((b) => `${b.from}:${b.kind}`)), new Set(["r1:supersedes", "r3:relates"]));
 	});
 });
@@ -148,7 +149,8 @@ describe("append-only event log — the immutable track", () => {
 		const e1 = store.readEvents()[0];
 		store.write({ content: "fact two", segment: "knowledge" });
 		const after2 = store.readEvents().length;
-		assert.ok(after2 > after1);
+		assert.equal(after1, 1);
+		assert.equal(after2, 2);
 		assert.deepEqual(store.readEvents()[0], e1); // prior entries unchanged after later writes
 	});
 });

@@ -19,6 +19,7 @@
  * Ported from `core/agent.ts:1373-1446` (Runtime A) — same logic.
  */
 
+import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import type { Model } from "@mariozechner/pi-ai";
 
@@ -33,6 +34,7 @@ export async function switchModelMidTurn(
 	session: AgentSession,
 	target: Model<any>,
 	userMessageToReplay: string,
+	thinkingLevel?: ThinkingLevel,
 ): Promise<boolean> {
 	// If no turn is active, the caller should use `session.setModel(target)`
 	// directly — the new model takes effect on the next user prompt. This
@@ -86,7 +88,25 @@ export async function switchModelMidTurn(
 	await session.abort();
 	await ended;
 
-	await session.setModel(target);
+	try {
+		await session.setModel(target);
+		// Re-anchor thinking AFTER setModel (which resets the session to the new model's
+		// DEFAULT level) but BEFORE the replay — so the replayed turn runs at the operator's
+		// preserved/clamped level, not Pi's default. Carrying that level IS the point of /switch.
+		if (thinkingLevel !== undefined) {
+			try {
+				session.setThinkingLevel(thinkingLevel as never);
+			} catch {
+				/* clamp / unsupported — the turn still replays on the new model */
+			}
+		}
+	} catch (err) {
+		// setModel validates auth + can throw (e.g. the target provider has no key). The turn
+		// is already aborted, so DON'T drop the user's message — replay it on the still-current
+		// model so the conversation isn't lost, then surface the switch failure to the caller.
+		await session.prompt(userMessageToReplay);
+		throw err;
+	}
 	await session.prompt(userMessageToReplay);
 	return true;
 }

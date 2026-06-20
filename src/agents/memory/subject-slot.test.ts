@@ -40,12 +40,20 @@ describe("subjectKey attribute slots — single-valued auto-supersede", () => {
 		assert.equal(archived?.lifecycle, "archived", "prior slot value archived (preference superseded by a correction — segment-independent)");
 		assert.ok(typeof archived?.validTo === "number", "validTo bi-temporally closed");
 		assert.equal(b.lifecycle, "active");
-		assert.ok(b.links?.some((l) => l.kind === "contradicts" && l.target === a.memoryId), "new fact carries a contradicts link to the superseded one");
+		// slot supersede always writes BOTH a contradicts AND a transition link (records.ts slotSuperseded flatMap)
+		const contradicts = b.links?.find((l) => l.kind === "contradicts" && l.target === a.memoryId);
+		const transition = b.links?.find((l) => l.kind === "transition" && l.target === a.memoryId);
+		assert.ok(contradicts, "new fact carries a contradicts link to the superseded one");
+		assert.ok(transition, "new fact carries a transition link to the superseded one");
+		assert.equal(b.links?.filter((l) => l.target === a.memoryId).length, 2, "exactly two links (contradicts + transition) reference the superseded id");
 
 		const hits = store.recall("deploy", { origin: owner, markAccessed: false });
-		assert.ok(hits.some((h) => h.memoryId === b.memoryId), "current value recallable");
+		// Only b is active for this origin — exactly one recall hit expected
+		assert.equal(hits.length, 1, "exactly one active fact recalled for deploy query");
+		assert.equal(hits[0]!.memoryId, b.memoryId, "the single hit is the current (b) value");
 		assert.ok(!hits.some((h) => h.memoryId === a.memoryId), "stale slot value dropped from recall");
-		assert.ok(store.readAll().some((r) => r.memoryId === a.memoryId), "archived value kept in history (not deleted)");
+		// archived is the record we found on line 39 — it is defined (not undefined) so a is in history
+		assert.ok(archived !== undefined, "archived value kept in history (not deleted)");
 	});
 
 	it("normalizes the slot key so phrasings collapse (Home City == home-city == home_city)", () => {
@@ -114,7 +122,10 @@ describe("supersede — slot-based is reliable; a slot-less correction safely CO
 		const mon = store.write({ content: "User deploys on Mondays", segment: "correction", subjectKey: "deploy_day", createdBy: owner });
 		assert.equal(store.readAll().find((r) => r.memoryId === fri.memoryId)?.lifecycle, "archived", "same-slot prior archived");
 		assert.equal(mon.lifecycle, "active");
+		// slot supersede always writes BOTH contradicts AND transition links (records.ts slotSuperseded flatMap)
 		assert.ok(mon.links?.some((l) => l.kind === "contradicts" && l.target === fri.memoryId), "contradicts link recorded");
+		assert.ok(mon.links?.some((l) => l.kind === "transition" && l.target === fri.memoryId), "transition link recorded");
+		assert.equal(mon.links?.filter((l) => l.target === fri.memoryId).length, 2, "exactly two links (contradicts + transition) reference the superseded id");
 		// a SECOND same-slot write collapses the chain — no pile-up
 		store.write({ content: "User deploys on Wednesdays", segment: "correction", subjectKey: "deploy_day", createdBy: owner });
 		const active = store.list({ origin: owner });

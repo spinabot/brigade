@@ -61,6 +61,7 @@ describe("graph-recall — the walk surfaces connected context", () => {
 		];
 		const query = "what does Sarah lead"; // no when/before/related/because/etc.
 		const out = recallWithGraph(recs, query, { limit: 5 }, NOW);
+		assert.equal(out.length, 3, "all three records surface: both seeds and the graph-reached non-matching fact");
 		const three = out.find((r) => r.record.memoryId === "3");
 		assert.ok(three?.viaGraph, "the inter-seed edge engaged the walk; the linked non-matching fact surfaced");
 	});
@@ -91,7 +92,8 @@ describe("graph-recall — single-fact flat (the route-gate guarantee)", () => {
 	it("forceWalk overrides the gate (for eval), but an isolated corpus still can't fabricate edges", () => {
 		const recs = [rec("1", "I like tea"), rec("2", "The sky is blue")];
 		const out = recallWithGraph(recs, "tea", { limit: 5, forceWalk: true }, NOW);
-		assert.ok(out.length >= 1);
+		assert.equal(out.length, 1, "only rec 1 matches — no edges mean the graph lane adds nothing");
+		assert.equal(out[0]?.record.memoryId, "1", "the single result is the BM25 hit");
 		assert.ok(out.every((r) => !r.viaGraph), "no edges in this corpus → nothing via graph even when forced");
 	});
 
@@ -115,9 +117,9 @@ describe("graph-recall — single-fact flat (the route-gate guarantee)", () => {
 		assert.equal(gated[0]?.record.memoryId, "1");
 		assert.ok(gated.every((r) => !r.viaGraph), "no graph activation while the gate is active");
 
+		assert.equal(forced.length, 2, "force-walked corpus surfaces both: the BM25 seed and the graph-reached rec 2");
 		const forcedTwo = forced.find((r) => r.record.memoryId === "2");
 		assert.ok(forcedTwo?.viaGraph, "forced walk surfaced rec 2 via the graph edge");
-		assert.ok(forced.length > gated.length, "the route-gate measurably changed the result — the gate works");
 	});
 });
 
@@ -134,7 +136,8 @@ describe("graph-recall — bi-temporal valid-time gate", () => {
 		const out = recallWithGraph([expired, live], "what editor theme do I prefer", { limit: 5 }, NOW);
 
 		assert.ok(!out.some((r) => r.record.memoryId === "1"), "expired (passed validTo) fact excluded from recall");
-		assert.ok(out.some((r) => r.record.memoryId === "2"), "the still-valid fact still surfaces");
+		assert.equal(out.length, 1, "only the still-valid fact survives the bi-temporal gate");
+		assert.equal(out[0]?.record.memoryId, "2", "the still-valid fact is the sole result");
 	});
 
 	it("a future validTo that has NOT yet passed still surfaces (the fact is currently valid)", () => {

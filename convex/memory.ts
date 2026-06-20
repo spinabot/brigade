@@ -208,6 +208,34 @@ export const deleteFactRecord = mutation({
 	},
 });
 
+// ── memory AUDIT EVENTS (the convex provenance trail; fs mode uses events.jsonl) ──
+export const appendMemoryEvent = mutation({
+	args: {
+		workspaceId: v.string(),
+		at: v.number(),
+		kind: v.string(),
+		data: v.string(),
+	},
+	handler: async (ctx, args) => {
+		await ctx.db.insert("memoryEvents", args);
+	},
+});
+
+/** The audit trail, oldest-first. Bounded to the most-recent `limit` (default 1000,
+ *  max 5000) to stay under Convex's 16 MiB per-execution read cap. */
+export const listMemoryEvents = query({
+	args: { workspaceId: v.string(), limit: v.optional(v.number()) },
+	handler: async (ctx, args) => {
+		const limit = args.limit && args.limit > 0 ? Math.min(args.limit, 5000) : 1000;
+		const rows = await ctx.db
+			.query("memoryEvents")
+			.withIndex("by_workspace_at", (q) => q.eq("workspaceId", args.workspaceId))
+			.order("desc")
+			.take(limit);
+		return rows.reverse().map((r) => r.data);
+	},
+});
+
 export const markAccessed = mutation({
 	args: { workspaceId: v.string(), memoryIds: v.array(v.string()) },
 	handler: async (ctx, args) => {
@@ -260,7 +288,10 @@ export const decay = mutation({
 			.withIndex("by_workspace_lifecycle_createdAt", (q) =>
 				q.eq("workspaceId", args.workspaceId).eq("lifecycle", "active" as const),
 			)
-			.collect();
+			// SAFETY BOUND (this is the DEAD path; live decay is runDecayGc): cap reads+patches
+			// under Convex's per-mutation 16 MiB-read / 8192-write budget so an accidental call
+			// can't bomb. Delete this whole mutation on the next deploy (see header).
+			.take(2000);
 		for (const row of activeRows) {
 			if (row.tier === "permanent") continue;
 			const idle = args.now - row.lastAccessedAt;
@@ -277,7 +308,7 @@ export const decay = mutation({
 			.withIndex("by_workspace_lifecycle_createdAt", (q) =>
 				q.eq("workspaceId", args.workspaceId).eq("lifecycle", "archived" as const),
 			)
-			.collect();
+			.take(2000); // SAFETY BOUND (dead path) — see the active-rows note above
 		for (const row of archivedRows) {
 			if (row.tier === "permanent") continue;
 			if (args.now - row.lastAccessedAt > archivedIdle) {
@@ -348,6 +379,9 @@ export const setExtractCursor = mutation({
 				q.eq("workspaceId", args.workspaceId).eq("sessionId", args.sessionId),
 			)
 			.first();
+		// `updatedAt` is stored for audit / introspection but is not read back by
+		// the client — only `processedCount` is queried (getExtractCursor). It is
+		// stamped here because the schema field is non-optional (see schema.ts).
 		const payload = { ...args, updatedAt: Date.now() };
 		if (existing) await ctx.db.replace(existing._id, payload);
 		else await ctx.db.insert("memoryExtractCursors", payload);

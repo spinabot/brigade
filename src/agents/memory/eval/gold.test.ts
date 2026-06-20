@@ -35,7 +35,10 @@ describe("seedGold", () => {
 		assert.equal(cases[0]!.relevantIds.length, 1);
 		// the resolved id must be a real, active record in the store
 		const active = store.list();
-		assert.ok(active.some((r) => r.memoryId === cases[0]!.relevantIds[0]));
+		assert.equal(active.length, 2, "both seeded facts must be active (no supersede in this spec)");
+		const matched = active.find((r) => r.memoryId === cases[0]!.relevantIds[0]);
+		assert.ok(matched, "the resolved relevantId must map to an active record");
+		assert.equal(matched!.content, "fact about apples", "the resolved record must be the one keyed 'a'");
 	});
 
 	it("applies supersedes — the stale fact is archived, only the new one is active", () => {
@@ -101,7 +104,7 @@ describe("SYNTHETIC_GOLD", () => {
 	it("seeds cleanly and every case resolves", () => {
 		const store = new FactStore(dir);
 		const cases = seedGold(store, SYNTHETIC_GOLD);
-		assert.ok(cases.length >= 10, "a meaningful number of cases");
+		assert.equal(cases.length, 13, "SYNTHETIC_GOLD has exactly 13 cases");
 		// non-abstention cases resolve to ≥1 id; abstention cases resolve to 0
 		const active = store.list(); // active-only
 		const activeById = new Map(active.map((r) => [r.memoryId, r]));

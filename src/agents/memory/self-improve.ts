@@ -95,6 +95,10 @@ export function reject(p: Proposal): Proposal {
  * and RETURNS the prior state (captured on the proposal for rollback). REFUSES
  * to apply anything not explicitly approved — that refusal is the Lane-B
  * guarantee, not a convention. Also refuses a safety-constrained target.
+ * Pass `appliedLedger` (a shared `Set<string>`) to enforce apply-once across
+ * proposal copies (status alone is bypassable if a caller holds a pre-apply ref).
+ * NOTE: `evalDelta` (set by `gateOnEval`) is informational — it is NOT enforced
+ * here; the human reads it and decides whether to call `approve`.
  */
 export function applyProposal(
 	p: Proposal,

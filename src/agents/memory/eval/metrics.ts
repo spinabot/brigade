@@ -118,3 +118,57 @@ export function meanIgnoringNaN(values: readonly number[]): number {
 	}
 	return n === 0 ? 0 : sum / n;
 }
+
+/** Deterministic 32-bit PRNG (mulberry32) — SEEDED so a bootstrap CI is fully
+ *  reproducible (an eval gate must not depend on `Math.random`). */
+function mulberry32(seed: number): () => number {
+	let a = seed >>> 0;
+	return () => {
+		a = (a + 0x6d2b79f5) | 0;
+		let t = Math.imul(a ^ (a >>> 15), 1 | a);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+export interface MeanCI {
+	/** Point estimate (mean over finite values). */
+	mean: number;
+	/** Lower / upper bound of the bootstrap CI band. */
+	lo: number;
+	hi: number;
+	/** Number of finite (non-abstention) values the CI was computed over. */
+	n: number;
+}
+
+/**
+ * Bootstrap confidence interval for the MEAN of a per-case metric sample
+ * (recall@k / reciprocal-rank / nDCG across queries). The plan's stats
+ * discipline: on a small frozen gold set, report a CI rather than asserting a
+ * point estimate, and DON'T assume the CLT. Resamples WITH REPLACEMENT
+ * `iterations` times via a seeded PRNG (reproducible) and returns the
+ * [(1-ci)/2, 1-(1-ci)/2] percentile band of the resampled means. NaN entries
+ * (abstention) are dropped first, matching {@link meanIgnoringNaN}.
+ */
+export function bootstrapMeanCI(
+	values: readonly number[],
+	opts: { iterations?: number; seed?: number; ci?: number } = {},
+): MeanCI {
+	const sample = values.filter((v) => Number.isFinite(v));
+	const n = sample.length;
+	if (n === 0) return { mean: 0, lo: 0, hi: 0, n: 0 };
+	const iterations = opts.iterations ?? 1000;
+	const ciFrac = opts.ci ?? 0.95;
+	const rnd = mulberry32(opts.seed ?? 0xc0ffee);
+	const means: number[] = [];
+	for (let b = 0; b < iterations; b++) {
+		let sum = 0;
+		for (let i = 0; i < n; i++) sum += sample[Math.floor(rnd() * n)]!;
+		means.push(sum / n);
+	}
+	means.sort((a, b) => a - b);
+	const pick = (p: number): number => means[Math.min(means.length - 1, Math.max(0, Math.floor(p * means.length)))]!;
+	const loP = (1 - ciFrac) / 2;
+	const mean = sample.reduce((s, v) => s + v, 0) / n;
+	return { mean, lo: pick(loP), hi: pick(1 - loP), n };
+}

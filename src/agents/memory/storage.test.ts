@@ -83,10 +83,10 @@ describe("FileMemoryStore.search", () => {
 		writeMemory("memory/2026-05-21.md", "Project uses pytest with -n auto.\n\nUnrelated note about lunch.");
 		const store = new FileMemoryStore(workspace);
 		const results = await store.search("pytest auto");
-		assert.ok(results.length >= 1);
+		assert.equal(results.length, 1);
 		assert.equal(results[0]?.relPath, "memory/2026-05-21.md");
 		assert.match(results[0]?.snippet ?? "", /pytest/);
-		assert.ok(results[0]!.score >= 2, "both query terms present");
+		assert.equal(results[0]!.score, 2.2, "both query terms present: distinct=2 + totalFreq=2/10");
 	});
 
 	it("returns [] for empty query", async () => {
@@ -211,7 +211,7 @@ describe("FileMemoryStore.search — output caps (round-1 audit B1/B2)", () => {
 		writeMemory("memory/2026-05-22.md", head + filler);
 		const store = new FileMemoryStore(workspace);
 		const results = await store.search("needle");
-		assert.ok(results.length >= 1, "head content is still searchable");
+		assert.equal(results.length, 1, "head content is still searchable");
 		assert.match(results[0]!.snippet, /needle is here at the top/);
 	});
 });

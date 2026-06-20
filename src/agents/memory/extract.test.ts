@@ -74,7 +74,7 @@ describe("storeExtractedFacts", () => {
 		// `correction` is CONFINED to descriptive `knowledge` — it can't author the
 		// operator's self-model — and its `corrects` is dropped (it's evidence, not authority).
 		assert.equal(all.find((r) => r.segment === "correction"), undefined, "no extraction-authored correction");
-		const confined = all.find((r) => r.content.startsWith("User uses pnpm"));
+		const confined = all.find((r) => r.content === "User uses pnpm... no, npm.");
 		assert.equal(confined?.segment, "knowledge");
 		assert.equal(confined?.metadata?.corrects, undefined);
 		assert.equal(confined?.sourceType, "extraction");
@@ -94,6 +94,66 @@ describe("storeExtractedFacts", () => {
 		const peerFacts = store.list({ origin: peer });
 		assert.equal(peerFacts.length, 1, "present only in the peer's own isolated scope");
 		assert.equal(peerFacts[0]?.sourceType, "channel_message", "honest provenance stamp");
+	});
+
+	// IDEMPOTENCY (Fix 1) — extraction re-reads the SAME turns the operator already
+	// taught via write_memory and REWORDS them; the reworded `knowledge`/no-subjectKey
+	// copy slips past write-time dedup's strict near-exact bar, so without an
+	// idempotency check it piles a subject-less churn twin beside the rich original.
+	// Extraction re-seeing an already-stored fact must be a NO-OP (reinforce), not a row.
+	it("does NOT re-create a fact the operator already taught (reinforces the existing one instead)", () => {
+		const owner = { kind: "owner" } as const;
+		const store = new FactStore(dir);
+		// The operator taught a rich, subject-bearing fact.
+		const taught = store.write({ content: "User is vegetarian — no meat or fish", segment: "identity", subjectKey: "diet", createdBy: owner });
+		// Post-turn extraction distils a REWORDED copy of the SAME fact (segment knowledge,
+		// no subjectKey) — a paraphrase well below the 0.85 write-time dedup bar.
+		const stored = storeExtractedFacts(
+			dir,
+			[{ content: "The user is vegetarian and does not eat meat or fish", segment: "knowledge" }],
+			"turn-9",
+			{ origin: owner },
+		);
+		assert.equal(stored, 0, "no new row — the reworded copy is recognised as already-known");
+		const active = store.list({ origin: owner });
+		assert.equal(active.length, 1, "no churn duplicate created");
+		assert.equal(active[0]?.memoryId, taught.memoryId, "the original rich record is what survived");
+		assert.equal(active[0]?.subjectKey, "diet", "survivor keeps its subjectKey (vault hub anchor)");
+		assert.equal(active[0]?.segment, "identity", "survivor keeps its specific segment");
+		assert.equal(active[0]?.accessCount, 1, "the existing fact was REINFORCED (not duplicated)");
+	});
+
+	it("still stores a GENUINELY new extracted fact (idempotency must not suppress distinct facts)", () => {
+		const owner = { kind: "owner" } as const;
+		const store = new FactStore(dir);
+		store.write({ content: "User lives in Hyderabad", segment: "identity", subjectKey: "location", createdBy: owner });
+		// A different subject entirely — must be stored, not swallowed by the location fact.
+		const stored = storeExtractedFacts(
+			dir,
+			[{ content: "User works at a startup in Bangalore", segment: "knowledge" }],
+			"turn-10",
+			{ origin: owner },
+		);
+		assert.equal(stored, 1, "a distinct fact is still stored");
+		assert.equal(store.list({ origin: owner }).length, 2, "both the existing and the new fact coexist");
+	});
+
+	it("idempotency is ORIGIN-isolated — a peer's prior does NOT suppress an owner's extracted fact", () => {
+		const owner = { kind: "owner" } as const;
+		const peer = { kind: "channel", channelId: "wa", conversationId: "c1", sessionKey: "s1" } as const;
+		const store = new FactStore(dir);
+		store.write({ content: "User is vegetarian — no meat or fish", segment: "identity", subjectKey: "diet", createdBy: peer });
+		// The SAME fact extracted under the OWNER origin must still be stored — a peer's
+		// record can't satisfy the owner's idempotency (origins are isolated stores).
+		const stored = storeExtractedFacts(
+			dir,
+			[{ content: "The user is vegetarian and does not eat meat or fish", segment: "knowledge" }],
+			"turn-11",
+			{ origin: owner },
+		);
+		assert.equal(stored, 1, "owner extraction is not suppressed by a peer's identical fact");
+		assert.equal(store.list({ origin: owner }).length, 1, "owner scope now has its own copy");
+		assert.equal(store.list({ origin: peer }).length, 1, "peer scope unchanged");
 	});
 });
 
@@ -160,6 +220,37 @@ describe("runExtractionSweep — batched, cursor-tracked, LLM injected", () => {
 		const res = await runExtractionSweep({ workspaceDir: dir, sessionId: "s1", messages, llm });
 		assert.equal(res.ran, false);
 		assert.equal(getCursor(dir, "s1"), 0, "cursor stays so the turns are retried");
+	});
+
+	it("ZERO-FACT GUARD: holds the cursor on an empty/garbage reply, but advances on a structured empty", async () => {
+		// An empty/non-JSON reply is a TRANSIENT failure (not "nothing to extract") —
+		// advancing here would skip these turns forever. Cursor must stay put.
+		for (const broken of ["", "   ", "I could not find anything", "{not json"]) {
+			const res = await runExtractionSweep({ workspaceDir: dir, sessionId: `g-${broken.length}`, messages, llm: async () => broken });
+			assert.equal(res.ran, false, `unparseable reply (${JSON.stringify(broken)}) → no advance`);
+			assert.equal(getCursor(dir, `g-${broken.length}`), 0, "cursor held for retry");
+		}
+		// MALFORMED-but-parseable replies that are NOT a reply envelope must ALSO hold —
+		// they can carry un-distilled content. A top-level ARRAY of fact objects is the
+		// worst case: its inner objects parse, but advancing would silently DROP those
+		// facts (the regression an over-broad "any parseable JSON advances" signal caused).
+		for (const [label, malformed] of [
+			["top-level array of facts", '[{"content":"the deploy is on friday","segment":"knowledge"}]'],
+			["object without a facts array", '{"foo":1}'],
+		] as const) {
+			const sid = `m-${label.length}`;
+			const res = await runExtractionSweep({ workspaceDir: dir, sessionId: sid, messages, llm: async () => malformed });
+			assert.equal(res.ran, false, `${label} → no advance (content not dropped)`);
+			assert.equal(getCursor(dir, sid), 0, `${label}: cursor held for retry`);
+		}
+		// A STRUCTURED empty reply ({} or {facts:[]}) DID engage the model — nothing to
+		// remember — so the cursor advances (re-distilling it would only waste calls).
+		for (const [sid, empty] of [["empty-obj", "{}"], ["empty-facts", '{"facts":[]}']] as const) {
+			const res = await runExtractionSweep({ workspaceDir: dir, sessionId: sid, messages, llm: async () => empty });
+			assert.equal(res.ran, true, `structured empty (${empty}) is a real sweep`);
+			assert.equal(res.stored, 0);
+			assert.equal(getCursor(dir, sid), messages.length, `cursor advances past a genuine empty (${empty})`);
+		}
 	});
 
 	it("respects minNewMessages (skips tiny slices without a call)", async () => {

@@ -173,7 +173,13 @@ function extractSpans(content: string): string[] {
 /** Model-free entity resolution: recurring proper-noun spans mentioned in
  *  ≥ `minMentions` DISTINCT facts. Heuristic (no NER model); the frequency
  *  threshold + stopword list keep "User"/"I"/sentence-starts out. Case-folded
- *  for clustering, surfaced in its most common original casing. */
+ *  for clustering, surfaced in its most common original casing.
+ *
+ *  STATUS (Step 19): the companion to the now-wired synonymy `relates` links (see
+ *  {@link synonymyEdges} + `FactStore.linkRelated`, persisted by the dream pass).
+ *  This RESOLVER primitive is complete + tested; the entity-NOTE PROMOTION pass
+ *  that consumes it (mint a hub note per resolved entity + `relates`-link its
+ *  mentions) is the remaining unwired half — kept ready + tested, not dead code. */
 export function resolveEntities(
 	records: readonly MemoryRecord[],
 	opts: { minMentions?: number } = {},
@@ -223,17 +229,43 @@ export interface SynonymyEdge {
 /** Synonymy/relatedness pairs over the embedding space: every DISTINCT pair of
  *  facts with cosine ≥ `threshold` (default 0.8). Uses each record's stored
  *  `embedding` when present, else embeds its content via the default embedder.
- *  O(n²) — fine at user scale; the caller passes a bounded origin-filtered set.
- *  Returns undirected pairs (from < to by id). v1 consumes these as a TRANSIENT
- *  consolidation SIGNAL (the dream merges near-duplicates) — they are NOT
- *  persisted as `relates` links into `links[]`; persisting them for the graph
- *  walk to traverse is a future step. */
+ *  Returns undirected pairs (from < to by id). The dream uses these BOTH as a
+ *  consolidation signal (merging near-duplicates above the merge bar) AND — for
+ *  related-but-not-merged pairs at/above the relatedness threshold — PERSISTS them as
+ *  `relates` links via `FactStore.linkRelated` (Step 19), so the graph-recall walk
+ *  can traverse them. Persistence is per-origin (the dream buckets by origin first).
+ *
+ *  O(n²) GUARD: the comparison is strict all-pairs, so it explodes as a store
+ *  grows. The nightly consolidation caller (dream.ts) buckets the WHOLE active
+ *  store by origin and passes each whole bucket here — origin-filtering scopes
+ *  the set but does NOT size-bound it (the owner bucket grows without limit). So
+ *  when `records.length` exceeds `maxRecords` (default 500) we restrict the
+ *  pairwise scan to the `maxRecords` most-recently-active facts (by
+ *  `lastAccessedAt`, then `createdAt`, then id — deterministic, no clock/random),
+ *  bounding both the embed work and the O(n²) loop. Pass `maxRecords` to widen/
+ *  narrow it; the high consolidate threshold means it caps the comparison COUNT,
+ *  not the (tiny) output. */
 export function synonymyEdges(
 	records: readonly MemoryRecord[],
-	opts: { threshold?: number; embedder?: Embedder } = {},
+	opts: { threshold?: number; embedder?: Embedder; maxRecords?: number } = {},
 ): SynonymyEdge[] {
 	const threshold = opts.threshold ?? 0.8;
 	const embedder = opts.embedder ?? getDefaultEmbedder();
+	const maxRecords = opts.maxRecords ?? 500;
+	// Above the cap, scan only the most-recently-active slice — newest beliefs are
+	// the consolidation-relevant ones, and this bounds the all-pairs cost on a
+	// store that grows unattended on the curator daemon. Copy before sorting so
+	// the caller's array is never mutated; ties break deterministically by id.
+	if (records.length > maxRecords) {
+		records = [...records]
+			.sort(
+				(a, b) =>
+					b.lastAccessedAt - a.lastAccessedAt ||
+					b.createdAt - a.createdAt ||
+					a.memoryId.localeCompare(b.memoryId),
+			)
+			.slice(0, maxRecords);
+	}
 	// Resolve a vector per record (stored embedding wins; else embed on the fly).
 	const needEmbed = records.filter((r) => !r.embedding || r.embedding.length === 0);
 	let fresh: number[][] = [];

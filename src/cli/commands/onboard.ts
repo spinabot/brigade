@@ -261,6 +261,7 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 					`Next: run ${chalk.bold("brigade gateway")} (then ${chalk.bold("brigade connect")} in a second terminal),\n` +
 					`      or ${chalk.bold("brigade")} for the in-process TUI.\n` +
 					`Web tools:   ${chalk.bold("brigade onboard web")} to (re-)pick a search backend.\n` +
+					`Memory:      facts auto-extract after every turn — run ${chalk.bold("brigade doctor")} to see the active embedder.\n` +
 					`Shell access: ${chalk.bold("bash is gated")} — agents must ask before running commands.\n` +
 					`              Approve with ${chalk.bold('brigade exec allow "<cmd>"')} ` +
 					`(${chalk.bold("brigade exec list")} to see what's approved).\n` +

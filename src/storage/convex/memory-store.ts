@@ -250,25 +250,38 @@ function rowToRecordOrNull(row: Record<string, unknown>): MemoryRecord | null {
 	}
 }
 
+/** Max memoryIds per markAccessed/setLifecycle mutation. Each id costs 1 query + 1 patch,
+ *  so 1000 stays well under Convex's 8192-write / 16 MiB-read per-mutation budget — a large
+ *  recall hit-set or decay sweep is split across several mutations instead of one bomb. */
+const CONVEX_MUTATION_ID_CHUNK = 1000;
+
 export class ConvexMemoryStore implements MemoryStore {
 	constructor(private readonly deps: Deps) {}
 
 	async listFacts(filter: ListFilter): Promise<MemoryRecord[]> {
-		const rows = (await this.deps.client.query(api.memory.listFacts, {
-			workspaceId: this.deps.workspaceId,
-			...(filter.lifecycle !== undefined ? { lifecycle: filter.lifecycle } : {}),
-			...(filter.limit !== undefined ? { limit: filter.limit } : {}),
-		})) as Array<Record<string, unknown>>;
-		let recs = rows.map(rowToRecordOrNull).filter((r): r is MemoryRecord => r !== null);
-		// The server query scopes by workspace + lifecycle (+ limit). Apply
-		// segment/origin CLIENT-side so recall scoping matches the filesystem
-		// FactStore.list (origin reuses the same recordMatchesOriginFilter).
-		// `tier` is intentionally NOT filtered: FactStore.list ignores it too, so
-		// honouring it in convex alone would DIVERGE — add it to BOTH modes at once
-		// if ever wanted. And the server applies `limit` (default-capped) BEFORE
-		// this client-side filtering, so a no-limit call over a very large store
-		// can truncate; callers needing the complete set use the paged
-		// listAllFactRecordsRaw.
+		// The server applies `limit` (default-capped at 200) BEFORE the client-side
+		// segment/origin filter below — so a SELECTIVE filter with NO explicit limit would
+		// silently truncate once a lifecycle holds >200 facts, diverging from the filesystem
+		// FactStore.list (which reads ALL, then filters). In that case page the full store so
+		// the two modes match exactly; otherwise the fast default-capped query is correct.
+		const lifecycle = filter.lifecycle ?? "active";
+		const needsCompleteSet =
+			filter.limit === undefined && (filter.segment !== undefined || filter.origin !== undefined);
+		let recs: MemoryRecord[];
+		if (needsCompleteSet) {
+			recs = (await this.listAllFactRecordsRaw(this.deps.workspaceId)).filter(
+				(r) => r.lifecycle === lifecycle,
+			);
+		} else {
+			const rows = (await this.deps.client.query(api.memory.listFacts, {
+				workspaceId: this.deps.workspaceId,
+				...(filter.lifecycle !== undefined ? { lifecycle: filter.lifecycle } : {}),
+				...(filter.limit !== undefined ? { limit: filter.limit } : {}),
+			})) as Array<Record<string, unknown>>;
+			recs = rows.map(rowToRecordOrNull).filter((r): r is MemoryRecord => r !== null);
+		}
+		// `tier` is intentionally NOT filtered: FactStore.list ignores it too, so honouring it
+		// in convex alone would DIVERGE — add it to BOTH modes at once if ever wanted.
 		if (filter.segment) recs = recs.filter((r) => r.segment === filter.segment);
 		if (filter.origin !== undefined) {
 			// `ListFilter.origin` (store.ts) and `MemoryRecordOrigin` (records.ts) are
@@ -390,19 +403,25 @@ export class ConvexMemoryStore implements MemoryStore {
 
 	async markFactsAccessed(memoryIds: string[]): Promise<void> {
 		if (memoryIds.length === 0) return;
-		await this.deps.client.mutation(api.memory.markAccessed, {
-			workspaceId: this.deps.workspaceId,
-			memoryIds,
-		});
+		// Chunk: the mutation does 1 query + 1 patch per id, so an unbounded array would blow
+		// Convex's per-mutation 8192-write / 16 MiB-read budget on a large recall/decay sweep.
+		for (let i = 0; i < memoryIds.length; i += CONVEX_MUTATION_ID_CHUNK) {
+			await this.deps.client.mutation(api.memory.markAccessed, {
+				workspaceId: this.deps.workspaceId,
+				memoryIds: memoryIds.slice(i, i + CONVEX_MUTATION_ID_CHUNK),
+			});
+		}
 	}
 
 	async setFactsLifecycle(memoryIds: string[], lifecycle: MemoryLifecycle): Promise<void> {
 		if (memoryIds.length === 0) return;
-		await this.deps.client.mutation(api.memory.setLifecycle, {
-			workspaceId: this.deps.workspaceId,
-			memoryIds,
-			lifecycle,
-		});
+		for (let i = 0; i < memoryIds.length; i += CONVEX_MUTATION_ID_CHUNK) {
+			await this.deps.client.mutation(api.memory.setLifecycle, {
+				workspaceId: this.deps.workspaceId,
+				memoryIds: memoryIds.slice(i, i + CONVEX_MUTATION_ID_CHUNK),
+				lifecycle,
+			});
+		}
 	}
 
 	async countActiveFacts(): Promise<number> {
@@ -630,5 +649,32 @@ export class ConvexMemoryStore implements MemoryStore {
 			workspaceId,
 			memoryId,
 		});
+	}
+
+	async appendMemoryEvent(workspaceId: string, event: Record<string, unknown>): Promise<void> {
+		await this.deps.client.mutation(api.memory.appendMemoryEvent, {
+			workspaceId,
+			at: typeof event.at === "number" ? event.at : Date.now(),
+			kind: typeof event.kind === "string" ? event.kind : "unknown",
+			data: JSON.stringify(event),
+		});
+	}
+
+	async listMemoryEvents(workspaceId: string): Promise<Array<Record<string, unknown>>> {
+		const rows = (await this.deps.client.query(api.memory.listMemoryEvents, { workspaceId })) as string[];
+		// Mirror the filesystem MemoryEventLog guard (event-log.ts): skip a corrupt/unparseable
+		// row and any event missing memoryId+kind, rather than inject a null-field event into
+		// every audit-trail consumer (the self-improve proposer, transparency).
+		const out: Array<Record<string, unknown>> = [];
+		for (const s of rows) {
+			let parsed: Record<string, unknown>;
+			try {
+				parsed = JSON.parse(s) as Record<string, unknown>;
+			} catch {
+				continue;
+			}
+			if (typeof parsed.memoryId === "string" && typeof parsed.kind === "string") out.push(parsed);
+		}
+		return out;
 	}
 }

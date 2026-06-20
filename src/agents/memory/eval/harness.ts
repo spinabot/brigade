@@ -154,7 +154,11 @@ export async function runRecallEval(
 			abstention: false,
 			retrievedIds,
 			recallAtK: recallAtK(retrievedIds, c.relevantIds, k),
-			reciprocalRank: reciprocalRank(retrievedIds, c.relevantIds),
+			// reciprocalRank takes no k param — slice to k first so MRR@k is
+			// consistent with the recall@k / nDCG@k / hitRate siblings (all capped
+			// at k). Without the slice, a relevant id at rank k+1 would count toward
+			// MRR but not the other metrics, making cross-metric comparisons misleading.
+			reciprocalRank: reciprocalRank(retrievedIds.slice(0, k), c.relevantIds),
 			ndcgAtK: ndcgAtK(retrievedIds, c.relevantIds, k),
 			hitAtK: hitAtK(retrievedIds, c.relevantIds, k),
 			latencyMs,

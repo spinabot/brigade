@@ -20,11 +20,13 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { access, chmod, copyFile, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join as joinPath } from "node:path";
 
 import type { ConnectionState, WAMessage, WASocket } from "@whiskeysockets/baileys";
 
 import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
+import { validateOutboundMediaPath } from "../../../security/media-path-guard.js";
 import { createDedupeCache } from "../dedupe.js";
 import { chunkText } from "./chunk.js";
 import { lookupLidReverseSync, useConvexAuthState } from "./convex-auth-state.js";
@@ -600,6 +602,123 @@ function installLibsignalConsoleFilter(): void {
 	flag[LIBSIGNAL_FILTER_MARKER] = true;
 }
 
+// Filesystem-mode creds durability. Baileys' useMultiFileAuthState persists
+// creds.json with a single non-atomic fs.writeFile and keeps no backup, so a
+// crash mid-save can truncate the file; on the next boot the parse fails,
+// Baileys falls back to a fresh unlinked identity, and the operator is forced
+// to re-scan the QR. The WhatsApp link surviving a restart is a stated Brigade
+// priority (see the final creds flush in close()), so the filesystem branch
+// wraps creds persistence to be crash-safe: a parseable on-disk copy is mirrored
+// to a sibling backup before each write, and the new state is written to a temp
+// file then atomically renamed into place. Convex mode is unaffected — it rides
+// useConvexAuthState with its own write-behind store.
+const FS_CREDS_FILE_NAME = "creds.json";
+const FS_CREDS_BACKUP_FILE_NAME = "creds.json.bak";
+
+/** True iff `path` exists and its contents parse as JSON. Best-effort. */
+async function fileParsesAsJson(path: string): Promise<boolean> {
+	try {
+		const raw = await readFile(path, "utf8");
+		JSON.parse(raw);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Before the first socket is built, recover from a half-written creds.json:
+ * when the live creds file is missing/empty/unparseable but the sibling backup
+ * parses cleanly, copy the backup over creds.json so Baileys loads the last
+ * good identity instead of minting a fresh one (which would force a re-pair).
+ * Best-effort — any failure degrades to Baileys' own fresh-creds path.
+ */
+async function restoreFsCredsFromBackupIfNeeded(
+	authDir: string,
+	log: (msg: string, meta?: Record<string, unknown>) => void,
+): Promise<void> {
+	try {
+		const credsPath = joinPath(authDir, FS_CREDS_FILE_NAME);
+		const backupPath = joinPath(authDir, FS_CREDS_BACKUP_FILE_NAME);
+		// Live file already good — nothing to do.
+		if (await fileParsesAsJson(credsPath)) return;
+		// No usable backup — leave Baileys to mint fresh creds.
+		if (!(await fileParsesAsJson(backupPath))) return;
+		await copyFile(backupPath, credsPath);
+		try {
+			await chmod(credsPath, 0o600);
+		} catch {
+			// chmod is a no-op / unsupported on some filesystems — ignore.
+		}
+		log("restored WhatsApp creds from backup after a corrupt/missing creds file");
+	} catch (err) {
+		// Restore is opportunistic — never let it block a connect.
+		log("WhatsApp creds backup-restore skipped", {
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
+/**
+ * Build a crash-safe replacement for Baileys' raw saveCreds (filesystem branch
+ * only). Baileys' saveCreds writes only creds.json, so fully owning that one
+ * write is sufficient. Each save: (1) mirror a currently-parseable creds.json to
+ * creds.json.bak — skipped when the live file is missing/corrupt so a known-good
+ * backup is never clobbered; (2) serialize the live creds with Baileys'
+ * BufferJSON.replacer to a unique temp file, then fs.rename it onto creds.json
+ * (atomic on the same filesystem). The temp file is cleaned up on error.
+ * `liveCreds` is the same object Baileys mutates in state.creds, so it always
+ * reflects the latest credentials at write time.
+ */
+function makeFsCrashSafeCredsSaver(
+	authDir: string,
+	liveCreds: unknown,
+	bufferJsonReplacer: (key: string, value: unknown) => unknown,
+	log: (msg: string, meta?: Record<string, unknown>) => void,
+): () => Promise<void> {
+	const credsPath = joinPath(authDir, FS_CREDS_FILE_NAME);
+	const backupPath = joinPath(authDir, FS_CREDS_BACKUP_FILE_NAME);
+	return async () => {
+		// 1. Back up the live file only when it currently parses — never
+		//    overwrite a good backup with a truncated one.
+		try {
+			if (await fileParsesAsJson(credsPath)) {
+				await copyFile(credsPath, backupPath);
+				try {
+					await chmod(backupPath, 0o600);
+				} catch {
+					// chmod unsupported here — ignore.
+				}
+			}
+		} catch (err) {
+			// A failed backup must not block the actual save.
+			log("WhatsApp creds backup skipped", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		// 2. Atomic write: temp file + rename.
+		const tmpPath = joinPath(authDir, `.creds.${process.pid}.${Date.now()}.tmp`);
+		try {
+			await writeFile(tmpPath, JSON.stringify(liveCreds, bufferJsonReplacer));
+			try {
+				await chmod(tmpPath, 0o600);
+			} catch {
+				// chmod unsupported here — ignore.
+			}
+			await rename(tmpPath, credsPath);
+		} catch (err) {
+			// Best-effort temp cleanup so a failed write doesn't litter authDir.
+			try {
+				await access(tmpPath);
+				await unlink(tmpPath);
+			} catch {
+				// Temp file never created or already gone — nothing to clean.
+			}
+			throw err instanceof Error ? err : new Error(String(err));
+		}
+	};
+}
+
 export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsAppConnection> {
 	installLibsignalConsoleFilter();
 	const baileys = await import("@whiskeysockets/baileys");
@@ -652,9 +771,22 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 		saveCreds = convexAuth.saveCreds;
 		convexAuthFlush = convexAuth.flush;
 	} else {
+		// Recover a half-written creds.json from its backup BEFORE Baileys loads
+		// the auth state — otherwise a truncated file parses as null and Baileys
+		// mints a fresh identity, forcing a QR re-pair.
+		await restoreFsCredsFromBackupIfNeeded(args.authDir, args.log);
 		const multiFile = await useMultiFileAuthState(args.authDir);
 		state = multiFile.state;
-		saveCreds = multiFile.saveCreds;
+		// Replace Baileys' raw (non-atomic, no-backup) saveCreds with a crash-safe
+		// wrapper. Baileys' saveCreds writes only creds.json, so owning that one
+		// write fully closes the durability gap. state.creds is the live object
+		// Baileys mutates, so the wrapper always serializes the current creds.
+		saveCreds = makeFsCrashSafeCredsSaver(
+			args.authDir,
+			state.creds,
+			baileys.BufferJSON.replacer as (key: string, value: unknown) => unknown,
+			args.log,
+		);
 	}
 	const { version } = await fetchLatestBaileysVersion();
 
@@ -1562,6 +1694,14 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			// the media (a single message) so the agent doesn't have to issue two
 			// sends; voice = audio + ptt=true with opus mime.
 			const url = media.path; // Baileys accepts an absolute path for `url`.
+			// SECURITY — refuse to upload a local secret/system file. media.path can be
+			// agent/tool-supplied, so a prompt-injected "send ~/.ssh/id_rsa" (or
+			// Brigade's own sealed auth) would otherwise exfiltrate it to the chat.
+			const mediaGuard = validateOutboundMediaPath(url);
+			if (!mediaGuard.ok) {
+				args.log?.(`sendMedia blocked: ${mediaGuard.reason}`);
+				throw new Error(`Refusing to send this file — ${mediaGuard.reason}.`);
+			}
 			const captionWa = media.caption ? markdownToWhatsApp(media.caption) : undefined;
 			let payload: Record<string, unknown>;
 			switch (media.kind) {

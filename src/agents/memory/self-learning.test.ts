@@ -66,6 +66,7 @@ describe("self-learning loop — feedback adapts memory", () => {
 		assert.equal(fb.length, 1);
 		assert.equal(fb[0]?.signal, "up");
 		assert.equal(fb[0]?.memoryId, a.memoryId);
+		assert.equal(fb[0]?.segment, "knowledge");
 	});
 
 	it("closes the loop: feedback INVERTS the BM25 order (not a length/frequency artifact)", () => {

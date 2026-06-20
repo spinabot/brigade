@@ -42,7 +42,7 @@ describe("dream — confirm (the done-when)", () => {
 
 		const after = store.list().find((r) => r.subjectKey === "indent");
 		assert.equal(after?.status, "confirmed", "the 3×-asserted belief is now confirmed");
-		assert.ok((after?.confidence ?? 0) >= 0.9, "confidence raised");
+		assert.equal(after?.confidence, 0.9, "confidence stamped at the exact default confirmConfidence=0.9");
 	});
 
 	it("a subject CORRECTED to new values 3× is confirmed too (correction-chain, not just reinforcement)", () => {
@@ -108,16 +108,64 @@ describe("dream — evict never touches confirmed", () => {
 			evictMinAgeMs: 0,
 		});
 		assert.equal(result.confirmed.length, 1, "the deploy_day belief confirmed");
-		assert.ok(result.evicted.length >= 1, "the throwaway context fact evicted");
+		assert.equal(result.evicted.length, 1, "exactly the one throwaway context fact evicted");
 
 		const survivors = store.list();
-		assert.ok(
-			survivors.some((r) => r.subjectKey === "deploy_day" && r.status === "confirmed"),
-			"the confirmed belief survived eviction",
+		assert.equal(survivors.length, 1, "exactly one active fact survives (the confirmed deploy_day belief)");
+		assert.equal(survivors[0]?.subjectKey, "deploy_day", "the survivor is the deploy_day belief");
+		assert.equal(survivors[0]?.status, "confirmed", "the surviving belief is confirmed");
+		assert.equal(survivors[0]?.segment, "preference", "the survivor is a preference record, not a context one");
+	});
+});
+
+describe("Step 19 — relates edges (FactStore.linkRelated + dream relatedness pass)", () => {
+	let dir2: string;
+	beforeEach(() => {
+		dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-relates-"));
+	});
+	afterEach(() => {
+		try {
+			fs.rmSync(dir2, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
+	});
+
+	it("linkRelated: bidirectional, deduped, capped, no self-link", () => {
+		const store = new FactStore(dir2);
+		const a = store.write({ content: "alpha fact one", segment: "knowledge" }).memoryId;
+		const b = store.write({ content: "beta fact two", segment: "knowledge" }).memoryId;
+		assert.equal(store.linkRelated([{ a, b }]), 2, "bidirectional: a→b and b→a");
+		const has = (id: string, target: string): boolean =>
+			(store.list().find((r) => r.memoryId === id)?.links ?? []).some((l) => l.kind === "relates" && l.target === target);
+		assert.ok(has(a, b) && has(b, a), "both directions persisted");
+		assert.equal(store.linkRelated([{ a, b }]), 0, "idempotent — no duplicate relates edge");
+		assert.equal(store.linkRelated([{ a, b: a }]), 0, "no self relates");
+
+		// Fan-out cap (hub-fact guard).
+		const hub = store.write({ content: "hub fact", segment: "knowledge" }).memoryId;
+		const leaves = Array.from({ length: 9 }, (_, i) => store.write({ content: `leaf ${i}`, segment: "knowledge" }).memoryId);
+		store.linkRelated(leaves.map((o) => ({ a: hub, b: o })), { maxPerRecord: 4 });
+		assert.equal(
+			(store.list().find((r) => r.memoryId === hub)?.links ?? []).filter((l) => l.kind === "relates").length,
+			4,
+			"hub capped at maxPerRecord",
 		);
-		assert.ok(
-			!survivors.some((r) => r.segment === "context"),
-			"the decayed context fact was evicted",
-		);
+	});
+
+	it("dream persists `relates` edges for related-but-not-merged facts (per-origin)", () => {
+		const store = new FactStore(dir2);
+		const a = store.write({ content: "My dog Rex loves running at the park", segment: "relationship" }).memoryId;
+		const b = store.write({ content: "My dog Rex enjoys swimming at the lake", segment: "relationship" }).memoryId;
+		store.write({ content: "Quarterly revenue grew in the spreadsheet", segment: "knowledge" }); // unrelated
+
+		// High merge bar (nothing merges) + low relates bar (the related pair links reliably).
+		const res = runDream(store, { relatesThreshold: 0.2, consolidateThreshold: 0.99 });
+		assert.equal(res.related, 2, "exactly 2 link entries written: a→b and b→a (bidirectional pair)");
+		const linked = (id: string, target: string): boolean =>
+			(store.list().find((r) => r.memoryId === id)?.links ?? []).some((l) => l.kind === "relates" && l.target === target);
+		assert.ok(linked(a, b) && linked(b, a), "the related Rex facts are now bidirectionally `relates`-linked");
+		// Both facts stay ACTIVE — a relation is not a supersede.
+		assert.equal(store.list().filter((r) => r.memoryId === a || r.memoryId === b).length, 2, "neither was archived");
 	});
 });

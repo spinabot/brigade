@@ -34,6 +34,7 @@ import {
 } from "@mariozechner/pi-tui";
 
 import { BrigadeEditor } from "../../ui/editor.js";
+import { sanitizeTerminalInput } from "../../security/terminal-input-sanitizer.js";
 import chalk from "chalk";
 
 // Brigade's `Markdown` is a thin Pi-TUI subclass that normalizes `_text_`
@@ -59,6 +60,7 @@ import {
 	renderPrideChartWithPins,
 	BRIGADE_FOOTER_RULE,
 } from "../../agents/org/pride-template.js";
+import type { MemoryQueryResult } from "../../agents/memory/query.js";
 import type { OrgGraph } from "../../agents/org/types.js";
 
 // Commander wrapper — `brigade connect` is the thin TUI client that
@@ -267,6 +269,9 @@ export async function wireConnectUi(
 	// Cumulative usage — accumulated from state snapshots so a reconnect picks
 	// up where we left off instead of zeroing the totals on the user's screen.
 	let lastSnapshot: SessionStateSnapshot | null = null;
+	// The last text the user sent as a prompt — the replay message for a `/switch`
+	// (Carrow) mid-turn model handoff: abort the live turn, swap, re-run this on the new model.
+	let lastUserPrompt = "";
 	let isAgentRunning = false;
 	// Connection-bound agent id. Defaults to the gateway's boot agent (filled
 	// in from the first `state` snapshot) so legacy single-agent gateways keep
@@ -345,6 +350,30 @@ export async function wireConnectUi(
 			if (frameSessionId !== boundSessionKey) return true;
 		}
 		return false;
+	};
+	// SECURITY (render-side escape scrub). The operator's OWN input is already
+	// scrubbed at the submit chokepoint (`sanitizeTerminalInput` in
+	// `editor.onSubmit`), but every string the GATEWAY pushes — tool-result
+	// previews, assistant text, log lines, cron system-events, the bash command
+	// echoed back in an approval confirmation — is attacker-influenceable (a
+	// model/tool can be steered to emit control bytes) and reaches a `Text` /
+	// `Markdown` widget that preserves raw ANSI. Embedded ESC[ / OSC sequences
+	// would otherwise move the cursor, clear the screen, rewrite the window
+	// title, or smuggle an OSC 52 clipboard write. Funnel every server-pushed
+	// render string through this single helper before it hits a widget.
+	//
+	// `sanitizeTerminalInput` already strips CSI/OSC/leaked-paste/stray-ESC, but
+	// it does NOT strip non-ESC C0 (0x00-0x1F, minus \n/\t) or C1 (0x80-0x9F)
+	// control bytes — those can still drive a terminal on their own — so we
+	// remove them here too. Newlines and tabs are preserved (multi-line tool
+	// errors + the `brigade exec allow …` call-to-action must keep their
+	// layout). Idempotent + pure; safe to apply to already-clean text.
+	const scrubRenderable = (text: string): string => {
+		if (!text) return text;
+		// First reuse the input-side stripper (CSI/OSC/leaked-paste/stray-ESC +
+		// lone-surrogate repair), then drop remaining bare C0/C1 control bytes.
+		// eslint-disable-next-line no-control-regex
+		return sanitizeTerminalInput(text).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 	};
 	// Build the standard `{ agentId?, sessionKey?, ...rest }` payload shape
 	// every RPC uses. Keeps the call sites compact and ensures sessionKey
@@ -529,6 +558,17 @@ export async function wireConnectUi(
 		{ name: "usage", description: "show token totals + estimated cost so far" },
 		{ name: "compact", description: "summarize older turns to free context" },
 		{
+			name: "memory",
+			description: "inspect memory — list / search <q> / inspect <id> / stats",
+			argumentHint: "[list | search <q> | inspect <id> | stats]",
+			getArgumentCompletions: (prefix) => {
+				const verbs = ["list", "search", "inspect", "stats"];
+				return verbs
+					.filter((v) => v.startsWith(prefix.toLowerCase()))
+					.map((v) => ({ value: v, label: v }));
+			},
+		},
+		{
 			name: "allow-all",
 			description: "on|off — skip shell approval prompts this session (guards still apply)",
 			argumentHint: "<on|off>",
@@ -664,7 +704,11 @@ export async function wireConnectUi(
 		// jarring and easy to misread as "the parent approved that".
 		const depth = typeof subagentDepth === "number" && subagentDepth > 0 ? subagentDepth : 0;
 		const subIndent = depth > 0 ? "  ".repeat(depth) : "";
-		const cmd = `${subIndent}    ${brand.dim(command.trim())}`;
+		// Scrub the server-pushed bash command before echoing it back (see
+		// `scrubRenderable`). The command string is attacker-influenceable
+		// (a model can request a command containing ANSI/OSC bytes) and is
+		// rendered verbatim in the confirmation stamped above the editor.
+		const cmd = `${subIndent}    ${brand.dim(scrubRenderable(command).trim())}`;
 		switch (resolution.decision) {
 			case "allow-once":
 				return [
@@ -914,12 +958,15 @@ export async function wireConnectUi(
 		// off-lane agents get silently dropped here, matching the same
 		// filter the server's subscribe applies.
 		if (isOffLane(entry.agentId, entry.sessionId)) return;
+		// Scrub the server-pushed log message before rendering (see
+		// `scrubRenderable`) — these can carry forwarded model/tool text.
+		const message = scrubRenderable(entry.message);
 		const tone =
 			entry.level === "error"
-				? brand.error(`✗ ${entry.message}`)
+				? brand.error(`✗ ${message}`)
 				: entry.level === "warn"
-					? brand.dim(`⚠ ${entry.message}`)
-					: brand.dim(`↻ ${entry.message}`);
+					? brand.dim(`⚠ ${message}`)
+					: brand.dim(`↻ ${message}`);
 		insertBeforeEditor(new Text(`  ${tone}`, 0, 0));
 	});
 
@@ -935,6 +982,11 @@ export async function wireConnectUi(
 		// Wave N3 (bug #3) — defensive lane drop. Cron-fired events stamped
 		// for another agent shouldn't surface on this operator's connect TUI.
 		if (isOffLane(event.agentId, event.sessionId)) return;
+		// Scrub the server-pushed event text before rendering (see
+		// `scrubRenderable`). A cron `system-event` carries the cron run's
+		// MODEL-GENERATED reply verbatim (server enqueueSystemEvent), so this
+		// is an attacker-influenceable path even though it's not direct bash.
+		const eventText = scrubRenderable(event.text);
 		const isCron = event.source === "cron" || event.jobName !== undefined;
 		if (isCron) {
 			const name = event.jobName ?? "cron";
@@ -945,10 +997,10 @@ export async function wireConnectUi(
 			} else if (event.delivered === false) {
 				suffix = ` ${brand.dim("· not delivered (TUI only)")}`;
 			}
-			insertBeforeEditor(new Text(`${heading} ${event.text}${suffix}`, 0, 0));
+			insertBeforeEditor(new Text(`${heading} ${eventText}${suffix}`, 0, 0));
 		} else {
 			const heading = brand.amber("🦁");
-			insertBeforeEditor(new Text(`${heading} ${event.text}`, 0, 0));
+			insertBeforeEditor(new Text(`${heading} ${eventText}`, 0, 0));
 		}
 		tui.requestRender();
 	});
@@ -987,7 +1039,12 @@ export async function wireConnectUi(
 			case "message_end": {
 				const msg = event.message;
 				if (!msg || msg.role !== "assistant") break;
-				const text = extractAssistantText(msg);
+				// Scrub server-pushed assistant text before it reaches the
+				// Markdown widget (see `scrubRenderable`). The model can be
+				// steered to emit ANSI/OSC control bytes; the widget preserves
+				// raw escapes, so strip them here. The brand-coloured label
+				// prefix added below is Brigade-internal chalk and stays intact.
+				const text = scrubRenderable(extractAssistantText(msg));
 				if (!text) break;
 				if (activeLoader) {
 					removeChild(activeLoader);
@@ -1083,16 +1140,22 @@ export async function wireConnectUi(
 					const summary = summarizeToolResult(event.result, {
 						preserveNewlines: event.isError,
 					});
+					// Scrub the server-pushed tool-result preview before it
+					// reaches a Text widget (see `scrubRenderable`). Tool output
+					// is the most direct attacker-influenceable render path —
+					// a `bash`/`read` result can carry ANSI/OSC control bytes.
+					// Done once here so both render branches below stay clean.
+					const previewText = scrubRenderable(summary.preview);
 					if (event.isError && summary.multiline) {
 						indicator.setText(`${subIndent}  ${mark} ${brand.tool(event.toolName)}`);
 						const errIndent = `${subIndent}      `;
-						const indentedBody = summary.preview
+						const indentedBody = previewText
 							.split("\n")
 							.map((line) => `${errIndent}${brand.dim(line)}`)
 							.join("\n");
 						insertBeforeEditor(new Text(indentedBody, 0, 0));
 					} else {
-						const preview = summary.hasContent ? ` ${brand.dim(`· ${summary.preview}`)}` : "";
+						const preview = summary.hasContent ? ` ${brand.dim(`· ${previewText}`)}` : "";
 						indicator.setText(`${subIndent}  ${mark} ${brand.tool(event.toolName)}${preview}`);
 					}
 					tui.requestRender();
@@ -1206,10 +1269,28 @@ export async function wireConnectUi(
 	// actual hang.
 	client.on("reconnected" as any, () => {
 		insertBeforeEditor(new Text(`  ${brand.dim("↻ reconnected to gateway")}`, 0, 0));
+		// Re-subscription after a dropped/restored gateway. BrigadeClient opens
+		// a BRAND-NEW socket on reconnect, so the gateway assigns a fresh
+		// connection id whose per-connection agent/session subscription Sets are
+		// EMPTY — and the broadcast filter falls through to "deliver everything",
+		// losing server-side lane isolation. It also means the bound agent's
+		// per-binding state snapshot (pushed only in response to a `subscribe`
+		// with the agentId) is never re-sent, so a non-boot binding's header
+		// reverts to the BOOT agent's snapshot. Re-issue the subscription below.
+		//
+		// First clear the last-committed sub mirror: the fresh connection has NO
+		// prior server-side subscription, so leaving these set would make
+		// applySubscription() fire a spurious `unsubscribe` for a sub this
+		// connection never had. Reset → re-subscribe is the correct sequence.
+		lastSubscribedAgentId = undefined;
+		lastSubscribedSessionKey = undefined;
 		// Fire-and-forget: ask the gateway for the current snapshot so the
 		// `state` handler above updates `isAgentRunning` + the header. Errors
 		// are swallowed — the next state push (any tool call / turn start)
-		// will refresh anyway.
+		// will refresh anyway. The re-subscribe is appended AFTER this settles
+		// (both success and failure) so ordering is deterministic and the
+		// subscribe-time per-binding snapshot push lands after the get-state
+		// reconcile.
 		client.request("get-state").then(
 			(snap) => {
 				if (!snap) return;
@@ -1238,12 +1319,24 @@ export async function wireConnectUi(
 			() => {
 				/* best-effort — silently ignore */
 			},
-		);
+		).then(() => {
+			// Re-subscribe the bound agent/session on the fresh connection.
+			// Runs after get-state settles (the rejection handler above swallows
+			// errors, so this chains in both cases) — deterministic ordering.
+			// This also triggers the server's subscribe-time per-binding snapshot
+			// push, restoring the correct header for a non-boot binding.
+			void applySubscription();
+		});
 	});
 
 	// Slash command + send wiring.
 	editor.onSubmit = async (value: string) => {
-		const trimmed = value.trim();
+		// SECURITY — scrub terminal escape sequences, leaked bracketed-paste markers,
+		// and lone surrogates from input BEFORE it reaches command dispatch, the model
+		// payload, or the echo. A hostile paste (or text the agent was told to copy
+		// from a malicious page) can otherwise corrupt the terminal or smuggle control
+		// bytes into the transcript. The single submit chokepoint covers every path.
+		const trimmed = sanitizeTerminalInput(value).trim();
 		if (!trimmed) return;
 
 		// Local commands first — never reach the gateway.
@@ -1274,6 +1367,10 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/agents")} — list every agent the gateway knows about\n` +
 						`- ${chalk.bold("/sessions [--all]")} — list live sessions (bound agent or all)\n` +
 						`- ${chalk.bold("/mute <id|key>")} — unsubscribe from an agent id or session key\n` +
+						`- ${chalk.bold("/memory")} — list recent memories\n` +
+						`- ${chalk.bold("/memory search <q>")} — search memories by keyword\n` +
+						`- ${chalk.bold("/memory inspect <id>")} — show a single memory by id prefix\n` +
+						`- ${chalk.bold("/memory stats")} — show memory counts by segment / origin\n` +
 						`- ${chalk.bold("/org")} — show the Pride hierarchy chart (Higher Office / Departments)\n` +
 						`- ${chalk.bold("/org <agent-id>")} — show a sub-tree of the chart\n` +
 						`- ${chalk.bold("/org --departments")} — chart without the Higher Office block\n` +
@@ -1639,6 +1736,73 @@ export async function wireConnectUi(
 		// render before each reply. Pi pushes thinking via `pi` events
 		// regardless; this is purely a local view filter applied in
 		// `extractAssistantText`.
+		if (trimmed === "/memory" || trimmed.startsWith("/memory ")) {
+			editor.setText("");
+			const rest = trimmed.slice("/memory".length).trim();
+			const sp = rest.indexOf(" ");
+			const verb = (sp === -1 ? rest : rest.slice(0, sp)).toLowerCase();
+			const arg = sp === -1 ? "" : rest.slice(sp + 1).trim();
+			let action: "list" | "search" | "inspect" | "stats" = "list";
+			let query: string | undefined;
+			let memoryId: string | undefined;
+			if (verb === "search") {
+				action = "search";
+				query = arg;
+			} else if (verb === "inspect") {
+				action = "inspect";
+				memoryId = arg;
+			} else if (verb === "stats") {
+				action = "stats";
+			} else if (verb === "list" || verb === "") {
+				action = "list";
+			} else {
+				// bare "/memory <terms>" → treat the whole thing as a search
+				action = "search";
+				query = rest;
+			}
+			try {
+				const res = (await client.request("memory-query", {
+					...withBinding(),
+					action,
+					...(query ? { query } : {}),
+					...(memoryId ? { memoryId } : {}),
+				})) as MemoryQueryResult;
+				const lines: string[] = [];
+				if (res.action === "stats" && res.stats) {
+					const s = res.stats;
+					const segs = Object.entries(s.bySegment)
+						.sort((a, b) => b[1] - a[1])
+						.map(([k, v]) => `${k} ${v}`)
+						.join(", ");
+					lines.push(`  memory — ${s.active} active (${s.total} total, ${s.archived} archived)`);
+					lines.push(`  by segment: ${segs || "—"}`);
+					lines.push(
+						`  by origin:  owner ${s.owner}, channel ${s.channel}   ·   added last 7d: ${s.addedLast7d}`,
+					);
+				} else if (res.facts.length === 0) {
+					lines.push("  (no matching memories)");
+				} else {
+					res.facts.forEach((f, i) => {
+						const sc = f.score !== undefined ? ` ·${f.score}` : "";
+						const lifecycleTag = f.lifecycle && f.lifecycle !== "active"
+							? ` ${brand.dim(`[${f.lifecycle}]`)}`
+							: "";
+						lines.push(`  ${i + 1}. ${f.content}${lifecycleTag}`);
+						lines.push(`     ${f.segment} · ${f.origin} · ${f.memoryId}${sc}`);
+					});
+				}
+				insertBeforeEditor(new Text(`${lines.join("\n")}\n`, 0, 0));
+			} catch (err) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+						0,
+						0,
+					),
+				);
+			}
+			return;
+		}
 		if (trimmed === "/reasoning" || trimmed.startsWith("/reasoning ")) {
 			editor.setText("");
 			const arg = trimmed === "/reasoning" ? "" : trimmed.slice("/reasoning ".length).trim().toLowerCase();
@@ -1725,7 +1889,8 @@ export async function wireConnectUi(
 						new Markdown(`${brand.user("you")}  ${trimmed}`, 1, 0, markdownTheme),
 					);
 					try {
-						await client.request("prompt", withBinding({ text: trimmed }), { timeoutMs: 0 });
+						lastUserPrompt = trimmed; // remember it as the replay message for a later `/switch` (Carrow) handoff
+			await client.request("prompt", withBinding({ text: trimmed }), { timeoutMs: 0 });
 					} catch (err2) {
 						const msg2 = err2 instanceof Error ? err2.message : String(err2);
 						insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg2)}`, 0, 0));
@@ -2004,6 +2169,45 @@ export async function wireConnectUi(
 			return;
 		}
 
+		// /switch <id> — Carrow cross-model handoff (vs /model = next turn): aborts an
+		// in-flight gateway turn, swaps the model, and REPLAYS your last message on the
+		// new one so the conversation continues across models. Idle ⇒ just sets the model.
+		if (trimmed === "/switch" || trimmed.startsWith("/switch ")) {
+			editor.setText("");
+			const arg = trimmed === "/switch" ? "" : trimmed.slice("/switch ".length).trim();
+			if (!arg) {
+				insertBeforeEditor(
+					new Markdown(`${brand.dim("usage: /switch <id> — Carrow mid-turn handoff (vs /model = next turn)")}`, 1, 0, markdownTheme),
+				);
+				return;
+			}
+			let switchModels: ModelSummary[];
+			try {
+				switchModels = await client.request("list-models");
+			} catch (err) {
+				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`, 0, 0));
+				return;
+			}
+			const switchMatches = switchModels.filter((m) => m.id === arg);
+			const switchTarget = switchMatches.find((m) => m.provider === lastSnapshot?.provider) ?? switchMatches[0];
+			if (!switchTarget) {
+				insertBeforeEditor(new Text(`  ${brand.error(`✗ no model with id "${arg}" on the gateway.`)}`, 0, 0));
+				return;
+			}
+			try {
+				await client.request(
+					"switch-model-mid-turn",
+					withBinding({ provider: switchTarget.provider, modelId: switchTarget.id, replayMessage: lastUserPrompt }),
+				);
+				insertBeforeEditor(
+					new Text(`  ${brand.amber("✓")} ${brand.dim("Carrow handoff →")} ${brand.white(`${switchTarget.provider} · ${switchTarget.id}`)}`, 0, 0),
+				);
+			} catch (err) {
+				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`, 0, 0));
+			}
+			return;
+		}
+
 		// /thinking [level]
 		if (trimmed === "/thinking" || trimmed.startsWith("/thinking ")) {
 			editor.setText("");
@@ -2048,6 +2252,7 @@ export async function wireConnectUi(
 			// routes this turn to that agent's session lane + runtime entry.
 			// Legacy single-agent gateways receive the same boot agent the
 			// snapshot reported, so behaviour is unchanged.
+			lastUserPrompt = trimmed; // remember it as the replay message for a later `/switch` (Carrow) handoff
 			await client.request("prompt", withBinding({ text: trimmed }), { timeoutMs: 0 });
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);

@@ -52,6 +52,7 @@ interface StatusReport {
 		fileCount: number;
 		totalBytes: number;
 		factCount: number;
+		embedder: string;
 	};
 	skills: {
 		count: number;
@@ -131,7 +132,7 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 		authProfileProviders,
 		sessionsDir,
 		sessionCount,
-		memory: { fileCount: memoryStatus.fileCount, totalBytes: memoryStatus.totalBytes, factCount },
+		memory: { fileCount: memoryStatus.fileCount, totalBytes: memoryStatus.totalBytes, factCount, embedder: process.env.BRIGADE_MEMORY_EMBEDDER ?? "model-free" },
 		skills: { count: skillCount },
 		execApprovals,
 		gateway: {
@@ -173,6 +174,20 @@ function countSessionFiles(sessionsDir: string): number {
 	}
 }
 
+/**
+ * Formats the memory embedder label for display.
+ * The CLI reads the configured intent (BRIGADE_MEMORY_EMBEDDER env) but
+ * cannot observe the gateway's resolved state. When a non-default value is
+ * configured, note that the gateway resolves it at runtime and may fall back
+ * to model-free HRR if the required key or dependency is absent.
+ */
+function formatEmbedderLabel(embedder: string): string {
+	if (embedder === "model-free") {
+		return "model-free";
+	}
+	return `${embedder} ${chalk.dim("(configured; gateway resolves — may run model-free if key or dep is missing)")}`;
+}
+
 function formatStatusText(r: StatusReport): string {
 	const lines: string[] = [];
 	lines.push(chalk.bold("brigade status"));
@@ -201,8 +216,9 @@ function formatStatusText(r: StatusReport): string {
 	} else {
 		const kb = (r.memory.totalBytes / 1024).toFixed(1);
 		lines.push(`  notes:         ${r.memory.fileCount} file${r.memory.fileCount === 1 ? "" : "s"}, ${kb} KB`);
-		lines.push(`  facts:         ${r.memory.factCount} active`);
+		lines.push(`  facts:         ${r.memory.factCount} across all origins (recall is owner-scoped)`);
 	}
+	lines.push(`  embedder:      ${formatEmbedderLabel(r.memory.embedder)}`);
 	lines.push("");
 	lines.push(chalk.dim("Skills"));
 	if (r.skills.count === 0) {

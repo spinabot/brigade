@@ -43,6 +43,7 @@ import { computeJobStaggerOffsetMs } from "../../cron/stagger.js";
 import {
 	add as cronAdd,
 	enqueueRun as cronEnqueueRun,
+	list as cronList,
 	listPage as cronListPage,
 	remove as cronRemove,
 	run as cronRun,
@@ -209,9 +210,11 @@ const CronToolParams = Type.Object({
 				'REQUIRED for `action:"add"`. A nested JSON OBJECT — never a quoted/' +
 				"stringified object, never flat top-level fields. Shape: " +
 				'{"name":"<kebab-case>","schedule":{"kind":"in"|"at"|"every"|"cron",…},' +
-				'"payload":{"kind":"agentTurn","message":"…"} or {"kind":"systemEvent","text":"…"},' +
-				'"delivery"?,"sessionTarget"?}. Copy a TEMPLATE from the tool description ' +
-				"and fill only the ⟨slots⟩.",
+				'"payload":{"kind":"agentTurn","message":"…"} or {"kind":"systemEvent","text":"…"} ' +
+				'or {"kind":"script","command":"<shell>","wakeAgent"?:false} (owner-only — runs a shell ' +
+				"command and by DEFAULT delivers its output with NO model turn; set wakeAgent:true to act " +
+				'on the output), "delivery"?,"sessionTarget"?}. Use "script" for cheap scheduled ' +
+				"health-checks/probes that cost zero tokens. Copy a TEMPLATE and fill only the ⟨slots⟩.",
 		}),
 	),
 	patch: Type.Optional(
@@ -507,7 +510,10 @@ export function makeCronTool(
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"  - `{mode: \"announce\", channel?, to?, threadId?, accountId?, bestEffort?}` —\n" +
 			"    send the reply via a channel adapter (WhatsApp / Slack / …).\n" +
-			"  - `{mode: \"webhook\", webhookUrl}` — HTTP POST to a URL.\n" +
+			"  - `{mode: \"webhook\", webhookUrl}` — NOT YET WIRED: no HTTP POST is\n" +
+			"    sent and the URL is not validated, so the reply is silently\n" +
+			"    dropped. Do NOT schedule this mode — use `announce` (to a chat)\n" +
+			"    or `none` (silent) instead.\n" +
 			"  - `{mode: \"none\"}` — silent; run still happens but reply is discarded.\n\n" +
 			"AUTO-ROUTING — when `add` is called from a channel-routed turn (operator\n" +
 			"is messaging from WhatsApp / Slack / …) and you DON'T set `delivery.channel`\n" +
@@ -714,8 +720,48 @@ export function makeCronTool(
 					const jobIn = (params as { job?: unknown }).job;
 					const delivery =
 						jobIn && typeof jobIn === "object"
-							? ((jobIn as { delivery?: { channel?: unknown; to?: unknown } }).delivery ?? undefined)
+							? ((jobIn as {
+									delivery?: {
+										mode?: unknown;
+										channel?: unknown;
+										to?: unknown;
+										webhookUrl?: unknown;
+									};
+								}).delivery ?? undefined)
 							: undefined;
+					// A non-owner peer may ONLY use announce delivery back to
+					// their own chat. An off-box `webhook` delivery names a
+					// different channel that escapes the "own chat only"
+					// confinement (the channel/to check below never inspects
+					// `mode`, and the autofill helper leaves a webhook job
+					// unchanged because `mode !== "announce"`), so refuse it
+					// here at the gate.
+					if (typeof delivery?.mode === "string" && delivery.mode.trim() === "webhook") {
+						return failedTextResult(
+							"cron: as a non-owner-routed turn you may only schedule reminders that announce back to your own chat — " +
+								"webhook delivery requires workspace-owner privilege.",
+							{ action } as never,
+						);
+					}
+					// Same confinement for the per-job failure alert: a
+					// non-owner-supplied `failureAlert` may not carry a webhook
+					// mode or a webhook URL (an off-box alert channel).
+					const failureAlertIn =
+						jobIn && typeof jobIn === "object"
+							? (jobIn as { failureAlert?: unknown }).failureAlert
+							: undefined;
+					if (
+						failureAlertIn &&
+						typeof failureAlertIn === "object" &&
+						(((failureAlertIn as { mode?: unknown }).mode === "webhook") ||
+							typeof (failureAlertIn as { webhookUrl?: unknown }).webhookUrl === "string")
+					) {
+						return failedTextResult(
+							"cron: as a non-owner-routed turn you may not configure a webhook failure alert — " +
+								"off-box alert delivery requires workspace-owner privilege.",
+							{ action } as never,
+						);
+					}
 					const channelMatchesCtx =
 						delivery?.channel === undefined || delivery.channel === channelContext.channelId;
 					const toMatchesCtx =
@@ -756,31 +802,55 @@ export function makeCronTool(
 					const limit = readNumberParam(params, "limit", { integer: true });
 					const offset = readNumberParam(params, "offset", { integer: true });
 					const query = readStringParam(params, "query");
+					// Non-owner callers see only the jobs they scheduled
+					// from this chat — never the operator's jobs nor jobs
+					// scheduled from other peers' chats. Keeps cron a
+					// per-chat surface for approved peers.
+					//
+					// Filter by ownership BEFORE paginating. If we paged the
+					// store-wide set first (cronListPage) and filtered the page
+					// afterwards, a peer could never reach their own jobs once
+					// the operator owns ≥`limit` jobs that sort ahead — the
+					// first page would be all-operator, filter to empty, and
+					// bumping `offset` would just shift the pre-filter window.
+					// So fetch the whole enabled set, scope to the caller, then
+					// slice — keeping `total`/`hasMore` consistent with the
+					// OWNED set.
+					if (!senderIsOwner) {
+						const queryLower = query?.toLowerCase() ?? "";
+						const allOwn = (
+							await cronList(state, { includeDisabled })
+						).filter((j) => jobIsOwnedByCaller(j));
+						const matched =
+							queryLower.length === 0
+								? allOwn
+								: allOwn.filter(
+										(j) =>
+											j.name.toLowerCase().includes(queryLower) ||
+											(j.description ?? "").toLowerCase().includes(queryLower) ||
+											(j.agentId ?? "").toLowerCase().includes(queryLower) ||
+											j.id.toLowerCase().includes(queryLower),
+									);
+						const pageLimit = Math.max(1, Math.min(200, limit ?? 50));
+						const pageOffset = Math.max(0, offset ?? 0);
+						const page = matched.slice(pageOffset, pageOffset + pageLimit);
+						return payloadTextResult({
+							action,
+							result: {
+								jobs: page,
+								total: matched.length,
+								offset: pageOffset,
+								limit: pageLimit,
+								hasMore: pageOffset + page.length < matched.length,
+							},
+						});
+					}
 					const result = await cronListPage(state, {
 						enabled: includeDisabled ? "all" : "enabled",
 						...(limit !== undefined ? { limit } : {}),
 						...(offset !== undefined ? { offset } : {}),
 						...(query !== undefined ? { query } : {}),
 					});
-					// Non-owner callers see only the jobs they scheduled
-					// from this chat — never the operator's jobs nor jobs
-					// scheduled from other peers' chats. Keeps cron a
-					// per-chat surface for approved peers.
-					if (!senderIsOwner) {
-						const ownJobs = result.jobs.filter((j) => jobIsOwnedByCaller(j));
-						return payloadTextResult({
-							action,
-							result: {
-								...result,
-								jobs: ownJobs,
-								// Re-derive `total` so the page footer doesn't
-								// imply other people's jobs are visible-just-
-								// paginated-elsewhere. The store-wide total is
-								// for owners only.
-								total: ownJobs.length,
-							},
-						});
-					}
 					return payloadTextResult({ action, result });
 				}
 				case "add": {

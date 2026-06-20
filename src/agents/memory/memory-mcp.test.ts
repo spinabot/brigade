@@ -39,9 +39,11 @@ describe("memory-mcp — the three tools", () => {
 
 		const stored = add.handler({ content: "I live in Hyderabad", segment: "identity" });
 		assert.equal(stored.isError, undefined, "add succeeded");
-		assert.match(stored.content[0]!.text, /^stored /);
+		assert.match(stored.content[0]!.text, /^stored mem_[0-9a-z]+_[0-9a-z]+$/, "stored text carries a well-formed memoryId");
 
 		const found = search.handler({ query: "where do I live" });
+		assert.match(found.content[0]!.text, /^<untrusted-memory>/, "result wrapped in untrusted-memory block");
+		assert.match(found.content[0]!.text, /- \[identity\]/, "segment label present");
 		assert.match(found.content[0]!.text, /Hyderabad/, "search recalls the stored fact");
 	});
 
@@ -54,9 +56,11 @@ describe("memory-mcp — the three tools", () => {
 		const big = ctxFn.handler({ query: "pet animal companion", maxChars: 9999 }).content[0]!.text;
 		const small = ctxFn.handler({ query: "pet animal companion", maxChars: 80 }).content[0]!.text;
 		assert.ok(small.length <= 80 + 60, "small budget respected (+ wrapper overhead)");
-		// The mechanism actually ran: the small budget yields strictly fewer fact lines.
+		// The mechanism actually ran: the big budget fits all 6 seeded facts; the
+		// small budget (80 chars, one line ≈53 chars) fits exactly 1.
 		const factLines = (s: string) => (s.match(/pet number/g) ?? []).length;
-		assert.ok(factLines(small) < factLines(big), `small budget truncated (${factLines(small)} < ${factLines(big)})`);
+		assert.equal(factLines(big), 6, "big budget surfaces all 6 seeded facts");
+		assert.equal(factLines(small), 1, "small budget truncates to exactly 1 fact line");
 	});
 
 	it("is PRINCIPAL-SCOPED — an owner-bound MCP never recalls a channel peer's facts", () => {
@@ -67,7 +71,7 @@ describe("memory-mcp — the three tools", () => {
 		tide.add({ content: "the peer secret is 4242", segment: "knowledge", createdBy: peer });
 		const ownerSearch = memoryMcpTools(tide, { origin: { kind: "owner" } }).find((t) => t.name === "memory_search")!;
 		const out = ownerSearch.handler({ query: "peer secret" });
-		assert.ok(!out.content[0]!.text.includes("4242"), "owner MCP does not leak the channel peer's fact");
+		assert.equal(out.content[0]!.text, "(no matches)", "owner MCP sees no results when only a channel peer's fact exists");
 	});
 
 	it("DEFANGS markup at the boundary (no injection through a stored fact)", () => {

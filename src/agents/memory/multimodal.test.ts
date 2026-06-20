@@ -38,9 +38,10 @@ describe("multimodal cold-pointer", () => {
 		assert.equal(rec.mediaPointer, "file:///voice/note-42.ogg");
 
 		const hit = store.recall("renew domain", { markAccessed: false })[0];
-		assert.match(hit?.content ?? "", /renew the domain/, "recallable by its transcript text");
-		assert.equal(hit?.modality, "audio", "modality travels with the hit");
-		assert.equal(hit?.mediaPointer, "file:///voice/note-42.ogg", "cold pointer travels with the hit");
+		assert.ok(hit, "recall must return at least one hit");
+		assert.equal(hit.content, "remember to renew the domain before Friday", "recallable by its exact transcript text");
+		assert.equal(hit.modality, "audio", "modality travels with the hit");
+		assert.equal(hit.mediaPointer, "file:///voice/note-42.ogg", "cold pointer travels with the hit");
 
 		// Cold-pointer invariant: the media URI/pointer tokens are NOT in the hot
 		// text index, so searching by them must not surface the fact.

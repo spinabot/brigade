@@ -97,6 +97,12 @@ export interface DefaultMemoryCapability extends MemoryCapability {
  */
 export function createDefaultMemoryCapability(args: {
 	workspaceDir: string;
+	/**
+	 * Reserved for future use — accepted so callers (e.g. `resolveActiveMemoryCapability`)
+	 * can forward it without a breaking API change, but neither `FactStore` nor
+	 * `FileMemoryStore` currently consume it. Wire it once the stores gain
+	 * per-agent scoping (e.g. an `agentId` partition key in the JSONL schema).
+	 */
 	agentId?: string;
 }): DefaultMemoryCapability {
 	const fileStore = new FileMemoryStore(args.workspaceDir);
@@ -191,6 +197,11 @@ export function resolveActiveMemoryCapability(args: {
 	config: BrigadeConfig;
 	registry: BrigadeExtensionRegistry;
 	workspaceDir: string;
+	/**
+	 * Forwarded to `createDefaultMemoryCapability` unchanged. Currently unused
+	 * by the stores; present so callers can pass agent context without an API
+	 * change when per-agent scoping lands.
+	 */
 	agentId?: string;
 }): MemoryCapability {
 	const pinned = args.registry.resolveSlot("memory", args.config, args.registry.memoryCapabilities);

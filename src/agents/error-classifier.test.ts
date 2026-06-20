@@ -3,11 +3,19 @@ import assert from "node:assert/strict";
 
 import {
   BrigadeRetryError,
+  classifyErrorDetailed,
   classifyErrorReason,
   isBrigadeRetryError,
   scrubAnthropicRefusalSentinel,
   summariseError,
 } from "./error-classifier.js";
+
+test("classifyErrorDetailed: no-tools model error → model_not_found, no same-model retry, friendly message", () => {
+  const r = classifyErrorDetailed(new Error("404 No endpoints found that support tool use. Try disabling read."));
+  assert.equal(r.class, "model_not_found");
+  assert.equal(r.retryableOnSameModel, false);
+  assert.match(r.message, /can't use tools/i);
+});
 
 test("classifyError: HTTP 429 → rate_limit", () => {
   const err = Object.assign(new Error("Too many requests"), { status: 429 });

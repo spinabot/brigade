@@ -31,7 +31,7 @@ describe("curator", () => {
 		const result = runCurator(store, { dream: { now: Date.now(), evictMinAgeMs: Number.POSITIVE_INFINITY } });
 		assert.equal(result.origins, 1, "one pass (single owner origin in the store)");
 		assert.equal(result.confirmed, 1, "the repeated belief confirmed");
-		assert.ok(result.activeAfter >= 1, "reports active count after the pass");
+		assert.equal(result.activeAfter, 1, "reports active count after the pass — exactly 1 fact (dedup collapsed the 3 identical writes into one)");
 		assert.equal(store.list()[0]?.status, "confirmed");
 	});
 
@@ -74,7 +74,13 @@ describe("curator", () => {
 		for (let i = 0; i < 3; i++) store.write({ content: "I deploy on Fridays", segment: "preference", subjectKey: "deploy" });
 		const r1 = runCurator(store, { dream: { now: Date.now(), evictMinAgeMs: Number.POSITIVE_INFINITY }, vaultDir });
 		assert.equal(r1.confirmed, 1, "the belief was confirmed (a change)");
-		assert.ok((r1.vaultWritten ?? 0) >= 1, "the vault was re-rendered after the change");
-		assert.ok(fs.existsSync(vaultDir) && fs.readdirSync(vaultDir).some((f) => f.endsWith(".md")), "notes on disk");
+		// The graph renderer writes a note per active fact, one topic-hub note per distinct
+		// subject (the hubs cluster the graph), AND one root MAP note (the graph's centre that
+		// links every hub). Here: 2 fact notes (the no-subject one-off + the "deploy" confirmed
+		// fact) + 1 hub note (the "deploy" subject) + 1 Map note = 4. (A Map is written whenever
+		// at least one subject exists — the "deploy" fact carries subjectKey, so a hub + Map appear.)
+		assert.equal(r1.vaultWritten, 4, "vault re-rendered after the change — 2 fact notes + 1 topic-hub (deploy) + 1 Memory Map");
+		assert.ok(fs.existsSync(vaultDir), "vault dir created on a changing pass");
+		assert.equal(fs.readdirSync(vaultDir).filter((f) => f.endsWith(".md")).length, 4, "4 .md notes on disk — 2 fact notes + 1 topic-hub (the 'deploy' subject) + 1 Memory Map");
 	});
 });

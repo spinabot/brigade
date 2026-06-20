@@ -532,6 +532,19 @@ export function classifyErrorDetailed(err: unknown): ClassifiedError {
   const code = extractCodeDetailed(err);
   const status = extractStatusDetailed(err);
 
+  // A model that can't use tools (e.g. OpenRouter routed to a non-function-calling model like
+  // gemma-2) is a model CHOICE problem — classify it BEFORE the status block (the message may or
+  // may not carry a parseable 404) so memory/recall users get a clear next step and NO 3× retry.
+  // retryableOnSameModel:false advances to the tool-capable fallback.
+  if (/no endpoints found that support tool|support tool use|does not support tool/i.test(message)) {
+    return {
+      class: "model_not_found",
+      message:
+        "This model can't use tools, so memory / recall (and any tool call) won't work. Switch to a tool-capable model — e.g. Claude, GPT, or a Gemini *-pro — with /model.",
+      retryableOnSameModel: false,
+    };
+  }
+
   if (code && NETWORK_ERROR_CODES_DETAILED.has(code)) {
     return {
       class: code === "ETIMEDOUT" || code === "ESOCKETTIMEDOUT" || code === "ECONNABORTED"

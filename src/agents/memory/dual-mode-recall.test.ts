@@ -88,8 +88,9 @@ describe("dual-mode runtime — recall identical + isolated in BOTH modes", () =
 	it("filesystem mode: write → search works, origin-isolated", () => {
 		const r = seedAndRecall(new FactStore(path.join(dir, "fsws"))); // no runtime ctx → fs mode
 		assert.equal(r.liveRanking.length, 1);
-		assert.match(r.liveRanking[0]!, /Hyderabad/);
-		assert.match(r.tabsRanking[0]!, /tabs/);
+		assert.equal(r.liveRanking[0], "I live in Hyderabad, India.");
+		assert.equal(r.tabsRanking.length, 1);
+		assert.equal(r.tabsRanking[0], "I prefer tabs over spaces when coding.");
 		assert.equal(r.ownerSeesPeer, 0, "owner must NOT recall the peer's fact");
 		assert.equal(r.peerSeesOwner, 0, "peer must NOT recall owner facts");
 		assert.equal(r.peerSeesOwn, 1, "peer DOES recall its own fact");
@@ -115,11 +116,11 @@ describe("dual-mode runtime — recall identical + isolated in BOTH modes", () =
 		const payloads = upserts.map((u) => u.rec as { content?: string; createdBy?: MemoryRecordOrigin });
 		const contents = payloads.map((p) => p.content);
 		assert.ok(
-			contents.some((c) => /Hyderabad/.test(c ?? "")),
+			contents.includes("I live in Hyderabad, India."),
 			"owner-seeded content must reach the backend verbatim",
 		);
 		assert.ok(
-			contents.some((c) => /dark mode themes/.test(c ?? "")),
+			contents.includes("this peer likes dark mode themes."),
 			"channel-seeded content must reach the backend verbatim",
 		);
 		const peerPayload = payloads.find((p) => /dark mode themes/.test(p.content ?? ""));

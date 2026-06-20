@@ -1039,7 +1039,7 @@ export function wrapStreamFnWithPayloadMutations(session: AgentSession): void {
     // OpenRouter app attribution: when (and only when) this request routes
     // through OpenRouter, merge Brigade's HTTP-Referer / X-OpenRouter-Title
     // headers into Pi's `SimpleStreamOptions.headers`. Caller-supplied headers
-    // win (matches OpenClaw's createOpenRouterWrapper precedence) so an
+    // win (last-wins precedence) so an
     // explicit override is never clobbered. Non-OpenRouter providers get
     // `undefined` back and are left untouched.
     const attribution = resolveOpenRouterAttributionHeaders(model);

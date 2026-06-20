@@ -18,6 +18,9 @@ import {
 	DEFAULT_TIMEOUT_MS,
 	readBodyWithLimit,
 	safeEqualHmac,
+	verifyTimestampFresh,
+	verifyWebhookSignature,
+	WebhookReplayGuard,
 } from "./webhook-guards.js";
 
 // Sanity: defaults match the documented values so an accidental edit downstream
@@ -256,5 +259,104 @@ describe("safeEqualHmac", () => {
 		// One bit flipped — must NOT match.
 		const tampered = `${expected.slice(0, -1)}${expected.endsWith("0") ? "1" : "0"}`;
 		assert.equal(safeEqualHmac(expected, tampered), false);
+	});
+});
+
+/* ────────────────── verifyTimestampFresh ────────────────── */
+
+describe("verifyTimestampFresh", () => {
+	const now = 1_700_000_000_000;
+	it("accepts a timestamp within the window (past or small future skew)", () => {
+		assert.equal(verifyTimestampFresh(now - 60_000, { nowMs: now }), true);
+		assert.equal(verifyTimestampFresh(now + 60_000, { nowMs: now }), true);
+	});
+	it("rejects a stale timestamp outside the window", () => {
+		assert.equal(verifyTimestampFresh(now - 600_000, { nowMs: now }), false);
+	});
+	it("rejects a non-finite timestamp", () => {
+		assert.equal(verifyTimestampFresh(Number.NaN, { nowMs: now }), false);
+	});
+	it("honors a custom window", () => {
+		assert.equal(verifyTimestampFresh(now - 90_000, { nowMs: now, windowMs: 120_000 }), true);
+		assert.equal(verifyTimestampFresh(now - 90_000, { nowMs: now, windowMs: 30_000 }), false);
+	});
+});
+
+/* ────────────────── WebhookReplayGuard ────────────────── */
+
+describe("WebhookReplayGuard", () => {
+	it("treats first sight as fresh and a repeat as a replay", () => {
+		const g = new WebhookReplayGuard();
+		assert.equal(g.check("delivery-1", 1000), false);
+		assert.equal(g.check("delivery-1", 2000), true);
+		assert.equal(g.check("delivery-2", 2000), false);
+	});
+	it("re-accepts an id once its TTL has elapsed", () => {
+		const g = new WebhookReplayGuard({ ttlMs: 10_000 });
+		assert.equal(g.check("d", 0), false);
+		assert.equal(g.check("d", 5_000), true); // within TTL
+		assert.equal(g.check("d", 20_000), false); // TTL elapsed
+	});
+	it("never treats an empty id as a replay (caller falls back to timestamp)", () => {
+		const g = new WebhookReplayGuard();
+		assert.equal(g.check("", 1000), false);
+		assert.equal(g.check("", 2000), false);
+	});
+	it("bounds memory with oldest-first eviction", () => {
+		const g = new WebhookReplayGuard({ maxEntries: 3 });
+		for (let i = 0; i < 10; i++) g.check(`id-${i}`, i);
+		assert.ok(g.size <= 3, `size capped (got ${g.size})`);
+		assert.equal(g.check("id-0", 100), false); // oldest was evicted → fresh again
+	});
+});
+
+/* ────────────────── verifyWebhookSignature ────────────────── */
+
+describe("verifyWebhookSignature", () => {
+	const secret = "shhh-very-secret";
+	const rawBody = Buffer.from(JSON.stringify({ event: "push", n: 1 }));
+
+	it("github: accepts a valid sha256= signature, rejects a tampered body", () => {
+		const sig = `sha256=${computeHmacSha256(rawBody, secret)}`;
+		assert.equal(verifyWebhookSignature("github", { headers: { "x-hub-signature-256": sig }, rawBody, secret }).ok, true);
+		const tampered = Buffer.from(JSON.stringify({ event: "push", n: 999 }));
+		assert.equal(
+			verifyWebhookSignature("github", { headers: { "x-hub-signature-256": sig }, rawBody: tampered, secret }).ok,
+			false,
+		);
+	});
+	it("github: fails closed on missing header or blank secret", () => {
+		assert.equal(verifyWebhookSignature("github", { headers: {}, rawBody, secret }).ok, false);
+		const sig = `sha256=${computeHmacSha256(rawBody, secret)}`;
+		assert.equal(verifyWebhookSignature("github", { headers: { "x-hub-signature-256": sig }, rawBody, secret: "" }).ok, false);
+	});
+	it("header lookup is case-insensitive", () => {
+		const sig = `sha256=${computeHmacSha256(rawBody, secret)}`;
+		assert.equal(verifyWebhookSignature("github", { headers: { "X-Hub-Signature-256": sig }, rawBody, secret }).ok, true);
+	});
+	it("gitlab: matches the shared token, rejects a wrong one", () => {
+		assert.equal(verifyWebhookSignature("gitlab", { headers: { "x-gitlab-token": secret }, rawBody, secret }).ok, true);
+		assert.equal(verifyWebhookSignature("gitlab", { headers: { "x-gitlab-token": "wrong" }, rawBody, secret }).ok, false);
+	});
+	it("slack: verifies v0 over v0:ts:body AND enforces timestamp freshness", () => {
+		const now = 1_700_000_000_000;
+		const ts = String(Math.floor(now / 1000));
+		const body = rawBody.toString("utf8");
+		const sig = `v0=${computeHmacSha256(`v0:${ts}:${body}`, secret)}`;
+		assert.equal(
+			verifyWebhookSignature("slack", { headers: { "x-slack-signature": sig, "x-slack-request-timestamp": ts }, rawBody, secret, nowMs: now }).ok,
+			true,
+		);
+		const staleTs = String(Math.floor((now - 600_000) / 1000));
+		const staleSig = `v0=${computeHmacSha256(`v0:${staleTs}:${body}`, secret)}`;
+		assert.equal(
+			verifyWebhookSignature("slack", { headers: { "x-slack-signature": staleSig, "x-slack-request-timestamp": staleTs }, rawBody, secret, nowMs: now }).ok,
+			false,
+		);
+	});
+	it("hmac-sha256: accepts bare hex and sha256=-prefixed forms", () => {
+		const hex = computeHmacSha256(rawBody, secret);
+		assert.equal(verifyWebhookSignature("hmac-sha256", { headers: { "x-webhook-signature": hex }, rawBody, secret }).ok, true);
+		assert.equal(verifyWebhookSignature("hmac-sha256", { headers: { "x-webhook-signature": `sha256=${hex}` }, rawBody, secret }).ok, true);
 	});
 });

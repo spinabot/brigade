@@ -66,8 +66,9 @@ describe("hybrid recall — vector lane closes the lexical gap", () => {
 		assert.notEqual(bm25Score(facts, HOME_QUERY, NOW)[0]?.record.memoryId, "home");
 
 		const hyb = recallHybrid(facts, HOME_QUERY, emb, NOW);
+		assert.equal(hyb.length, 1, "only the home fact clears the minSim floor (editor and coffee embed to [0,1])");
 		assert.equal(hyb[0]?.record.memoryId, "home", "hybrid recovers the home fact");
-		assert.ok(hyb[0]?.vecRank !== undefined, "the win came through the vector lane");
+		assert.equal(hyb[0]?.vecRank, 1, "the win came through the vector lane at rank 1");
 	});
 
 	it("a recovered fact is appended BELOW every lexical hit (no reorder of BM25)", () => {
@@ -81,11 +82,12 @@ describe("hybrid recall — vector lane closes the lexical gap", () => {
 			rec("home", "I reside in Hyderabad, India", emb),
 		];
 		const hyb = recallHybrid(facts, "coffee", emb, NOW);
+		assert.equal(hyb.length, 2, "exactly one lexical hit (coffee) and one vector recovery (home)");
 		assert.equal(hyb[0]?.record.memoryId, "coffee", "the lexical hit ranks first");
-		assert.ok(hyb[0]?.lexRank !== undefined, "coffee is a primary (lexical) hit");
-		const home = hyb.find((h) => h.record.memoryId === "home");
-		assert.ok(home && home.vecRank !== undefined, "home recovered via the vector lane");
-		assert.ok(home.score < hyb[0]!.score, "recovered fact scores strictly below the lexical hit");
+		assert.equal(hyb[0]?.lexRank, 1, "coffee is the primary (lexical) hit at lexRank 1");
+		assert.equal(hyb[1]?.record.memoryId, "home", "home is appended as the vector recovery in position 1");
+		assert.equal(hyb[1]?.vecRank, 1, "home is the first (and only) vector-lane recovery");
+		assert.ok((hyb[1]?.score ?? 0) < (hyb[0]?.score ?? 0), "recovered fact scores strictly below the lexical hit");
 	});
 
 	it("a lexical-only hit (no embedding on the record) still ranks via BM25", () => {
@@ -93,7 +95,7 @@ describe("hybrid recall — vector lane closes the lexical gap", () => {
 		const hyb = recallHybrid([noVec], "deploy token", new HashingEmbedder(256), NOW);
 		assert.equal(hyb[0]?.record.memoryId, "x");
 		assert.equal(hyb[0]?.vecRank, undefined);
-		assert.ok(hyb[0]?.lexRank !== undefined);
+		assert.equal(hyb[0]?.lexRank, 1);
 	});
 
 	it("among two vector-recovered facts the more-trusted ranks above (trust beats cosine rank)", () => {
@@ -118,10 +120,13 @@ describe("hybrid recall — vector lane closes the lexical gap", () => {
 		assert.equal(bm25Score([trusted, untrusted], "find my place", NOW).length, 0);
 
 		const hyb = recallHybrid([trusted, untrusted], "find my place", emb, NOW);
-		const t = hyb.find((h) => h.record.memoryId === "trusted");
-		const u = hyb.find((h) => h.record.memoryId === "untrusted");
-		assert.ok(t?.vecRank !== undefined && u?.vecRank !== undefined, "both recovered via the vector lane");
-		assert.ok((t?.score ?? 0) > (u?.score ?? 0), "the more-trusted recovered fact ranks above the closer-but-untrusted one");
+		assert.equal(hyb.length, 2, "both facts are recovered by the vector lane");
+		assert.equal(hyb[0]?.record.memoryId, "trusted", "the higher-trust fact ranks first despite lower cosine");
+		assert.equal(hyb[1]?.record.memoryId, "untrusted", "the lower-trust fact ranks second despite higher cosine");
+		// untrusted is cosine-closer (0.6) so it gets vecRank 1; trusted is further (0.5) so vecRank 2.
+		assert.equal(hyb[0]?.vecRank, 2, "trusted: cosine 0.5 → vecRank 2 (second in raw cosine order)");
+		assert.equal(hyb[1]?.vecRank, 1, "untrusted: cosine 0.6 → vecRank 1 (first in raw cosine order)");
+		assert.ok((hyb[0]?.score ?? 0) > (hyb[1]?.score ?? 0), "the more-trusted recovered fact scores strictly higher");
 	});
 
 	it("a fact whose cosine is just below the minSim floor is NOT recovered", () => {
@@ -145,8 +150,8 @@ describe("hybrid recall — vector lane closes the lexical gap", () => {
 		const belowRec = rec("below", "just below the floor", emb);
 
 		const hyb = recallHybrid([aboveRec, belowRec], "locate me", emb, NOW);
-		assert.ok(hyb.some((h) => h.record.memoryId === "above"), "the above-floor fact is recovered");
-		assert.ok(!hyb.some((h) => h.record.memoryId === "below"), "the sub-floor fact is NOT recovered");
+		assert.equal(hyb.length, 1, "exactly one fact clears the minSim floor (0.31 ≥ 0.3; 0.29 < 0.3)");
+		assert.equal(hyb[0]?.record.memoryId, "above", "the above-floor fact is recovered and is the only result");
 	});
 
 	it("empty candidates → empty", () => {
@@ -185,10 +190,14 @@ describe("hybrid recall — MMR diversity (opt-in λ<1)", () => {
 		const diverse = recallHybrid(facts, QUERY, emb, NOW, { mmrLambda: 0.7 });
 
 		const rankIn = (res: ReturnType<typeof recallHybrid>, id: string) => res.findIndex((h) => h.record.memoryId === id);
-		// λ=1: pure relevance ⇒ both duplicates ahead of the distinct fact.
-		assert.ok(rankIn(plain, "dupB") < rankIn(plain, "distinct"), "λ=1 ranks the near-duplicate above the distinct fact");
-		// λ=0.7: diversity demotes the near-duplicate below the distinct fact.
-		assert.ok(rankIn(diverse, "dupB") > rankIn(diverse, "distinct"), "λ=0.7 demotes the near-duplicate below the distinct fact");
+		// λ=1: pure relevance ⇒ dupA(0), dupB(1), distinct(2) — both duplicates above distinct.
+		assert.equal(rankIn(plain, "dupA"), 0, "λ=1: dupA is first (highest BM25, inserted first)");
+		assert.equal(rankIn(plain, "dupB"), 1, "λ=1: dupB is second (same BM25 as dupA, inserted second)");
+		assert.equal(rankIn(plain, "distinct"), 2, "λ=1: distinct is last (lower BM25 score)");
+		// λ=0.7: MMR penalises dupB (cosine=1 to already-selected dupA); distinct gets rank 1.
+		assert.equal(rankIn(diverse, "dupA"), 0, "λ=0.7: dupA still first (highest MMR on first pick)");
+		assert.equal(rankIn(diverse, "distinct"), 1, "λ=0.7: distinct promoted to second by diversity");
+		assert.equal(rankIn(diverse, "dupB"), 2, "λ=0.7: dupB demoted to last (penalised for near-duplicate cosine with dupA)");
 	});
 
 	it("recallHybridAsync smoke: pre-embeds the query and recovers like the sync path", async () => {
@@ -198,8 +207,9 @@ describe("hybrid recall — MMR diversity (opt-in λ<1)", () => {
 			rec("coffee", "I drink black coffee with no sugar", emb),
 		];
 		const hyb = await recallHybridAsync(facts, HOME_QUERY, emb, NOW);
+		assert.equal(hyb.length, 1, "async path: only the home fact clears the cosine floor");
 		assert.equal(hyb[0]?.record.memoryId, "home", "async path recovers the home fact via the vector lane");
-		assert.ok(hyb[0]?.vecRank !== undefined);
+		assert.equal(hyb[0]?.vecRank, 1, "async path: home is vecRank 1 (the only vector recovery)");
 	});
 });
 

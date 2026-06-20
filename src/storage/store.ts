@@ -246,6 +246,17 @@ export interface MemoryStore {
 	listAllFactRecordsRaw(workspaceId: string): Promise<MemoryRecord[]>;
 	upsertFactRecordRaw(workspaceId: string, record: MemoryRecord): Promise<void>;
 	deleteFactRecordRaw(workspaceId: string, memoryId: string): Promise<void>;
+
+	/** Append-only memory AUDIT EVENTS (created / invalidated / confirmed / evicted /
+	 *  blocked / feedback / reinforced) — the convex-mode provenance trail. Filesystem
+	 *  mode uses an on-disk `events.jsonl` instead (via `FactStore` directly), so these
+	 *  are exercised only in convex mode. OPTIONAL: a backend that omits them simply has
+	 *  no convex audit trail (the fs path is unaffected) — this is the additive hook the
+	 *  `FactStore` calls when present. Append is BEST-EFFORT (an audit-log write must
+	 *  never fail a memory write). Event shape is loose (like `MemoryRecord` here);
+	 *  the rich `MemoryEvent` type lives in `agents/memory/event-log.ts`. */
+	appendMemoryEvent?(workspaceId: string, event: Record<string, unknown>): Promise<void>;
+	listMemoryEvents?(workspaceId: string): Promise<Array<Record<string, unknown>>>;
 }
 
 // =============================================================================

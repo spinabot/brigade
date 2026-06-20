@@ -16,12 +16,13 @@
  *     },
  *   });
  *
- * The implementation itself delegates to `executeCronAgentRun` — that's
- * where the actual `runSingleTurn` integration happens, with the per-job
- * model / thinking / tools-allow / light-context handling.
+ * The implementation delegates to `executeCronIsolatedRun`, which dispatches by
+ * payload kind — `agentTurn` → the full `runSingleTurn` integration (per-job
+ * model / thinking / tools-allow / light-context), `script` → a shell run that
+ * by default delivers output with no model turn (the cost-saver).
  */
 
-import { executeCronAgentRun } from "./run-executor.js";
+import { executeCronIsolatedRun } from "./run-executor.js";
 import type {
 	CronIsolatedRunArgs,
 	CronIsolatedRunOutcome,
@@ -31,5 +32,5 @@ import type {
 export async function runCronIsolatedAgentJob(
 	args: CronIsolatedRunArgs,
 ): Promise<CronIsolatedRunOutcome> {
-	return executeCronAgentRun(args);
+	return executeCronIsolatedRun(args);
 }

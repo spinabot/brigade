@@ -27,7 +27,7 @@ import * as path from "node:path";
 
 import { FactStore } from "../records.js";
 import { tokenize } from "../scoring.js";
-import type { GoldCase, GoldFact, GoldSpec } from "./gold.js";
+import { GOLD_REVIEW_PLACEHOLDER, type GoldCase, type GoldFact, type GoldSpec } from "./gold.js";
 
 /**
  * Build a gold-set scaffold from a store's ACTIVE facts. Facts are keyed by
@@ -56,15 +56,18 @@ export function exportGoldScaffold(store: FactStore, opts: { maxCases?: number }
 			id: `cand-${i}`,
 			// ⚠ TRIVIAL placeholder — rewrite into a realistic paraphrase on approval.
 			// If auto-extraction yields no terms (content was all stopwords/punctuation),
-			// emit a visible TODO so the operator can't miss the empty query on review.
-			query: terms.length > 0 ? terms : "TODO: rewrite (auto-extraction empty)",
+			// emit a visible placeholder so the operator can't miss the empty query on
+			// review — and `loadGoldSpec` HARD-REJECTS any spec that still carries it.
+			query: terms.length > 0 ? terms : GOLD_REVIEW_PLACEHOLDER,
 			relevantKeys: [r.memoryId],
 			// A reasonable default bucket (the fact's segment); refine to a GOLD_CATEGORIES
 			// taxonomy label (single-session/temporal/abstention/…) during approval.
 			category: r.segment,
 		};
 	});
-	return { facts, cases };
+	// approved:false ⇒ `loadGoldSpec` refuses to score this until the operator
+	// reviews the trivial auto-queries and flips it to true (anti-inflation gate).
+	return { approved: false, facts, cases };
 }
 
 /**

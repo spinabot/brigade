@@ -17,7 +17,7 @@
 // Docs: https://openrouter.ai/docs/app-attribution
 //
 // Without this, Brigade's OpenRouter requests inherit the Pi SDK's default
-// referrer and show up as "pi". This module mirrors OpenClaw's approach
+// referrer and show up as "pi". This module mirrors proviuder attribution approach
 // (src/agents/provider-attribution.ts → createOpenRouterWrapper): a tiny policy
 // resolved per request and merged into Pi's `SimpleStreamOptions.headers`,
 // gated so the headers ONLY attach to OpenRouter — never Anthropic, Google
@@ -27,7 +27,7 @@
 import type { Model } from "@mariozechner/pi-ai";
 
 /** Brigade's canonical app identity reported to OpenRouter. */
-export const BRIGADE_OPENROUTER_REFERER = "https://brigade-agent.ai";
+export const BRIGADE_OPENROUTER_REFERER = "https://brigade.spinabot.com";
 export const BRIGADE_OPENROUTER_TITLE = "Brigade";
 export const BRIGADE_OPENROUTER_CATEGORIES = "cli-agent";
 

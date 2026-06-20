@@ -46,6 +46,7 @@ describe("governance — purge cascades along source_pointers", () => {
 
 		const result = purge(store, src.memoryId);
 
+		assert.equal(result.purged.length, 3, "exactly the three related facts are purged — not the unrelated one");
 		assert.ok(result.purged.includes(src.memoryId), "the source is purged");
 		assert.ok(result.purged.includes(derived.memoryId), "the derived citation is cascade-purged");
 		assert.ok(result.purged.includes(derived2.memoryId), "the second-order derivation too");
@@ -77,7 +78,7 @@ describe("governance — retention TTL", () => {
 
 		// ttl 0 ⇒ everything is "expired", but the confirmed belief is retained.
 		const result = applyRetention(store, { ttlMs: 0, now: Date.now() + 10_000 });
-		assert.ok(result.purged.length >= 1, "the transient note expired");
+		assert.equal(result.purged.length, 1, "exactly the transient note is purged — the confirmed belief is retained");
 		const survivors = store.readAll();
 		assert.ok(
 			survivors.some((r) => r.subjectKey === "coffee" && r.status === "confirmed"),

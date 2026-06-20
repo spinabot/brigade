@@ -1,0 +1,37 @@
+{
+	"name": "brigade-tideline",
+	"version": "0.1.0",
+	"description": "Tideline — a model-agnostic long-term memory engine: hybrid BM25+vector recall, bi-temporal decay, a provenance write-gate, per-origin isolation, a typed link graph, and a reflect/consolidate pass. Behind one facade + a small adapter SPI.",
+	"type": "module",
+	"license": "MIT",
+	"keywords": ["memory", "long-term-memory", "rag", "recall", "bm25", "agent", "llm", "knowledge-graph"],
+	"author": "Bhasvanth",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/spinabot/brigade.git",
+		"directory": "src/tideline"
+	},
+	"bugs": "https://github.com/spinabot/brigade/issues",
+	"homepage": "https://github.com/spinabot/brigade/tree/main/src/tideline#readme",
+	"main": "./index.js",
+	"types": "./index.d.ts",
+	"exports": {
+		".": {
+			"types": "./index.d.ts",
+			"import": "./index.js"
+		},
+		"./advanced": {
+			"types": "./advanced.d.ts",
+			"import": "./advanced.js"
+		},
+		"./eval": {
+			"types": "./eval.d.ts",
+			"import": "./eval.js"
+		}
+	},
+	"files": ["index.js", "index.d.ts", "advanced.js", "advanced.d.ts", "eval.js", "eval.d.ts", "README.md"],
+	"sideEffects": false,
+	"engines": {
+		"node": ">=22.12"
+	}
+}

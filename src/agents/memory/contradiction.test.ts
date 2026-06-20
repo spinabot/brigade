@@ -61,7 +61,7 @@ describe("findContradictions", () => {
 		const unrelated = rec("other", "I drink black coffee", NOW, "preference");
 
 		const cands = findContradictions([neu, old, unrelated]);
-		assert.ok(cands.length >= 1, "found a contradiction candidate");
+		assert.equal(cands.length, 1, "exactly one contradiction candidate (same-segment pair only; unrelated is a different segment)");
 		const top = cands[0];
 		const ids = new Set([top?.a.memoryId, top?.b.memoryId]);
 		assert.ok(ids.has("old") && ids.has("neu"), "the two location facts are the pair");
@@ -89,7 +89,7 @@ describe("findContradictions", () => {
 		const b = rec("b", "I live in Bangalore city", NOW, "identity", [0, 1]);
 		const cands = findContradictions([a, b]);
 		assert.equal(cands.length, 1, "opposed embeddings on a shared subject → a contradiction candidate");
-		assert.ok((cands[0]?.divergence ?? 0) > 0.9, "divergence is driven by the embedding cosine (≈1)");
+		assert.equal(cands[0]?.divergence, 1, "divergence is exactly 1 for opposed unit vectors [1,0] vs [0,1] (cosine=0, divergence=1-0=1)");
 		assert.equal(cands[0]?.a.memoryId, "a", "the newer fact is `a`");
 	});
 

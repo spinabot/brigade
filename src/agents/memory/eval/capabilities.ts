@@ -14,6 +14,8 @@
  * have no fixed cap, so their default is "return all matching candidates".
  */
 
+import { effectiveScore } from "../decay.js";
+import { cosine, type Embedder } from "../embedder.js";
 import { recallWithGraph } from "../graph-recall.js";
 import { FactStore, type RecordOriginFilter } from "../records.js";
 import { bm25Score, linearScanScore } from "../scoring.js";
@@ -115,6 +117,53 @@ export function hybridRecallCapability(store: FactStore, origin?: RecordOriginFi
 }
 
 /**
+ * **Weighted-sum fusion baseline** (Step 1, the "competitor reproduced" baseline) —
+ * reproduces the recall FORMULA used by a mature FTS+vector memory engine: a
+ * WEIGHTED-SUM fuse of normalised vector-cosine (0.7) + normalised BM25 (0.3),
+ * × temporal decay. The EMBEDDER IS HELD CONSTANT (Brigade's HRR) so this
+ * isolates the FUSION ALGORITHM — the classic weighted-sum vs BM25-primary-with-
+ * recovery (Tideline's `searchHybrid`). It is deliberately NOT a full
+ * reproduction: that engine's LEARNED embedder is the separate "learned-embedder"
+ * upgrade. With a weak model-free vector the 0.7 vec weight is a handicap —
+ * which is exactly the trap Tideline avoids by keeping BM25 PRIMARY and using
+ * the vector only as an append-below recovery lane. So this baseline answers
+ * "is our fusion better than the standard weighted-sum, at equal embedder?"
+ * honestly; the embedder gap is measured separately when a learned model lands.
+ */
+export function weightedSumFusionBaseline(
+	store: FactStore,
+	embedder: Embedder,
+	origin?: RecordOriginFilter,
+): RecallCapability {
+	return {
+		async search(query, opts) {
+			const now = Date.now();
+			const candidates = store
+				.list(origin !== undefined ? { origin } : {})
+				.filter((r) => r.validTo === undefined || r.validTo > now);
+			if (candidates.length === 0) return [];
+			// Plain BM25 (no Tideline modulation) → normalise to [0,1].
+			const lex = bm25Score(candidates, query, now, { modulate: false });
+			const lexById = new Map(lex.map((s) => [s.record.memoryId, s.score]));
+			const lexMax = Math.max(1e-9, ...lex.map((s) => s.score));
+			const qv = (embedder.embed([query]) as number[][])[0] ?? [];
+			const fused = candidates
+				.map((r) => {
+					const lexN = (lexById.get(r.memoryId) ?? 0) / lexMax;
+					const sim =
+						r.embedding && r.embedding.length === qv.length ? Math.max(0, cosine(qv, r.embedding)) : 0;
+					// Classic weighted-sum (0.7 vec / 0.3 text), faded by temporal decay.
+					return { record: r, score: (0.7 * sim + 0.3 * lexN) * effectiveScore(r, now) };
+				})
+				.filter((x) => x.score > 0)
+				.sort((a, b) => b.score - a.score || b.record.createdAt - a.record.createdAt);
+			const limited = opts?.limit && opts.limit > 0 ? fused.slice(0, opts.limit) : fused;
+			return limited.map((x) => ({ id: x.record.memoryId, score: x.score }));
+		},
+	};
+}
+
+/**
  * **Graph-augmented recall** (Step 20) — the gated spreading-activation walk
  * over the store's active + origin-filtered records. `forceWalk` is ON for the
  * eval lane so the multi-hop benefit is measurable on a multi-hop gold set (the
@@ -141,13 +190,14 @@ export function graphRecallCapability(store: FactStore, origin?: RecordOriginFil
 
 /**
  * **Full-context dump** (the "no-retrieval" baseline) — returns ALL active
- * (origin-filtered) facts, IGNORING the query, in insertion order (no ranking —
- * that's the point). Models "just stuff everything into the prompt".
+ * (origin-filtered) facts, IGNORING the query, in most-recent-first order
+ * (`store.list()` sorts by `createdAt` descending — no relevance ranking, that's
+ * the point). Models "just stuff everything into the prompt".
  *
  * Reading its recall@k HONESTLY: at k ≥ corpus it includes everything → recall =
  * 1.0 (it never LOSES a fact — see the k≥corpus test). Below that, a context
  * BUDGET forces a choice of which k facts to include; un-ranked, it takes the
- * first-k-written, so a low recall@k is a TRUNCATION artifact, NOT a recall
+ * most-recently-written k facts, so a low recall@k is a TRUNCATION artifact, NOT a recall
  * deficiency — the gap to the index is exactly "ranking fills a bounded budget
  * with RELEVANT facts; dumping can't". Its genuine, non-tautological cost vs the
  * index is ABSTENTION: it returns facts even on a no-answer query (a

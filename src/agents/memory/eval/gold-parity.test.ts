@@ -102,7 +102,18 @@ describe("cross-mode parity — fs recall ≡ convex recall on the gold", () => 
 			assert.equal(cx.abstentionViolation, f.abstentionViolation, `case ${cx.caseId}: abstention identical`);
 		}
 
-		// Sanity: the bench actually ran (not two empty results comparing equal).
-		assert.ok(fsRes.nScored > 0 && fsRes.recallAtK > 0, "the parity run actually scored cases");
+		// Corpus shape: the synthetic gold has 13 cases (10 scored + 3 abstention).
+		// These counts are pinned by SYNTHETIC_GOLD and must not silently shrink.
+		assert.equal(fsRes.n, 13, "total cases must be 13 (10 scored + 3 abstention)");
+		assert.equal(fsRes.nScored, 10, "scored (non-abstention) cases must be exactly 10");
+		assert.equal(fsRes.nAbstention, 3, "abstention cases must be exactly 3");
+
+		// All 10 scored cases hit their unique relevant fact at rank-1, so the
+		// aggregate accuracy figures are all 1.0 — a regression to any fraction
+		// would break these.
+		assert.equal(fsRes.recallAtK, 1, "recall@k baseline must be 1.0 (every scored case hits at rank ≤ k)");
+		assert.equal(fsRes.mrr, 1, "MRR baseline must be 1.0 (every relevant fact ranks first)");
+		assert.equal(fsRes.ndcgAtK, 1, "nDCG@k baseline must be 1.0 (ideal ranking on all scored cases)");
+		assert.equal(fsRes.hitRate, 1, "hitRate baseline must be 1.0 (every scored case has a top-k hit)");
 	});
 });

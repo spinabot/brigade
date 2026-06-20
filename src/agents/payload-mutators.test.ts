@@ -254,7 +254,7 @@ function captureWrappedOptions(
 
 test("wrapStreamFnWithPayloadMutations: injects Brigade attribution headers for OpenRouter", () => {
   const opts = captureWrappedOptions({ provider: "openrouter", id: "anthropic/claude" }, {});
-  assert.equal(opts?.headers?.["HTTP-Referer"], "https://brigade-agent.ai");
+  assert.equal(opts?.headers?.["HTTP-Referer"], "https://brigade.spinabot.com");
   assert.equal(opts?.headers?.["X-OpenRouter-Title"], "Brigade");
   assert.equal(opts?.headers?.["X-OpenRouter-Categories"], "cli-agent");
 });

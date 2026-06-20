@@ -42,7 +42,7 @@ test("resolveOpenRouterAttributionHeaders: returns the three headers for OpenRou
   });
   // Sanity: the identity is Brigade's, not Pi's default.
   assert.equal(headers!["X-OpenRouter-Title"], "Brigade");
-  assert.equal(headers!["HTTP-Referer"], "https://brigade-agent.ai");
+  assert.equal(headers!["HTTP-Referer"], "https://brigade.spinabot.com");
 });
 
 test("resolveOpenRouterAttributionHeaders: undefined for non-OpenRouter providers", () => {

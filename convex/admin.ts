@@ -30,6 +30,7 @@ const RESETTABLE_TABLES = [
 	"memoryFacts",
 	"memoryExtractCursors",
 	"memoryConsolidateState",
+	"memoryEvents",
 	"sessions",
 	"sessionTranscriptRecords",
 	"sessionInboxEvents",

@@ -38,6 +38,9 @@ const DEFAULT_MIN_SIM = 0.3;
 // (assembling a varied prompt) not a fact-FINDING one — on single-relevant-fact
 // recall, diversifying only hurts ranking. No v1 caller opts in: recall() and
 // context() both run at the λ=1 default; λ<1 is exercised only by tests.
+// (Reconciles the plan's "λ=0.7": that 0.7 IS this opt-in — a deliberate DEFAULT of
+// 1.0 for fact recall, with 0.7 available per-call for multi-fact block assembly,
+// rather than diversifying single-fact lookups by default. A tuned default, not a gap.)
 const DEFAULT_MMR_LAMBDA = 1.0;
 
 /**
@@ -194,6 +197,15 @@ export async function recallHybridAsync(
 	opts: { limit?: number; minSim?: number; mmrLambda?: number } = {},
 ): Promise<HybridScored[]> {
 	const qv = (await embedder.embed([query]))[0] ?? [];
-	const preEmbedded: Embedder = { id: embedder.id, dims: embedder.dims, embed: () => [qv] };
+	// Preserve the embedder's recommended recovery-lane floor when rebuilding the
+	// pre-embedded stand-in: recallHybrid reads `embedder.minSim` off this wrapper,
+	// so omitting it would silently drop the per-embedder `minSim` contract (a
+	// no-op for every current embedder, which omit it; matters for a learned one).
+	const preEmbedded: Embedder = {
+		id: embedder.id,
+		dims: embedder.dims,
+		...(embedder.minSim !== undefined ? { minSim: embedder.minSim } : {}),
+		embed: () => [qv],
+	};
 	return recallHybrid(candidates, query, preEmbedded, now, opts);
 }

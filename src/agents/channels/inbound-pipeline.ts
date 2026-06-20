@@ -26,6 +26,7 @@
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import type { BrigadeConfig } from "../../config/io.js";
 import type { ChannelAdapter, ChannelCommand, InboundMessage } from "../extensions/types.js";
+import { getActiveRegistry } from "../extensions/active-registry.js";
 import {
 	addAllowFrom,
 	type DmPolicy,
@@ -42,6 +43,7 @@ import {
 	tryConsumeChannelApprovalReply,
 } from "./approval-router.js";
 import { recordLastChannelForAgent } from "./last-channel.js";
+import { buildMediaNote } from "./media-capture.js";
 import { resolveAgentRoute } from "../routing/resolve-route.js";
 import { normalizeAccountId } from "../routing/account-id.js";
 import { resolveThreadSessionKeys } from "../routing/session-key.js";
@@ -512,15 +514,13 @@ export async function runChannelInboundPipeline(
 		// Media + reply-context note synthesis (moved from pre-gate — the
 		// gate never reads `text`, and synthesis must wait for the deferred
 		// media above).
+		// Audio/voice attachments are TRANSCRIBED (when a provider is configured) and the
+		// transcript is folded into the note, so the agent reads what was said AND the existing
+		// post-turn extraction captures it as memory. Best-effort — falls back to a path stub
+		// on any failure, so a flaky STT provider can't break ingest. (See media-capture.ts.)
 		const mediaNote =
 			msg.media && msg.media.length > 0
-				? msg.media
-						.map((m) => {
-							const caption = m.caption ? `: "${m.caption}"` : "";
-							const name = m.fileName ? ` (${m.fileName})` : "";
-							return `[attached ${m.kind}${name}${caption} → ${m.path}]`;
-						})
-						.join("\n")
+				? await buildMediaNote(msg.media, { registry: getActiveRegistry(), config: cfg })
 				: "";
 		const replyNote = msg.replyTo?.body
 			? `> ${msg.replyTo.body.replace(/\n/g, " ").slice(0, 200)}\n`

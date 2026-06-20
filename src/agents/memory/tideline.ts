@@ -54,6 +54,20 @@ export interface ClockAdapter {
 	now(): number;
 }
 
+/** Recall-time CONTENT-safety seam. **Optional**: when wired, every "recall →
+ *  drop into a prompt" surface on the facade ({@link Tideline.context}) runs each
+ *  recalled fact's text through it and, on a non-empty result, substitutes a
+ *  non-actionable `[BLOCKED]` placeholder instead of surfacing the fact verbatim
+ *  (the markup-escape stays as defense-in-depth on top). This is the SAME
+ *  injection/exfil/C2 net the in-process auto-recall loop applies; defining it as
+ *  an injectable adapter (rather than importing a scanner) keeps the facade free
+ *  of host-specific imports so it stays extractable. `scan(content)` returns the
+ *  matched threat-pattern ids (empty = clean). Default = no scan (returns `[]`),
+ *  preserving the markup-escape-only behavior. */
+export interface ThreatScanAdapter {
+	scan(content: string): string[];
+}
+
 /** The persistence backend. `FactStore` is the v1 realization (it dispatches
  *  fs ↔ convex internally); an alternative backend or an OSS adopter targets
  *  this. Invariants every adapter MUST uphold (the bundled FactStore does):
@@ -101,6 +115,9 @@ export interface FactInspection {
 }
 
 const SYSTEM_CLOCK: ClockAdapter = { now: () => Date.now() };
+/** Default recall-time scan = no-op (markup-escape only). A host wires a real
+ *  scanner via the `threatScan` adapter to enforce the full content-safety net. */
+const NO_THREAT_SCAN: ThreatScanAdapter = { scan: () => [] };
 
 // ───────────────────────────── the facade ────────────────────────────
 
@@ -114,25 +131,39 @@ export class Tideline {
 	private constructor(
 		private readonly store: StorageAdapter,
 		private readonly clock: ClockAdapter,
+		private readonly threatScan: ThreatScanAdapter,
 		private readonly embedder?: EmbedderAdapter,
 		private readonly llm?: LlmAdapter,
 	) {}
 
 	/** Open Tideline for a workspace directory (the common case). The optional
-	 *  adapters default to: system clock, no embedder (v1 = FTS5-only), no LLM. */
+	 *  adapters default to: system clock, no recall-time threat scan (markup-escape
+	 *  only), no embedder (v1 = FTS5-only), no LLM. */
 	static open(
 		workspaceDir: string,
-		adapters: { clock?: ClockAdapter; embedder?: EmbedderAdapter; llm?: LlmAdapter } = {},
+		adapters: { clock?: ClockAdapter; threatScan?: ThreatScanAdapter; embedder?: EmbedderAdapter; llm?: LlmAdapter } = {},
 	): Tideline {
-		return new Tideline(new FactStore(workspaceDir), adapters.clock ?? SYSTEM_CLOCK, adapters.embedder, adapters.llm);
+		return new Tideline(
+			new FactStore(workspaceDir),
+			adapters.clock ?? SYSTEM_CLOCK,
+			adapters.threatScan ?? NO_THREAT_SCAN,
+			adapters.embedder,
+			adapters.llm,
+		);
 	}
 
 	/** Wrap an existing {@link StorageAdapter} (DI / shared store / a swapped backend). */
 	static over(
 		store: StorageAdapter,
-		adapters: { clock?: ClockAdapter; embedder?: EmbedderAdapter; llm?: LlmAdapter } = {},
+		adapters: { clock?: ClockAdapter; threatScan?: ThreatScanAdapter; embedder?: EmbedderAdapter; llm?: LlmAdapter } = {},
 	): Tideline {
-		return new Tideline(store, adapters.clock ?? SYSTEM_CLOCK, adapters.embedder, adapters.llm);
+		return new Tideline(
+			store,
+			adapters.clock ?? SYSTEM_CLOCK,
+			adapters.threatScan ?? NO_THREAT_SCAN,
+			adapters.embedder,
+			adapters.llm,
+		);
 	}
 
 	/** Whether a learned embedder is WIRED into the facade — reflects wiring only,
@@ -175,8 +206,12 @@ export class Tideline {
 	/** A budgeted, origin-scoped recall block ready to drop into a prompt — the
 	 *  facts joined into a capped string (relevance-ranked (decay-weighted),
 	 *  highest first, truncated to `maxChars`, default 1200). Passive (no decay
-	 *  reinforcement). `<`/`>` in fact text are defanged so a fact can't inject
-	 *  markup. Returns `undefined` when nothing relevant is stored. */
+	 *  reinforcement). Content-safety: when a {@link ThreatScanAdapter} is wired,
+	 *  any fact whose text matches an injection/exfil/C2 pattern is replaced by a
+	 *  non-actionable `[BLOCKED]` placeholder (the SAME recall-time net the
+	 *  in-process auto-recall loop applies); `<`/`>` in the surfaced fact text are
+	 *  ALSO defanged so a fact can't inject markup (defense-in-depth, always on).
+	 *  Returns `undefined` when nothing relevant is stored. */
 	context(query: string, opts: ContextOpts = {}): string | undefined {
 		const { maxChars = 1200, ...recallOpts } = opts;
 		const recallOptsPassive = { ...recallOpts, markAccessed: false };
@@ -187,7 +222,16 @@ export class Tideline {
 		const lines: string[] = [];
 		let used = 0;
 		for (const h of hits) {
-			const safe = h.content.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+			// Recall-time content scan FIRST: a fact carrying an injection/exfil/C2
+			// payload is surfaced as a non-actionable `[BLOCKED]` line — never its
+			// raw text — mirroring auto-recall's renderRecalledFact. The markup-
+			// escape below is the second, always-on layer (the no-angle-bracket
+			// natural-language class the scan catches has no `<`/`>` to escape).
+			const threats = this.threatScan.scan(h.content);
+			const safe =
+				threats.length > 0
+					? `[BLOCKED] this ${h.segment} fact matched threat pattern(s): ${threats.join(", ")} — omitted from context`
+					: h.content.replace(/</g, "&lt;").replace(/>/g, "&gt;");
 			const line = `- [${h.segment}] ${safe}`;
 			// `+ 1` per line accounts for the "\n" separator. This is a conservative
 			// upper bound: the final line carries no trailing separator, so the
@@ -198,6 +242,16 @@ export class Tideline {
 			used += line.length + 1;
 		}
 		return lines.join("\n");
+	}
+
+	/** Apply the wired threat-scan to a piece of content (empty array = clean).
+	 *  Exposes the injected {@link ThreatScanAdapter} so recall surfaces built on
+	 *  this facade (e.g. the MCP `memory_search` tool, which returns per-hit results
+	 *  rather than a `context()` block) enforce the SAME recall-time content-safety
+	 *  net `context()` applies — without importing a concrete scanner here (the
+	 *  facade stays Brigade-import-free + OSS-extractable). */
+	scanThreats(content: string): string[] {
+		return this.threatScan.scan(content);
 	}
 
 	// ── feedback ──

@@ -6,11 +6,14 @@
  *   - `every` — fixed interval, optionally anchored to a base timestamp
  *   - `at` — one-shot at an absolute timestamp (auto-deletes by default)
  *
- * Two payload kinds:
+ * Three payload kinds:
  *   - `systemEvent` — text injected into the operator's active session
  *     (must pair with `sessionTarget: "main"`)
  *   - `agentTurn` — a full agent run in its own session (must pair with
  *     `sessionTarget: "isolated"` or `session:<id>`)
+ *   - `script` — run a shell command; by default deliver its output with NO
+ *     model turn (zero tokens — a scheduled health-check / probe). OWNER-ONLY
+ *     (a channel peer must never schedule shell execution). Isolated-like.
  *
  * Validation invariants live in `assertSupportedJobSpec` in `service/jobs.ts`.
  * Defaults + coercion live in `normalize.ts`.
@@ -58,7 +61,32 @@ export interface CronPayloadAgentTurn {
 	lightContext?: boolean;
 }
 
-export type CronPayload = CronPayloadSystemEvent | CronPayloadAgentTurn;
+/**
+ * Run a shell command on schedule. By DEFAULT the command's stdout is delivered
+ * directly with NO model turn — a zero-token scheduled probe / health-check /
+ * pre-fetch. OWNER-ONLY: a channel-peer-created job may never carry this kind
+ * (it is shell execution as the gateway). Isolated-like (never `sessionTarget:"main"`).
+ */
+export interface CronPayloadScript {
+	kind: "script";
+	/** Shell command to run. Operator-authored (owner-only) → trusted, like a crontab line. */
+	command: string;
+	/** Working directory. Defaults to the job's agent workspace. */
+	cwd?: string;
+	/** Kill the script after N seconds (default 60). */
+	timeoutSeconds?: number;
+	/**
+	 * When true, run an agent turn AFTER the script with its stdout injected
+	 * ("## Script Output"). When false/unset = NO model turn (the cost win). A
+	 * script whose last stdout line is `{"wakeAgent":false}` forces no-turn even
+	 * when this is true (the script decides at runtime there's nothing to act on).
+	 */
+	wakeAgent?: boolean;
+	/** Message for the woken agent turn (the script stdout is appended). */
+	agentMessage?: string;
+}
+
+export type CronPayload = CronPayloadSystemEvent | CronPayloadAgentTurn | CronPayloadScript;
 
 /**
  * Where the resulting work lands.

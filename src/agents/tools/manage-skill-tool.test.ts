@@ -10,14 +10,18 @@ import { makeManageSkillTool, sanitizeSkillName } from "./manage-skill-tool.js";
 import { resolveAgentWorkspaceDir } from "../../config/paths.js";
 
 interface ManageSkillResult {
-	action: "create" | "delete";
+	action: "create" | "patch" | "delete" | "write_file" | "remove_file";
 	name: string;
 	scope: "agent" | "managed";
 	agentId?: string;
 	skillDir: string;
 	skillFile: string;
+	filePath?: string;
 	created?: boolean;
+	patched?: boolean;
 	deleted?: boolean;
+	wroteFile?: boolean;
+	removedFile?: boolean;
 	ok: boolean;
 	message: string;
 }
@@ -228,6 +232,199 @@ describe("manage_skill tool", () => {
 	it("is owner-only (ownerOnly flag set)", () => {
 		const tool = makeManageSkillTool();
 		assert.equal(tool.ownerOnly, true);
+	});
+
+	it("patch appends a section to an existing skill (keeps the original)", async () => {
+		const tool = makeManageSkillTool({ requesterAgentId: "main" });
+		await tool.execute("p1", {
+			action: "create",
+			scope: "managed",
+			name: "runbook",
+			body: "# runbook\n\nstep one",
+		});
+		const res = parseResult(
+			(
+				await tool.execute("p2", {
+					action: "patch",
+					scope: "managed",
+					name: "runbook",
+					body: "## Pitfall\n\nrotate the key first",
+				})
+			).content,
+		);
+		assert.equal(res.ok, true);
+		assert.equal(res.patched, true);
+		const onDisk = fs.readFileSync(res.skillFile, "utf8");
+		assert.match(onDisk, /step one/); // original preserved
+		assert.match(onDisk, /rotate the key first/); // refinement appended
+	});
+
+	it("patch a non-existent skill fails with a clear message", async () => {
+		const tool = makeManageSkillTool({ requesterAgentId: "main" });
+		const res = parseResult(
+			(await tool.execute("p3", { action: "patch", scope: "managed", name: "ghost", body: "## x" })).content,
+		);
+		assert.equal(res.ok, false);
+		assert.match(res.message, /to patch|No skill/);
+	});
+
+	it("patch requires a body", async () => {
+		const tool = makeManageSkillTool({ requesterAgentId: "main" });
+		await tool.execute("p4a", { action: "create", scope: "managed", name: "needs-body", body: "# x\n\ny" });
+		const res = parseResult(
+			(await tool.execute("p4b", { action: "patch", scope: "managed", name: "needs-body" })).content,
+		);
+		assert.equal(res.ok, false);
+		assert.match(res.message, /body.*required/i);
+	});
+});
+
+describe("manage_skill — support files (write_file / remove_file)", () => {
+	async function createSkill(name: string): Promise<void> {
+		const tool = makeManageSkillTool();
+		const res = parseResult(
+			(await tool.execute(`mk-${name}`, { action: "create", scope: "managed", name, body: `# ${name}\n\nbody` })).content,
+		);
+		assert.equal(res.ok, true);
+	}
+
+	it("write_file attaches a reference doc under references/ on an existing skill", async () => {
+		await createSkill("packaged");
+		const tool = makeManageSkillTool();
+		const res = parseResult(
+			(
+				await tool.execute("wf-1", {
+					action: "write_file",
+					scope: "managed",
+					name: "packaged",
+					filePath: "references/api-notes.md",
+					fileContent: "# API notes\n\nThe endpoint is POST /v1/run.",
+				})
+			).content,
+		);
+		assert.equal(res.ok, true);
+		assert.equal(res.wroteFile, true);
+		assert.equal(res.filePath, "references/api-notes.md");
+		const onDisk = fs.readFileSync(path.join(res.skillDir, "references", "api-notes.md"), "utf8");
+		assert.match(onDisk, /POST \/v1\/run/);
+	});
+
+	it("write_file supports scripts/ (runnable support files)", async () => {
+		await createSkill("with-script");
+		const tool = makeManageSkillTool();
+		const res = parseResult(
+			(
+				await tool.execute("wf-2", {
+					action: "write_file",
+					scope: "managed",
+					name: "with-script",
+					filePath: "scripts/check.sh",
+					fileContent: "#!/usr/bin/env bash\necho ok\n",
+				})
+			).content,
+		);
+		assert.equal(res.ok, true);
+		assert.ok(fs.existsSync(path.join(res.skillDir, "scripts", "check.sh")));
+	});
+
+	it("write_file REFUSES path traversal", async () => {
+		await createSkill("guarded");
+		const tool = makeManageSkillTool();
+		const res = parseResult(
+			(
+				await tool.execute("wf-3", {
+					action: "write_file",
+					scope: "managed",
+					name: "guarded",
+					filePath: "../../../etc/passwd",
+					fileContent: "x",
+				})
+			).content,
+		);
+		assert.equal(res.ok, false);
+		assert.equal(res.wroteFile, false);
+		assert.equal(fs.existsSync(path.join(tmpRoot, "etc", "passwd")), false);
+	});
+
+	it("write_file REFUSES a non-allowed subdir", async () => {
+		await createSkill("subdir-guard");
+		const tool = makeManageSkillTool();
+		const res = parseResult(
+			(
+				await tool.execute("wf-4", {
+					action: "write_file",
+					scope: "managed",
+					name: "subdir-guard",
+					filePath: "secrets/leak.md",
+					fileContent: "x",
+				})
+			).content,
+		);
+		assert.equal(res.ok, false);
+		assert.match(res.message, /references\/, templates\/, scripts\/, or assets\//);
+	});
+
+	it("write_file to a non-existent skill fails clearly", async () => {
+		const tool = makeManageSkillTool();
+		const res = parseResult(
+			(
+				await tool.execute("wf-5", {
+					action: "write_file",
+					scope: "managed",
+					name: "ghost-skill",
+					filePath: "references/x.md",
+					fileContent: "x",
+				})
+			).content,
+		);
+		assert.equal(res.ok, false);
+		assert.match(res.message, /No skill at|Create it/);
+	});
+
+	it("write_file rejects oversized content", async () => {
+		await createSkill("big");
+		const tool = makeManageSkillTool();
+		const res = parseResult(
+			(
+				await tool.execute("wf-6", {
+					action: "write_file",
+					scope: "managed",
+					name: "big",
+					filePath: "references/huge.md",
+					fileContent: "x".repeat(300_000),
+				})
+			).content,
+		);
+		assert.equal(res.ok, false);
+		assert.match(res.message, /limit/i);
+	});
+
+	it("remove_file deletes the support file and prunes the empty subdir", async () => {
+		await createSkill("cleanup");
+		const tool = makeManageSkillTool();
+		await tool.execute("wf-7a", {
+			action: "write_file",
+			scope: "managed",
+			name: "cleanup",
+			filePath: "templates/start.txt",
+			fileContent: "starter",
+		});
+		const removed = parseResult(
+			(
+				await tool.execute("wf-7b", {
+					action: "remove_file",
+					scope: "managed",
+					name: "cleanup",
+					filePath: "templates/start.txt",
+				})
+			).content,
+		);
+		assert.equal(removed.ok, true);
+		assert.equal(removed.removedFile, true);
+		assert.equal(fs.existsSync(path.join(removed.skillDir, "templates", "start.txt")), false);
+		// emptied subdir pruned, skill root intact
+		assert.equal(fs.existsSync(path.join(removed.skillDir, "templates")), false);
+		assert.ok(fs.existsSync(path.join(removed.skillDir, "SKILL.md")));
 	});
 });
 

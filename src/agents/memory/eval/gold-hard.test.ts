@@ -92,7 +92,7 @@ describe("hard gold — competition discriminates the recall lanes (the wins)", 
 
 		// ── Retrieval floor: every lane FINDS the answers (the wins are about RANK).
 		for (const [n, r] of [["floor", floor], ["plain-FTS", fts], ["BM25xeff", bm25], ["hybrid", hybrid]] as const) {
-			assert.ok(r.recallAtK >= 1 - 1e-9, `${n} must retrieve every answer (recall@${K}=${(r.recallAtK * 100).toFixed(0)}%)`);
+			assert.equal(r.recallAtK, 1, `${n} must retrieve every answer (recall@${K}=${(r.recallAtK * 100).toFixed(0)}%)`);
 		}
 
 		// ── POISON (trust): the hybrid recovers the trusted answer that plain lexical sinks.
@@ -100,7 +100,7 @@ describe("hard gold — competition discriminates the recall lanes (the wins)", 
 			cat(hybrid, "poison") > cat(fts, "poison") + 1e-9,
 			`hybrid poison MRR (${cat(hybrid, "poison").toFixed(2)}) must beat plain-FTS (${cat(fts, "poison").toFixed(2)})`,
 		);
-		assert.ok(cat(hybrid, "poison") >= 0.95, `hybrid should rank the trusted answer ~#1 on poison (got ${cat(hybrid, "poison").toFixed(2)})`);
+		assert.equal(cat(hybrid, "poison"), 1, `hybrid should rank the trusted answer #1 on ALL poison cases (got ${cat(hybrid, "poison").toFixed(2)})`);
 
 		// ── IMPORTANCE (modulation): the modulated lanes lift the important answer over a
 		// higher-BM25 distractor; plain-FTS (no importance) is fooled. The ISOLATION is
@@ -108,15 +108,17 @@ describe("hard gold — competition discriminates the recall lanes (the wins)", 
 		// `modulate:false`, so the delta IS the modulation (not a different scorer). (The
 		// floor may also rank these #1 via its own term-overlap scorer — that's a separate
 		// lane, not a modulation claim; the modulation claim is precisely bm25 > fts.)
-		assert.ok(
-			cat(bm25, "importance") > cat(fts, "importance") + 1e-9,
-			`BM25×eff importance MRR (${cat(bm25, "importance").toFixed(2)}) must beat plain-FTS (${cat(fts, "importance").toFixed(2)})`,
-		);
-		assert.ok(cat(hybrid, "importance") > cat(fts, "importance") + 1e-9, "hybrid importance MRR must beat plain-FTS too");
+		// Exact measured values (clock pinned to 0, deterministic): fts importance MRR=0.5 (2 of 4 cases
+		// rank the important answer #2 because raw BM25 favours the distractor), bm25 and hybrid = 1.0
+		// (effectiveScore modulation lifts the high-importance answer to #1 on all 4 cases).
+		assert.equal(cat(fts, "importance"), 0.5, "plain-FTS importance MRR must be 0.5 (distractor wins on raw BM25 for half the cases)");
+		assert.equal(cat(bm25, "importance"), 1, "BM25×eff importance MRR must be 1.0 (modulation lifts the important answer to #1 on all cases)");
+		assert.equal(cat(hybrid, "importance"), 1, "hybrid importance MRR must be 1.0 (modulation + trust both score the important answer #1)");
 
 		// ── Overall: the modulated lanes out-rank plain lexical.
-		assert.ok(hybrid.mrr >= bm25.mrr - 1e-9, `hybrid overall MRR (${hybrid.mrr.toFixed(2)}) ≥ BM25×eff (${bm25.mrr.toFixed(2)})`);
-		assert.ok(bm25.mrr > fts.mrr + 1e-9, `Tideline BM25×eff (${bm25.mrr.toFixed(2)}) must out-rank plain-FTS (${fts.mrr.toFixed(2)})`);
+		assert.equal(hybrid.mrr, 0.96875, `hybrid overall MRR (${hybrid.mrr.toFixed(3)}) must equal the measured value 0.96875`);
+		assert.equal(bm25.mrr, 0.84375, `Tideline BM25×eff MRR (${bm25.mrr.toFixed(3)}) must equal the measured value 0.84375`);
+		assert.equal(fts.mrr, 0.75, `plain-FTS MRR (${fts.mrr.toFixed(3)}) must equal the measured value 0.75`);
 
 		// ── The SERVED path beats the crude floor. recall() delegates to the HYBRID
 		// (records.ts), so THE gate that matters is hybrid > floor — both overall and on
@@ -126,22 +128,16 @@ describe("hard gold — competition discriminates the recall lanes (the wins)", 
 		// (0.67) < floor (0.83) — because modulation alone can't down-rank a well-crafted
 		// untrusted distractor. That gap is exactly WHY trust (the hybrid) is the served
 		// path; we therefore gate the floor-beating claim on the hybrid, not BM25×eff.
-		assert.ok(
-			hybrid.mrr >= floor.mrr - 1e-9,
-			`served hybrid MRR (${hybrid.mrr.toFixed(2)}) must beat the linear-scan floor (${floor.mrr.toFixed(2)})`,
-		);
-		assert.ok(
-			cat(hybrid, "poison") > cat(floor, "poison") + 1e-9,
-			`served hybrid poison MRR (${cat(hybrid, "poison").toFixed(2)}) must beat the floor (${cat(floor, "poison").toFixed(2)}) — trust is the poison defense`,
-		);
+		assert.equal(floor.mrr, 0.9375, `linear-scan floor MRR (${floor.mrr.toFixed(4)}) must equal the measured value 0.9375`);
+		assert.equal(hybrid.mrr, 0.96875, `served hybrid MRR (${hybrid.mrr.toFixed(4)}) must equal the measured value 0.96875 (exceeds floor 0.9375)`);
+		assert.equal(cat(floor, "poison"), 5 / 6, `floor poison MRR (${cat(floor, "poison").toFixed(4)}) must equal the measured value 5/6 ≈ 0.8333`);
+		assert.equal(cat(hybrid, "poison"), 1, `served hybrid poison MRR (${cat(hybrid, "poison").toFixed(2)}) must equal 1.0 — trust is the complete poison defense`);
 		// nDCG quality gate: the served hybrid's nDCG@k must also clear the floor, so a
 		// ranking regression that happened to spare MRR/recall@3 still trips a gate.
 		// (On single-relevant gold nDCG tracks MRR; this locks a non-regression floor
 		// on the served lane's nDCG ahead of multi-relevant gold in v2.)
-		assert.ok(
-			hybrid.ndcgAtK >= floor.ndcgAtK - 1e-9,
-			`served hybrid nDCG@${K} (${hybrid.ndcgAtK.toFixed(2)}) must beat the linear-scan floor (${floor.ndcgAtK.toFixed(2)})`,
-		);
+		assert.equal(floor.ndcgAtK, 0.9538662191964322, `floor nDCG@${K} (${floor.ndcgAtK.toFixed(6)}) must equal the measured value`);
+		assert.equal(hybrid.ndcgAtK, 0.9769331095982161, `served hybrid nDCG@${K} (${hybrid.ndcgAtK.toFixed(6)}) must equal the measured value (exceeds floor)`);
 
 		// ── The DEFAULT recall lane abstains cleanly on no-answer queries.
 		assert.equal(bm25.abstentionViolations, 0, "the default BM25×eff lane must abstain on no-answer queries");
@@ -154,9 +150,6 @@ describe("hard gold — competition discriminates the recall lanes (the wins)", 
 		// we GATE the measured bound so a regression (MORE no-answer false-positives
 		// shipping on the served path) fails CI rather than slipping through green.
 		const HYBRID_ABSTENTION_CEILING = 2; // measured on this gold; the model-free HRR bound.
-		assert.ok(
-			hybrid.abstentionViolations <= HYBRID_ABSTENTION_CEILING,
-			`production hybrid abstention violations (${hybrid.abstentionViolations}) must not regress past the model-free bound (${HYBRID_ABSTENTION_CEILING}) — a learned embedder is the path to 0`,
-		);
+		assert.equal(hybrid.abstentionViolations, HYBRID_ABSTENTION_CEILING, `production hybrid abstention violations (${hybrid.abstentionViolations}) must equal the model-free bound (${HYBRID_ABSTENTION_CEILING}) — a learned embedder is the path to 0`);
 	});
 });

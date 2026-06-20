@@ -19,7 +19,11 @@ describe("self-improve — propose from telemetry", () => {
 		const events = [...down("f-hot", 3), ...down("f-cold", 1)];
 		const proposals = proposeFromTelemetry(events, { minDownvotes: 3 });
 		assert.equal(proposals.length, 1);
+		assert.equal(proposals[0]!.id, "prop:f-hot");
+		assert.equal(proposals[0]!.diff.kind, "preference");
 		assert.equal(proposals[0]!.diff.target, "f-hot");
+		assert.equal(proposals[0]!.diff.before, "active");
+		assert.equal(proposals[0]!.diff.after, "retracted");
 		assert.equal(proposals[0]!.status, "pending");
 	});
 
@@ -51,6 +55,8 @@ describe("self-improve — human gate + reversible apply", () => {
 		const behaviour = { f1: "active" };
 
 		const approved = approve(p0!);
+		assert.equal(approved.status, "approved");
+		assert.equal(approved.id, "prop:f1");
 		const applied = applyProposal(approved, (diff) => {
 			const prior = behaviour[diff.target as "f1"];
 			behaviour.f1 = diff.after; // "retracted"

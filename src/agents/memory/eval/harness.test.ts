@@ -54,8 +54,8 @@ describe("metrics", () => {
 
 	it("nDCG@k rewards higher-ranked relevant hits", () => {
 		assert.equal(ndcgAtK(["a", "x", "y"], ["a"], 3), 1); // perfect: gold at rank 1
-		const r2 = ndcgAtK(["x", "a", "y"], ["a"], 3); // gold at rank 2
-		assert.ok(r2 > 0 && r2 < 1);
+		const r2 = ndcgAtK(["x", "a", "y"], ["a"], 3); // gold at rank 2 → DCG=1/log2(3), IDCG=1
+		assert.ok(Math.abs(r2 - 1 / Math.log2(3)) < 1e-9);
 		assert.equal(ndcgAtK(["x", "y", "z", "a"], ["a"], 3), 0); // gold outside top-3
 		assert.equal(ndcgAtK(["a", "b", "x"], ["a", "b"], 3), 1); // ideal ordering of 2 gold
 	});
@@ -136,8 +136,7 @@ describe("runRecallEval", () => {
 			[{ id: "c1", query: "deep gold", relevantIds: ["mem_gold"], category: "single-session" }],
 			{ k: 3, limit: 3, clock: zeroClock() },
 		);
-		assert.equal(res.perCase[0]!.retrievedIds.length, 3, "retrievedIds is capped to the search limit");
-		assert.ok(!res.perCase[0]!.retrievedIds.includes("mem_gold"), "the gold id beyond the limit is not retrieved");
+		assert.deepEqual(res.perCase[0]!.retrievedIds, ["mem_1", "mem_2", "mem_3"], "retrievedIds is the exact capped window — mem_gold at rank 4 is absent");
 		assert.equal(res.perCase[0]!.recallAtK, 0, "the truncated-away gold id is a miss");
 		assert.equal(res.recallAtK, 0);
 	});

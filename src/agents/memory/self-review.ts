@@ -1,7 +1,7 @@
 /**
  * Self-review loop — Brigade's continual-learning "self-learning" review pass:
  * after a cadence of turns, a SCOPED background review distils the conversation
- * into durable memory (and later, skills), non-blocking, attributed,
+ * into durable memory, non-blocking, attributed,
  * autonomously — the LLM decides WHAT to learn under guidance; the loop runs
  * itself.
  *
@@ -64,9 +64,10 @@ export interface ReviewProposal {
 
 /**
  * The reviewer seam — runs the {@link SELF_REVIEW_PROMPT} over a transcript and
- * returns proposed facts. In production this is a SCOPED sub-agent (whitelisted
- * to memory tools, fresh session, the parent's model) — the forked-reviewer.
- * Injected so the loop is testable without a model.
+ * returns proposed facts. The intended production wiring is a SCOPED sub-agent
+ * (whitelisted to memory tools, fresh session, the parent's model) — the
+ * forked-reviewer pattern. Not yet wired in server.ts (behavior-review is the
+ * active path); injected here so the loop is testable without a model.
  */
 export type Reviewer = (prompt: string, transcript: string) => Promise<ReviewProposal>;
 

@@ -7,8 +7,8 @@ export declare const read: import("convex/server").RegisteredQuery<"public", {
     channels?: any;
     session?: any;
     defaults?: any;
-    gateway?: any;
     agents?: any;
+    gateway?: any;
     skills?: any;
     org?: any;
     tools?: any;
@@ -31,8 +31,8 @@ export declare const write: import("convex/server").RegisteredMutation<"public",
     channels?: any;
     session?: any;
     defaults?: any;
-    gateway?: any;
     agents?: any;
+    gateway?: any;
     skills?: any;
     org?: any;
     tools?: any;

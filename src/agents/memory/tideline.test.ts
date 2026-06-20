@@ -35,8 +35,9 @@ describe("Tideline facade — frozen surface", () => {
 		const t = Tideline.open(dir);
 		t.add({ content: "I live in Hyderabad India", segment: "identity" });
 		const hits = t.search("where do I live", { markAccessed: false });
+		assert.equal(hits.length, 1);
 		assert.equal(hits[0]?.content, "I live in Hyderabad India");
-		assert.ok(typeof hits[0]?.score === "number");
+		assert.ok(hits[0].score > 0);
 	});
 
 	it("FactStore satisfies the StorageAdapter SPI, and `over` wraps it", () => {
@@ -125,7 +126,7 @@ describe("Tideline facade — frozen surface", () => {
 		assert.ok(block, "at least one fact recalled");
 		assert.ok(block.length <= maxChars, "block stays within the char budget");
 		const lines = block.split("\n").length;
-		assert.ok(lines < stored, "fewer lines than stored — trailing facts dropped by the budget break");
+		assert.equal(lines, 1, "exactly one line fits: first line is ~49 chars, second pushes used past 60 — trailing facts dropped by the budget break");
 	});
 
 	it("feedback IS the self-learning loop: up raises importance + reinforces; down lowers it (asymmetric)", () => {
@@ -134,11 +135,11 @@ describe("Tideline facade — frozen surface", () => {
 		const base = t.list()[0]?.importance ?? 0;
 		t.feedback(a.memoryId, "up");
 		const up = t.list()[0]?.importance ?? 0;
-		assert.ok(up > base, "up raises importance");
+		assert.equal(up, 0.75, "up raises importance: preference base 0.70 + 0.05 = 0.75");
 		assert.equal(t.list()[0]?.accessCount, 1, "up reinforces decay");
 		t.feedback(a.memoryId, "down");
 		const down = t.list()[0]?.importance ?? 0;
-		assert.ok(down < up, "down lowers importance (asymmetric −0.10 outweighs +0.05)");
+		assert.equal(down, 0.65, "down lowers importance: 0.75 − 0.10 = 0.65 (asymmetric)");
 		assert.equal(t.list()[0]?.accessCount, 1, "down does not reinforce decay");
 	});
 
@@ -156,10 +157,18 @@ describe("Tideline facade — frozen surface", () => {
 		const b = t.add({ content: "new office uptown", segment: "knowledge", supersedes: [a.memoryId], links: [{ kind: "corrects", target: a.memoryId }] });
 		const ins = t.inspect(b.memoryId);
 		assert.ok(ins);
-		assert.ok(ins.links.some((l) => l.kind === "corrects" && l.target === a.memoryId));
-		assert.ok(ins.links.some((l) => l.kind === "supersedes" && l.target === a.memoryId));
+		// linksFrom merges explicit links first then supersedes[] — exact ordered result
+		assert.deepEqual(ins.links, [
+			{ kind: "corrects", target: a.memoryId },
+			{ kind: "supersedes", target: a.memoryId },
+		]);
 		const backOnA = t.inspect(a.memoryId);
-		assert.ok(backOnA && backOnA.backlinks.some((bl) => bl.from === b.memoryId));
+		assert.ok(backOnA);
+		// b's linksFrom yields corrects then supersedes, so backlinks on a follow that order
+		assert.deepEqual(backOnA.backlinks, [
+			{ from: b.memoryId, kind: "corrects" },
+			{ from: b.memoryId, kind: "supersedes" },
+		]);
 		assert.equal(t.inspect("nope"), undefined);
 	});
 

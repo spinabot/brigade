@@ -46,8 +46,8 @@ function jaccard(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
  * `threshold`. Returns pairs newest-first as `a`. O(n²) over the candidate set —
  * fine at single-operator scale; gate to a segment/recent window for big stores.
  *
- * NOTE: surface-only — no auto-invalidate caller is wired yet; a future caller
- * pairs this with `FactStore.invalidate` after a winner is chosen.
+ * NOTE: surface-only — callers choose the winner and call `FactStore.invalidate`
+ * after (e.g. `dream.ts` consolidation, `manage-memory-tool` write path).
  */
 export function findContradictions(
 	records: readonly MemoryRecord[],

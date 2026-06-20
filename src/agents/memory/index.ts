@@ -1,9 +1,10 @@
 /**
  * Brigade memory — public re-exports.
  *
- * Lets call sites (tools, agent-loop, gateway) import from one well-known
- * spot instead of reaching into the per-file modules. Internal files keep
- * the granular paths so circular imports stay easy to spot.
+ * Re-exports the core memory surface for external consumers (e.g. the
+ * Tideline public package and downstream packages). Internal Brigade call
+ * sites (tools, agent-loop, gateway) import directly from the per-file
+ * modules to keep circular imports easy to spot and avoid barrel indirection.
  */
 
 export {

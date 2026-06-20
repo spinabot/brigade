@@ -9,12 +9,11 @@
  * this way?" — provenance, audit (every blocked poisoning attempt is recorded),
  * and a basis for rebuilding the store.
  *
- * v1 scope: FILESYSTEM mode appends to `<workspace>/memory/events.jsonl`. Convex
- * mode does NOT yet append — the active store + hydrated cache are authoritative
- * for recall (what v1 ships), and the convex `memoryEvents` table belongs to the
- * convex SERVER-side work validated by the live-deploy smoke (same boundary as
- * the rest of the convex backend). The log is additive provenance: its absence
- * never affects recall, so this asymmetry is safe for v1.
+ * FILESYSTEM mode appends to `<workspace>/memory/events.jsonl`. CONVEX mode
+ * appends to the `memoryEvents` Convex table via `MemoryStore.appendMemoryEvent`
+ * (called from `FactStore.emit`), which is best-effort and fire-and-forget so
+ * that a failed audit-log write never fails an active-store write. The log is
+ * additive provenance: its absence never affects recall in either mode.
  */
 
 import * as fs from "node:fs";

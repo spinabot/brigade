@@ -76,12 +76,17 @@ describe("manage_memory tool", () => {
 		store.write({ content: "I deploy on Fridays", segment: "preference", subjectKey: "deploy" });
 		const v1 = await details("vault");
 		assert.equal(v1.ok, true);
-		assert.equal(v1.written, 1);
+		// 3 notes written: the fact note + 1 topic-hub note for the "deploy" subject (the hubs
+		// cluster the graph) + 1 root "Memory Map" note (the graph's centre that links the hub).
+		// A Map is written whenever ≥1 subject exists, and this fact carries subjectKey "deploy".
+		assert.equal(v1.written, 3);
 
 		// hand-edit the pinned region, then re-render — the edit MUST survive verbatim.
 		const vaultDir = v1.dir as string;
-		const noteFile = fs.readdirSync(vaultDir).find((f) => f.endsWith(".md"));
-		assert.ok(noteFile, "a note was written");
+		// Target the FACT note (not the topic-hub) — the hub also carries a pinned region, so select
+		// by the fact sentinel to stay deterministic regardless of readdir order.
+		const noteFile = fs.readdirSync(vaultDir).find((f) => f.endsWith(".md") && fs.readFileSync(path.join(vaultDir, f), "utf8").includes("%% tideline:fact %%"));
+		assert.ok(noteFile, "a fact note was written");
 		const full = path.join(vaultDir, noteFile as string);
 		fs.writeFileSync(
 			full,

@@ -35,6 +35,17 @@ describe("tokenize", () => {
 		assert.deepEqual(tokenize("I prefer the tabs"), ["prefer", "tabs"]);
 		assert.deepEqual(tokenize("x of o"), ["x", "o"]);
 	});
+
+	it("is Unicode-aware — non-Latin scripts tokenize instead of vanishing", () => {
+		// The ASCII-only delimiter class used to drop whole scripts, making non-Latin
+		// facts unrecallable. Space-separated scripts split into words; a space-less
+		// script (CJK) yields one whole-run token (exact-phrase match).
+		assert.deepEqual(tokenize("пользователь любит кофе"), ["пользователь", "любит", "кофе"]);
+		assert.deepEqual(tokenize("Привет, мир"), ["привет", "мир"]);
+		assert.deepEqual(tokenize("用户喜欢咖啡"), ["用户喜欢咖啡"]);
+		// Mixed Latin + non-Latin keeps both.
+		assert.deepEqual(tokenize("deploy 部署 v2"), ["deploy", "部署", "v2"]);
+	});
 });
 
 describe("linearScanScore (the floor)", () => {
@@ -55,9 +66,10 @@ describe("bm25Score", () => {
 			rec("car", "I drive a blue car"),
 		];
 		const out = bm25Score(docs, "tabs spaces", NOW);
-		assert.ok(out.length >= 1);
+		assert.equal(out.length, 1, "only the matching doc is returned");
 		assert.equal(out[0]!.record.memoryId, "editor");
 		assert.ok(!out.some((s) => s.record.memoryId === "coffee"), "non-matching docs are dropped");
+		assert.ok(!out.some((s) => s.record.memoryId === "car"), "non-matching docs are dropped");
 	});
 
 	it("weights a RARE query term above a common one", () => {
@@ -69,6 +81,7 @@ describe("bm25Score", () => {
 			rec("c3", "common thing"),
 		];
 		const out = bm25Score(docs, "alpha common", NOW);
+		assert.equal(out.length, 4, "all four docs match at least one query term");
 		assert.equal(out[0]!.record.memoryId, "rare", "the doc with the rare term ranks first");
 	});
 
@@ -78,7 +91,9 @@ describe("bm25Score", () => {
 			rec("high", "alpha", { importance: 0.9 }),
 		];
 		const out = bm25Score(docs, "alpha", NOW);
+		assert.equal(out.length, 2, "both docs match and are returned");
 		assert.equal(out[0]!.record.memoryId, "high", "same BM25 → higher importance wins via effectiveScore");
+		assert.equal(out[1]!.record.memoryId, "low", "lower-importance doc ranks second");
 	});
 
 	it("modulate:false is pure BM25 — importance no longer breaks the tie", () => {
@@ -104,7 +119,9 @@ describe("bm25Score", () => {
 			rec("imp", "alpha beta", { importance: 0.5 }),
 		];
 		const out = bm25Score(docs, "alpha", NOW);
+		assert.equal(out.length, 2, "both docs match and are returned");
 		assert.equal(out[0]!.record.memoryId, "lex", "the more-relevant fact ranks first despite lower importance");
+		assert.equal(out[1]!.record.memoryId, "imp", "less-relevant doc ranks second");
 	});
 
 	it("a >2x BM25 gap is NOT overridden by the importance modulator (near the ±50% boundary)", () => {

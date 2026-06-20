@@ -1,11 +1,11 @@
 export declare const appendSessionEvent: import("convex/server").RegisteredMutation<"public", {
     toolName?: string | undefined;
+    content?: ArrayBuffer | undefined;
     args?: ArrayBuffer | undefined;
     aborted?: boolean | undefined;
     inner?: string | undefined;
     delta?: string | undefined;
     role?: string | undefined;
-    content?: ArrayBuffer | undefined;
     stopReason?: string | undefined;
     errorMessage?: string | undefined;
     toolCallId?: string | undefined;
@@ -33,12 +33,12 @@ export declare const readSessionEventTail: import("convex/server").RegisteredQue
     _id: import("convex/values").GenericId<"sessionEvents">;
     _creationTime: number;
     toolName?: string | undefined;
+    content?: ArrayBuffer | undefined;
     args?: ArrayBuffer | undefined;
     aborted?: boolean | undefined;
     inner?: string | undefined;
     delta?: string | undefined;
     role?: string | undefined;
-    content?: ArrayBuffer | undefined;
     stopReason?: string | undefined;
     errorMessage?: string | undefined;
     toolCallId?: string | undefined;
@@ -65,12 +65,12 @@ export declare const findLastError: import("convex/server").RegisteredQuery<"pub
     _id: import("convex/values").GenericId<"sessionEvents">;
     _creationTime: number;
     toolName?: string | undefined;
+    content?: ArrayBuffer | undefined;
     args?: ArrayBuffer | undefined;
     aborted?: boolean | undefined;
     inner?: string | undefined;
     delta?: string | undefined;
     role?: string | undefined;
-    content?: ArrayBuffer | undefined;
     stopReason?: string | undefined;
     errorMessage?: string | undefined;
     toolCallId?: string | undefined;

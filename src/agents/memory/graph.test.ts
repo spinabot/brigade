@@ -89,11 +89,10 @@ describe("graph — entity resolution (model-free)", () => {
 		];
 		const entities = resolveEntities(records, { minMentions: 2 });
 		const names = entities.map((e) => e.name);
-		assert.ok(names.includes("Bangalore"), "Bangalore (2 mentions) resolved");
-		assert.ok(names.includes("Biscuit"), "Biscuit (2 mentions) resolved");
-		assert.ok(!names.includes("Paris"), "Paris (1 mention) below threshold");
-		assert.ok(!names.includes("User"), "stopword 'User' never resolves despite recurring");
-		assert.ok(!names.includes("The"), "sentence-start 'The' filtered");
+		// Exactly 2 entities survive (Bangalore + Biscuit); Paris/User/The/year/last are filtered.
+		// Sort: same mention count (2 each) → alphabetical: "Bangalore" < "Biscuit".
+		assert.equal(entities.length, 2, "exactly 2 entities survive the minMentions:2 threshold");
+		assert.deepEqual(names, ["Bangalore", "Biscuit"], "exact entity set in mention-desc + alpha order");
 		const bangalore = entities.find((e) => e.name === "Bangalore");
 		assert.deepEqual(bangalore?.mentions.sort(), ["1", "2"]);
 	});
@@ -125,8 +124,10 @@ describe("graph — synonymy edges", () => {
 		const edges = synonymyEdges(records, { threshold: 0.8 });
 		const ab = edges.find((e) => e.from === "a" && e.to === "b");
 		assert.ok(ab, "a and b (identical) are synonymy-linked");
-		assert.ok(ab!.sim >= 0.8);
-		// c should not link to a/b at the 0.8 bar
+		// Identical content → identical HRR vector → cosine ≈ 1.0 (≥ 1.0 within float rounding; far above the 0.8 bar).
+		assert.ok(ab!.sim >= 1 - Number.EPSILON * 2, `identical content yields cosine sim ≈ 1.0, got ${ab!.sim}`);
+		// Exactly one edge (a–b); c is not linked to anything at this threshold.
+		assert.equal(edges.length, 1, "only the a–b pair survives; c produces no edge");
 		assert.ok(!edges.some((e) => e.from === "c" || e.to === "c"), "unrelated text not linked");
 	});
 });
@@ -149,19 +150,23 @@ describe("graph — transition edges on supersede (Step 19)", () => {
 		const first = store.write({ content: "I live in Bangalore", segment: "identity", subjectKey: "home_city" });
 		const second = store.write({ content: "I live in Hyderabad now", segment: "identity", subjectKey: "home_city" });
 		const links = second.links ?? [];
-		assert.ok(
-			links.some((l) => l.kind === "transition" && l.target === first.memoryId),
-			"the new fact carries a transition edge to the superseded one",
-		);
-		assert.ok(
-			links.some((l) => l.kind === "contradicts" && l.target === first.memoryId),
-			"the contradicts edge is still recorded too",
+		// The subjectKey path flatMaps exactly one slotSuperseded entry → 2 links total.
+		assert.equal(links.length, 2, "exactly 2 links emitted: one contradicts + one transition");
+		// Sorted by kind for deterministic deepEqual (alphabetical: contradicts < transition).
+		assert.deepEqual(
+			[...links].sort((a, b) => a.kind.localeCompare(b.kind)),
+			[
+				{ kind: "contradicts", target: first.memoryId },
+				{ kind: "transition", target: first.memoryId },
+			],
+			"both contradicts and transition edges point at the superseded memoryId",
 		);
 		// And the graph sees it as a temporal edge from new → old, via the
 		// transition-kind filter.
 		const g = buildGraph(store.readAll());
-		assert.ok(
-			neighbors(g, second.memoryId, { direction: "out", kinds: TRANSITION_KINDS }).includes(first.memoryId),
+		assert.deepEqual(
+			neighbors(g, second.memoryId, { direction: "out", kinds: TRANSITION_KINDS }),
+			[first.memoryId],
 			"the transition is traversable via the transition-kind filter",
 		);
 		// Boundary: the SAME query with an unrelated kind returns nothing — proves

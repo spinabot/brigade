@@ -9,9 +9,10 @@
  * by-construction parity. `node:sqlite` FTS5 stays a deferred fs-side SCALE
  * optimization — at single-user scale a full in-app pass is microseconds.
  *
- * `bm25Score` = Okapi BM25 (k1, b) over tokenized content, multiplied by each
- * record's `effectiveScore` (decay + importance) so recency/importance shape
- * the ranking. `linearScanScore` is the OLD crude term-overlap, kept as the
+ * `bm25Score` = Okapi BM25 (k1, b) over tokenized content, MODULATED by a
+ * damped `effectiveScore` (`0.5 + 0.5 * effectiveScore`) so recency/importance
+ * shape the ranking without overriding a >2× relevance gap. `linearScanScore`
+ * is the OLD crude term-overlap, kept as the
  * explicit linear-floor BASELINE. Both take records the CALLER has already
  * filtered to active + origin-matching — origin isolation is enforced upstream
  * (records.ts / capabilities.ts), never bypassed here.
@@ -39,11 +40,22 @@ const STOPWORDS = new Set([
 	"which", "who", "will", "with", "you", "your",
 ]);
 
-/** Lowercase alphanumeric tokens (shared by docs + queries), minus stopwords. */
+/**
+ * Lowercase Unicode word tokens (shared by docs + queries), minus stopwords.
+ * Splits on any run of non-word characters via the Unicode letter/number
+ * classes (`\p{L}\p{N}`) rather than an ASCII-only `[a-z0-9]` class, so
+ * non-Latin scripts (CJK, Cyrillic, Greek, Arabic, Hebrew, …) tokenize instead
+ * of being silently discarded — an ASCII-only delimiter class made non-Latin
+ * facts unrecallable (empty token list → no BM25 match). The stopword set stays
+ * intentionally ASCII-only (non-Latin tokens simply aren't members). Note: a
+ * space-less script (e.g. CJK) yields one whole-run token, so it matches by
+ * exact phrase rather than per-word — partial-substring matching would need a
+ * dedicated n-gram path.
+ */
 export function tokenize(text: string): string[] {
 	return text
 		.toLowerCase()
-		.split(/[^a-z0-9]+/)
+		.split(/[^\p{L}\p{N}]+/u)
 		.filter((t) => t.length > 0 && !STOPWORDS.has(t));
 }
 

@@ -61,7 +61,7 @@ describe("createDefaultMemoryCapability", () => {
 		const hit = hits[0]!;
 		assert.match(hit.content, /spaces over tabs/);
 		assert.equal(hit.source, "memory", "fact hits surface as source=memory");
-		assert.equal(typeof hit.id, "string");
+		assert.match(hit.id, /^mem_/, "fact id should follow FactStore mem_<base36>_<rand> format");
 		assert.ok(hit.score > 0, "score should be positive");
 	});
 

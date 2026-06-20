@@ -83,13 +83,17 @@ describe("convex hybrid lane — embed-on-write + searchHybrid", () => {
 			captured.every((c) => (c.record.createdBy as { kind?: string } | undefined)?.kind === "owner"),
 			"each marshalled payload carries the owner origin (isolation survives marshalling)",
 		);
-		assert.ok(captured.every((c) => typeof c.record.segment === "string"), "segment marshalled");
+		assert.deepEqual(
+			captured.map((c) => c.record.segment),
+			["identity", "preference", "preference"],
+			"segment marshalled with the exact segment values from the write calls",
+		);
 
 		// A content-token query ranks the coffee fact via BM25 (a bag-of-words
 		// embedder does NOT beat BM25 on synonymy — that needs a learned model). This
 		// asserts the live recall MECHANISM + origin isolation, not vector magic.
 		const hyb = store.searchHybrid("black coffee", { origin: owner, markAccessed: false });
-		assert.match(hyb[0]?.content ?? "", /coffee/, "hybrid ranks the coffee fact first");
+		assert.equal(hyb[0]?.content, "I drink black coffee with no sugar", "hybrid ranks the coffee fact first with its exact content");
 
 		const peer = store.searchHybrid("black coffee", {
 			origin: { kind: "channel", channelId: "wa", conversationId: "c1", sessionKey: "s1" },
@@ -107,6 +111,6 @@ describe("convex hybrid lane — embed-on-write + searchHybrid", () => {
 			"fs mode ALSO embeds (both-modes hybrid → identical recall fs ↔ convex)",
 		);
 		const hyb = store.searchHybrid("Hyderabad", { origin: owner, markAccessed: false });
-		assert.match(hyb[0]?.content ?? "", /Hyderabad/, "fs hybrid ranks the matching fact");
+		assert.equal(hyb[0]?.content, "I reside in Hyderabad, India", "fs hybrid ranks the matching fact with its exact content");
 	});
 });

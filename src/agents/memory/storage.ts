@@ -8,11 +8,12 @@
  * injected into the prompt) plus the daily notes under
  * `memory/YYYY-MM-DD.md`.
  *
- * Writing is NOT part of this interface. The agent appends durable facts
- * to `memory/<today>.md` using its ordinary `write` / `edit` tool — Pi's
- * session cwd is the workspace dir, so `write({path: "memory/2026-05-21.md"})`
- * lands in the right place. There is no dedicated low-level write tool;
- * memory writes go through the normal file tool.
+ * Writing is NOT part of this interface. Durable structured facts are
+ * persisted via the `write_memory` tool (see `memory-tools.ts`), which
+ * routes through `FactStore` / `MemoryCapability`. The agent may also
+ * append free-form notes directly to `memory/<today>.md` using its
+ * ordinary `write` / `edit` tool — Pi's session cwd is the workspace dir,
+ * so `write({path: "memory/2026-05-21.md"})` lands in the right place.
  *
  * Phase 2 implements `BrigadeStorage` over a database. Because the contract
  * is just these three methods, the memory tools (`recall_memory`,

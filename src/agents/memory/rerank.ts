@@ -23,9 +23,6 @@ export type Reranker = (query: string, candidates: readonly RerankHit[]) => Rera
 export const identityReranker: Reranker = (_query, candidates) => [...candidates];
 
 let _reranker: Reranker = identityReranker;
-export function getReranker(): Reranker {
-	return _reranker;
-}
 /** Plug a model-backed reranker (cross-encoder / LLM-judge) into the seam. */
 export function setReranker(r: Reranker): void {
 	_reranker = r;

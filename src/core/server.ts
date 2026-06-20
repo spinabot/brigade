@@ -63,6 +63,7 @@ import {
 import { applyAutoEnableA2AAtBoot } from "../agents/a2a-policy-canonicalize.js";
 import { runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop.js";
 import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
+import { setActiveRegistry } from "../agents/extensions/active-registry.js";
 import type { GatewayCaller, GatewayMethodHandler, HttpRoute, Service } from "../agents/extensions/index.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
 import { extractFrameTags, shouldDeliverFrame } from "./ws-subscription-filter.js";
@@ -79,7 +80,6 @@ import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { listOpenRouterModels } from "../integrations/provider-discovery.js";
-import { switchModelMidTurn as piSwitchModelMidTurn } from "../agents/mid-turn-switch.js";
 import { onAgentEvent } from "../agents/agent-event-bus.js";
 import {
 	InMemoryApprovalBridge,
@@ -186,10 +186,25 @@ import {
 import { defaultSessionKey, readSessionStore } from "../sessions/session-store.js";
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
 import { resolveSessionTranscriptPath } from "../config/paths.js";
-import { makeExtractionLlm, runExtractionSweep } from "../agents/memory/extract.js";
+import {
+	flattenConversation,
+	makeExtractionLlm,
+	runExtractionSweep,
+	setPreCompactionExtractionHook,
+} from "../agents/memory/extract.js";
+import { makeSkillReviewer, runSkillReview, shouldReviewSkills } from "../agents/skills/skill-review.js";
+import { detectAndRecordSkillUses, runSkillCurator } from "../agents/skills/skill-curator.js";
+import { makeSkillConsolidationLlm, runSkillConsolidation } from "../agents/skills/skill-consolidate.js";
+import { getDefaultEmbedder, setDefaultEmbedder } from "../agents/memory/embedder.js";
+import { resolveEmbedder } from "../agents/memory/embedder-providers.js";
+import { reembedPending } from "../agents/memory/reembed.js";
+import { makeBehaviorReviewer, runBehaviorReview, shouldReviewBehavior } from "../agents/memory/behavior-review.js";
 import { resolveAutoRecallOrigin } from "../agents/memory/auto-recall.js";
 import { runCurator } from "../agents/memory/curator.js";
 import { runDecayGc } from "../agents/memory/decay.js";
+import { runMemoryMaintenance } from "../agents/memory/maintenance.js";
+import { exportMemoryGraph } from "../agents/memory/graph-export.js";
+import { queryMemory } from "../agents/memory/query.js";
 import { FactStore, type MemoryRecordOrigin, type MemorySourceType } from "../agents/memory/records.js";
 import {
 	makeConsolidationLlm,
@@ -231,6 +246,7 @@ function persistDefaultModel(cfg: Config, provider: string, modelId: string): Co
 import { type ConsoleStream } from "./console-stream.js";
 import { attachEventLogger, getTodayLogPath } from "./event-logger.js";
 import { pickInitialThinkingLevel, readPersistedThinkingLevel, remapThinkingLevel } from "./model-caps.js";
+import { Carrow } from "../agents/carrow.js";
 import { getBuildInfo } from "../version.js";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { extractIdentityName, isIdentityNameUnset } from "./system-prompt.js";
@@ -911,6 +927,34 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// debounce) doesn't re-arm timers or run sweeps against a torn-down server.
 	let serverStopped = false;
 
+	// ── Recall embedder selection ── Default = the model-free HRR (air-gap,
+	// zero-dep — unchanged). Opt into a LEARNED embedder for true-synonymy recall
+	// via BRIGADE_MEMORY_EMBEDDER = "auto" | "local-embeddinggemma" | "openai-256"
+	// (local model preferred, then remote, graceful-degrade to HRR). Fire-and-
+	// forget: recall uses HRR until a learned model finishes loading
+	// (a local GGUF can take seconds), then switches the process default in place;
+	// the sweep's re-embed pass backfills vectors for facts written meanwhile.
+	const embedderSelection = process.env.BRIGADE_MEMORY_EMBEDDER ?? "model-free";
+	void resolveEmbedder(embedderSelection)
+		.then((e) => {
+			setDefaultEmbedder(e);
+			const memLog = createSubsystemLogger("memory");
+			// VISIBLE degradation: a requested LEARNED embedder that fell back to the
+			// model-free HRR (missing key / model / optional dep) would otherwise drop
+			// recall to BM25-primary SILENTLY. Warn so the operator knows synonymy
+			// recovery is off; otherwise confirm which embedder is live.
+			if (embedderSelection !== "model-free" && e.id.startsWith("hrr")) {
+				memLog.warn(
+					`memory embedder "${embedderSelection}" unavailable (missing key / model / optional dep) — ` +
+						`degraded to model-free HRR. Recall stays BM25-primary; true-synonymy recovery is OFF ` +
+						`until a learned embedder loads.`,
+				);
+			} else {
+				memLog.info(`memory embedder ready: ${e.id} (${e.dims}-dim)`);
+			}
+		})
+		.catch(() => {});
+
 	// ── Background memory extraction (off the hot path) ──
 	// After a turn settles we DEBOUNCE a batched sweep: during quiet time it
 	// distills the NEW transcript turns into structured facts in ONE extra
@@ -966,12 +1010,208 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	let extractTokenSeq = 0;
 	const extractionStuckBufferMs = 30_000;
 
+	// ── Skill-learning review (the behavior-change half of self-improvement) ──
+	// On a cadence, a tool-less reviewer distils the OWNER's session into reusable
+	// SKILLS (written to the agent's workspace, discovered on its next turn). This
+	// is the half memory can't do: it changes how the agent ACTS, not just what it
+	// knows. OWNER-ONLY by construction — a skill is authority over behavior, so a
+	// channel peer must never author one (that would be behavior injection). The
+	// per-(agent|session) counter fires every BRIGADE_SKILL_REVIEW_INTERVAL drains
+	// (default 6); BRIGADE_DISABLE_SKILL_REVIEW=1 (or interval 0) turns it off.
+	const skillReviewEnabled = process.env.BRIGADE_DISABLE_SKILL_REVIEW !== "1";
+	const skillReviewInterval = (() => {
+		const raw = Number(process.env.BRIGADE_SKILL_REVIEW_INTERVAL);
+		return Number.isFinite(raw) && raw >= 0 ? raw : 6;
+	})();
+	const skillReviewCounter = new Map<string, number>();
+
+	// ── Skill curator (the maintenance half) ── Off-hot-path aging of agent-
+	// created skills so the auto-learned library doesn't bloat: it records which
+	// skills were USED (a SKILL.md read in the transcript) and ages out the rest
+	// (active→stale→archived, reversible). BRIGADE_DISABLE_SKILL_CURATOR=1 turns
+	// it off; the day-cutoffs are tunable for testing.
+	const skillCuratorEnabled = process.env.BRIGADE_DISABLE_SKILL_CURATOR !== "1";
+	const skillStaleDays = (() => {
+		const raw = Number(process.env.BRIGADE_SKILL_STALE_DAYS);
+		return Number.isFinite(raw) && raw >= 0 ? raw : 30;
+	})();
+	const skillArchiveDays = (() => {
+		const raw = Number(process.env.BRIGADE_SKILL_ARCHIVE_DAYS);
+		return Number.isFinite(raw) && raw >= 0 ? raw : 90;
+	})();
+
+	// ── Behavioral review (the self-model half of self-improvement) ── On a cadence,
+	// distil the OWNER's durable preferences/corrections/persona and write them
+	// FIRST-CLASS (owner_message trust). OWNER-only (a peer must never shape the
+	// self-model). The write-gate makes the preference AUTHORITATIVE regardless of
+	// order — an untrusted extraction write can never override/supersede an owner
+	// fact — so the run-before-extraction ordering is incidental, not load-bearing;
+	// extraction still confines preferences→knowledge as defense-in-depth.
+	// BRIGADE_DISABLE_BEHAVIOR_REVIEW=1 off.
+	const behaviorReviewEnabled = process.env.BRIGADE_DISABLE_BEHAVIOR_REVIEW !== "1";
+	const behaviorReviewInterval = (() => {
+		const raw = Number(process.env.BRIGADE_BEHAVIOR_REVIEW_INTERVAL);
+		return Number.isFinite(raw) && raw >= 0 ? raw : 6;
+	})();
+	const behaviorReviewCounter = new Map<string, number>();
+
+	/** One cadence-gated behavioral review for an owner session (no-op otherwise).
+	 *  Writes self-model facts first-class; best-effort, never throws into the sweep. */
+	const maybeReviewBehavior = async (
+		targetAgentId: string,
+		sessionId: string,
+		entry: ExtractEntry,
+		ctx: { workspaceDir: string; agentDir: string; agentAuth: unknown; agentModel: unknown },
+	): Promise<void> => {
+		if (!behaviorReviewEnabled || behaviorReviewInterval <= 0) return;
+		if (entry.origin.kind !== "owner") return; // peers never shape the self-model
+		const key = `${targetAgentId}|${sessionId}`;
+		// Bound the per-session cadence map (see maybeReviewSkills) — FIFO-evict the
+		// oldest when a new key arrives at the cap, so it can't grow unbounded.
+		if (behaviorReviewCounter.size >= 4096 && !behaviorReviewCounter.has(key)) {
+			const oldest = behaviorReviewCounter.keys().next().value;
+			if (oldest !== undefined) behaviorReviewCounter.delete(oldest);
+		}
+		const n = (behaviorReviewCounter.get(key) ?? 0) + 1;
+		if (!shouldReviewBehavior(n, behaviorReviewInterval)) {
+			behaviorReviewCounter.set(key, n);
+			return;
+		}
+		behaviorReviewCounter.set(key, 0);
+		try {
+			const transcript = flattenConversation(entry.messages);
+			if (transcript.trim().length === 0) return;
+			const br = await runBehaviorReview({
+				transcript,
+				reviewer: makeBehaviorReviewer({
+					workspaceDir: ctx.workspaceDir,
+					agentDir: ctx.agentDir,
+					authStorage: ctx.agentAuth,
+					modelRegistry,
+					model: ctx.agentModel,
+				}),
+				store: new FactStore(ctx.workspaceDir),
+				origin: entry.origin,
+			});
+			if (br.written) {
+				opts.consoleStream?.info?.(`behavior review (agent=${targetAgentId}): ${br.summary}`);
+			}
+		} catch (brErr) {
+			opts.consoleStream?.info?.(
+				`behavior review error (agent=${targetAgentId}): ${brErr instanceof Error ? brErr.message : String(brErr)}`,
+			);
+		}
+	};
+
+	/** One cadence-gated skill-review pass for an owner session (no-op otherwise).
+	 *  Best-effort: never throws into the sweep; the isolated LLM is wall-clock-bounded. */
+	const maybeReviewSkills = async (
+		targetAgentId: string,
+		sessionId: string,
+		entry: ExtractEntry,
+		ctx: { workspaceDir: string; agentDir: string; agentAuth: unknown; agentModel: unknown },
+	): Promise<void> => {
+		if (!skillReviewEnabled || skillReviewInterval <= 0) return;
+		// OWNER-only — a channel peer must never author the agent's behavior.
+		if (entry.origin.kind !== "owner") return;
+		const key = `${targetAgentId}|${sessionId}`;
+		// Bound the per-session cadence map on a long-lived gateway (one entry per
+		// owner session, never reclaimed otherwise): FIFO-evict the oldest when a NEW
+		// key arrives at the cap. An evicted session just restarts its cadence count.
+		if (skillReviewCounter.size >= 4096 && !skillReviewCounter.has(key)) {
+			const oldest = skillReviewCounter.keys().next().value;
+			if (oldest !== undefined) skillReviewCounter.delete(oldest);
+		}
+		const n = (skillReviewCounter.get(key) ?? 0) + 1;
+		if (!shouldReviewSkills(n, skillReviewInterval)) {
+			skillReviewCounter.set(key, n);
+			return;
+		}
+		skillReviewCounter.set(key, 0); // reset on fire
+		try {
+			const transcript = flattenConversation(entry.messages);
+			if (transcript.trim().length === 0) return;
+			const sr = await runSkillReview({
+				transcript,
+				reviewer: makeSkillReviewer({
+					workspaceDir: ctx.workspaceDir,
+					agentDir: ctx.agentDir,
+					authStorage: ctx.agentAuth,
+					modelRegistry,
+					model: ctx.agentModel,
+				}),
+				agentId: targetAgentId,
+			});
+			if (sr.created.length) {
+				opts.consoleStream?.info?.(`skill review (agent=${targetAgentId}): ${sr.summary}`);
+			}
+		} catch (skillErr) {
+			opts.consoleStream?.info?.(
+				`skill review error (agent=${targetAgentId}): ${skillErr instanceof Error ? skillErr.message : String(skillErr)}`,
+			);
+		}
+	};
+
 	const armExtractTimer = (): void => {
 		if (serverStopped) return; // never re-arm after shutdown
 		if (extractTimer) clearTimeout(extractTimer);
 		extractTimer = setTimeout(() => void runExtractionNow(), EXTRACT_DEBOUNCE_MS);
 		extractTimer.unref?.();
 	};
+
+	// FINAL DRAIN — fire any pending (debounced) extraction NOW and await it,
+	// bounded, so the last turn's facts land before shutdown instead of being lost
+	// with the unref'd timer. Called by handle.stop() BEFORE `serverStopped` flips
+	// (runExtractionNow no-ops once stopped). Best-effort + time-boxed: a wedged
+	// provider must never hang teardown.
+	const flushPendingExtraction = async (timeoutMs = 5_000): Promise<void> => {
+		if (extractTimer) {
+			clearTimeout(extractTimer);
+			extractTimer = null;
+		}
+		if (pendingExtracts.size === 0) return;
+		await Promise.race([
+			runExtractionNow().catch(() => {}),
+			new Promise<void>((resolve) => {
+				const t = setTimeout(resolve, timeoutMs);
+				t.unref?.();
+			}),
+		]);
+	};
+
+	// PRE-COMPACTION extraction hook (memory-ops) — when the agent loop is about to
+	// compact a session, distil the about-to-be-replaced history FIRST so a fact
+	// living only in those turns isn't lost. Runs the SAME extraction sweep as the
+	// post-turn path, with the turn's origin (isolation-preserving). Guarded against
+	// overlapping an in-flight sweep for the same agent (no cursor race), and a no-op
+	// once the server is stopped or extraction is disabled.
+	setPreCompactionExtractionHook(async ({ agentId, sessionId, messages, origin }) => {
+		if (!memoryExtractEnabled || serverStopped) return;
+		if (extractingAgents.has(agentId)) return; // an in-flight sweep already covers this agent
+		extractingAgents.add(agentId);
+		extractingSince.set(agentId, Date.now());
+		try {
+			const workspaceDir = resolveAgentWorkspaceDir(agentId);
+			const agentDir = resolveAgentDir(agentId);
+			const agentAuth = getAuthStorageForAgent(agentId);
+			const agentModel = getAgentRuntime(agentId).model;
+			const llm = makeExtractionLlm({
+				workspaceDir,
+				agentDir,
+				authStorage: agentAuth,
+				modelRegistry,
+				model: agentModel,
+			});
+			await runExtractionSweep({ workspaceDir, sessionId, messages, llm, origin });
+		} catch (err) {
+			opts.consoleStream?.info?.(
+				`pre-compaction extraction error (agent=${agentId}): ${err instanceof Error ? err.message : String(err)}`,
+			);
+		} finally {
+			extractingAgents.delete(agentId);
+			extractingSince.delete(agentId);
+		}
+	});
 
 	const runExtractionNow = async (): Promise<void> => {
 		if (pendingExtracts.size === 0 || serverStopped) return;
@@ -1045,6 +1285,14 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						model: agentModel,
 					});
 					for (const [sessionId, entry] of sessions) {
+						// Self-model half: distil the owner's durable preferences/corrections
+						// BEFORE extraction (which confines them) — owner-only, cadence-gated.
+						await maybeReviewBehavior(targetAgentId, sessionId, entry, {
+							workspaceDir,
+							agentDir,
+							agentAuth,
+							agentModel,
+						});
 						await runExtractionSweep({
 							workspaceDir,
 							sessionId,
@@ -1053,10 +1301,40 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 							origin: entry.origin,
 							...(entry.sourceType ? { sourceType: entry.sourceType } : {}),
 						});
+						// Record which agent-created skills the model USED this session (a
+						// SKILL.md read) so the curator ages on real use, not just creation.
+						if (skillCuratorEnabled && entry.origin.kind === "owner") {
+							try {
+								detectAndRecordSkillUses(joinPath(workspaceDir, "skills"), entry.messages);
+							} catch {
+								/* best-effort telemetry */
+							}
+						}
+						// Behavior-change half: distil reusable SKILLS from owner sessions
+						// (cadence-gated, owner-only — see maybeReviewSkills).
+						await maybeReviewSkills(targetAgentId, sessionId, entry, {
+							workspaceDir,
+							agentDir,
+							agentAuth,
+							agentModel,
+						});
 					}
 					// Cheap, no-model-call decay GC in the same quiet window for THIS
 					// agent's workspace. Runs once per drain per agent.
 					runDecayGc(workspaceDir);
+					// Re-embed pass: fill vectors that embed-on-write SKIPPED under a
+					// LEARNED (async) embedder. No-op for the sync HRR default (facts are
+					// vectored inline on write). Best-effort + bounded — gives a selected
+					// learned embedder its synonymy recall progressively.
+					if (!getDefaultEmbedder().id.startsWith("hrr")) {
+						try {
+							await reembedPending(new FactStore(workspaceDir), getDefaultEmbedder());
+						} catch (reErr) {
+							opts.consoleStream?.info?.(
+								`reembed error (agent=${targetAgentId}): ${reErr instanceof Error ? reErr.message : String(reErr)}`,
+							);
+						}
+					}
 					// Deterministic memory maintenance (no LLM): PER-ORIGIN confirm of
 					// repeatedly-asserted/corrected beliefs + near-duplicate merge.
 					// Eviction is intentionally left to runDecayGc above (no double-GC),
@@ -1075,6 +1353,27 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 							`memory curator error (agent=${targetAgentId}): ${curErr instanceof Error ? curErr.message : String(curErr)}`,
 						);
 					}
+					// Skill curator (maintenance half) — pure, cheap aging of agent-created
+					// skills (active→stale→archived, reversible). Own try/catch so a hiccup
+					// can't skip the consolidation below.
+					if (skillCuratorEnabled) {
+						try {
+							const sc = runSkillCurator({
+								skillsRoot: joinPath(workspaceDir, "skills"),
+								staleAfterDays: skillStaleDays,
+								archiveAfterDays: skillArchiveDays,
+							});
+							if (sc.archived || sc.markedStale || sc.reactivated) {
+								opts.consoleStream?.info?.(
+									`skill curator (agent=${targetAgentId}): ${sc.markedStale} stale, ${sc.archived} archived, ${sc.reactivated} reactivated`,
+								);
+							}
+						} catch (scErr) {
+							opts.consoleStream?.info?.(
+								`skill curator error (agent=${targetAgentId}): ${scErr instanceof Error ? scErr.message : String(scErr)}`,
+							);
+						}
+					}
 					// Lean semantic consolidation (1 LLM call) per agent — THROTTLED
 					// per-workspace via shouldRunConsolidation's mtime gate, so each
 					// agent's workspace tracks its own consolidation cadence.
@@ -1089,7 +1388,53 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 							modelRegistry,
 							model: agentModel,
 						});
-						await runConsolidation({ workspaceDir, llm: consolidateLlm });
+						try {
+							await runConsolidation({ workspaceDir, llm: consolidateLlm });
+						} catch (mcErr) {
+							// Best-effort: a throw here must NOT skip markConsolidationRun below
+							// (else the throttle never stamps and a full LLM consolidation
+							// re-fires every drain). Its own LLM failure is already swallowed
+							// inside runConsolidation; this catches an fs/store throw.
+							opts.consoleStream?.info?.(
+								`memory consolidation error (agent=${targetAgentId}): ${mcErr instanceof Error ? mcErr.message : String(mcErr)}`,
+							);
+						}
+						// Skill consolidation (umbrella-building) rides the SAME throttle —
+						// merges overlapping auto-learned skills into class-level keepers
+						// (owner workspace; reuses append + archive; reversible). Own
+						// try/catch so a hiccup can't skip the throttle stamp below.
+						if (skillCuratorEnabled) {
+							try {
+								const scResult = await runSkillConsolidation({
+									skillsRoot: joinPath(workspaceDir, "skills"),
+									llm: makeSkillConsolidationLlm({
+										workspaceDir,
+										agentDir,
+										authStorage: agentAuth,
+										modelRegistry,
+										model: agentModel,
+									}),
+								});
+								if (scResult.merged || scResult.pruned) {
+									// Surface the rename-map ("where did my skill go") + that a
+									// rollback snapshot was saved, so a surprising merge is legible
+									// and reversible.
+									const renameMap = scResult.appliedMerges
+										.map((m) => `${m.folded.join("+")}→${m.keeper}`)
+										.join(", ");
+									opts.consoleStream?.info?.(
+										`skill consolidation (agent=${targetAgentId}): ${scResult.merged} merged, ${scResult.pruned} pruned` +
+											(renameMap ? ` [${renameMap}]` : "") +
+											(scResult.appliedPrunes.length ? `; pruned ${scResult.appliedPrunes.join(", ")}` : "") +
+											(scResult.snapshotPath ? " (rollback snapshot saved)" : ""),
+									);
+								}
+							} catch (scErr) {
+								opts.consoleStream?.info?.(
+									`skill consolidation error (agent=${targetAgentId}): ${scErr instanceof Error ? scErr.message : String(scErr)}`,
+								);
+							}
+						}
 						markConsolidationRun(workspaceDir);
 					}
 				} catch (err) {
@@ -1299,7 +1644,26 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// "starting HTTP server..." line.
 	bootLog("starting HTTP server...");
 	const httpServer: HttpServer = createServer();
-	const wss = new WebSocketServer({ server: httpServer });
+	// Inbound frame size cap. Without this the `ws` default is 100 MiB PER
+	// FRAME — every message is fully buffered then `JSON.parse`'d synchronously
+	// on the single event loop (see the `ws.on("message", ...)` handler below),
+	// so one oversized frame blocks the loop that also refreshes the heartbeat
+	// file in the tick timer; a stalled refresh makes the external supervisor
+	// see a wedged gateway and restart it. The per-connection rate limiter
+	// bounds the NUMBER of requests, never their SIZE. `maxPayload` makes `ws`
+	// reject oversized frames at the protocol layer BEFORE they are buffered or
+	// parsed. The cap is sized for the largest legitimate frame (chat history /
+	// media snapshots) and is the concrete value the handshake's
+	// `HelloOk.policy.maxPayload` field is meant to advertise.
+	const MAX_WS_PAYLOAD_BYTES = 32 * 1024 * 1024; // 32 MiB
+	// Per-client send-buffer cap. `broadcast()` below checks `ws.bufferedAmount`
+	// against this before sending so a live-but-slow consumer (answers PINGs, so
+	// the ping reaper never reaps it, but can't drain its receive side) does not
+	// grow gateway memory without bound under a busy turn. This is the concrete
+	// value the handshake's `HelloOk.policy.maxBufferedBytes` field advertises;
+	// at 2× the payload cap a client this far behind is a stuck/slow consumer.
+	const MAX_WS_BUFFERED_BYTES = 64 * 1024 * 1024; // 64 MiB
+	const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_WS_PAYLOAD_BYTES });
 
 	// `WebSocketServer` re-emits errors from the underlying httpServer (and
 	// can emit its own — bad upgrade frame, etc). With NO 'error' listener on
@@ -1383,14 +1747,49 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		const { agentId: frameAgentId, sessionId: frameSessionId } = extractFrameTags(payload);
 		for (const ws of clients) {
 			if (ws.readyState !== ws.OPEN) continue;
+			// Slow-consumer backpressure. A client that keeps answering
+			// protocol-level PINGs (so the ping reaper never reaps it) but
+			// can't drain its receive side accumulates every broadcast in its
+			// send buffer without bound — `broadcast` fires on every Pi event
+			// mid-turn. When the buffered bytes exceed the cap, close the
+			// socket (1008 = policy violation) and drop the client instead of
+			// growing gateway memory. The `close` handler removes it from
+			// `clients` + the subscription maps.
+			if (ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
+				try {
+					ws.close(1008, "slow consumer");
+				} catch {
+					/* best-effort — socket may already be closing */
+				}
+				continue;
+			}
 			const connId = clientConnIds.get(ws);
 			// No connId yet (race between socket open + onConnection assign):
 			// best-effort send (matches old behaviour).
+			//
+			// `ws.send` is wrapped because the `readyState === OPEN` check
+			// above narrows but does not fully eliminate the window — a socket
+			// can transition state between the check and the send. Most
+			// not-OPEN sends surface as an async `'error'` event (handled by
+			// `ws.on("error")`) rather than a synchronous throw, so an escaping
+			// throw is unlikely, but the swallow keeps a hot broadcast path
+			// (Pi events, tick, cron) from ever crashing on one bad socket —
+			// matching the try-wrapped `ws.ping()` in the reaper below.
 			if (!connId) {
-				ws.send(json);
+				try {
+					ws.send(json);
+				} catch {
+					/* best-effort — drop send to a transitioning socket */
+				}
 				continue;
 			}
-			if (connWantsFrame(connId, frameAgentId, frameSessionId)) ws.send(json);
+			if (connWantsFrame(connId, frameAgentId, frameSessionId)) {
+				try {
+					ws.send(json);
+				} catch {
+					/* best-effort — drop send to a transitioning socket */
+				}
+			}
 		}
 	};
 
@@ -2325,8 +2724,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					modelId: p.modelId,
 					model: target,
 					// Preserve the operator's thinking level across the switch (clamp
-					// only if the new model can't honor it) instead of resetting it.
-					thinkingLevel: remapThinkingLevel(getAgentRuntime(targetAgentId).thinkingLevel, target),
+					// only if the new model can't honor it) — re-anchored via Carrow,
+					// the named cross-model continuity API (delegates to model-caps).
+					thinkingLevel: Carrow.reanchorThinking(getAgentRuntime(targetAgentId).thinkingLevel, target),
 				});
 				// Boot agent's set-model also refreshes the snapshot's cached
 				// thinking caps (since the snapshot mirrors the boot agent).
@@ -2430,18 +2830,34 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// when a turn is actually running for the target session. If one
 				// is, perform it on that session; either way, update the
 				// agent's runtime so subsequent turns continue on the new model.
-				const liveSession = liveSessionsByKey.get(targetKey);
-				if (liveSession) {
-					await piSwitchModelMidTurn(liveSession, target, p.replayMessage);
-				}
+				// Re-anchor the operator's thinking level to what the target can honor (Carrow).
+				const reanchoredThinking = Carrow.reanchorThinking(
+					getAgentRuntime(targetAgentId).thinkingLevel,
+					target,
+				);
+				// Set the new model + re-anchored thinking FIRST — so the replay below, a NORMAL
+				// gateway turn (which reads perAgentRuntime), runs on the new model at this level.
 				perAgentRuntime.set(targetAgentId, {
 					provider: p.provider,
 					modelId: p.modelId,
 					model: target,
-					// Preserve the operator's thinking level across the switch (clamp
-					// only if the new model can't honor it) instead of resetting it.
-					thinkingLevel: remapThinkingLevel(getAgentRuntime(targetAgentId).thinkingLevel, target),
+					thinkingLevel: reanchoredThinking,
 				});
+				const liveSession = liveSessionsByKey.get(targetKey);
+				if (liveSession && p.replayMessage) {
+					// MID-TURN: abort the in-flight turn, then REPLAY the user's last message as a
+					// FULL gateway turn — runGatewayTurn gives it TUI event broadcast (attachTurnSession)
+					// AND post-turn extraction, on the new model. The per-session FIFO lane serialises
+					// the replay behind the aborting turn. This replaces the old headless
+					// session.prompt replay, which emitted no TUI events and mined no facts — so the
+					// operator now SEES the handoff reply stream and Tideline extracts from it.
+					await liveSession.abort().catch(() => {});
+					await runGatewayTurn({
+						text: p.replayMessage,
+						sessionKey: targetKey,
+						agentId: targetAgentId,
+					});
+				}
 				if (targetAgentId === agentId) {
 					cachedSupportsThinking = !!target.reasoning;
 					cachedThinkingLevels = deriveThinkingLevels(target);
@@ -2675,6 +3091,34 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			case "get-state": {
 				return buildSnapshot() as ResponseFor[M];
+			}
+			case "memory-graph": {
+				// Memory Graph dashboard data — nodes + typed edges + topic clusters
+				// + stats, for an agent's workspace. Read; default-pass access guard
+				// (declares the decision; denies only a forbidden session target). The
+				// local WS client is the operator. maxNodes caps the viz set.
+				const guardErr = defaultPassSessionGuard(rawParams, "list");
+				if (guardErr) throw guardErr;
+				const p = (params ?? {}) as RequestParams["memory-graph"];
+				const wsDir = resolveAgentWorkspaceDir(p.agentId ?? agentId);
+				const graph = exportMemoryGraph(new FactStore(wsDir).readAll(), { maxNodes: p.maxNodes ?? 250 });
+				return graph as ResponseFor[M];
+			}
+			case "memory-query": {
+				// Operator memory inspection — PASSIVE (no recall/reinforcement, no
+				// mutation); read, default-pass access guard. The local WS client is the
+				// operator, so all origins are shown (labeled) for auditing.
+				const guardErr = defaultPassSessionGuard(rawParams, "list");
+				if (guardErr) throw guardErr;
+				const p = (params ?? {}) as RequestParams["memory-query"];
+				const wsDir = resolveAgentWorkspaceDir(p.agentId ?? agentId);
+				const result = queryMemory(new FactStore(wsDir), {
+					action: p.action,
+					query: p.query,
+					memoryId: p.memoryId,
+					limit: p.limit,
+				});
+				return result as ResponseFor[M];
 			}
 			case "agents.list": {
 				// Wave N5 (bug #9) — emit every agent the gateway has runtime
@@ -3013,6 +3457,61 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		});
 	}, TICK_INTERVAL_MS);
 	tickTimer.unref(); // don't block process exit on timer
+
+	// Idle-gateway memory hygiene. The post-turn quiet window runs decay-GC + curator per
+	// workspace, but ONLY after a turn — so a gateway that sits quiet for days never ages or
+	// consolidates memory. This wall-clock sweep runs the same cheap (no-model) pass for every
+	// configured agent workspace, independent of traffic. Cleared on shutdown; unref'd so it
+	// never blocks process exit. Cadence via BRIGADE_MAINTENANCE_INTERVAL_MS (default 24h).
+	const maintenanceIntervalMs = (() => {
+		const env = Number(process.env.BRIGADE_MAINTENANCE_INTERVAL_MS);
+		return Number.isFinite(env) && env > 0 ? env : 24 * 60 * 60 * 1000;
+	})();
+	const maintenanceTimer = setInterval(() => {
+		// Skip on shutdown, OR when the memory kill-switch (BRIGADE_DISABLE_MEMORY_EXTRACT=1)
+		// froze the fact store — decay/curator are background memory processing, so they must
+		// honor the same freeze the post-turn sweep does (else facts age while "disabled").
+		if (serverStopped || !memoryExtractEnabled) return;
+		void (async () => {
+			try {
+				const cfg = await loadConfig();
+				const ids = new Set<string>([agentId]);
+				const ab = (cfg as { agents?: Record<string, unknown> }).agents;
+				if (ab && typeof ab === "object") {
+					for (const id of Object.keys(ab)) {
+						if (id !== "defaults" && id.trim()) ids.add(id.trim());
+					}
+				}
+				for (const id of ids) {
+					runMemoryMaintenance(
+						resolveAgentWorkspaceDir(id),
+						(stage, err) =>
+							opts.consoleStream?.info?.(
+								`memory maintenance ${stage} error (agent=${id}): ${err instanceof Error ? err.message : String(err)}`,
+							),
+						(pairs) => {
+							// Surface contradictions for human review — never auto-resolve.
+							const top = [...pairs].sort((a, b) => b.score - a.score).slice(0, 3);
+							opts.consoleStream?.info?.(
+								`memory: ${pairs.length} possible contradiction(s) for agent=${id} (review; not auto-resolved): ${top
+									.map((p) => `"${p.a.content.length > 80 ? p.a.content.slice(0, 80) + "…" : p.a.content}" <-> "${p.b.content.length > 80 ? p.b.content.slice(0, 80) + "…" : p.b.content}" (${p.score.toFixed(2)})`)
+									.join("; ")}`,
+							);
+						},
+					);
+					// Yield to the event loop between agents so channel inbounds keep flowing
+					// during a multi-agent sweep — Brigade's org can have ~22 agents; without
+					// this the whole batch runs sync in one tick and starves inbound handling.
+					await new Promise((resolve) => setImmediate(resolve));
+				}
+			} catch (err) {
+				opts.consoleStream?.info?.(
+					`memory maintenance sweep error: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		})();
+	}, maintenanceIntervalMs);
+	maintenanceTimer.unref(); // don't block process exit on timer
 
 	// Server-side dead-client reaper. Pattern (mirrors the `ws` library's
 	// own example): on each cycle, terminate any client that didn't ACK
@@ -4400,6 +4899,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			meta: { agentId, workspaceDir, cwd: workspaceDir, config: cfg as never },
 		});
 		extensionRegistry = registry;
+		// Publish the live registry so deep hot-path callers (e.g. the inbound media
+		// pipeline reaching a TranscriptionProvider) can fetch it without threading it
+		// through every channel adapter's args. Cleared on shutdown.
+		setActiveRegistry(registry);
 
 		// Gateway methods: module-registered RPCs + two built-ins. The `system.`
 		// prefix is reserved for built-ins — a module that uses it would be
@@ -4692,6 +5195,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		port,
 		host,
 		async stop() {
+			// FINAL DRAIN — land the last turn's pending memory extraction before we
+			// freeze background work. The debounce timer is unref'd, so without this a
+			// clean shutdown right after a turn would silently drop that turn's facts.
+			// Bounded inside flushPendingExtraction so it can't hang teardown.
+			try {
+				await flushPendingExtraction();
+			} catch {
+				/* best-effort — never block shutdown on extraction */
+			}
+			setPreCompactionExtractionHook(undefined); // drop the module hook → no stale closure
 			serverStopped = true; // freeze background memory work
 			// Signal the lane engine to reject new enqueues. Channel inbounds
 			// that arrive during shutdown get a clean `GatewayDrainingError`
@@ -4863,6 +5376,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			clearInterval(tickTimer);
 			clearInterval(pingTimer);
+			clearInterval(maintenanceTimer);
 			if (extractTimer) clearTimeout(extractTimer);
 			pendingExtracts.clear();
 			// Detach the approval bridge so a late-arriving exec-gate call
@@ -4878,6 +5392,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				/* best-effort; service may already be down */
 			}
 			setActiveCronService(null);
+			setActiveRegistry(undefined);
 			// Stop all product capabilities (channels + services) first so no new
 			// inbound turn is enqueued during teardown. Routed through the lifecycle
 			// queue so it can't race an in-flight `system.reload`.

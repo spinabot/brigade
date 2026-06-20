@@ -440,8 +440,19 @@ async function syncWorkspaceMirrors(
 							}
 						}
 					}
+					// Skills the curator/consolidation ARCHIVED were moved aside to the
+					// sibling `skills-archive/` dir (reversible, intentional). They are
+					// gone from the live dir on purpose — never restore them, and reap the
+					// stale table row so they can't resurrect on a later boot (same guard
+					// shape as the consumed-BOOTSTRAP reap above). Without this, every
+					// auto-aged/merged/pruned skill comes back on the next gateway restart.
+					const archiveDir = path.join(path.dirname(skillsDir), "skills-archive");
 					for (const [name, record] of convexByName) {
 						if (diskNames.has(name)) continue;
+						if (existsSync(path.join(archiveDir, name, "SKILL.md"))) {
+							await store.skills.remove({ scope: "workspace", agentId, name } as never);
+							continue;
+						}
 						const skillFile = path.join(skillsDir, name, "SKILL.md");
 						await fsp.mkdir(path.dirname(skillFile), { recursive: true });
 						await fsp.writeFile(

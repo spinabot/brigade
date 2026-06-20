@@ -82,6 +82,38 @@ function rrf(rank: number, k: number): number {
  * (non-superseded) candidate set. Returns top-k fused results; when the
  * route-gate declines, returns the pure hybrid ranking (single-fact flat).
  */
+/**
+ * ASYNC graph recall — pre-embeds the query (so a LEARNED async embedder works),
+ * wraps it in a sync embedder, then runs the UNCHANGED sync {@link recallWithGraph}
+ * (whose internal `recallHybrid` then uses the pre-embedded query). The pre-embed
+ * trick (same as `recallHybridAsync`) keeps the graph walk sync — no refactor.
+ * With the sync HRR default, awaiting a sync embed is a no-op → identical result;
+ * with a learned embedder this is what delivers true-synonymy graph recall on the
+ * live auto-recall path.
+ */
+export async function recallWithGraphAsync(
+	active: readonly MemoryRecord[],
+	query: string,
+	opts: GraphRecallOpts = {},
+	now: number = Date.now(),
+	embedder: Embedder = getDefaultEmbedder(),
+): Promise<GraphRecallResult[]> {
+	const qv = (await embedder.embed([query]))[0] ?? [];
+	// Carry the embedder's optional recovery-lane floor onto the sync shim so the
+	// wrapper stays transparent: recallHybrid resolves `minSim` as
+	// `opts.minSim ?? embedder.minSim ?? 0.3`, so dropping it here would silently
+	// fall back to 0.3 for any learned embedder that sets its own floor — a
+	// different vector-recovery lane than the sync path on the same query. With the
+	// sync HRR default (no minSim) this spread is a literal no-op → identical result.
+	const preEmbedded: Embedder = {
+		id: embedder.id,
+		dims: embedder.dims,
+		...(embedder.minSim !== undefined ? { minSim: embedder.minSim } : {}),
+		embed: () => [qv],
+	};
+	return recallWithGraph(active, query, opts, now, preEmbedded);
+}
+
 export function recallWithGraph(
 	active: readonly MemoryRecord[],
 	query: string,

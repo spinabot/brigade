@@ -386,6 +386,7 @@ export function makeReadMemoryTool(
 		name: "read_memory",
 		label: "read memory",
 		displaySummary: "reading memory",
+		ownerOnly: true,
 		description:
 			"Read a bounded excerpt of a memory file (MEMORY.md or a memory/<name>.md daily " +
 			"note). Use after recall_memory to pull the full context around a snippet. " +

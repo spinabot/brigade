@@ -33,11 +33,13 @@ describe("cosine", () => {
 		const b = [0, 1, 0];
 		assert.equal(cosine(a, b), 0);
 		assert.equal(cosine(a, a), 1);
-		// A general unit vector: cosine equals the raw dot product.
+		// A general unit vector: cosine equals the raw dot product exactly.
+		// u and v are genuine unit vectors (0.6²+0.8²=1) so the division is by 1.0
+		// and IEEE 754 preserves the exact value 0.96 — no tolerance needed.
 		const u = [0.6, 0.8];
 		const v = [0.8, 0.6];
 		const dot = u[0]! * v[0]! + u[1]! * v[1]!;
-		assert.ok(Math.abs(cosine(u, v) - dot) < 1e-12);
+		assert.equal(cosine(u, v), dot);
 	});
 });
 
@@ -56,15 +58,30 @@ describe("HrrEmbedder", () => {
 		assert.ok(empty);
 		const norm = Math.sqrt(empty.reduce((s, x) => s + x * x, 0));
 		assert.ok(Math.abs(norm - 1) < 1e-9);
-		// SENTINEL SENSITIVITY: this assertion FAILS if the `__hrr_empty__` sentinel
+		// SENTINEL SENSITIVITY: these assertions FAIL if the `__hrr_empty__` sentinel
 		// push is removed. Without it, feats=[] ⇒ every phase = atan2(0,0) = 0 ⇒
 		// vec[2i+1] = sin(0) = 0 for ALL i (a degenerate [1,0,1,0,…] vector that is
 		// STILL a unit vector — so the norm check above can't catch the regression).
-		// The sentinel hashes to real phases, so some sin (odd-index) component is ≠0.
+		// The sentinel hashes to real phases → ALL 128 sin (odd-index) components
+		// are non-zero (verified empirically; the embedder is deterministic).
 		const sinComponents = empty.filter((_, i) => i % 2 === 1);
-		assert.ok(
-			sinComponents.some((x) => Math.abs(x) > 1e-9),
-			"the empty sentinel yields real phases (non-degenerate) — a sin component is non-zero",
+		assert.equal(
+			sinComponents.length,
+			128,
+			"expected 128 sin components (one per phase)",
+		);
+		assert.equal(
+			sinComponents.filter((x) => Math.abs(x) > 1e-9).length,
+			128,
+			"the empty sentinel yields real phases — ALL 128 sin components must be non-zero",
+		);
+		// Pin the exact value of the first sin component (index 1) so that a change
+		// to the sentinel string, the phase-atom algorithm, or the SHA-256 round
+		// schedule would be caught — not just a degenerate-zero regression.
+		assert.equal(
+			empty[1],
+			0.03892841099936575,
+			"empty sentinel: exact first sin component (index 1) must match the known deterministic value",
 		);
 	});
 

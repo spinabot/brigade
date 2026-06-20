@@ -69,7 +69,7 @@ describe("real-data gold export — privacy-safe local pipeline", () => {
 		// default (every fact gets a candidate case), so it never silently truncates.
 		assert.equal(exportGoldScaffold(store, { maxCases: -1 }).cases.length, 3, "negative maxCases falls through to default");
 		const empty = new FactStore(path.join(dir, "empty"));
-		assert.deepEqual(exportGoldScaffold(empty), { facts: [], cases: [] });
+		assert.deepEqual(exportGoldScaffold(empty), { approved: false, facts: [], cases: [] });
 	});
 
 	it("emits a visible TODO when auto-extraction yields no terms (all stopwords)", () => {
@@ -111,7 +111,12 @@ describe("real-data gold export — privacy-safe local pipeline", () => {
 		const store = new FactStore(dir);
 		seedRealish(store);
 		const localPath = path.join(dir, "gold.local.json");
-		writeLocalGoldSpec(localPath, exportGoldScaffold(store));
+		// Operator review step: a scaffold is approved:false; here the auto-queries are
+		// already real terms, so "approval" is just flipping the flag. loadGoldSpec
+		// REFUSES it until then (see the APPROVAL GATE tests below).
+		const scaffold = exportGoldScaffold(store);
+		scaffold.approved = true;
+		writeLocalGoldSpec(localPath, scaffold);
 
 		// Reload (the loader gold.ts already shipped) and seed a FRESH store —
 		// the real store is never mutated by measurement.
@@ -137,5 +142,29 @@ describe("real-data gold export — privacy-safe local pipeline", () => {
 		assert.equal(result.nScored, 3, "all three gold cases scored (load-bearing — no silent drop)");
 		assert.equal(result.n, 3, "all three cases present");
 		assert.equal(result.recallAtK, 1, "every trivial self-token query recalls its fact at rank ≤ k");
+	});
+
+	it("APPROVAL GATE: loadGoldSpec refuses an un-approved scaffold (anti-inflation)", () => {
+		const store = new FactStore(dir);
+		seedRealish(store);
+		const localPath = path.join(dir, "gold.local.json");
+		// The raw scaffold is approved:false — its queries self-match their own facts.
+		writeLocalGoldSpec(localPath, exportGoldScaffold(store));
+		assert.throws(() => loadGoldSpec(localPath), /un-approved scaffold/, "un-reviewed scaffold must not be scorable");
+		// After the operator reviews + sets approved:true, it loads.
+		const approved = exportGoldScaffold(store);
+		approved.approved = true;
+		writeLocalGoldSpec(localPath, approved);
+		assert.equal(loadGoldSpec(localPath).facts.length, 3, "an approved spec loads");
+	});
+
+	it("APPROVAL GATE: loadGoldSpec refuses a spec that still carries a rewrite placeholder", () => {
+		const store = new FactStore(path.join(dir, "ph"));
+		store.write({ content: "I do it", segment: "preference" }); // all stopwords ⇒ placeholder query
+		const localPath = path.join(dir, "gold.local.json");
+		const spec = exportGoldScaffold(store);
+		spec.approved = true; // even approved, a left-in placeholder is an un-reviewed case
+		writeLocalGoldSpec(localPath, spec);
+		assert.throws(() => loadGoldSpec(localPath), /placeholder/, "a left-in placeholder blocks scoring");
 	});
 });

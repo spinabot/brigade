@@ -205,15 +205,13 @@ describe("assembleBrigadeToolset — senderIsOwner gating", () => {
 	});
 
 	it("senderIsOwner: false wraps any ownerOnly tool so it refuses execute", async () => {
-		// The bundled memory tools aren't ownerOnly today, so this test
-		// asserts the wrapper is APPLIED (rather than test-driving an
-		// existing ownerOnly tool) — we directly call wrapOwnerOnlyToolExecution
-		// on a synthesised ownerOnly tool and confirm the assemble path's
-		// per-tool wrap reaches the same outcome. The contract is that
-		// assembleBrigadeToolset's tool list contains wrapped tools when
-		// senderIsOwner=false. Today no bundled tool is ownerOnly so the
-		// observable surface is unchanged; the wiring is still in place
-		// (verified by the wrapper unit tests above).
+		// `manage_memory` and `read_memory` are ownerOnly. This test confirms
+		// the wrapper is APPLIED (via wrapOwnerOnlyToolExecution) so that a
+		// non-owner call is refused with BrigadeToolAuthorizationError. The
+		// contract is that assembleBrigadeToolset's tool list contains wrapped
+		// tools when senderIsOwner=false. The wiring is verified by the
+		// wrapper unit tests above; this test asserts the full-surface shape
+		// (tool count + names) is stable regardless of wrapping.
 		const ts = assembleBrigadeToolset({
 			workspaceDir: workspace,
 			agentId: "main",

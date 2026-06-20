@@ -1,15 +1,16 @@
 /**
- * Content-quality retry — detects "model said it would act but didn't" /
- * "model returned reasoning but no visible reply" / "model returned empty"
- * after a turn settles, then re-prompts ONCE with a tailored steering
- * message.
+ * Content-quality retry — after a turn settles, detects low-quality output and
+ * re-prompts with a tailored steer. Two tiers (see `runWithContentQualityRetry`):
+ *   - RECOVERY ("said it would act but didn't" / "reasoning but no visible reply" /
+ *     "empty") → exactly ONE re-prompt (one retry recovers the common cases; looping
+ *     a pathological empty turn would just burn budget).
+ *   - QUALITY GATE (slop) → keeps forcing a rewrite until the reply clears the slop
+ *     bar or a cap (default 3), so a sloppy reply can't ship after a single nudge.
  *
- * Why one-shot: this wrapper composes with model-fallback + retry-policy
- * + stream-wrappers. Without a hard cap, a pathological turn could chain
- * 4-6 prompts. One retry is enough to recover the common cases (most
- * smaller models follow the steer on the second attempt).
+ * The slop cap bounds the compounded budget across the other retry layers
+ * (model-fallback + retry-policy + stream-wrappers).
  *
- * Three failure modes:
+ * Failure modes:
  *   - **empty** — no content blocks at all
  *   - **reasoning-only** — thinking blocks present but no visible text
  *     OR tool call (the user sees a blank reply)
@@ -110,10 +111,10 @@ export function detectContentIssue(
 		if (PLANNING_PHRASES.some((re) => re.test(totalText))) return "planning-only";
 	}
 
-	// Slop (Step 31's post-generation gate) — LOWEST priority, only on a visible
-	// text reply that isn't otherwise broken. The detector's density threshold
-	// keeps this rare (it takes several distinct filler/cliché hits to trip), and
-	// the one-shot cap below means at most one rewrite re-prompt.
+	// Slop (the post-generation quality gate) — LOWEST priority, only on a visible
+	// text reply that isn't otherwise broken. The detector's density threshold keeps
+	// this rare (it takes several distinct filler/cliché hits to trip); the wrapper
+	// then re-drives a rewrite until the reply clears the bar or the cap.
 	if (totalText.length > 0 && detectSlop(totalText).isSlop) return "slop";
 
 	return null;
@@ -122,19 +123,30 @@ export function detectContentIssue(
 export interface ContentQualityRetryOptions {
 	/** Called when a retry is triggered, with the detected reason. */
 	onRetry?: (reason: NonNullable<ContentQualityIssue>) => void;
+	/** Max rewrite re-prompts for the QUALITY (slop) gate. The gate keeps forcing a
+	 *  rewrite until the reply clears the slop bar OR this cap is hit — then it ships the
+	 *  last attempt (a response must go out eventually). Default 3. The RECOVERY issues
+	 *  (empty / reasoning-only / planning-only) always get exactly ONE re-prompt,
+	 *  regardless of this value — looping those is pathological, not a quality bar. */
+	maxSlopRewrites?: number;
 }
 
 /**
- * Run a prompt body. After it resolves, inspect the final assistant
- * message for low-quality content. If detected, queue a steering
- * message and re-run ONCE.
+ * Run a prompt body. After it resolves, inspect the final assistant message for
+ * low-quality content; if detected, re-prompt with a tailored steer.
  *
- * Hardcoded cap of one retry — by control flow, not configuration.
- * Composes with other retry layers (model-fallback, retry-policy,
- * thinking-fallback) without compounding the budget.
+ * Two tiers:
+ *   - RECOVERY (empty / reasoning-only / planning-only) → exactly ONE re-prompt.
+ *     One retry recovers the common cases; looping a pathological empty turn would
+ *     just burn budget.
+ *   - QUALITY GATE (slop) → keeps forcing a rewrite until the reply clears the slop
+ *     bar or `maxSlopRewrites` (default 3) is hit. This is the "no slop ships" gate:
+ *     a single sloppy reply can't slip through after one nudge — it's re-driven until
+ *     clean (or, at the cap, the last attempt ships, since a response must go out).
  *
- * The retry is a fresh `session.prompt()` with the steer text — NOT a
- * provider-specific prefill. More tokens, but provider-portable in v1.
+ * Composes with the other retry layers (model-fallback, retry-policy, thinking-
+ * fallback) — the slop cap bounds the compounded budget. Each retry is a fresh
+ * `session.prompt()` with the steer text (provider-portable, not a prefill).
  */
 export async function runWithContentQualityRetry(
 	session: AgentSession,
@@ -143,27 +155,36 @@ export async function runWithContentQualityRetry(
 ): Promise<void> {
 	await body();
 
-	// Snapshot session state immediately so async subscribers can't mutate
-	// what we're inspecting. Race window without the snapshot: between
-	// body() resolving and detectContentIssue() running, another event
-	// listener (extension hook, telemetry handler) could append a
-	// message — making "last assistant" be something other than what
-	// body() actually produced.
-	const snapshot = [...session.messages];
-	const tools = (session.agent.state as { tools?: unknown }).tools;
-	const hadTools = Array.isArray(tools) && tools.length > 0;
+	// Inspect the LAST assistant message off a fresh snapshot each call — async
+	// subscribers (extension hooks, telemetry) could append between a prompt
+	// resolving and our inspection, so "last assistant" must be re-read, not cached.
+	const inspectLast = (): ContentQualityIssue => {
+		const snapshot = [...session.messages];
+		const tools = (session.agent.state as { tools?: unknown }).tools;
+		const hadTools = Array.isArray(tools) && tools.length > 0;
+		const lastAssistant = [...snapshot].reverse().find((m: { role?: string }) => m.role === "assistant");
+		return detectContentIssue(lastAssistant, hadTools);
+	};
 
-	const lastAssistant = [...snapshot]
-		.reverse()
-		.find((m: { role?: string }) => m.role === "assistant");
-	const issue = detectContentIssue(lastAssistant, hadTools);
+	const issue = inspectLast();
 	if (!issue) return;
 
-	options.onRetry?.(issue);
+	// RECOVERY issues — a single steer re-prompt (Pi's `agent.steer` is for mid-turn
+	// injection; this fires AFTER the turn, so we re-prompt directly).
+	if (issue !== "slop") {
+		options.onRetry?.(issue);
+		await session.prompt(STEER_FOR[issue]);
+		return;
+	}
 
-	// Queue the steer message as a normal user prompt — we re-prompt
-	// directly here (Pi's `agent.steer` is for mid-turn injection; this
-	// fires AFTER the turn ended). The steer text addresses the specific
-	// failure mode.
-	await session.prompt(STEER_FOR[issue]);
+	// QUALITY GATE (slop) — force a rewrite, re-check, and keep going until the reply
+	// clears the bar or the cap. "No slop ships" within budget.
+	const maxRewrites = Math.max(1, options.maxSlopRewrites ?? 3);
+	for (let attempt = 0; attempt < maxRewrites; attempt++) {
+		options.onRetry?.("slop");
+		await session.prompt(STEER_FOR.slop);
+		if (inspectLast() !== "slop") return; // cleared the bar — ship it
+	}
+	// Hit the cap with the reply still flagged — ship the last attempt (a response
+	// must go out eventually; the gate forced `maxRewrites` rewrites trying to clear it).
 }

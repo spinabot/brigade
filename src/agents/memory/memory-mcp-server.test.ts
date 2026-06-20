@@ -38,10 +38,13 @@ describe("memory-mcp-server dispatch", () => {
 	});
 
 	it("tools/list returns the three memory tools with schemas", () => {
-		const res = server().handle(req(2, "tools/list"));
-		const tools = (res?.result as { tools: Array<{ name: string; inputSchema: unknown }> }).tools;
+		const s = server();
+		assert.equal(s.toolCount, 3);
+		const res = s.handle(req(2, "tools/list"));
+		const tools = (res?.result as { tools: Array<{ name: string; inputSchema: { type: string } }> }).tools;
+		assert.equal(tools.length, 3);
 		assert.deepEqual(tools.map((t) => t.name).sort(), ["memory_add", "memory_context", "memory_search"]);
-		assert.ok(tools.every((t) => t.inputSchema));
+		assert.ok(tools.every((t) => t.inputSchema.type === "object"));
 	});
 
 	it("tools/call drives add → search round-trip", () => {

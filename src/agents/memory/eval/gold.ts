@@ -9,9 +9,11 @@
  * each case's `relevantKeys` into the `relevantIds` the harness compares
  * against. EMPTY `relevantKeys` ⇒ an abstention case.
  *
- * Two sources, per the plan: the SYNTHETIC hard cases here (self-contained,
- * runnable today) and — exported + decrypted + human-approved — the
- * operator's REAL Convex facts (`loadGoldSpec` reads that JSON; built jointly).
+ * Two sources, per the plan: the SYNTHETIC hard cases in the sibling
+ * gold-synthetic / gold-hard / gold-rich files (self-contained, runnable
+ * today) and — exported + decrypted + human-approved — the operator's REAL
+ * Convex facts (`loadGoldSpec` reads that JSON; built jointly). This file is
+ * infrastructure only: types, `seedGold`, `loadGoldSpec`, and `GOLD_CATEGORIES`.
  */
 
 import * as fs from "node:fs";
@@ -57,7 +59,20 @@ export interface GoldCase {
 export interface GoldSpec {
 	facts: GoldFact[];
 	cases: GoldCase[];
+	/** Real-data path ONLY (`loadGoldSpec`): an exported scaffold is `false`; the
+	 *  operator MUST review + rewrite the trivial auto-queries into real paraphrases
+	 *  and flip this to `true` before it can be scored. `loadGoldSpec` REFUSES a spec
+	 *  that isn't explicitly `true` (an un-reviewed scaffold self-matches ⇒ inflated
+	 *  recall). Committed hand-authored sets bypass `loadGoldSpec`, so they ignore it. */
+	approved?: boolean;
 }
+
+/** The full, deliberately-unique sentinel an export scaffold emits for a query it
+ *  could not auto-derive. `loadGoldSpec` rejects any spec whose queries still
+ *  contain it — a left-in placeholder means the operator hasn't finished the
+ *  human-approval rewrite. (The whole phrase, not the bare "TODO: rewrite" token,
+ *  so a legitimate query mentioning "TODO" or "rewrite" is never falsely rejected.) */
+export const GOLD_REVIEW_PLACEHOLDER = "TODO: rewrite (auto-extraction empty)";
 
 /**
  * Seed `store` with the spec's facts (in order, so supersede targets exist)
@@ -195,5 +210,25 @@ export function loadGoldSpec(jsonPath: string): GoldSpec {
 			throw new Error(`gold spec at ${jsonPath}: cases[${i}] (${c.id}) needs a string category`);
 		}
 	});
+	// APPROVAL GATE — an exported scaffold's queries are lifted straight from its
+	// facts (trivially self-matching ⇒ inflated recall). It is NOT a measurement
+	// until the operator rewrites those queries into real paraphrases and marks the
+	// spec reviewed. Refuse to load anything not explicitly approved, and refuse a
+	// spec that still carries an auto-extraction placeholder (an un-rewritten case).
+	if (raw.approved !== true) {
+		throw new Error(
+			`gold spec at ${jsonPath} is an un-approved scaffold (approved !== true). Its auto-generated ` +
+				`queries self-match their own facts and would inflate recall. Review each case — rewrite the ` +
+				`query into a realistic paraphrase, set the GOLD_CATEGORIES taxonomy label, drop noise/mark ` +
+				`abstentions — then set "approved": true to score it.`,
+		);
+	}
+	const placeheld = raw.cases.find((c) => c.query.includes(GOLD_REVIEW_PLACEHOLDER));
+	if (placeheld) {
+		throw new Error(
+			`gold spec at ${jsonPath}: case "${placeheld.id}" still carries the "${GOLD_REVIEW_PLACEHOLDER}" ` +
+				`placeholder — finish the human-approval rewrite before scoring (a left-in placeholder is an un-reviewed case).`,
+		);
+	}
 	return raw;
 }

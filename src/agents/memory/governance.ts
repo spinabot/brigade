@@ -17,7 +17,7 @@ import { backlinksTo, linksFrom, type MemoryLink, type MemoryLinkKind } from "./
 import { FactStore, recordMatchesOriginFilter, type MemoryRecord, type RecordOriginFilter } from "./records.js";
 
 export interface PurgeResult {
-	/** Every id hard-removed — the seed(s) plus the source_pointers cascade. */
+	/** Every id hard-removed — the seed(s) plus the sourcePointers cascade. */
 	purged: string[];
 }
 
@@ -65,7 +65,7 @@ export function purge(store: FactStore, seedIds: string | readonly string[]): Pu
 
 /**
  * Retention TTL — hard-purge facts whose transaction-time age exceeds `ttlMs`,
- * cascading along source_pointers. Confirmed beliefs are retained by default
+ * cascading along sourcePointers. Confirmed beliefs are retained by default
  * (a confirmed preference shouldn't expire just because it's old).
  */
 export function applyRetention(
@@ -84,7 +84,7 @@ export function applyRetention(
 		inOrigin(r) && now - r.createdAt > opts.ttlMs && !(keepConfirmed && r.status === "confirmed");
 	const expired = all.filter(eligible).map((r) => r.memoryId);
 	if (expired.length === 0) return { purged: [] };
-	// Cascade along source_pointers — but re-apply the SAME eligibility to every cascade
+	// Cascade along sourcePointers — but re-apply the SAME eligibility to every cascade
 	// member, NOT just origin. Otherwise a same-origin fact that merely CITES an expired
 	// seed is hard-purged even when it is itself CONFIRMED or WITHIN the TTL, silently
 	// breaking the keepConfirmed guarantee and the age contract (a brand-new fact that

@@ -48,7 +48,11 @@ function hash32(s: string, salt: number): number {
  *  features the hashing embedder buckets — n-grams give the morphological signal
  *  BM25 lacks. */
 function features(text: string): string[] {
-	const toks = text.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 0);
+	// Unicode-aware split (lockstep with scoring.ts tokenize) so non-Latin scripts
+	// (CJK / Cyrillic / Greek / Arabic / Hebrew) produce real feature tokens instead
+	// of collapsing to the empty-vector sentinel — keeps the vector lane consistent
+	// with the lexical lane. ASCII text tokenizes identically (zero change for Latin).
+	const toks = text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length > 0);
 	const out: string[] = [];
 	for (const t of toks) {
 		out.push(`w:${t}`); // unigram
@@ -108,6 +112,10 @@ export function cosine(a: readonly number[], b: readonly number[]): number {
 	return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
+/** Max cached phase atoms before FIFO eviction — bounds the singleton embedder's
+ *  memory in a long-running gateway (atoms recompute cheaply + deterministically). */
+const ATOM_CACHE_CAP = 50_000;
+
 /**
  * HRR embedder — Holographic Reduced Representations: SHA-256-seeded phase atoms
  * bundled by superposition; no model, deterministic, offline. The upgrade over
@@ -126,9 +134,6 @@ export function cosine(a: readonly number[], b: readonly number[]): number {
  * learned model (a local embedding model, or a hosted embeddings API), which
  * plugs into this same {@link Embedder} seam (async) when wanted.
  */
-/** Max cached phase atoms before FIFO eviction — bounds the singleton embedder's
- *  memory in a long-running gateway (atoms recompute cheaply + deterministically). */
-const ATOM_CACHE_CAP = 50_000;
 
 export class HrrEmbedder implements Embedder {
 	readonly id: string;

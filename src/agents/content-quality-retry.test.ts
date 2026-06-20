@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { detectContentIssue } from "./content-quality-retry.js";
+import { detectContentIssue, runWithContentQualityRetry } from "./content-quality-retry.js";
 
 describe("detectContentIssue — base cases", () => {
 	it("returns null for non-assistant messages", () => {
@@ -187,5 +187,69 @@ describe("detectContentIssue — slop (Step 31 post-generation gate)", () => {
 	});
 	it("structural issues take priority over slop (empty content stays empty)", () => {
 		assert.equal(detectContentIssue({ role: "assistant", content: [] }, true), "empty");
+	});
+});
+
+describe("runWithContentQualityRetry — slop gate forces rewrites until clean", () => {
+	const txt = (text: string) => ({ role: "assistant" as const, content: [{ type: "text", text }] });
+	const SLOP =
+		"At the end of the day, it's important to note that we need to leverage synergy to unlock value. " +
+		"In today's fast-paced world, let's circle back and move the needle going forward to take it to the next level.";
+	const CLEAN = "Fixed the null check in parseConfig() at line 42; the failing test passes now.";
+
+	// A fake session whose each prompt() pushes the next scripted assistant message
+	// (the LAST entry repeats if prompts outrun the script). The body callback pushes
+	// the initial message itself.
+	function fakeSession(promptOutputs: Array<{ role: string; content: unknown }>) {
+		const messages: Array<{ role: string; content: unknown }> = [];
+		let prompts = 0;
+		const session = {
+			messages,
+			agent: { state: { tools: [] } },
+			prompt: async (_t: string) => {
+				const out = promptOutputs[prompts] ?? promptOutputs[promptOutputs.length - 1];
+				if (out) messages.push(out);
+				prompts++;
+			},
+		} as unknown as Parameters<typeof runWithContentQualityRetry>[0];
+		return { session, messages, getPrompts: () => prompts };
+	}
+
+	it("re-prompts until the reply clears the slop bar, then ships", async () => {
+		// body=slop, rewrite#1 still slop, rewrite#2 clean → stops after 2 prompts.
+		const { session, messages, getPrompts } = fakeSession([txt(SLOP), txt(CLEAN)]);
+		const retries: string[] = [];
+		await runWithContentQualityRetry(
+			session,
+			async () => {
+				messages.push(txt(SLOP));
+			},
+			{ onRetry: (r) => retries.push(r), maxSlopRewrites: 4 },
+		);
+		assert.equal(getPrompts(), 2, "kept forcing a rewrite until the reply was clean");
+		assert.deepEqual(retries, ["slop", "slop"], "each rewrite reported");
+	});
+
+	it("caps the rewrites and ships the last attempt if slop persists", async () => {
+		const { session, messages, getPrompts } = fakeSession([txt(SLOP)]); // every rewrite still slop
+		const retries: string[] = [];
+		await runWithContentQualityRetry(
+			session,
+			async () => {
+				messages.push(txt(SLOP));
+			},
+			{ onRetry: (r) => retries.push(r), maxSlopRewrites: 2 },
+		);
+		assert.equal(getPrompts(), 2, "stopped at maxSlopRewrites — no infinite loop");
+		assert.deepEqual(retries, ["slop", "slop"], "onRetry fired exactly maxSlopRewrites times, all slop");
+	});
+
+	it("a recovery issue (empty) gets exactly ONE re-prompt, not a loop", async () => {
+		const { session, messages, getPrompts } = fakeSession([txt(CLEAN)]);
+		await runWithContentQualityRetry(session, async () => {
+			messages.push({ role: "assistant", content: [] });
+		});
+		assert.equal(getPrompts(), 1, "one re-prompt for a recovery issue");
+		assert.equal(messages.length, 2, "exactly two messages: initial empty + clean recovery reply");
 	});
 });

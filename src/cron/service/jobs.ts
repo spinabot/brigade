@@ -104,6 +104,7 @@ export function createJob(input: CronJobCreate, nowMs: number): CronJob {
 		sessionTarget: input.sessionTarget,
 		payload: input.payload,
 	});
+	assertScriptPayloadOwnerOnly(input.payload, input.createdBy);
 	const id = randomUUID();
 	const job: CronJob = {
 		id,
@@ -142,6 +143,7 @@ export function applyJobPatch(
 	const nextSessionTarget = patch.sessionTarget ?? job.sessionTarget;
 	const nextPayload = patch.payload ?? job.payload;
 	assertSupportedJobSpec({ sessionTarget: nextSessionTarget, payload: nextPayload });
+	assertScriptPayloadOwnerOnly(nextPayload, patch.createdBy ?? job.createdBy);
 	const scheduleChanged = patch.schedule !== undefined;
 	const enabledChanged = patch.enabled !== undefined && patch.enabled !== job.enabled;
 	const next: CronJob = {
@@ -371,7 +373,8 @@ export function recordScheduleComputeError(job: CronJob, message: string): CronJ
  * wrap). Three rules:
  *   1. session-target "session:*" must have a safe id (no `/`, `\`, NUL, etc.).
  *   2. session-target "main" must pair with payload.kind "systemEvent".
- *   3. session-target "isolated" / "session:*" must pair with payload.kind "agentTurn".
+ *   3. session-target "isolated" / "session:*" must pair with payload.kind
+ *      "agentTurn" OR "script" (both run in an isolated/session context).
  */
 export function assertSupportedJobSpec(args: {
 	sessionTarget: CronSessionTarget;
@@ -387,15 +390,30 @@ export function assertSupportedJobSpec(args: {
 	// `"current"` is normally resolved to `"session:<id>"` or `"isolated"`
 	// by `defaultCronJobCreate`, but assertSupportedJobSpec is also called
 	// from `createJob` / `applyJobPatch` and any external paths that
-	// bypass normalize. Defensive: still require agentTurn pairing.
+	// bypass normalize. Defensive: still require an isolated-compatible payload.
 	const isIsolatedLike =
 		sessionTarget === "isolated" ||
 		sessionTarget === "current" ||
 		isSessionTargetWithId(sessionTarget);
-	if (isIsolatedLike && payload.kind !== "agentTurn") {
+	if (isIsolatedLike && payload.kind !== "agentTurn" && payload.kind !== "script") {
 		throw new Error(
-			'cron sessionTarget "isolated"/"current"/"session:*" requires payload.kind "agentTurn"',
+			'cron sessionTarget "isolated"/"current"/"session:*" requires payload.kind "agentTurn" or "script"',
 		);
+	}
+}
+
+/**
+ * Shell-exec via cron is OWNER-ONLY. A channel-peer-created job must never carry
+ * a `script` payload — that would be remote code execution as the gateway from a
+ * messaging peer. Legacy jobs (createdBy undefined) are treated as owner. Enforced
+ * at create + patch; the executor re-checks at run time (defense in depth).
+ */
+function assertScriptPayloadOwnerOnly(
+	payload: CronPayload,
+	createdBy: { kind: string } | undefined,
+): void {
+	if (payload.kind === "script" && createdBy !== undefined && createdBy.kind !== "owner") {
+		throw new Error('cron payload.kind "script" is owner-only (a channel peer may not schedule shell execution)');
 	}
 }
 

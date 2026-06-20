@@ -173,15 +173,16 @@ export type AgentBusEvent =
 	  }
 	| {
 			/** Content-quality retry fired with reason: empty / reasoning-only /
-			 *  planning-only. The loop sent a steer-prompt asking the model to
-			 *  produce an actual visible answer / actually do the work. */
+			 *  planning-only / slop. The loop sent a steer-prompt asking the model to
+			 *  produce an actual visible answer / actually do the work / rewrite
+			 *  without filler. */
 			type: "turn-content-retry";
 			runId: string;
 			/** Wave I — agent that produced this lifecycle event. */
 			agentId?: string;
 			/** Wave I — session that produced this lifecycle event. */
 			sessionKey?: string;
-			reason: "empty" | "reasoning-only" | "planning-only";
+			reason: "empty" | "reasoning-only" | "planning-only" | "slop";
 	  }
 	| {
 			/** Thinking level downgraded (model rejected the configured level)

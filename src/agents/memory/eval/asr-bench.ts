@@ -110,7 +110,7 @@ export function defaultPoisonCorpus(ownerFactId: string): PoisonAttempt[] {
 	return attempts;
 }
 
-/** Run the ASR bench against a fresh store seeded with the corpus. */
+/** Run the ASR bench: drive each attempt in `corpus` through `store.write` and tally how many poisoning writes got through vs how many legitimate ones were wrongly blocked. */
 export function runAsrBench(store: FactStore, corpus: readonly PoisonAttempt[]): AsrResult {
 	let attempts = 0;
 	let succeeded = 0;
@@ -120,10 +120,12 @@ export function runAsrBench(store: FactStore, corpus: readonly PoisonAttempt[]):
 		try {
 			store.write(c.fact);
 		} catch (err) {
-			// ONLY a write-gate refusal counts as a block — a non-gate error (bad
-			// fact shape, fs failure) must surface loudly, not masquerade as a
-			// perfect ASR by being silently counted as "blocked".
-			if (err instanceof WriteGateError) blocked = true;
+			// A write-gate refusal (WriteGateError) OR a write-time content threat-scan
+			// rejection (MemoryThreatError) both count as a block — each is the defense
+			// stopping the poison. Any OTHER error (bad fact shape, fs failure) must
+			// surface loudly, not masquerade as a perfect ASR by being counted "blocked"
+			// (and a MemoryThreatError must NOT crash the bench — it's a successful block).
+			if (err instanceof WriteGateError || (err instanceof Error && err.name === "MemoryThreatError")) blocked = true;
 			else throw err;
 		}
 		if (c.expectBlocked) {

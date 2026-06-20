@@ -18,7 +18,7 @@ const DAY_MS = 86_400_000;
 /** Base half-life in days; scaled up by importance. */
 const BASE_HALF_LIFE_DAYS = 11.25;
 const DECAY_BETA = 0.8;
-/** Below this live score → prune (dead). */
+/** Below this live score → prune (dead) for short/context facts; long-tier facts archive instead (never hard-pruned). */
 const PRUNE_THRESHOLD = 0.05;
 /** Below this (and not a long-tier fact) → archive (kept, out of active recall). */
 const ARCHIVE_THRESHOLD = 0.15;
@@ -57,6 +57,10 @@ export function runDecayGc(workspaceDir: string, now: number = Date.now()): Deca
 	const toArchive: string[] = [];
 	for (const r of active) {
 		if (r.tier === "permanent") continue;
+		// A confirmed fact is eviction-immune — it has been promoted by the dream
+		// pass as a settled belief and must survive until explicitly demoted.
+		// Mirrors the `r.status !== "confirmed"` guard in dream.ts's EVICT path.
+		if (r.status === "confirmed") continue;
 		const score = effectiveScore(r, now);
 		// Long-tier (identity/preference/correction/relationship/project) is the DURABLE
 		// tier: decay may at most ARCHIVE it (kept, recoverable via reactivate), NEVER

@@ -56,7 +56,7 @@ describe("self-review loop — distils a transcript into attributed memory", () 
 		// proposed `preference`/`identity` are CONFINED to descriptive `knowledge` —
 		// laundered content can't pose as the operator's authoritative self-model.
 		assert.ok(all.every((r) => r.segment === "knowledge"), "protected segments confined to knowledge evidence");
-		assert.match(res.summary, /learned 2 fact/);
+		assert.equal(res.summary, "self-review: learned 2 fact(s) — knowledge, knowledge");
 	});
 
 	it("is best-effort: a reviewer error is a no-op, never throws into the turn", async () => {
@@ -67,7 +67,7 @@ describe("self-review loop — distils a transcript into attributed memory", () 
 		const res = await runSelfReview({ transcript: "x", reviewer, store });
 		assert.equal(res.written, 0);
 		assert.equal(store.list().length, 0);
-		assert.match(res.summary, /skipped/);
+		assert.equal(res.summary, "self-review: skipped (reviewer error)");
 	});
 
 	it("is best-effort on a MALFORMED reviewer return (facts missing/non-array) — no-op, never throws", async () => {
@@ -96,7 +96,7 @@ describe("self-review loop — distils a transcript into attributed memory", () 
 		const reviewer: Reviewer = async () => ({ facts: [{ content: "   ", segment: "knowledge" }] });
 		const res = await runSelfReview({ transcript: "x", reviewer, store });
 		assert.equal(res.written, 0);
-		assert.match(res.summary, /nothing durable/);
+		assert.equal(res.summary, "self-review: nothing durable to learn");
 	});
 
 	it("a review-distilled fact is recallable next turn (the loop's payoff)", async () => {
@@ -106,7 +106,7 @@ describe("self-review loop — distils a transcript into attributed memory", () 
 		});
 		await runSelfReview({ transcript: "x", reviewer, store, origin: owner });
 		const hit = store.recall("how do I deploy", { origin: owner, markAccessed: false })[0];
-		assert.match(hit?.content ?? "", /npm run release/, "learned fact surfaces in later recall");
+		assert.equal(hit?.content, "The user's deploy command is npm run release", "learned fact surfaces in later recall");
 		// …but stays origin-scoped: the same query under a DIFFERENT origin gets no hit.
 		const otherOrigin: MemoryRecordOrigin = { kind: "channel", channelId: "whatsapp", conversationId: "c1", sessionKey: "s1" };
 		const crossHit = store.recall("how do I deploy", { origin: otherOrigin, markAccessed: false });

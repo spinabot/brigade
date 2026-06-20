@@ -23,9 +23,9 @@ import type { Command } from "commander";
 import {
 	DEFAULT_AGENT_ID,
 	resolveAgentWorkspaceDir,
-	resolveAuthProfilesPath,
 	resolveSessionsDir,
 } from "../../config/paths.js";
+import { readProfiles } from "../../auth/profiles.js";
 import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { FactStore } from "../../agents/memory/records.js";
 import { discoverEligibleSkills } from "../../agents/skills/index.js";
@@ -60,6 +60,7 @@ const MIN_NODE_MINOR = 12;
 export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise<number> {
 	const checks: CheckResult[] = [];
 	checks.push(checkNodeVersion());
+	checks.push(checkTlsCaBundle());
 	checks.push(checkBrigadeDir());
 	checks.push(await checkBrigadeConfig());
 	checks.push(checkAuthProfiles());
@@ -107,6 +108,38 @@ function checkNodeVersion(): CheckResult {
 	};
 }
 
+/**
+ * Validate operator-set TLS CA-bundle env vars point at readable files. Unset =
+ * ok (the system trust store is used). Set-but-unreadable is a corporate-proxy /
+ * custom-CA misconfiguration that otherwise surfaces only as an opaque mid-call
+ * connection failure — surface it here, actionably, instead.
+ */
+function checkTlsCaBundle(): CheckResult {
+	const vars = ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"];
+	const set = vars.filter((v) => (process.env[v] ?? "").trim().length > 0);
+	if (set.length === 0) {
+		return { name: "tls ca bundle", status: "ok", message: "using the system trust store" };
+	}
+	const unreadable: string[] = [];
+	for (const v of set) {
+		const p = (process.env[v] ?? "").trim();
+		try {
+			fs.accessSync(p, fs.constants.R_OK);
+		} catch {
+			unreadable.push(`${v} → ${p}`);
+		}
+	}
+	if (unreadable.length > 0) {
+		return {
+			name: "tls ca bundle",
+			status: "warn",
+			message: `custom CA bundle not readable: ${unreadable.join(", ")}`,
+			hint: "point the variable at a readable PEM bundle, or unset it to use the system trust store",
+		};
+	}
+	return { name: "tls ca bundle", status: "ok", message: `${set.join(", ")} → readable` };
+}
+
 function checkBrigadeDir(): CheckResult {
 	if (!fs.existsSync(BRIGADE_DIR)) {
 		return {
@@ -143,29 +176,14 @@ async function checkBrigadeConfig(): Promise<CheckResult> {
 }
 
 function checkAuthProfiles(): CheckResult {
-	const profilesPath = resolveAuthProfilesPath(DEFAULT_AGENT_ID);
-	if (!fs.existsSync(profilesPath)) {
-		return {
-			name: "auth profiles",
-			status: "warn",
-			message: "no profiles file yet",
-			hint: "run `brigade onboard` to add an API key",
-		};
-	}
+	// Mode-aware read: in convex mode this returns the boot-primed in-memory
+	// profiles cache (auth-profiles.json is never materialised to disk), in
+	// filesystem mode it falls through to the same on-disk read as before.
+	// Reading the raw file directly would false-warn on a healthy convex
+	// deployment and trip `brigade doctor --strict`.
+	let file: ReturnType<typeof readProfiles>;
 	try {
-		const parsed = JSON.parse(fs.readFileSync(profilesPath, "utf8")) as {
-			profiles?: Record<string, unknown>;
-		};
-		const count = Object.keys(parsed.profiles ?? {}).length;
-		if (count === 0) {
-			return {
-				name: "auth profiles",
-				status: "warn",
-				message: "profiles file exists but is empty",
-				hint: "run `brigade onboard` to add an API key",
-			};
-		}
-		return { name: "auth profiles", status: "ok", message: `${count} profile${count === 1 ? "" : "s"}` };
+		file = readProfiles(DEFAULT_AGENT_ID);
 	} catch (err) {
 		return {
 			name: "auth profiles",
@@ -173,6 +191,16 @@ function checkAuthProfiles(): CheckResult {
 			message: `failed to parse: ${(err as Error).message}`,
 		};
 	}
+	const count = Object.keys(file.profiles ?? {}).length;
+	if (count === 0) {
+		return {
+			name: "auth profiles",
+			status: "warn",
+			message: "no profiles yet",
+			hint: "run `brigade onboard` to add an API key",
+		};
+	}
+	return { name: "auth profiles", status: "ok", message: `${count} profile${count === 1 ? "" : "s"}` };
 }
 
 function checkConfiguredProvider(config: Awaited<ReturnType<typeof loadConfig>> | undefined): CheckResult {
@@ -221,62 +249,55 @@ function checkConfiguredProvider(config: Awaited<ReturnType<typeof loadConfig>> 
 			};
 		}
 	}
-	const profilesPath = resolveAuthProfilesPath(DEFAULT_AGENT_ID);
-	if (fs.existsSync(profilesPath)) {
-		try {
-			const parsed = JSON.parse(fs.readFileSync(profilesPath, "utf8")) as {
-				profiles?: Record<
-					string,
-					{
-						provider?: string;
-						key?: string;
-						keyRef?: { source?: string; id?: string } | string;
-					}
-				>;
-			};
-			// Plaintext profiles: any non-empty `key` field counts.
-			const profile = Object.values(parsed.profiles ?? {}).find(
-				(p) => p?.provider === provider,
-			);
-			if (profile) {
-				if (typeof profile.key === "string" && profile.key.length > 0) {
-					return { name: "default provider", status: "ok", message: `${provider}/${modelId}` };
-				}
-				// Ref profiles: resolve the env var the keyRef points at and
-				// surface a precise message (helps the user diagnose
-				// "I have a profile but the env is unset" without grepping).
-				const ref = profile.keyRef;
-				if (ref && typeof ref === "object" && ref.source === "env" && ref.id) {
-					const envValue = process.env[ref.id];
-					if (typeof envValue === "string" && envValue.length > 0) {
-						return {
-							name: "default provider",
-							status: "ok",
-							message: `${provider}/${modelId} (keyRef → ${ref.id})`,
-						};
-					}
+	// Mode-aware read: serves the boot-primed convex profiles cache when the
+	// deployment stores the key in convex (auth-profiles.json is never written
+	// to disk in convex mode), and reads the same on-disk file in filesystem
+	// mode. Reading the raw file directly false-warned "no API key found" on a
+	// healthy convex deployment and tripped `brigade doctor --strict`.
+	try {
+		const file = readProfiles(DEFAULT_AGENT_ID);
+		// Plaintext profiles: any non-empty `key` field counts.
+		const profile = Object.values(file.profiles ?? {}).find(
+			(p) => p?.provider === provider,
+		);
+		if (profile) {
+			if (typeof profile.key === "string" && profile.key.length > 0) {
+				return { name: "default provider", status: "ok", message: `${provider}/${modelId}` };
+			}
+			// Ref profiles: resolve the env var the keyRef points at and
+			// surface a precise message (helps the user diagnose
+			// "I have a profile but the env is unset" without grepping).
+			const ref: { source?: string; id?: string } | string | undefined = profile.keyRef;
+			if (ref && typeof ref === "object" && ref.source === "env" && ref.id) {
+				const envValue = process.env[ref.id];
+				if (typeof envValue === "string" && envValue.length > 0) {
 					return {
 						name: "default provider",
-						status: "warn",
-						message: `${provider}/${modelId} — profile pins keyRef → ${ref.id}, but the env var is unset`,
-						hint: `export ${ref.id}=... in your shell, or run \`brigade onboard\` to switch the credential shape.`,
+						status: "ok",
+						message: `${provider}/${modelId} (keyRef → ${ref.id})`,
 					};
 				}
-				if (typeof ref === "string") {
-					// Legacy `${VAR}` literal form.
-					const m = /^\$\{([A-Z_][A-Z0-9_]*)\}$/.exec(ref);
-					if (m && m[1] && process.env[m[1]]) {
-						return {
-							name: "default provider",
-							status: "ok",
-							message: `${provider}/${modelId} (keyRef → ${m[1]})`,
-						};
-					}
+				return {
+					name: "default provider",
+					status: "warn",
+					message: `${provider}/${modelId} — profile pins keyRef → ${ref.id}, but the env var is unset`,
+					hint: `export ${ref.id}=... in your shell, or run \`brigade onboard\` to switch the credential shape.`,
+				};
+			}
+			if (typeof ref === "string") {
+				// Legacy `${VAR}` literal form.
+				const m = /^\$\{([A-Z_][A-Z0-9_]*)\}$/.exec(ref);
+				if (m && m[1] && process.env[m[1]]) {
+					return {
+						name: "default provider",
+						status: "ok",
+						message: `${provider}/${modelId} (keyRef → ${m[1]})`,
+					};
 				}
 			}
-		} catch {
-			// fall through
 		}
+	} catch {
+		// fall through
 	}
 	return {
 		name: "default provider",
@@ -341,20 +362,30 @@ async function checkMemory(): Promise<CheckResult> {
 	} catch {
 		/* no fact store yet */
 	}
+	const embedder = process.env.BRIGADE_MEMORY_EMBEDDER ?? "model-free";
+	// When a non-default embedder is configured, note that the gateway
+	// resolves it and may fall back to model-free HRR if the key or dep is
+	// missing. The CLI sees only the configured intent, not the resolved state.
+	const embedderLabel =
+		embedder === "model-free"
+			? "model-free"
+			: `${embedder} (configured; gateway resolves — may run model-free if key or dep is missing)`;
 	if (summary.fileCount === 0 && factCount === 0) {
 		// "ok" — an empty memory corpus is the normal fresh state. The agent
 		// populates it as it learns durable facts.
 		return {
 			name: "memory",
 			status: "ok",
-			message: "no memory yet — facts + MEMORY.md + memory/ notes fill in as the agent learns",
+			message: `no memory yet — facts auto-extract after every turn (embedder: ${embedderLabel})`,
 		};
 	}
 	const kb = (summary.totalBytes / 1024).toFixed(1);
+	// factCount covers all origins; recall is owner-scoped, so the number
+	// can exceed what a single-owner recall query returns.
 	return {
 		name: "memory",
 		status: "ok",
-		message: `${factCount} fact${factCount === 1 ? "" : "s"} · ${summary.fileCount} note file${summary.fileCount === 1 ? "" : "s"}, ${kb} KB`,
+		message: `${factCount} fact${factCount === 1 ? "" : "s"} across all origins · ${summary.fileCount} note file${summary.fileCount === 1 ? "" : "s"}, ${kb} KB (embedder: ${embedderLabel})`,
 	};
 }
 
