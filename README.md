@@ -1,7 +1,7 @@
-# 🦁 Brigade — The self-hosted enterprise AI crew
+# 🦁 Brigade — Your personal intelligence, built enterprise-grade
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/spinabot/brigade/main/assets/brigade-banner.gif" alt="Brigade — the self-hosted enterprise AI crew" width="900" />
+  <img src="https://raw.githubusercontent.com/spinabot/brigade/main/assets/brigade-banner.gif" alt="Brigade — your personal intelligence, built enterprise-grade" width="900" />
 </p>
 
 <p align="center">
@@ -16,12 +16,12 @@
   <a href="https://brigade.spinabot.com"><img src="https://img.shields.io/badge/website-brigade.spinabot.com-E8B021?style=for-the-badge&logo=googlechrome&logoColor=white" alt="website"></a>
 </p>
 
-**Brigade is a self-hosted enterprise AI crew**: a team of AI agents on a real org
-chart that share one long-term memory, Tideline, so what one agent learns, the rest
-can use. They delegate to each other, switch models mid-task without losing the
-thread, and act inside the 1,000+ apps you already use. You run it yourself, with the
-controls and data sovereignty an enterprise needs: no account to create, no SaaS in
-the middle.
+**Brigade is your personal intelligence, built on enterprise-grade tech**: a crew of
+AI agents on a real org chart that share one long-term memory, Tideline, so what one
+agent learns, the rest can use. They delegate to each other, switch models mid-task
+without losing the thread, and act inside the 1,000+ apps you already use. It's an
+ecosystem you host yourself, with the controls and data sovereignty of enterprise
+tech: no account to create, no SaaS in the middle.
 
 The same crew runs on a Raspberry Pi or a server. By default it's a small filesystem
 install; switch to a self-hosted Convex database when you want one. Bring any model:
