@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.2](https://github.com/spinabot/brigade/compare/brigade-v1.2.1...brigade-v1.2.2) (2026-06-21)
+
+
+### Bug Fixes
+
+* **deps:** migrate Pi SDK to @earendil-works/pi-* (0.79.9) — clears last advisory ([7a3e877](https://github.com/spinabot/brigade/commit/7a3e8770194a733be35ad1950476759fe365dde4))
+
 ## [1.2.1](https://github.com/spinabot/brigade/compare/brigade-v1.2.0...brigade-v1.2.1) (2026-06-21)
 
 
