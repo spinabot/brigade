@@ -165,7 +165,7 @@
     "@mariozechner/pi-coding-agent": "0.73.1",
     "@mariozechner/pi-tui": "0.73.1",
     "@mozilla/readability": "^0.6.0",
-    "@whiskeysockets/baileys": "7.0.0-rc.9",
+    "@whiskeysockets/baileys": "7.0.0-rc13",
     "cfonts": "^3.3.1",
     "chalk": "^5.3.0",
     "cli-highlight": "^2.1.11",
