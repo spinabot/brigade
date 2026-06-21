@@ -364,6 +364,9 @@ principle is the same: *independent verification, never the agent judging itself
 | `brigade store mode set <mode>` | Pin the mode (`--convex-url` for convex) |
 | `brigade store migrate --to <mode>` | Copy data between backends (`--convex-url`, `--dry-run`, `--keep-source`) |
 | `brigade store reset` | Factory-reset the Convex backend (`--yes`, `--purge-local`) |
+| `brigade convex dev` · `start` | Run the **bundled** self-hosted Convex backend + dashboard in the foreground (`brigade convex:dev` also works) |
+| `brigade convex status` · `stop` | Probe whether the backend is running / how to stop it (Ctrl-C) |
+| `brigade convex push` · `codegen` | Deploy the bundled Convex functions to the backend / regenerate the client |
 | `brigade encrypt status` · `init` · `test` | Manage the AES-256-GCM at-rest key |
 | `brigade backup create` · `verify` · `restore` | Snapshot / verify / restore your install as a `.tar.gz` |
 | `brigade secrets audit` | Find suspected leaked credentials in your install |
@@ -619,13 +622,24 @@ brigade store migrate --to convex --dry-run               # preview a migration
 brigade store migrate --to filesystem                     # copy data back
 ```
 
-Run the local Convex backend (downloads a standalone binary, no account):
+Run the **bundled** self-hosted Convex backend — no Convex account, no separate
+install. The backend binary + functions ship inside Brigade, so this works from
+anywhere once `brigade` is installed, not just a repo checkout:
 
 ```bash
-npm run convex:install   # fetch convex-local-backend + dashboard into bin/
-npm run convex:dev       # backend :3210, site proxy :3211, dashboard :6791
-npm run convex:codegen   # regenerate convex/_generated/ against the local backend
+brigade convex dev       # download the backend if needed, then run it + dashboard (foreground)
+brigade convex status    # is the backend up? (probes :3210)
+brigade convex push      # deploy the bundled Convex functions to the backend
+brigade convex codegen   # regenerate convex/_generated/ against the local backend
 ```
+
+`brigade convex dev` runs the backend on `:3210`, the site proxy on `:3211`, and
+the dashboard on `:6791`, with binaries + data under `~/.brigade/convex/`. Ctrl-C
+to stop; the `brigade convex:dev` colon form works too. Then point Brigade at it
+with `brigade store mode set convex --convex-url http://127.0.0.1:3210` (above).
+
+> Running from a repo checkout? The `npm run convex:install` / `convex:dev` /
+> `convex:codegen` scripts still work and write into the repo's `bin/` + `.convex-data/`.
 
 Turn on **at-rest encryption** for Convex byte columns (credentials, persona,
 memory, cron payloads, transcripts) with `BRIGADE_ENCRYPTION_KEY`:
