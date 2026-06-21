@@ -162,12 +162,19 @@ main() {
 
   # Re-affirm PATH after install (covers the fallback that switched to the
   # bundled Node, and confirms the brigade bin dir is persisted).
-  ensure_on_path "$(npm_global_bin)"
+  GBIN="$(npm_global_bin)"
+  ensure_on_path "$GBIN"
 
-  printf '\n\033[1;32mOK: Brigade installed.\033[0m  Run:  \033[1mbrigade onboard\033[0m\n'
-  if ! command -v brigade >/dev/null 2>&1; then
-    printf '   Open a new terminal (or run:  exec %s -l ) so brigade is on your PATH.\n' "${SHELL:-sh}"
-  fi
+  printf '\n\033[1;32mOK: Brigade installed.\033[0m  (%s/brigade)\n' "$GBIN"
+  # `curl | sh` runs in a SUBSHELL, so it cannot change the PATH of the terminal
+  # you ran it from. We persisted it to your shell profile so NEW terminals find
+  # brigade automatically. To use it in the terminal you're in RIGHT NOW, load
+  # it into this session first. (We deliberately do NOT gate this on
+  # `command -v brigade` - that would check this script's own PATH, not your
+  # interactive shell, and lie, which is exactly the bug that hid this hint.)
+  printf '\n   New terminals will find brigade automatically.\n'
+  printf '   To use it in THIS terminal now, run:\n\n'
+  printf '       \033[1mexport PATH="%s:$PATH" && brigade onboard\033[0m\n' "$GBIN"
 }
 
 main
