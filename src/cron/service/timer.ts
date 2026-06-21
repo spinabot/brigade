@@ -29,6 +29,7 @@
 import { withPerInstanceLock } from "./locked.js";
 import {
 	parseSessionRetention,
+	reapIdleThreadSessions,
 	reapIsolatedCronSessions,
 	shouldRunSweep,
 } from "../session-reaper.js";
@@ -123,6 +124,12 @@ const DEFAULT_EXECUTION_TIMEOUT_MS = 60_000;
  * the dispatcher returning `false`.
  */
 const ANNOUNCE_DISPATCH_TIMEOUT_MS = 8_000;
+
+/** True when a positive channel-thread idle TTL is configured (drives the thread reaper). */
+function reapThreadsConfigured(state: CronServiceState): boolean {
+	const ttl = state.deps.resolveThreadIdleTtlMs?.() ?? null;
+	return ttl !== null && ttl > 0;
+}
 
 /** Compute the minimum next-fire across all enabled jobs. `undefined` = no work pending. */
 export function nextWakeAtMs(state: CronServiceState): number | undefined {
@@ -320,26 +327,49 @@ export async function onTimer(state: CronServiceState): Promise<void> {
 		const sweepNow = state.deps.nowMs!();
 		if (shouldRunSweep(state.lastReapAtMs, sweepNow)) {
 			const retentionMs = parseSessionRetention(state.config.sessionRetention);
-			if (retentionMs !== null && retentionMs > 0) {
+			const reapCron = retentionMs !== null && retentionMs > 0;
+			if (reapCron || reapThreadsConfigured(state)) {
 				const agentIds = new Set<string>([DEFAULT_AGENT_ID]);
 				for (const job of state.store.jobs) {
 					if (typeof job.agentId === "string" && job.agentId.trim().length > 0) {
 						agentIds.add(job.agentId);
 					}
 				}
+				// Resolve the channel-thread idle TTL once per sweep (e.g. from
+				// `channels.telegram.threadIdleTtlMs`). When configured + positive,
+				// idle thread sessions (Telegram forum topics etc.) are aged out
+				// alongside the isolated-cron-run sweep. Unwired / null disables it.
+				const threadIdleTtlMs = state.deps.resolveThreadIdleTtlMs?.() ?? null;
 				for (const agentId of agentIds) {
-					try {
-						await reapIsolatedCronSessions({
-							agentId,
-							retentionMs,
-							nowMs: sweepNow,
-							log: state.deps.log,
-						});
-					} catch (err) {
-						state.deps.log.warn("session reaper sweep threw", {
-							agentId,
-							error: err instanceof Error ? err.message : String(err),
-						});
+					if (reapCron) {
+						try {
+							await reapIsolatedCronSessions({
+								agentId,
+								retentionMs: retentionMs as number,
+								nowMs: sweepNow,
+								log: state.deps.log,
+							});
+						} catch (err) {
+							state.deps.log.warn("session reaper sweep threw", {
+								agentId,
+								error: err instanceof Error ? err.message : String(err),
+							});
+						}
+					}
+					if (threadIdleTtlMs !== null && threadIdleTtlMs > 0) {
+						try {
+							await reapIdleThreadSessions({
+								agentId,
+								ttlMs: threadIdleTtlMs,
+								nowMs: sweepNow,
+								log: state.deps.log,
+							});
+						} catch (err) {
+							state.deps.log.warn("thread reaper sweep threw", {
+								agentId,
+								error: err instanceof Error ? err.message : String(err),
+							});
+						}
 					}
 				}
 			}

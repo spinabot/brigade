@@ -75,6 +75,12 @@ import {
 } from "../agents/channels/channel-plugin-manager.js";
 import { listWhatsAppAccountIds, whatsappChannelEnabled } from "../agents/channels/whatsapp/account-config.js";
 import { createWhatsAppPlugin, type WhatsAppPluginHandle } from "../agents/channels/whatsapp/plugin.js";
+import {
+	listTelegramAccountIds,
+	telegramChannelEnabled,
+	telegramThreadIdleTtlMs,
+} from "../agents/channels/telegram/account-config.js";
+import { createTelegramPlugin, type TelegramPluginHandle } from "../agents/channels/telegram/plugin.js";
 import { createPluginChannelManagerFacade } from "../agents/channels/plugin-channel-manager-facade.js";
 import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
@@ -1974,6 +1980,21 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			 * check" rather than blocking ALL cron adds.
 			 */
 			listKnownChannelIds: () => channelManager?.started ?? [],
+			/**
+			 * Idle channel-thread TTL for the session-reaper's thread sweep — read
+			 * live from `channels.telegram.threadIdleTtlMs` so an idle Telegram
+			 * forum-topic session gets aged out. `null` (default / unset) leaves
+			 * thread sessions untouched; the isolated-cron-run reaper is unaffected.
+			 */
+			resolveThreadIdleTtlMs: () => {
+				try {
+					// `loadConfig` is synchronous + cheap; reading fresh keeps the TTL
+					// live across config reloads without threading a mutable holder.
+					return telegramThreadIdleTtlMs(loadConfig() as never);
+				} catch {
+					return null;
+				}
+			},
 			/**
 			 * Heartbeat trigger for `wakeMode: "now"` crons. Fires a synthetic
 			 * agent turn on the operator's main session that drains any
@@ -5080,6 +5101,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 		// Channels — inbound runs through the SAME serialized turn queue as TUI
 		// prompts (`runGatewayTurn`), so a channel turn never overlaps a TUI turn.
+		//
+		// The manager is mounted UNCONDITIONALLY (even when zero channels are
+		// configured at boot) so the owner-gated `connect_channel` tool can
+		// start the FIRST channel LIVE via `getActiveChannelManager().startChannel(id)`
+		// without a gateway restart. The manager captures the FULL adapter
+		// catalog (`registry.channels`), so a channel that isn't started at boot
+		// is still reachable for a later live start. Bundled modules guarantee
+		// `registry.channels` is non-empty in normal installs; the guard stays
+		// only so a build that trims every channel module doesn't construct an
+		// empty manager.
 		if (registry.channels.length > 0) {
 			channelManager = await startChannels({
 				adapters: registry.channels,
@@ -5097,10 +5128,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				},
 			});
 			// Mount the channel manager as a process-wide singleton so the
-			// `send_message` agent tool (+ future channel-action tools) can
-			// reach the started adapters. Without this the tool registry's
-			// `getActiveChannelManager()` returns null and `send_message`
-			// quietly stays out of the surface.
+			// `send_message` + `connect_channel` agent tools (+ future
+			// channel-action tools) can reach the started adapters AND start /
+			// stop a single channel live. Without this the tool registry's
+			// `getActiveChannelManager()` returns null and those tools quietly
+			// stay out of the surface (or can't perform a live connect).
 			setActiveChannelManager(channelManager);
 			if (channelManager.started.length > 0) bootLog(`channels: ${channelManager.started.join(", ")}`);
 		}
@@ -5113,22 +5145,44 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		const whatsappAccounts = whatsappChannelEnabled(cfg as never)
 			? listWhatsAppAccountIds(cfg as never)
 			: [];
-		const wantMultiAccount = whatsappAccounts.length > 1;
-		if (wantMultiAccount) {
-			const whatsappPlugin = createWhatsAppPlugin({
-				defaultAgentId: agentId,
-				loadConfig: () => cfg as never,
-				runTurn: (turn) => runGatewayTurn(turn),
-				onPairing: (channelId, accountId, info) => {
-					const line =
-						info.kind === "qr"
-							? `[${channelId}/${accountId}] scan the QR code shown in the gateway logs to link your account`
-							: `[${channelId}/${accountId}] pairing code: ${info.value}`;
-					bootLog(line);
-					broadcast("log", { level: "info", message: line, at: Date.now() });
-				},
-			});
-			bundledChannelPlugins = [whatsappPlugin];
+		const telegramAccounts = telegramChannelEnabled(cfg as never)
+			? listTelegramAccountIds(cfg as never)
+			: [];
+		const wantWhatsAppMulti = whatsappAccounts.length > 1;
+		const wantTelegramMulti = telegramAccounts.length > 1;
+		if (wantWhatsAppMulti || wantTelegramMulti) {
+			// Fresh list each (re)start so a reload doesn't accumulate stale plugins.
+			bundledChannelPlugins = [];
+			const facadeHandles: Array<WhatsAppPluginHandle | TelegramPluginHandle> = [];
+			const multiAccountSummary: string[] = [];
+			if (wantWhatsAppMulti) {
+				const whatsappPlugin = createWhatsAppPlugin({
+					defaultAgentId: agentId,
+					loadConfig: () => cfg as never,
+					runTurn: (turn) => runGatewayTurn(turn),
+					onPairing: (channelId, accountId, info) => {
+						const line =
+							info.kind === "qr"
+								? `[${channelId}/${accountId}] scan the QR code shown in the gateway logs to link your account`
+								: `[${channelId}/${accountId}] pairing code: ${info.value}`;
+						bootLog(line);
+						broadcast("log", { level: "info", message: line, at: Date.now() });
+					},
+				});
+				bundledChannelPlugins.push(whatsappPlugin);
+				facadeHandles.push(whatsappPlugin);
+				multiAccountSummary.push(`whatsapp x${whatsappAccounts.length}`);
+			}
+			if (wantTelegramMulti) {
+				const telegramPlugin = createTelegramPlugin({
+					defaultAgentId: agentId,
+					loadConfig: () => cfg as never,
+					runTurn: (turn) => runGatewayTurn(turn),
+				});
+				bundledChannelPlugins.push(telegramPlugin);
+				facadeHandles.push(telegramPlugin);
+				multiAccountSummary.push(`telegram x${telegramAccounts.length}`);
+			}
 			const pluginById = new Map(bundledChannelPlugins.map((p) => [p.id, p] as const));
 			channelPluginManager = createChannelPluginManager({
 				loadConfig: () => cfg as never,
@@ -5136,18 +5190,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				getChannelPlugin: (id) => pluginById.get(id),
 			});
 			await channelPluginManager.startChannels();
-			// Mount a thin manager facade so the `send_message` agent tool's
-			// `getActiveChannelManager().adapter("whatsapp")` lookup returns a
-			// working per-account adapter on multi-account installs. Without
-			// this the tool quietly hid from the surface because the legacy
-			// `startChannels` manager only runs when there's <= 1 account.
-			const whatsappHandles: WhatsAppPluginHandle[] = [whatsappPlugin];
+			// Mount a thin manager facade so the `send_message` + `message_action`
+			// agent tools' `getActiveChannelManager().adapter(id)` lookup returns a
+			// working per-account adapter on multi-account installs. Without this
+			// those tools quietly hid because the legacy `startChannels` manager
+			// only runs when there's <= 1 account per channel.
 			if (!channelManager) {
 				setActiveChannelManager(
-					createPluginChannelManagerFacade({ plugins: whatsappHandles }),
+					createPluginChannelManagerFacade({ plugins: facadeHandles }),
 				);
 			}
-			bootLog(`channels (multi-account): whatsapp x${whatsappAccounts.length}`);
+			bootLog(`channels (multi-account): ${multiAccountSummary.join(", ")}`);
 		}
 
 		// Background services — start each; a failing one is skipped, not fatal.

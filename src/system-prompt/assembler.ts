@@ -131,6 +131,20 @@ export interface AssembleArgs {
   channels?: {
     /** Channel ids currently started + ready to send. */
     started: readonly string[];
+    /**
+     * Channels that are REGISTERED (bundled adapters) but NOT currently
+     * connected — i.e. the operator COULD connect them via `connect_channel`.
+     * Reflects real config state: `connectable` true means the adapter is
+     * available to wire up. Surfaced in the `## Messaging` block so the model
+     * knows it can OFFER to connect e.g. Telegram (instead of claiming it
+     * can't message there). Skipped for channels already in `started`.
+     */
+    available?: ReadonlyArray<{
+      channelId: string;
+      label: string;
+      /** True when the channel can be connected right now (registered + not started). */
+      connectable: boolean;
+    }>;
     /** Linked self-account per started channel (adapter `selfId()`), when
      *  connected. For personal channels (WhatsApp) the linked account IS
      *  the operator's own number — surfaced so "send me a text" resolves
@@ -773,33 +787,59 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // minimal mode (cron / sub-agent runs) — those get a scoped tool
   // surface that already tells them what they can use without needing
   // the directory.
+  // Connectable channels = registered adapters not currently started. Computed
+  // once so both the render gate and the "you can connect" line use the same set.
+  const connectableChannels =
+    !isMinimalMode && args.channels
+      ? (args.channels.available ?? []).filter((c) => c.connectable)
+      : [];
   if (
     !isMinimalMode &&
     args.channels &&
-    args.channels.started.length > 0
+    (args.channels.started.length > 0 || connectableChannels.length > 0)
   ) {
-    const channelList = args.channels.started.join(", ");
+    const hasStarted = args.channels.started.length > 0;
     lines.push("## Messaging");
-    lines.push(
-      `You can message the operator (or anyone they ask you to) on: ${channelList}.`,
-    );
-    // Linked self-accounts — for personal channels the linked account IS
-    // the operator. Without this line the model asks "what's your number?"
-    // for a number the adapter already knows.
-    if (args.channels.linked && args.channels.linked.length > 0) {
-      for (const l of args.channels.linked) {
-        lines.push(
-          `- ${l.channelId} is linked to the operator's own account: \`${l.selfId}\`. "Text me" / "send me a message" means \`send_message({channel: "${l.channelId}", to: "${l.selfId}", text})\` — never ask the operator for their number on a linked channel.`,
-        );
-      }
+    if (hasStarted) {
+      const channelList = args.channels.started.join(", ");
+      lines.push(
+        `You can message the operator (or anyone they ask you to) on: ${channelList}.`,
+      );
+    } else {
+      // Nothing connected yet — but channels are available to wire up.
+      lines.push(
+        "No messaging channel is connected yet. You can connect one when the operator asks.",
+      );
     }
-    lines.push("- To send now: `send_message`. From a channel-routed turn, just pass `{text}` — it replies in place. Otherwise pass `{channel, to, text}`.");
-    lines.push("- To send later (\"in 2 minutes\", \"daily at 9am\"): `cron` with a future `at` / cron schedule — it routes through the same channel at fire time.");
-    lines.push("- Never use `bash` / curl to send messages. Always go through `send_message` or `cron`.");
+    if (hasStarted) {
+      // Linked self-accounts — for personal channels the linked account IS
+      // the operator. Without this line the model asks "what's your number?"
+      // for a number the adapter already knows.
+      if (args.channels.linked && args.channels.linked.length > 0) {
+        for (const l of args.channels.linked) {
+          lines.push(
+            `- ${l.channelId} is linked to the operator's own account: \`${l.selfId}\`. "Text me" / "send me a message" means \`send_message({channel: "${l.channelId}", to: "${l.selfId}", text})\` — never ask the operator for their number on a linked channel.`,
+          );
+        }
+      }
+      lines.push("- To send now: `send_message`. From a channel-routed turn, just pass `{text}` — it replies in place. Otherwise pass `{channel, to, text}`.");
+      lines.push("- To send later (\"in 2 minutes\", \"daily at 9am\"): `cron` with a future `at` / cron schedule — it routes through the same channel at fire time.");
+      lines.push("- Never use `bash` / curl to send messages. Always go through `send_message` or `cron`.");
+    }
+    // Available-but-not-connected channels — tell the model it can OFFER to
+    // connect them. `connect_channel` is owner-gated, so the model proposes it
+    // and the operator confirms; for token channels (Telegram) it needs the
+    // token, for QR channels (WhatsApp) it points at `brigade channels link`.
+    if (connectableChannels.length > 0) {
+      const names = connectableChannels.map((c) => c.label).join(", ");
+      lines.push(
+        `- Available to connect (not yet connected): ${names}. If the operator wants one, use \`connect_channel({action:"connect", channel, token?})\` — owner-only; for Telegram pass the @BotFather token, for WhatsApp it links by QR. Offer this instead of saying you can't message there.`,
+      );
+    }
     // Surface degraded adapters so the model warns the operator BEFORE
     // attempting a send that will fail. Phrased in human language —
     // "WhatsApp is offline" not "channel adapter is in a degraded state".
-    if (args.channels.degraded && args.channels.degraded.length > 0) {
+    if (hasStarted && args.channels.degraded && args.channels.degraded.length > 0) {
       lines.push("");
       lines.push("**Right now, these aren't working:**");
       for (const d of args.channels.degraded) {
@@ -810,7 +850,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
         "If the operator asks you to send via one of these, tell them what's wrong + the fix command. Don't try to send — it will fail.",
       );
     }
-    if (args.channels.currentChannel) {
+    if (hasStarted && args.channels.currentChannel) {
       lines.push("");
       lines.push(
         `This turn came in from ${args.channels.currentChannel.channelId}. \`send_message({text})\` (no other args) replies right back here.`,

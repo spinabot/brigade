@@ -74,11 +74,18 @@ describe("brigade channels enable / disable", () => {
 		assert.equal((readConfig().channels as Record<string, { enabled?: boolean }>).whatsapp?.enabled, false);
 	});
 
-	it("auto-picks the only available channel when --channel is omitted", async () => {
-		// BUNDLED_MODULES has exactly one channel (whatsapp) in this phase.
+	it("requires --channel when more than one channel is bundled", async () => {
+		// BUNDLED_MODULES now bundles multiple channels (whatsapp + telegram),
+		// so an omitted --channel is ambiguous and must error (exit 2) rather
+		// than silently auto-pick one.
 		const code = await runChannelsEnable({}, { json: true });
+		assert.equal(code, 2);
+	});
+
+	it("enables telegram when explicitly selected", async () => {
+		const code = await runChannelsEnable({ channel: "telegram" }, { json: true });
 		assert.equal(code, 0);
-		assert.equal((readConfig().channels as Record<string, { enabled?: boolean }>).whatsapp?.enabled, true);
+		assert.equal((readConfig().channels as Record<string, { enabled?: boolean }>).telegram?.enabled, true);
 	});
 
 	it("rejects an unknown channel id with exit code 2", async () => {
@@ -106,7 +113,7 @@ describe("brigade channels enable / disable", () => {
 });
 
 describe("brigade channels list / status", () => {
-	it("list emits at least the bundled whatsapp channel in JSON mode", async () => {
+	it("list emits the bundled whatsapp + telegram channels in JSON mode", async () => {
 		const { result, out } = await captureStdout(() => runChannelsList({ json: true }));
 		assert.equal(result, 0);
 		const parsed = JSON.parse(out) as { channels: { id: string; label: string; enabled: boolean; linked: boolean }[] };
@@ -114,6 +121,10 @@ describe("brigade channels list / status", () => {
 		assert.ok(whatsapp, "whatsapp should appear in `channels list`");
 		assert.equal(whatsapp?.linked, false); // nothing on disk in the tempdir
 		assert.equal(whatsapp?.enabled, false); // freshly seeded config
+		const telegram = parsed.channels.find((c) => c.id === "telegram");
+		assert.ok(telegram, "telegram should appear in `channels list`");
+		assert.equal(telegram?.label, "Telegram");
+		assert.equal(telegram?.enabled, false); // freshly seeded config
 	});
 
 	it("status reports the per-channel snapshot in JSON mode", async () => {

@@ -40,9 +40,11 @@ import { isAbortTrigger } from "./abort-triggers.js";
 import { buildAgentSwitchCommands } from "./agent-switch-command.js";
 import {
 	type ChannelApprovalRoute,
+	tryConsumeChannelApprovalCallback,
 	tryConsumeChannelApprovalReply,
 } from "./approval-router.js";
 import { recordLastChannelForAgent } from "./last-channel.js";
+import { recordLastSentMessage } from "./last-sent-message.js";
 import { buildMediaNote } from "./media-capture.js";
 import { resolveAgentRoute } from "../routing/resolve-route.js";
 import { normalizeAccountId } from "../routing/account-id.js";
@@ -371,7 +373,15 @@ export async function runChannelInboundPipeline(
 		// Cheap empty-message fast-path. Media synthesis happens AFTER the
 		// access gate now (media may be a deferred download — see below), so
 		// this only needs presence checks: text, eager media, or a deferral.
-		if (!msg.text?.trim() && !(msg.media && msg.media.length > 0) && !msg.resolveMedia) {
+		// An inline-button press (`callbackQuery`) carries no text/media but
+		// MUST still flow through to the post-gate approval-callback intercept,
+		// so it is explicitly exempt from this empty-content bail.
+		if (
+			!msg.text?.trim() &&
+			!(msg.media && msg.media.length > 0) &&
+			!msg.resolveMedia &&
+			!msg.callbackQuery
+		) {
 			return;
 		}
 
@@ -492,6 +502,58 @@ export async function runChannelInboundPipeline(
 			} catch {
 				/* cosmetic */
 			}
+		}
+		// Inline-button approval callback (BEFORE the text-reply path).
+		// A native button press (Telegram callback_query, etc.) arrives as
+		// `msg.callbackQuery` and usually carries NO text, so it must be
+		// consumed here, after the access gate admits the sender but before the
+		// `if (!text) return;` empty-text bail below would silently drop it.
+		// Decode then resolve the SAME approval bridge centrally; authorization
+		// is routed through the channel's own `authorizeApprover` so a
+		// non-operator press is refused centrally.
+		if (msg.callbackQuery) {
+			const capAuthorize = adapter.approvalCapability?.authorizeApprover;
+			const authorizeApprover = capAuthorize
+				? (p: { accountId?: string; senderId?: string; approvalKind: "exec" | "plugin" }) =>
+						capAuthorize({
+							cfg,
+							...(p.accountId !== undefined ? { accountId: p.accountId } : {}),
+							...(p.senderId !== undefined ? { senderId: p.senderId } : {}),
+							action: "approve" as const,
+							approvalKind: p.approvalKind,
+						})
+				: undefined;
+			const cbResult = tryConsumeChannelApprovalCallback({
+				channelId: adapter.id,
+				conversationId: msg.conversationId,
+				callbackData: msg.callbackQuery.data,
+				...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
+				...(msg.accountId !== undefined ? { accountId: msg.accountId } : {}),
+				...(msg.from !== undefined ? { senderId: msg.from } : {}),
+				...(authorizeApprover ? { authorizeApprover } : {}),
+			});
+			if (cbResult.matched) {
+				const ack =
+					cbResult.decision === "allow-once"
+						? "Allowed once. 🦁"
+						: cbResult.decision === "allow-always"
+							? "Allowed and saved to the allowlist. 🦁"
+							: "Denied. 🦁";
+				await safeSendText(adapter, msg.conversationId, ack, buildSendOpts(msg.threadId, msg.accountId));
+				return;
+			}
+			if (cbResult.refused) {
+				await safeSendText(
+					adapter,
+					msg.conversationId,
+					cbResult.reason ?? "Not authorized to answer that approval.",
+					buildSendOpts(msg.threadId, msg.accountId),
+				);
+				return;
+			}
+			// A callback that matched no pending approval (stale / foreign
+			// button) is dropped silently, there is nothing to dispatch.
+			return;
 		}
 		// ── Sender ADMITTED — only now pay for media. ──────────────────────
 		// Deferred downloads (msg.resolveMedia) run here, after the access
@@ -778,11 +840,23 @@ export async function runChannelInboundPipeline(
 		if (controller.signal.aborted) return;
 		const reply = sanitizeReplyForChannel(result.reply?.trim() ?? "");
 		if (reply) {
-			await c.adapter.sendText(
+			// Capture the sent id (additive `{ messageId }` return) so the agent
+			// can later reference "my last message" via `message_action` without
+			// having to track ids itself. Channels that return void simply leave
+			// the last-sent record unset.
+			const sent = await c.adapter.sendText(
 				a.conversationId,
 				reply,
 				buildSendOpts(a.threadId, a.accountId),
 			);
+			recordLastSentMessage({
+				agentId: a.agentId,
+				channelId: c.adapter.id,
+				conversationId: a.conversationId,
+				messageId: sent && typeof sent === "object" ? sent.messageId : undefined,
+				...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
+				...(a.accountId !== undefined ? { accountId: a.accountId } : {}),
+			});
 		}
 	}
 

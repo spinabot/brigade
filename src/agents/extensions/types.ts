@@ -27,11 +27,28 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { TSchema } from "typebox";
 
 import type { BrigadeConfig } from "../../config/io.js";
+import type {
+	ChannelApprovalCapability,
+	ChannelMessageAction,
+	ChannelMessageActionResult,
+} from "../channels/types.adapters.js";
+import type { ChannelCapabilities } from "../channels/types.core.js";
 import type { AnyBrigadeTool } from "../tools/types.js";
 
 /* ─────────────────────────── capability contracts ─────────────────────────── */
 /* These are the LOCKED interfaces. Implementations arrive per phase; the shapes
  * are stable so nothing downstream is rewritten when a capability lands. */
+
+// Re-export the channel message-action + approval-capability contracts so the
+// runtime `ChannelAdapter` (defined here) and the channel SDK barrel share ONE
+// canonical union — the action shape an adapter's `handleAction` receives is
+// byte-for-byte the same one the `message_action` tool emits.
+export type {
+	ChannelApprovalCapability,
+	ChannelMessageAction,
+	ChannelMessageActionResult,
+} from "../channels/types.adapters.js";
+export type { ChannelCapabilities } from "../channels/types.core.js";
 
 /** Outbound media payload — what the agent wants to send out via `sendMedia`. */
 export interface OutboundMedia {
@@ -176,6 +193,18 @@ export interface InboundMessage {
 	 * to the channel-manager-level account-id resolution.
 	 */
 	accountId?: string;
+	/**
+	 * Inline-button callback context — present ONLY when this inbound is a
+	 * native button press (Telegram `callback_query`, Slack block action,
+	 * Discord component interaction) rather than a typed message. `data` is the
+	 * opaque payload the pressed button declared at send time (e.g. an
+	 * approval-callback codec string); `callbackId` is the channel-native id the
+	 * adapter uses to acknowledge the press (Telegram `answerCallbackQuery`).
+	 * The inbound pipeline routes a present `callbackQuery` to the central
+	 * approval-callback path BEFORE the text-reply path. `undefined` for every
+	 * ordinary message — channels without inline buttons never set it.
+	 */
+	callbackQuery?: { data: string; callbackId: string };
 	/** Raw provider payload (for adapters that need more). */
 	raw?: unknown;
 }
@@ -346,8 +375,19 @@ export interface ChannelAdapter {
 	 * Send an outbound text reply to a conversation. Optional `opts` carries
 	 * thread routing + future per-send hints; channels that don't honour an
 	 * option silently ignore it.
+	 *
+	 * Return value is ADDITIVE: a channel that can surface the sent message's
+	 * native id returns `{ messageId }` so the pipeline can let the agent
+	 * reference "my last message" (for a later edit / delete / react). Channels
+	 * that don't track an outbound id — and every existing caller, which ignores
+	 * the return — keep working unchanged: returning `void` (or `undefined`) is
+	 * still valid. WhatsApp is unaffected.
 	 */
-	sendText(conversationId: string, text: string, opts?: OutboundSendOptions): Promise<void>;
+	sendText(
+		conversationId: string,
+		text: string,
+		opts?: OutboundSendOptions,
+	): Promise<{ messageId?: string } | void>;
 	/**
 	 * Optional: send a media attachment (image / video / audio / voice / doc /
 	 * sticker) to a conversation. Channels that don't support media omit this
@@ -355,8 +395,12 @@ export interface ChannelAdapter {
 	 * pointing at the file path; it does NOT auto-fallback to `sendText`. If
 	 * you want a text fallback, the LLM calls `send_message` itself after the
 	 * refusal. See `send-media-tool.ts` for the refusal branch.
+	 *
+	 * Return value is ADDITIVE (same shape + rationale as `sendText`): a channel
+	 * may return `{ messageId }` for the sent media; `void`/`undefined` stays
+	 * valid for channels (and callers) that don't use it. WhatsApp is unaffected.
 	 */
-	sendMedia?(conversationId: string, media: OutboundMedia): Promise<void>;
+	sendMedia?(conversationId: string, media: OutboundMedia): Promise<{ messageId?: string } | void>;
 	/**
 	 * Optional: react to a previously-received message with an emoji (or pass
 	 * `""` to clear a prior reaction). `messageId` is the inbound message id
@@ -430,6 +474,42 @@ export interface ChannelAdapter {
 	 * QR/OAuth pairing (WhatsApp) leave it undefined.
 	 */
 	setup?: ChannelSetupAdapter;
+	/**
+	 * Optional: static capability flags advertised by this channel
+	 * (`reactions` / `edit` / `unsend` / `reply` / `media` / …). The central
+	 * `message_action` tool PRE-CHECKS the relevant flag here before invoking
+	 * `handleAction`, so a channel that declares `edit: false` cleanly reports
+	 * an edit as unsupported without the adapter ever being called. Adapters
+	 * that omit this advertise nothing — every action pre-check treats a missing
+	 * `capabilities` as "not supported" for that action.
+	 */
+	capabilities?: ChannelCapabilities;
+	/**
+	 * Optional: opt INTO native inline-button approvals. When present and it
+	 * exposes `sendApprovalPrompt`, the central approval-router renders the
+	 * approval question as the channel's native buttons (with codec-encoded
+	 * callback payloads) instead of the default "reply yes/no" text card; the
+	 * resulting button press arrives back as an `InboundMessage.callbackQuery`
+	 * and is consumed centrally. When absent, the router keeps using the text
+	 * prompt. The router — NOT the adapter — owns all pending-approval
+	 * bookkeeping; the adapter just posts the question.
+	 */
+	approvalCapability?: ChannelApprovalCapability;
+	/**
+	 * Optional: perform a message_action (edit / delete / react / pin / unpin /
+	 * reply) the agent requested via the central `message_action` tool. The
+	 * channel manager PRE-CHECKS the relevant `capabilities` flag (e.g.
+	 * `capabilities.edit`) before calling this, so an adapter only ever sees an
+	 * action it advertised support for. Channels that expose no message actions
+	 * omit this slot; the tool then reports the action unsupported cleanly.
+	 */
+	handleAction?(params: {
+		/** Destination conversation id (the `to` the action targets). */
+		conversationId: string;
+		action: ChannelMessageAction;
+		accountId?: string;
+		signal?: AbortSignal;
+	}): Promise<ChannelMessageActionResult>;
 }
 
 /** Context for a channel command handler (a `/cmd` typed in a channel chat). */

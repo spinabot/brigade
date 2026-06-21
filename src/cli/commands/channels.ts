@@ -25,6 +25,11 @@ import { loadConfig, saveConfig } from "../../core/config.js";
 import { isProcessAlive, readPid } from "../../core/gateway-probe.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { WHATSAPP_DEFAULT_ACCOUNT_ID } from "../../agents/channels/whatsapp/account-config.js";
+import {
+	resolveTelegramBotToken,
+	TELEGRAM_CHANNEL_ID,
+} from "../../agents/channels/telegram/account-config.js";
+import { probeTelegram, type TelegramProbeResult } from "../../agents/channels/telegram/probe.js";
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
@@ -215,8 +220,19 @@ export async function runChannelsStatus(
 	if (!chosen) return reportUnknownChannel(channels, args.channel);
 	const snap = snapshotChannel(chosen.adapter, config);
 	const gateway = await gatewayIsRunning();
+	// Telegram is token-based + stateless on disk, so "linked" can't be read from
+	// files — probe `getMe` for real reachability + bot identity. The probe runs
+	// only when a token is configured (otherwise it's a guaranteed failure that
+	// adds noise). Best-effort: a probe error never fails the status command.
+	let telegramProbe: TelegramProbeResult | undefined;
+	if (chosen.adapter.id === TELEGRAM_CHANNEL_ID) {
+		const token = resolveTelegramBotToken(config as never, null);
+		if (token) telegramProbe = await probeTelegram({ token });
+	}
 	if (opts.json) {
-		process.stdout.write(`${JSON.stringify({ ...snap, gateway }, null, 2)}\n`);
+		process.stdout.write(
+			`${JSON.stringify({ ...snap, gateway, ...(telegramProbe ? { probe: telegramProbe } : {}) }, null, 2)}\n`,
+		);
 		return 0;
 	}
 	// Human-readable status. The raw `stateDir` lives only on the `--json` path
@@ -225,7 +241,18 @@ export async function runChannelsStatus(
 	process.stdout.write(`${snap.label} (${snap.id})\n`);
 	process.stdout.write(`  enabled  : ${snap.enabled ? "yes" : "no"}\n`);
 	process.stdout.write(`  configured: ${snap.configured ? "yes" : "no"}\n`);
-	process.stdout.write(`  linked   : ${snap.linked ? "yes" : "no"}\n`);
+	// For Telegram, the probe is the authoritative "is it actually working" signal.
+	if (telegramProbe) {
+		if (telegramProbe.ok) {
+			const who = telegramProbe.bot?.username ? `@${telegramProbe.bot.username}` : `id ${telegramProbe.bot?.id ?? "?"}`;
+			process.stdout.write(`  reachable: yes (${who}, ${telegramProbe.elapsedMs}ms)\n`);
+			process.stdout.write(`  can join groups: ${telegramProbe.bot?.canJoinGroups ? "yes" : "no"}\n`);
+		} else {
+			process.stdout.write(`  reachable: no (${telegramProbe.error ?? "unknown error"})\n`);
+		}
+	} else {
+		process.stdout.write(`  linked   : ${snap.linked ? "yes" : "no"}\n`);
+	}
 	process.stdout.write(`  gateway  : ${gateway ? "running" : "stopped"}\n`);
 	return 0;
 }

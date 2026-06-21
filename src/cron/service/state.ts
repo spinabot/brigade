@@ -174,6 +174,16 @@ export interface CronServiceDeps {
 	 * + standalone CLI invocations where no channel manager is wired.
 	 */
 	listKnownChannelIds?: () => readonly string[];
+	/**
+	 * Resolve the idle-thread-session TTL in ms (e.g. from
+	 * `channels.telegram.threadIdleTtlMs`), or `null`/`undefined` when no thread
+	 * aging is configured. When wired + positive, the session-reaper sweep ALSO
+	 * ages out idle channel-thread sessions (Telegram forum topics, Slack/Discord
+	 * threads) older than the TTL — keeping idle-topic transcripts from piling up.
+	 * Returning `null` (the default when unwired) disables thread reaping; the
+	 * isolated-cron-run reaper is unaffected.
+	 */
+	resolveThreadIdleTtlMs?: () => number | null;
 }
 
 /** Tunable knobs the operator can set in `brigade.json`. */

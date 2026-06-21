@@ -70,6 +70,18 @@ export function isIsolatedCronRunSessionKey(sessionKey: string): boolean {
 	return /(^|:)cron:[^:]+:run:[^:]+$/.test(sessionKey);
 }
 
+/**
+ * Return true if the session key belongs to a CHANNEL THREAD (Telegram forum
+ * topic, Slack/Discord thread). Thread session keys carry a `:thread:<id>`
+ * suffix (see `routing/session-key.ts`'s `resolveThreadSessionKeys`). These are
+ * ephemeral by nature — a forum topic goes quiet and the session never gets
+ * re-used — so an opt-in idle TTL can age them out. The base (non-thread)
+ * session is NEVER matched, so a peer's main conversation is always preserved.
+ */
+export function isThreadSessionKey(sessionKey: string): boolean {
+	return /:thread:[^:]+$/.test(sessionKey);
+}
+
 export interface ReapSweepArgs {
 	agentId: string;
 	retentionMs: number;
@@ -149,6 +161,77 @@ export async function reapIsolatedCronSessions(args: ReapSweepArgs): Promise<Rea
 			pruned,
 			transcriptsRemoved,
 			retentionMs,
+		});
+	}
+	return { scanned, pruned, transcriptsRemoved };
+}
+
+/**
+ * One pass over CHANNEL THREAD sessions (Telegram forum topics etc.): delete
+ * the session + transcript for every `:thread:<id>` key whose last-used
+ * timestamp is older than `ttlMs` ago. Opt-in — the caller only invokes this
+ * when a `threadIdleTtlMs` is configured. Mirrors `reapIsolatedCronSessions`
+ * (best-effort, never throws on a per-entry failure) so an idle forum topic's
+ * transcript doesn't accumulate forever after the conversation goes quiet.
+ *
+ * Only thread sub-sessions are touched; a peer's BASE conversation session is
+ * never matched (it carries no `:thread:` suffix), so aging out an idle topic
+ * never disturbs the main chat.
+ */
+export async function reapIdleThreadSessions(args: {
+	agentId: string;
+	ttlMs: number;
+	nowMs: number;
+	log: SubsystemLogger;
+}): Promise<ReapSweepResult> {
+	const { agentId, ttlMs, nowMs, log } = args;
+	const cutoff = nowMs - ttlMs;
+	const store = readSessionStore(agentId);
+	let scanned = 0;
+	let pruned = 0;
+	let transcriptsRemoved = 0;
+	for (const [sessionKey, entry] of Object.entries(store.sessions)) {
+		if (!isThreadSessionKey(sessionKey)) continue;
+		scanned++;
+		const lastUsed = Date.parse(entry.lastUsedAt);
+		if (!Number.isFinite(lastUsed) || lastUsed > cutoff) continue;
+		try {
+			const sessionIdStr = typeof entry.sessionId === "string" ? entry.sessionId : null;
+			if (sessionIdStr) {
+				const rctx = tryGetRuntimeContext();
+				if (rctx?.mode === "convex") {
+					await rctx.store.messages.deleteTranscript(agentId, sessionIdStr);
+					const transcriptPath = resolveSessionTranscriptPath(agentId, sessionIdStr);
+					await fs.rm(transcriptPath, { force: true });
+				} else {
+					const transcriptPath = resolveSessionTranscriptPath(agentId, sessionIdStr);
+					await fs.rm(transcriptPath, { force: true });
+				}
+				transcriptsRemoved++;
+			}
+		} catch (err) {
+			log.warn("thread-reaper failed to delete transcript", {
+				sessionKey,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		try {
+			deleteSessionEntry(agentId, sessionKey);
+			pruned++;
+		} catch (err) {
+			log.warn("thread-reaper failed to delete session entry", {
+				sessionKey,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	if (pruned > 0) {
+		log.info("thread-reaper pruned idle thread sessions", {
+			agentId,
+			scanned,
+			pruned,
+			transcriptsRemoved,
+			ttlMs,
 		});
 	}
 	return { scanned, pruned, transcriptsRemoved };

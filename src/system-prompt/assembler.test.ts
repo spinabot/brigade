@@ -886,3 +886,66 @@ describe("assembleSystemPrompt — ## Messaging linked self-accounts", () => {
 		assert.match(out.text, /telegram is linked to the operator's own account: `operator_tg`/);
 	});
 });
+
+describe("assembleSystemPrompt — ## Messaging available-but-not-connected channels", () => {
+	it("renders ## Messaging with a connect offer when nothing is started but a channel is connectable", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			channels: {
+				started: [],
+				available: [{ channelId: "telegram", label: "Telegram", connectable: true }],
+			},
+		});
+		assert.match(out.text, /## Messaging/);
+		assert.match(out.text, /No messaging channel is connected yet/);
+		assert.match(out.text, /Available to connect \(not yet connected\): Telegram/);
+		assert.match(out.text, /connect_channel/);
+		// No "send now" line when nothing is connected.
+		assert.doesNotMatch(out.text, /To send now: `send_message`/);
+	});
+
+	it("lists both the connected channel AND the connectable one when both exist", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			channels: {
+				started: ["whatsapp"],
+				available: [{ channelId: "telegram", label: "Telegram", connectable: true }],
+			},
+		});
+		assert.match(out.text, /## Messaging/);
+		assert.match(out.text, /message the operator.*on: whatsapp/);
+		assert.match(out.text, /Available to connect \(not yet connected\): Telegram/);
+	});
+
+	it("does NOT render a connect line for a channel marked connectable:false", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			channels: {
+				started: ["whatsapp"],
+				available: [{ channelId: "telegram", label: "Telegram", connectable: false }],
+			},
+		});
+		assert.match(out.text, /## Messaging/);
+		assert.doesNotMatch(out.text, /Available to connect/);
+	});
+
+	it("omits the ## Messaging block entirely in sub-agent mode even with connectable channels", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			capabilities: { subagentMode: true },
+			channels: {
+				started: [],
+				available: [{ channelId: "telegram", label: "Telegram", connectable: true }],
+			},
+		});
+		assert.doesNotMatch(out.text, /## Messaging/);
+	});
+});

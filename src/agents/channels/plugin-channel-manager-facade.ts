@@ -11,12 +11,23 @@
  */
 
 import type { ChannelAdapter } from "../extensions/types.js";
-import type { ChannelManager } from "./manager.js";
-import type { WhatsAppPluginHandle } from "./whatsapp/plugin.js";
+import type { ChannelManager, StartChannelResult, StopChannelResult } from "./manager.js";
+
+/**
+ * The minimal per-account introspection surface the facade needs from a plugin
+ * handle — `id` + which accounts are running + a per-account adapter lookup.
+ * Both `WhatsAppPluginHandle` and `TelegramPluginHandle` satisfy this, so the
+ * facade is channel-agnostic and one facade can front a mixed plugin list.
+ */
+export interface PluginChannelManagerHandle {
+	id: string;
+	startedAccountIds(): string[];
+	getAdapter(accountId: string): ChannelAdapter | undefined;
+}
 
 /** Build a manager facade over a list of plugin handles. */
 export function createPluginChannelManagerFacade(args: {
-	plugins: WhatsAppPluginHandle[];
+	plugins: PluginChannelManagerHandle[];
 }): ChannelManager {
 	const started = (): string[] => {
 		const ids: string[] = [];
@@ -48,6 +59,27 @@ export function createPluginChannelManagerFacade(args: {
 		async stop(): Promise<void> {
 			// Stop is owned by the `ChannelPluginManager` directly; the facade
 			// is a read-only surface for the `send_message` tool.
+		},
+		async startChannel(id: string): Promise<StartChannelResult> {
+			// The multi-account plugin path owns its own lifecycle through the
+			// `ChannelPluginManager` (per-account loops + restart-backoff), so a
+			// live single-channel start does NOT route through this read-only
+			// facade. Report it honestly so `connect_channel` falls back to
+			// "config written — restart the gateway to connect".
+			return {
+				ok: false,
+				started: false,
+				reason: "start-failed",
+				message: `live start for "${id}" is managed by the multi-account channel plugin manager — restart the gateway to apply config changes`,
+			};
+		},
+		async stopChannel(id: string): Promise<StopChannelResult> {
+			// Same ownership note as startChannel — the plugin manager owns stop.
+			return {
+				ok: true,
+				stopped: false,
+				message: `live stop for "${id}" is managed by the multi-account channel plugin manager`,
+			};
 		},
 	};
 }

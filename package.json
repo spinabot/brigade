@@ -3,14 +3,15 @@
   "version": "1.1.0",
   "description": "Brigade — your personal AI crew",
   "homepage": "https://brigade-agent.ai",
-  "author": "Spinabot",
+  "author": "Spinabot <hello@brigade-agent.ai>",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/spinabot/brigade.git"
   },
   "bugs": {
-    "url": "https://github.com/spinabot/brigade/issues"
+    "url": "https://github.com/spinabot/brigade/issues",
+    "email": "hello@brigade-agent.ai"
   },
   "publishConfig": {
     "access": "public"
@@ -111,6 +112,14 @@
     "wa:unlink": "node scripts/run-brigade.mjs channels unlink --channel whatsapp",
     "wa:status": "node scripts/run-brigade.mjs channels status --channel whatsapp",
     "wa:allow": "node scripts/run-brigade.mjs channels allow list --channel whatsapp",
+    "telegram": "node scripts/run-brigade.mjs channels status --channel telegram",
+    "telegram:status": "node scripts/run-brigade.mjs channels status --channel telegram",
+    "telegram:enable": "node scripts/run-brigade.mjs channels enable --channel telegram",
+    "telegram:disable": "node scripts/run-brigade.mjs channels disable --channel telegram",
+    "telegram:allow": "node scripts/run-brigade.mjs channels allow list --channel telegram",
+    "telegram:allow:add": "node scripts/run-brigade.mjs channels allow add --channel telegram",
+    "telegram:allow:remove": "node scripts/run-brigade.mjs channels allow remove --channel telegram",
+    "telegram:token": "node scripts/run-brigade.mjs channels add --channel telegram",
     "pairing": "node scripts/run-brigade.mjs pairing list --channel whatsapp",
     "pairing:list": "node scripts/run-brigade.mjs pairing list --channel whatsapp",
     "pairing:approve": "node scripts/run-brigade.mjs pairing approve --channel whatsapp",
@@ -150,6 +159,9 @@
   },
   "dependencies": {
     "@composio/core": "^0.10.0",
+    "@grammyjs/runner": "^2.0.3",
+    "@grammyjs/transformer-throttler": "^1.2.1",
+    "@grammyjs/types": "^3.21.0",
     "@mariozechner/pi-coding-agent": "0.73.1",
     "@mariozechner/pi-tui": "0.73.1",
     "@mozilla/readability": "^0.6.0",
@@ -160,6 +172,7 @@
     "commander": "^12.1.0",
     "convex": "^1.40.0",
     "croner": "^10.0.1",
+    "grammy": "^1.42.0",
     "json5": "^2.2.3",
     "linkedom": "^0.18.12",
     "minimatch": "^10.2.5",

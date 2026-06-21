@@ -1088,7 +1088,27 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // standalone CLI runs where no manager is mounted.
     channels: (() => {
       const manager = getActiveChannelManager();
-      if (!manager || manager.started.length === 0) return undefined;
+      const started = manager ? manager.started : [];
+      const startedSet = new Set(started);
+      // AVAILABLE-but-not-connected channels (channel-foundation awareness):
+      // every REGISTERED channel adapter that isn't currently started is one
+      // the operator could wire up via `connect_channel`. Reflects real state
+      // — the model can OFFER to connect e.g. Telegram instead of claiming it
+      // can't message there. Sourced from the same per-agent extension registry
+      // the gateway uses (already loaded for this turn). Skipped entirely when
+      // no registry is mounted (standalone CLI runs).
+      const available: Array<{ channelId: string; label: string; connectable: boolean }> = [];
+      try {
+        for (const adapter of extensionRegistry.channels) {
+          if (startedSet.has(adapter.id)) continue;
+          available.push({ channelId: adapter.id, label: adapter.label, connectable: true });
+        }
+      } catch {
+        // Registry read failures must never break a turn — just skip awareness.
+      }
+      // Nothing started AND nothing to connect → omit the channels arg entirely
+      // (keeps the prompt byte-identical to the no-channels shape).
+      if (started.length === 0 && available.length === 0) return undefined;
       const route = args.channelApprovalRoute;
       // Probe each started adapter's health (sync, cheap — reads a cached
       // bool) so the assembler can surface a `⚠️ degraded` block when any
@@ -1103,8 +1123,8 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       // connection id). The assembler surfaces it in `## Messaging` so the
       // model knows the operator's own number instead of asking for it.
       const linked: Array<{ channelId: string; selfId: string }> = [];
-      for (const id of manager.started) {
-        const adapter = manager.adapter(id);
+      for (const id of started) {
+        const adapter = manager?.adapter(id);
         if (!adapter) continue;
         const selfId = typeof adapter.selfId === "function" ? adapter.selfId() : undefined;
         if (selfId) linked.push({ channelId: id, selfId });
@@ -1119,7 +1139,8 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         }
       }
       return {
-        started: manager.started,
+        started,
+        ...(available.length > 0 ? { available } : {}),
         ...(linked.length > 0 ? { linked } : {}),
         ...(degraded.length > 0 ? { degraded } : {}),
         ...(route
@@ -1768,6 +1789,14 @@ async function buildPersonaPrompt(args: {
    */
   channels?: {
     started: readonly string[];
+    /** Registered-but-not-connected channels the operator could wire up via
+     *  `connect_channel`. Surfaced in `## Messaging` so the model can offer
+     *  to connect e.g. Telegram. */
+    available?: ReadonlyArray<{
+      channelId: string;
+      label: string;
+      connectable: boolean;
+    }>;
     linked?: ReadonlyArray<{
       channelId: string;
       selfId: string;

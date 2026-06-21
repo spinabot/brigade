@@ -13,8 +13,8 @@ export declare const listAccess: import("convex/server").RegisteredQuery<"public
     accountId: string;
     kind: "allow-from" | "group-allow-from" | "pairing";
     channelId: string;
-    ownerId: string;
     senderId: ArrayBuffer;
+    ownerId: string;
 }[]>>;
 /** Every access row for the owner — single-operator scale keeps this tiny.
  *  Boot hydration uses it to fill the in-process access cache in one query
@@ -31,8 +31,8 @@ export declare const listAllAccess: import("convex/server").RegisteredQuery<"pub
     accountId: string;
     kind: "allow-from" | "group-allow-from" | "pairing";
     channelId: string;
-    ownerId: string;
     senderId: ArrayBuffer;
+    ownerId: string;
 }[]>>;
 /** Replace the row set for one (channel, account, kind) in a single
  *  transaction — the convex-mode realisation of the filesystem's
@@ -59,8 +59,8 @@ export declare const upsertAccess: import("convex/server").RegisteredMutation<"p
     accountId: string;
     kind: "allow-from" | "group-allow-from" | "pairing";
     channelId: string;
-    ownerId: string;
     senderId: ArrayBuffer;
+    ownerId: string;
 }, Promise<{
     changed: boolean;
 }>>;
@@ -68,8 +68,8 @@ export declare const removeAccess: import("convex/server").RegisteredMutation<"p
     accountId: string;
     kind: "allow-from" | "group-allow-from" | "pairing";
     channelId: string;
-    ownerId: string;
     senderId: ArrayBuffer;
+    ownerId: string;
 }, Promise<boolean>>;
 export declare const eraseAccount: import("convex/server").RegisteredMutation<"public", {
     accountId: string;
@@ -80,8 +80,8 @@ export declare const upsertPairingRequest: import("convex/server").RegisteredMut
     senderName?: string | undefined;
     accountId: string;
     channelId: string;
-    ownerId: string;
     senderId: ArrayBuffer;
+    ownerId: string;
 }, Promise<{
     code: string;
     isNew: boolean;

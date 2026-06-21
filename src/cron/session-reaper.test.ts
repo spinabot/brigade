@@ -14,6 +14,7 @@ import {
 	DEFAULT_RETENTION_MS,
 	MIN_SWEEP_INTERVAL_MS,
 	isIsolatedCronRunSessionKey,
+	isThreadSessionKey,
 	parseSessionRetention,
 	shouldRunSweep,
 } from "./session-reaper.js";
@@ -65,6 +66,22 @@ describe("session-reaper — isIsolatedCronRunSessionKey", () => {
 	it("does NOT match unrelated session keys", () => {
 		assert.equal(isIsolatedCronRunSessionKey("agent:main:main"), false);
 		assert.equal(isIsolatedCronRunSessionKey("whatsapp:thread:abc"), false);
+	});
+});
+
+describe("session-reaper — isThreadSessionKey", () => {
+	it("matches a channel-thread session key (`:thread:<id>` suffix)", () => {
+		assert.equal(isThreadSessionKey("agent:main:telegram:555:thread:88"), true);
+		assert.equal(isThreadSessionKey("telegram:peer:thread:topic-12"), true);
+	});
+
+	it("does NOT match a base (non-thread) session key", () => {
+		assert.equal(isThreadSessionKey("agent:main:telegram:555"), false);
+		assert.equal(isThreadSessionKey("agent:main:main"), false);
+	});
+
+	it("does NOT match cron-run keys (those are the other reaper's job)", () => {
+		assert.equal(isThreadSessionKey("cron:job-1:run:abc"), false);
 	});
 });
 

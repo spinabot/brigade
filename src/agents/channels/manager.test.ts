@@ -1128,3 +1128,279 @@ describe("startChannels", () => {
 		await mgr.stop();
 	});
 });
+
+/* ───────────────────── runtime single-channel start/stop (connect_channel) ───────────────────── */
+
+describe("ChannelManager.startChannel / stopChannel — live single-channel lifecycle", () => {
+	it("startChannel brings up an adapter that was NOT started at boot (config-disabled → enabled)", async () => {
+		// Adapter reports unconfigured at boot, then configured once `enabled`
+		// flips — exactly the connect_channel flow (write config, then start live).
+		let enabled = false;
+		const f = makeFakeChannel({ isConfigured: () => enabled });
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		// Nothing started at boot.
+		assert.deepEqual(mgr.started, []);
+		// Operator "enables" the channel, then a live start brings it up.
+		enabled = true;
+		const res = await mgr.startChannel("fake");
+		assert.equal(res.ok, true);
+		assert.equal(res.started, true);
+		assert.deepEqual(mgr.started, ["fake"]);
+		// And it's wired: inbound routes through the pipeline to a reply.
+		await mgr.stop();
+	});
+
+	it("startChannel refreshes the config snapshot when a fresh config is passed", async () => {
+		// The manager captured the boot config (channel disabled). Passing the
+		// just-written config to startChannel must make isConfigured see the new
+		// value WITHOUT a manager rebuild.
+		const seenConfigs: unknown[] = [];
+		const f = makeFakeChannel({
+			isConfigured: (cfg) => {
+				seenConfigs.push(cfg);
+				return (cfg as { channels?: { fake?: { enabled?: boolean } } }).channels?.fake?.enabled === true;
+			},
+		});
+		const bootCfg = { channels: { fake: { enabled: false } } } as unknown as BrigadeConfig;
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: bootCfg,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		assert.deepEqual(mgr.started, []);
+		const freshCfg = { channels: { fake: { enabled: true } } } as unknown as BrigadeConfig;
+		const res = await mgr.startChannel("fake", freshCfg);
+		assert.equal(res.started, true);
+		assert.deepEqual(mgr.started, ["fake"]);
+		await mgr.stop();
+	});
+
+	it("startChannel is idempotent — starting an already-running channel is a no-op", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		assert.deepEqual(mgr.started, ["fake"]);
+		const res = await mgr.startChannel("fake");
+		assert.equal(res.ok, true);
+		assert.equal(res.started, false, "already running → started:false");
+		assert.deepEqual(mgr.started, ["fake"], "still exactly one entry");
+		await mgr.stop();
+	});
+
+	it("startChannel reports unknown-channel for an id with no registered adapter", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		const res = await mgr.startChannel("telegram");
+		assert.equal(res.ok, false);
+		assert.equal(res.reason, "unknown-channel");
+		await mgr.stop();
+	});
+
+	it("startChannel reports not-configured when the adapter still isn't configured", async () => {
+		const f = makeFakeChannel({ isConfigured: () => false });
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		const res = await mgr.startChannel("fake");
+		assert.equal(res.ok, false);
+		assert.equal(res.reason, "not-configured");
+		assert.deepEqual(mgr.started, []);
+		await mgr.stop();
+	});
+
+	it("stopChannel tears down ONE channel and leaves the others running", async () => {
+		const a = makeFakeChannel({ id: "a" });
+		const b = makeFakeChannel({ id: "b" });
+		const mgr = await startChannels({
+			adapters: [a.adapter, b.adapter],
+			config: { channels: { a: { dmPolicy: "open" }, b: { dmPolicy: "open" } } } as unknown as BrigadeConfig,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		assert.deepEqual(mgr.started.sort(), ["a", "b"]);
+		const res = await mgr.stopChannel("a");
+		assert.equal(res.ok, true);
+		assert.equal(res.stopped, true);
+		assert.equal(a.stopped(), true, "a.stop() was called");
+		assert.equal(b.stopped(), false, "b stays running");
+		assert.deepEqual(mgr.started, ["b"], "only b remains started");
+		await mgr.stop();
+	});
+
+	it("stopChannel only aborts its OWN channel's signal, not the others", async () => {
+		const a = makeFakeChannel({ id: "a" });
+		const b = makeFakeChannel({ id: "b" });
+		const mgr = await startChannels({
+			adapters: [a.adapter, b.adapter],
+			config: { channels: { a: { dmPolicy: "open" }, b: { dmPolicy: "open" } } } as unknown as BrigadeConfig,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		assert.equal(a.ctx().signal.aborted, false);
+		assert.equal(b.ctx().signal.aborted, false);
+		await mgr.stopChannel("a");
+		assert.equal(a.ctx().signal.aborted, true, "a's signal aborted");
+		assert.equal(b.ctx().signal.aborted, false, "b's signal untouched");
+		await mgr.stop();
+	});
+
+	it("stopChannel is idempotent — stopping a non-running channel returns stopped:false", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		await mgr.stopChannel("fake");
+		const res = await mgr.stopChannel("fake");
+		assert.equal(res.ok, true);
+		assert.equal(res.stopped, false);
+		await mgr.stop();
+	});
+
+	it("a channel stopped then started again re-registers cleanly (start → stop → start)", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		assert.deepEqual(mgr.started, ["fake"]);
+		await mgr.stopChannel("fake");
+		assert.deepEqual(mgr.started, []);
+		const res = await mgr.startChannel("fake");
+		assert.equal(res.started, true);
+		assert.deepEqual(mgr.started, ["fake"]);
+		await mgr.stop();
+	});
+
+	it("master stop() still cascades to a live-started channel's signal", async () => {
+		// A channel started live (not at boot) must still be torn down + signalled
+		// by the all-channels stop().
+		let enabled = false;
+		const f = makeFakeChannel({ isConfigured: () => enabled });
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		enabled = true;
+		await mgr.startChannel("fake");
+		assert.equal(f.ctx().signal.aborted, false);
+		await mgr.stop();
+		assert.equal(f.ctx().signal.aborted, true, "master stop() aborts the live-started channel too");
+		assert.equal(f.stopped(), true);
+	});
+
+	it("startChannel after master stop() refuses", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "" }),
+		});
+		await mgr.stop();
+		const res = await mgr.startChannel("fake");
+		assert.equal(res.ok, false, "manager is stopped — startChannel refuses");
+	});
+});
+
+describe("inbound pipeline — inline-button approval callback (end-to-end)", () => {
+	it("a callbackQuery inbound resolves a pending approval through the central pipeline", async () => {
+		const { encodeApprovalCallback } = await import("./approval-callback-codec.js");
+		const {
+			dispatchChannelApproval,
+			resetChannelApprovalRouterForTests,
+		} = await import("./approval-router.js");
+		const f = makeFakeChannel();
+		let ranTurn = false;
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => {
+				ranTurn = true;
+				return { reply: "should-not-run-for-a-callback" };
+			},
+		});
+		// Raise a pending approval on this peer (as the exec-gate would).
+		let settled: { kind: string } | undefined;
+		await dispatchChannelApproval({
+			request: {
+				id: "exec:cb-e2e",
+				command: "ls -la",
+				toolName: "bash",
+				timeoutMs: 60_000,
+				decisions: ["allow-once", "allow-always", "deny"],
+			},
+			route: { channelId: "fake", conversationId: "c1", agentId: "main" },
+			resolveOnBridge: (d) => {
+				settled = { kind: d.kind };
+			},
+		});
+		// The operator taps "Allow once" — arrives as a callbackQuery inbound.
+		const data = encodeApprovalCallback({ approvalId: "exec:cb-e2e", decision: "allow-once" })!;
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "c1",
+			from: "u1",
+			text: "",
+			callbackQuery: { data, callbackId: "cbq-1" },
+		});
+		assert.deepEqual(settled, { kind: "allow-once" }, "bridge settled via the callback");
+		assert.equal(ranTurn, false, "a callback must NOT trigger a normal agent turn");
+		// An acknowledgement was sent back to the conversation.
+		assert.ok(f.sent.some((s) => /Allowed once/i.test(s.text)), "ack posted to the chat");
+		resetChannelApprovalRouterForTests();
+		await mgr.stop();
+	});
+});
+
+describe("inbound pipeline — last-sent message id capture", () => {
+	it("records the sent reply id (from sendText's additive return) for message_action", async () => {
+		const { getLastSentMessage, resetLastSentMessageRegistryForTests } = await import(
+			"./last-sent-message.js"
+		);
+		resetLastSentMessageRegistryForTests();
+		// A fake adapter whose sendText returns a native message id.
+		const f = makeFakeChannel({
+			async sendText(_conversationId, _text) {
+				return { messageId: "sent-id-123" };
+			},
+		});
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "pong" }),
+		});
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u1", text: "ping" });
+		const rec = getLastSentMessage("main", "fake", "c1");
+		assert.ok(rec, "a last-sent record exists");
+		assert.equal(rec?.messageId, "sent-id-123");
+		resetLastSentMessageRegistryForTests();
+		await mgr.stop();
+	});
+});

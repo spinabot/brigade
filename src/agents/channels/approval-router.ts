@@ -41,9 +41,20 @@
  * the bridge itself (see `approval-bridge.ts` for the same rationale).
  */
 
+import type { BrigadeConfig } from "../../config/io.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import type { ApprovalDecision, ApprovalDecisionKind, ApprovalRequest } from "../approval-bridge.js";
+import {
+	type ApprovalCallbackDecision,
+	decodeApprovalCallback,
+} from "./approval-callback-codec.js";
+import type {
+	ChannelApprovalCapability,
+	ChannelApprovalKind,
+	ChannelApprovalPromptParams,
+} from "./types.adapters.js";
+import type { RuntimeEnv } from "./types.core.js";
 
 const log = createSubsystemLogger("brigade/channel-approvals");
 
@@ -65,14 +76,34 @@ export interface ChannelApprovalRoute {
  * `startChannels` boot from each adapter's outbound surface.
  */
 export interface ChannelApprovalDispatcher {
-	/** Send the approval prompt to the conversation. */
+	/**
+	 * Send the approval prompt to the conversation. The return is intentionally
+	 * widened to accept adapters whose `sendText` now yields `{ messageId? }`
+	 * (the additive outbound-id surface) — the router ignores any returned id;
+	 * it only needs the send to resolve.
+	 */
 	sendText: (
 		conversationId: string,
 		text: string,
 		opts?: { threadId?: string; accountId?: string },
-	) => Promise<void>;
+	) => Promise<{ messageId?: string } | void>;
 	/** Human-readable label for log lines + the prompt header (e.g. "WhatsApp"). */
 	prettyName: string;
+	/**
+	 * Optional native-button approval capability. When the registering channel's
+	 * adapter exposes `approvalCapability.sendApprovalPrompt`, the router renders
+	 * the approval question via THAT (inline buttons carrying codec-encoded
+	 * callback payloads) instead of the default text card. Absent → text path.
+	 * Additive: dispatchers registered with only `{ sendText, prettyName }`
+	 * (WhatsApp, the manager's default) keep using the text prompt unchanged.
+	 */
+	approvalCapability?: ChannelApprovalCapability;
+	/**
+	 * Supplies the `runtime` + `cfg` a native `sendApprovalPrompt` call needs.
+	 * Only consulted when `approvalCapability.sendApprovalPrompt` is present, so
+	 * text-only dispatchers never need it.
+	 */
+	getApprovalContext?: () => { runtime: RuntimeEnv; cfg: BrigadeConfig };
 }
 
 /** Entry stored per pending approval. The router owns the lifecycle. */
@@ -264,6 +295,17 @@ function buildPromptText(args: {
 }
 
 /**
+ * Infer the approval KIND for a request so a native prompt can label itself
+ * ("approve this shell command" vs "approve this plugin action"). Brigade's
+ * exec-gate raises shell-command approvals (the overwhelming common case); a
+ * `plugin:`-prefixed id marks a plugin-capability approval. The distinction is
+ * cosmetic for the channel render — the bridge resolution is identical.
+ */
+function approvalKindForRequest(request: ApprovalRequest): ChannelApprovalKind {
+	return request.id.startsWith("plugin:") ? "plugin" : "exec";
+}
+
+/**
  * Decode an operator's text reply into a decision kind. Liberal in what
  * it accepts so the operator can type the obvious shapes without thinking:
  *   yes / y / ok / allow / sure  → allow-once
@@ -384,11 +426,36 @@ export async function dispatchChannelApproval(args: {
 		const sendOpts: { threadId?: string; accountId?: string } = {};
 		if (route.threadId) sendOpts.threadId = route.threadId;
 		if (route.accountId) sendOpts.accountId = route.accountId;
-		await dispatcher.sendText(
-			route.conversationId,
-			prompt,
-			Object.keys(sendOpts).length > 0 ? sendOpts : undefined,
-		);
+		// Native inline-button render when the channel opted in; otherwise the
+		// default text prompt. The button payloads carry codec-encoded
+		// `{ approvalId, decision }` and the press comes back as an
+		// `InboundMessage.callbackQuery` → `tryConsumeChannelApprovalCallback`.
+		const native = dispatcher.approvalCapability?.sendApprovalPrompt;
+		if (native) {
+			const promptCtx = dispatcher.getApprovalContext?.();
+			const promptParams: ChannelApprovalPromptParams = {
+				// `runtime`/`cfg` come from the registering channel; fall back to
+				// empty shapes so a capability that ignores them still works.
+				runtime: promptCtx?.runtime ?? ({} as RuntimeEnv),
+				cfg: promptCtx?.cfg ?? ({} as BrigadeConfig),
+				conversationId: route.conversationId,
+				...(route.accountId !== undefined ? { accountId: route.accountId } : {}),
+				...(route.threadId !== undefined ? { threadId: route.threadId } : {}),
+				approvalId: request.id,
+				approvalKind: approvalKindForRequest(request),
+				command: request.command,
+				...(request.toolName !== undefined ? { toolName: request.toolName } : {}),
+				...(request.cwd !== undefined ? { cwd: request.cwd } : {}),
+				timeoutMs: request.timeoutMs,
+			};
+			await native(promptParams);
+		} else {
+			await dispatcher.sendText(
+				route.conversationId,
+				prompt,
+				Object.keys(sendOpts).length > 0 ? sendOpts : undefined,
+			);
+		}
 	} catch (err) {
 		// Release the reserved slot so the WS-fallback path can run cleanly.
 		if (pendingByPeer.get(key) === reservationToken) {
@@ -431,6 +498,7 @@ export async function dispatchChannelApproval(args: {
 		conversationId: route.conversationId,
 		approvalId: request.id,
 		via: dispatcher.prettyName,
+		render: dispatcher.approvalCapability?.sendApprovalPrompt ? "buttons" : "text",
 	});
 	return true;
 }
@@ -454,6 +522,52 @@ export async function dispatchChannelApproval(args: {
  *     This keeps the router test-friendly (no I/O side effects on the
  *     intercept path) and lets per-channel formatting differ.
  */
+/**
+ * Locate the pending approval that a reply / callback from this peer should
+ * settle, returning the entry + its map key. Shared by BOTH the text-reply and
+ * the inline-button consumers so the peer-disambiguation rules (exact-route key
+ * first, then a per-channel+conversation fallback scan for under-pinned
+ * inbounds like WhatsApp flat-DMs) are identical on both paths.
+ */
+function findPendingEntry(args: {
+	channelId: string;
+	conversationId: string;
+	threadId?: string;
+	accountId?: string;
+	agentId?: string;
+}): { entry: PendingChannelApproval; entryKey: string } | undefined {
+	const exactKey = peerKey({
+		channelId: args.channelId,
+		conversationId: args.conversationId,
+		...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+		...(args.accountId !== undefined ? { accountId: args.accountId } : {}),
+		...(args.agentId !== undefined ? { agentId: args.agentId } : {}),
+	});
+	const exact = pendingByPeer.get(exactKey);
+	if (exact) return { entry: exact, entryKey: exactKey };
+	// Fall back to a per-channel + per-conversation scan that matches when the
+	// caller didn't pin every dimension (e.g. WhatsApp inbound has no
+	// thread/account). Stops on the first agreeing route to preserve the
+	// "one prompt per peer at a time" invariant.
+	for (const [k, candidate] of pendingByPeer.entries()) {
+		const r = candidate.route;
+		if (r.channelId !== args.channelId || r.conversationId !== args.conversationId) continue;
+		if (args.threadId !== undefined && r.threadId !== undefined && r.threadId !== args.threadId) continue;
+		if (args.accountId !== undefined && r.accountId !== undefined && r.accountId !== args.accountId) continue;
+		if (args.agentId !== undefined && r.agentId !== undefined && r.agentId !== args.agentId) continue;
+		return { entry: candidate, entryKey: k };
+	}
+	return undefined;
+}
+
+/** Evict a resolved entry from both maps + cancel its watchdog, then settle the bridge. */
+function settlePending(entry: PendingChannelApproval, entryKey: string, kind: ApprovalDecisionKind): void {
+	pendingByPeer.delete(entryKey);
+	pendingById.delete(entry.request.id);
+	clearTimeout(entry.timer);
+	entry.resolveOnBridge({ kind });
+}
+
 export function tryConsumeChannelApprovalReply(args: {
 	channelId: string;
 	conversationId: string;
@@ -462,52 +576,115 @@ export function tryConsumeChannelApprovalReply(args: {
 	accountId?: string;
 	agentId?: string;
 }): { matched: true; decision: ApprovalDecisionKind; approvalId: string } | { matched: false } {
-	// First, try the exact-route key (covers thread + account + agent
-	// disambiguation). If nothing matches AND the caller didn't pin all
-	// dimensions, scan for any pending entry whose route's pinned dimensions
-	// agree with the caller — that handles the WhatsApp-style flat-DM case
-	// where the inbound carries no threadId but the approval was raised on
-	// the same channel+conversation.
-	const exactKey = peerKey({
-		channelId: args.channelId,
-		conversationId: args.conversationId,
-		...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
-		...(args.accountId !== undefined ? { accountId: args.accountId } : {}),
-		...(args.agentId !== undefined ? { agentId: args.agentId } : {}),
-	});
-	let entry = pendingByPeer.get(exactKey);
-	let entryKey = exactKey;
-	if (!entry) {
-		// Fall back to a per-channel + per-conversation scan that matches when
-		// the caller didn't pin every dimension (e.g. WhatsApp inbound has no
-		// thread/account). Stops on the first agreeing route to preserve the
-		// "one prompt per peer at a time" invariant.
-		for (const [k, candidate] of pendingByPeer.entries()) {
-			const r = candidate.route;
-			if (r.channelId !== args.channelId || r.conversationId !== args.conversationId) continue;
-			if (args.threadId !== undefined && r.threadId !== undefined && r.threadId !== args.threadId) continue;
-			if (args.accountId !== undefined && r.accountId !== undefined && r.accountId !== args.accountId) continue;
-			if (args.agentId !== undefined && r.agentId !== undefined && r.agentId !== args.agentId) continue;
-			entry = candidate;
-			entryKey = k;
-			break;
-		}
-	}
-	if (!entry) return { matched: false };
+	const found = findPendingEntry(args);
+	if (!found) return { matched: false };
 	const kind = decodeReply(args.text);
 	if (kind === null) return { matched: false };
-	pendingByPeer.delete(entryKey);
-	pendingById.delete(entry.request.id);
-	clearTimeout(entry.timer);
-	const decision: ApprovalDecision = { kind };
-	entry.resolveOnBridge(decision);
+	settlePending(found.entry, found.entryKey, kind);
 	log.info("approval resolved via channel reply", {
 		channelId: args.channelId,
 		conversationId: args.conversationId,
-		approvalId: entry.request.id,
+		approvalId: found.entry.request.id,
 		decision: kind,
 	});
-	return { matched: true, decision: kind, approvalId: entry.request.id };
+	return { matched: true, decision: kind, approvalId: found.entry.request.id };
+}
+
+/**
+ * Try to consume an inline-button press (Telegram `callback_query` etc.) as the
+ * answer to a pending approval for this peer. Mirrors `tryConsumeChannelApprovalReply`
+ * but decodes the button's codec payload instead of free text, and runs an
+ * optional central authorization gate before settling.
+ *
+ * Returns:
+ *   - `{ matched: true, decision, approvalId }` — the payload decoded to a
+ *     pending approval for an AUTHORIZED presser and the bridge was resolved.
+ *     The caller should acknowledge the press and NOT dispatch a turn.
+ *   - `{ matched: false, refused: true, reason }` — the payload matched a
+ *     pending approval but the presser was refused by `authorizeApprover`. The
+ *     pending entry is left intact (a non-operator press must not consume the
+ *     operator's approval). The caller should ack with the refusal reason.
+ *   - `{ matched: false }` — not an approval callback for this peer (foreign /
+ *     malformed payload, or no pending entry). Caller proceeds normally.
+ *
+ * MUST be called AFTER the channel access gate (only trusted peers reach here)
+ * and BEFORE the text-reply path. `authorizeApprover` is the channel's own
+ * predicate (from its `ChannelApprovalCapability`); when provided it is invoked
+ * centrally so a non-operator's button press is refused here, not in the
+ * adapter.
+ */
+export function tryConsumeChannelApprovalCallback(args: {
+	channelId: string;
+	conversationId: string;
+	callbackData: string;
+	threadId?: string;
+	accountId?: string;
+	agentId?: string;
+	senderId?: string;
+	authorizeApprover?: (params: {
+		accountId?: string;
+		senderId?: string;
+		approvalKind: ChannelApprovalKind;
+	}) => { authorized: boolean; reason?: string };
+}):
+	| { matched: true; decision: ApprovalDecisionKind; approvalId: string }
+	| { matched: false; refused?: true; reason?: string } {
+	// Decode FIRST — a foreign / malformed button payload is simply "not ours".
+	const decoded = decodeApprovalCallback(args.callbackData);
+	if (!decoded) return { matched: false };
+	const found = findPendingEntry(args);
+	if (!found) return { matched: false };
+	// The decoded payload must reference the SAME pending approval we matched by
+	// peer — otherwise a stale button from a previous (already-resolved-and-
+	// replaced) prompt could settle the wrong approval.
+	if (found.entry.request.id !== decoded.approvalId) return { matched: false };
+	// Central approver authorization: refuse a non-operator press BEFORE
+	// settling. Leave the pending entry intact so the real operator can still
+	// answer.
+	if (args.authorizeApprover) {
+		const verdict = args.authorizeApprover({
+			...(args.accountId !== undefined ? { accountId: args.accountId } : {}),
+			...(args.senderId !== undefined ? { senderId: args.senderId } : {}),
+			approvalKind: approvalKindForRequest(found.entry.request),
+		});
+		if (!verdict.authorized) {
+			log.warn("approval callback refused — presser not authorized", {
+				channelId: args.channelId,
+				conversationId: args.conversationId,
+				approvalId: found.entry.request.id,
+				senderId: args.senderId,
+			});
+			return {
+				matched: false,
+				refused: true,
+				...(verdict.reason !== undefined ? { reason: verdict.reason } : {}),
+			};
+		}
+	}
+	const kind = callbackDecisionToBridgeKind(decoded.decision);
+	settlePending(found.entry, found.entryKey, kind);
+	log.info("approval resolved via channel callback", {
+		channelId: args.channelId,
+		conversationId: args.conversationId,
+		approvalId: found.entry.request.id,
+		decision: kind,
+	});
+	return { matched: true, decision: kind, approvalId: found.entry.request.id };
+}
+
+/** Map a codec decision onto the bridge's decision-kind vocabulary. */
+function callbackDecisionToBridgeKind(decision: ApprovalCallbackDecision): ApprovalDecisionKind {
+	// The codec's three values are a strict subset of ApprovalDecisionKind, so
+	// this is a widening pass — kept explicit so a future codec value can't
+	// silently leak an unhandled kind onto the bridge.
+	switch (decision) {
+		case "allow-once":
+			return "allow-once";
+		case "allow-always":
+			return "allow-always";
+		case "deny":
+			return "deny";
+	}
 }
 
 /**

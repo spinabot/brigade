@@ -7,6 +7,7 @@
  * + loaded by the loader alongside these (same gating) — see `discovery.ts`.
  */
 
+import { telegramModule } from "../../channels/telegram/module.js";
 import { whatsAppModule } from "../../channels/whatsapp/module.js";
 import { arxivModule } from "./arxiv.js";
 import { braveModule } from "./brave.js";
@@ -25,6 +26,9 @@ import type { BrigadeModule } from "../types.js";
 
 export const BUNDLED_MODULES: BrigadeModule[] = [
 	whatsAppModule,
+	// Telegram channel adapter — inert until `channels.telegram.enabled: true`
+	// and a bot token resolves (config `${VAR}` ref or TELEGRAM_BOT_TOKEN env).
+	telegramModule,
 	// Web-fetch + web-search providers. Each module is inert unless its
 	// credential is configured (env var or `tools.web.{search,fetch}.providers.<id>`).
 	// The registry picks the active provider by `autoDetectOrder` ascending —

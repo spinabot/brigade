@@ -38,6 +38,8 @@ import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
 import { makeManageAccessTool } from "./manage-access-tool.js";
 import { makeManageChannelAccessTool } from "./manage-channel-access-tool.js";
+import { makeConnectChannelTool } from "./connect-channel-tool.js";
+import { makeMessageActionTool } from "./message-action-tool.js";
 import { makeComposioTool } from "./composio-tool.js";
 import { makeManageProviderTool } from "./manage-provider-tool.js";
 import { makeOAuthAuthorizeTool } from "./oauth-authorize-tool.js";
@@ -268,6 +270,25 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// groupAllowJids / groupFollowUpWindowMs, so "let the crew answer in this
 		// group / stop making me tag you" is one validated call, not a hand-edit.
 		makeManageChannelAccessTool(),
+		// connect_channel — connect / disconnect a messaging channel (Telegram,
+		// WhatsApp, …) LIVE from chat without a gateway restart. Always mounted so
+		// the crew is always aware it CAN connect a channel. list/status are
+		// read-only + safe for anyone; connect/disconnect are owner-gated per-call
+		// (a channel peer must never wire up / tear down a messaging surface), and
+		// a supplied token is sealed as a `${VAR}` secret-ref (never stored raw).
+		makeConnectChannelTool(
+			opts.senderIsOwner !== undefined ? { senderIsOwner: opts.senderIsOwner } : {},
+		),
+		// message_action: edit / delete / react / pin on an EXISTING channel
+		// message. Always mounted (like connect_channel) so the crew is aware
+		// it CAN amend/remove a message; owner-only per-call (a peer must never
+		// mutate arbitrary messages). The tool pre-checks the channel's
+		// capability flag and reports unsupported actions cleanly.
+		makeMessageActionTool({
+			...(opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {}),
+			...(opts.senderIsOwner !== undefined ? { senderIsOwner: opts.senderIsOwner } : {}),
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		}),
 		// composio — owner-only universal app connector (Composio, 1,000+ apps).
 		// Always mounted (like oauth_authorize) so the crew is always aware it
 		// can connect apps; set-key seals the operator's Composio key, then

@@ -96,9 +96,11 @@ describe("brigade pairing list/approve/revoke", () => {
 		assert.equal(parsed.pending[0]?.senderId, "alice");
 	});
 
-	it("auto-picks the only available channel when --channel is omitted", async () => {
+	it("approves against an explicitly-selected channel", async () => {
+		// More than one channel is now bundled (whatsapp + telegram), so the
+		// channel must be named explicitly — omitting it is ambiguous.
 		const { code } = upsertPairingRequest({ channelId: "whatsapp", senderId: "alice" });
-		const exit = await runPairingApprove({ code }, { json: true });
+		const exit = await runPairingApprove({ code, channel: "whatsapp" }, { json: true });
 		assert.equal(exit, 0);
 		assert.deepEqual(readAllowFrom("whatsapp"), ["alice"]);
 	});
