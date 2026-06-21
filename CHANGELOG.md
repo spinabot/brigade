@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/spinabot/brigade/compare/brigade-v1.2.0...brigade-v1.2.1) (2026-06-21)
+
+
+### Bug Fixes
+
+* **deps:** resolve npm audit advisories (8 of 9; pi has no upstream fix yet) ([30d63c0](https://github.com/spinabot/brigade/commit/30d63c0f6a2cc389d56552da88197a5a2a0ae4c6))
+
 ## [1.2.0](https://github.com/spinabot/brigade/compare/brigade-v1.1.0...brigade-v1.2.0) (2026-06-21)
 
 
