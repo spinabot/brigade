@@ -1,0 +1,93 @@
+name: Supply Chain Audit
+
+# Narrow, high-signal scanner for supply-chain attack patterns in a PR's added
+# lines. Deliberately ruthless about scope: it only fires on a few critical
+# indicators so reviewers never learn to ignore it. If you're tempted to add
+# low-signal heuristics (plain base64, plain exec, dependency edits), put them in
+# a separate advisory-only workflow instead.
+#
+# Covered (npm/JS adaptation of the classic supply-chain vectors):
+#   - new npm install lifecycle hooks (preinstall/install/postinstall) — auto-run on `npm install`
+#   - base64/atob decode passed straight to eval()/new Function()
+#   - child_process spawned from a base64- or char-code-obfuscated command
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  scan:
+    name: Scan PR for critical supply-chain patterns
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan diff for critical patterns
+        id: scan
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          # Three-dot diff: only changes introduced by this PR, lockfiles excluded.
+          DIFF=$(git diff "$BASE"..."$HEAD" -- . ':!package-lock.json' ':!*.lock' ':!yarn.lock' ':!pnpm-lock.yaml' || true)
+          ADDED=$(printf '%s\n' "$DIFF" | grep -E '^\+' | grep -v '^\+\+\+' || true)
+          FINDINGS=""
+
+          # 1) New npm install lifecycle hooks in any package.json
+          PKG_HOOKS=$(git diff "$BASE"..."$HEAD" -- '**/package.json' 'package.json' \
+            | grep -E '^\+' | grep -v '^\+\+\+' \
+            | grep -iE '"(preinstall|install|postinstall)"[[:space:]]*:' || true)
+          if [ -n "$PKG_HOOKS" ]; then
+            FINDINGS="${FINDINGS}"$'\n'"### 🚨 CRITICAL: npm install hook added"$'\n'"A \`preinstall\`/\`install\`/\`postinstall\` script runs automatically on \`npm install\` — a common supply-chain execution vector."$'\n\n'"\`\`\`"$'\n'"${PKG_HOOKS}"$'\n'"\`\`\`"$'\n'
+          fi
+
+          # 2) base64/atob decode + eval/Function on the same added line
+          B64_EXEC=$(printf '%s\n' "$ADDED" | grep -iE 'buffer\.from\([^)]*base64|atob\(' | grep -iE 'eval\(|new Function\(' | head -10 || true)
+          if [ -n "$B64_EXEC" ]; then
+            FINDINGS="${FINDINGS}"$'\n'"### 🚨 CRITICAL: base64 decode + eval/Function"$'\n'"Decoded strings passed straight to eval/Function are the signature of hidden payloads."$'\n\n'"\`\`\`"$'\n'"${B64_EXEC}"$'\n'"\`\`\`"$'\n'
+          fi
+
+          # 3) child_process spawned from an obfuscated command string
+          PROC=$(printf '%s\n' "$ADDED" | grep -iE 'child_process|exec\(|execsync\(|spawn\(' | grep -iE 'base64|fromcharcode' | head -10 || true)
+          if [ -n "$PROC" ]; then
+            FINDINGS="${FINDINGS}"$'\n'"### 🚨 CRITICAL: process exec with obfuscated command"$'\n'"Spawning a process from a base64- or char-code-encoded string is a strong payload indicator."$'\n\n'"\`\`\`"$'\n'"${PROC}"$'\n'"\`\`\`"$'\n'
+          fi
+
+          if [ -n "$FINDINGS" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "$FINDINGS" > /tmp/findings.md
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment on critical findings
+        if: steps.scan.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 🚨 Critical supply-chain pattern detected"
+            echo ""
+            echo "This PR contains a pattern seen in real supply-chain attacks. A maintainer must review the flagged code carefully before merging."
+            echo ""
+            cat /tmp/findings.md
+            echo ""
+            echo "---"
+            echo "_This scanner only fires on high-signal indicators (install hooks, base64+eval, obfuscated process exec). If you're seeing this, the finding is worth inspecting._"
+          } > /tmp/comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/comment.md \
+            || echo "::warning::Could not post PR comment (expected for fork PRs — GITHUB_TOKEN is read-only)."
+
+      - name: Fail on critical findings
+        if: steps.scan.outputs.found == 'true'
+        run: |
+          echo "::error::Critical supply-chain pattern detected in this PR. See the PR comment for details."
+          exit 1

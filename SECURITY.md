@@ -119,6 +119,20 @@ act.
 - The gateway stays loopback-only (`127.0.0.1`) unless you add your own authentication
   and network controls in front of it.
 
+## Security automation
+
+Brigade's CI runs layered automated security checks on every pull request and on a
+weekly schedule against `main`:
+
+- **CodeQL** — static analysis (code scanning) for JavaScript/TypeScript.
+- **OSV-Scanner** — scans `package-lock.json` against the OSV vulnerability database.
+- **Dependency Review** — blocks PRs that introduce known-vulnerable dependencies.
+- **Supply-chain audit** — flags high-signal supply-chain patterns in PR diffs (new
+  npm install hooks, base64 + `eval`, obfuscated `child_process` payloads).
+- **Dependabot** — keeps dependencies and GitHub Actions patched.
+
+Findings surface in the repository's **Security** tab.
+
 ## Runtime requirements
 
 Brigade requires **Node.js 22.12 or later**, which includes important security patches.

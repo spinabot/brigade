@@ -1,0 +1,91 @@
+name: "🔧 Setup / Installation Help"
+description: Trouble installing or configuring Brigade? Ask here.
+title: "[Setup]: "
+labels: ["setup"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Sorry you're having trouble! Please fill out the details below so we can help.
+
+        **Quick checks first:**
+        - Make sure you're on **Node.js 22.12+** (`node --version`).
+        - Reinstall the latest: `npm i -g @spinabot/brigade`.
+        - Run `brigade doctor` and paste the output in the Doctor Report section below.
+        - For general questions, a [GitHub Discussion](https://github.com/spinabot/brigade/discussions) is often faster.
+
+        ⚠️ **Do not paste API keys, tokens, or other secrets.** Redact anything sensitive.
+  - type: textarea
+    id: description
+    attributes:
+      label: What's going wrong?
+      description: Describe what you're trying to do and where it fails.
+      placeholder: |
+        I ran `brigade onboard` and connected a provider, but when I start the
+        gateway I get...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps taken
+      description: What did you do? Include the exact commands you ran.
+      placeholder: |
+        1. npm i -g @spinabot/brigade
+        2. brigade onboard → picked OpenRouter, entered API key
+        3. brigade gateway run → error...
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Installation method
+      options:
+        - npm global (npm i -g @spinabot/brigade)
+        - From source (git clone + npm install)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04 / macOS 15.2 / Windows 11
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node version
+      description: Output of `node --version`.
+      placeholder: v22.12.0
+    validations:
+      required: true
+  - type: input
+    id: brigade-version
+    attributes:
+      label: Brigade version
+      description: Output of `brigade --version` (if install got that far).
+      placeholder: 0.1.2
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Doctor report
+      description: Output of `brigade doctor` (redact any secrets).
+      render: shell
+  - type: textarea
+    id: error-output
+    attributes:
+      label: Full error output
+      description: Paste the complete error message or stack trace.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What I've already tried
+      placeholder: |
+        - Reinstalled with npm i -g @spinabot/brigade
+        - Confirmed Node 22.12+
+        - Ran brigade doctor
