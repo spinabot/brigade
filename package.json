@@ -158,7 +158,7 @@
     "node": ">=22.12"
   },
   "dependencies": {
-    "@composio/core": "^0.10.0",
+    "@composio/core": "^0.11.0",
     "@grammyjs/runner": "^2.0.3",
     "@grammyjs/transformer-throttler": "^1.2.1",
     "@grammyjs/types": "^3.21.0",
