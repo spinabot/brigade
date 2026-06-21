@@ -806,7 +806,7 @@ A pride of contributors who make Brigade better. Thank you to everyone who has
 joined the crew!
 
 <a href="https://github.com/spinabot/brigade/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=spinabot/brigade" alt="Brigade contributors — the Brigadiers" />
+  <img src="https://contrib.rocks/image?repo=spinabot/brigade&columns=12&anon=1" alt="Brigade contributors — the Brigadiers" />
 </a>
 
 Want to join the pride? See [CONTRIBUTING.md](CONTRIBUTING.md).
