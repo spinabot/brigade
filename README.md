@@ -116,9 +116,11 @@ brigade gateway run
 brigade tui
 ```
 
-The onboarding wizard walks you through three steps: **pick a provider** (Anthropic,
-OpenAI, Gemini, OpenRouter, Ollama, and more), **connect it** (paste an API key or scan
-your local Ollama), and **choose a default model**. Subsequent launches resume right
+The onboarding wizard walks you through **five steps**: **(0) storage mode**
+(filesystem or self-hosted Convex), **(1) pick a provider** (Anthropic, OpenAI, Gemini,
+OpenRouter, Ollama, and more), **(2) connect it** (paste an API key, validated live, or
+connect local Ollama), **(3) choose a default model**, and **(4) web search** (pick a
+search backend; keyless options work out of the box). Subsequent launches resume right
 where you left off.
 
 `brigade tui` (or just `brigade`) auto-starts the gateway if it isn't already running,
