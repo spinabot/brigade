@@ -1,0 +1,19 @@
+# Normalize text files in the repo.
+* text=auto
+
+# Shell scripts MUST stay LF, or `curl … | sh` fails with "bad interpreter" on
+# macOS/Linux (a CR in the shebang breaks it).
+*.sh text eol=lf
+
+# Windows scripts stay CRLF.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Brand / media assets are binary — never line-ending- or diff-mangled.
+*.gif binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
