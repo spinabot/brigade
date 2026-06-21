@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/spinabot/brigade/compare/brigade-v1.1.0...brigade-v1.2.0) (2026-06-21)
+
+
+### Features
+
+* **channels:** Telegram channel + channel SDK ([71bb2e6](https://github.com/spinabot/brigade/commit/71bb2e6a50d024ca39e90ac49f456b81428f5729))
+
 ## [1.1.0](https://github.com/spinabot/brigade/compare/brigade-v1.0.2...brigade-v1.1.0) (2026-06-21)
 
 
