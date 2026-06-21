@@ -39,7 +39,9 @@ bin/_dashboard.zip
 .convex-data/
 .convex/
 .convex-tmp/
-convex/_generated/
+# convex/_generated/ is intentionally committed: src/storage/* imports it for
+# types, so a clean `npm ci && npm run build` (CI + contributors) must resolve it
+# without running a Convex backend. Regenerate with `npm run convex:dev`.
 .agents/
 CLAUDE.md
 skills-lock.json
