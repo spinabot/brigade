@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/spinabot/brigade/compare/brigade-v1.0.1...brigade-v1.0.2) (2026-06-21)
+
+
+### Bug Fixes
+
+* ship convex/ in the npm package so convex mode works when installed ([8851238](https://github.com/spinabot/brigade/commit/8851238f823ce44e01e88954621924641b949f0f))
+
 ## [1.0.1](https://github.com/spinabot/brigade/compare/brigade-v1.0.0...brigade-v1.0.1) (2026-06-21)
 
 
