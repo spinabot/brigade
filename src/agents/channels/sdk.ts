@@ -276,6 +276,52 @@ export type {
 	ResolvedOutboundTarget,
 } from "./channel-messaging-registry.js";
 
+/* ───────────────────────── security: the channel-security registry (supplementary DM-policy consult + audit) ───────────────────────── */
+
+export {
+	/** Register a channel's SUPPLEMENTARY `security` adapter (resolveDmPolicy / collectWarnings /
+	 *  collectAuditFindings). The pipeline consults it as a TIGHTEN-ONLY overlay on top of the central
+	 *  access-control engine; the central config stays authoritative. */
+	registerChannelSecurityAdapter,
+	/** Bulk-register every plugin's `security` adapter (gateway bootstrap seeds with its plugin list). */
+	syncChannelSecurityAdaptersFromPlugins,
+	/** Look up a channel's registered security adapter by id (undefined → no supplementary opinion). */
+	getChannelSecurityAdapter,
+	/** Diagnostic — list the channel ids that registered a security adapter. */
+	listChannelSecurityAdapters,
+	/** Consult a channel's security adapter for a DM-policy opinion + reconcile it with the central
+	 *  policy under the strict TIGHTEN-ONLY rule (returns the base policy unchanged when none/null/throws). */
+	consultChannelDmPolicy,
+	/** Reconcile a central `DmPolicy` with a security adapter's `ChannelSecurityDmPolicy` opinion —
+	 *  the adapter may only TIGHTEN, never loosen. */
+	reconcileDmPolicy,
+	/** Map an author-facing `ChannelSecurityDmPolicy` onto the pipeline's `DmPolicy` vocabulary. */
+	securityDmPolicyToDmPolicy,
+	/** Tightness rank of a `DmPolicy` (higher = more restrictive) — the ladder precedence compares on. */
+	dmPolicyTightness,
+	/** Iterate registered security adapters + collect their structured audit findings (for `brigade doctor`). */
+	collectChannelSecurityAudit,
+} from "./channel-security-registry.js";
+export type {
+	/** One channel's findings, grouped under its id, from `collectChannelSecurityAudit`. */
+	ChannelSecurityAuditGroup,
+} from "./channel-security-registry.js";
+
+/* ───────────────────────── access-control: shared allow-from display formatter ───────────────────────── */
+
+export {
+	/** Shared display formatter for a channel's allow-from list — the `/allowlist list` command + the
+	 *  `brigade channels allow list` CLI both render through this so the output is identical. A channel
+	 *  customizes rendering via the optional `ChannelConfigAdapter.formatAllowFrom` hook. */
+	formatAllowFrom,
+} from "./access-control/format-allow-from.js";
+export type {
+	/** A single allow-from entry to render: a bare id, or `{ id, name? }`. */
+	AllowFromEntry,
+	/** Options for `formatAllowFrom` (channelLabel / emptyText / omitHeader / indent). */
+	FormatAllowFromOptions,
+} from "./access-control/format-allow-from.js";
+
 /* ───────────────────────── channel-exposure resolver (visibility surfaces) ───────────────────────── */
 
 export {
@@ -519,7 +565,8 @@ export type {
 	ChannelSecurityAdapter,
 	/** Per-call context for the security adapter's check methods. */
 	ChannelSecurityContext,
-	/** DM policy verdict ("owner" | "allow-from" | "all"). */
+	/** Author-facing DM-policy verdict ("owner" | "allow-from" | "all" | "disabled"); reconciled with
+	 *  the pipeline's `DmPolicy` via the channel-security registry under a TIGHTEN-only rule. */
 	ChannelSecurityDmPolicy,
 	/** A single structured finding from `security.collectAuditFindings`. */
 	ChannelSecurityAuditFinding,

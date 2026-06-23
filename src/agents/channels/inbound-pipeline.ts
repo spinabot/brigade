@@ -33,6 +33,7 @@ import {
 	approvePairingCode,
 	type DmPolicy,
 	evaluateAccess,
+	formatAllowFrom,
 	readAllowFrom,
 	readChannelOwner,
 	readGroupAllowFrom,
@@ -57,6 +58,7 @@ import { normalizeAccountId } from "../routing/account-id.js";
 import { resolveThreadSessionKeys } from "../routing/session-key.js";
 import { resolveLinkedPeerIdFromConfig } from "../identity-links.js";
 import { resolveInboundConversation } from "./channel-messaging-registry.js";
+import { consultChannelDmPolicy } from "./channel-security-registry.js";
 import { sanitizeReplyForChannel } from "./reply-sanitizer.js";
 import { classifyErrorReason, isBrigadeRetryError } from "../error-classifier.js";
 import { isRetryExhaustedError } from "../retry-policy.js";
@@ -381,9 +383,9 @@ export function buildBundledCommands(adapter: ChannelAdapter): ChannelCommand[] 
 				const sub = (parts[0] ?? "list").toLowerCase();
 				if (sub === "list" || !sub) {
 					const allow = readAllowFrom(ctx.channel);
-					return allow.length === 0
-						? "Allow-from list is empty."
-						: `Allow-from (${allow.length}):\n  ${allow.join("\n  ")}`;
+					// Shared display formatter so the in-chat `/allowlist list` and the
+					// `brigade channels allow list` CLI render the list identically.
+					return formatAllowFrom(allow);
 				}
 				const target = parts[1];
 				if (sub === "add" && target) {
@@ -527,7 +529,24 @@ export async function runChannelInboundPipeline(
 
 		// Access-control gate.
 		const isGroup = msg.isGroup === true || msg.chatType === "group";
-		const dmPolicy = resolveDmPolicy(cfg, adapter.id);
+		// Central config-read policy (AUTHORITATIVE). A channel plugin MAY also
+		// register a SUPPLEMENTARY security adapter; we consult it right here and
+		// reconcile under a strict TIGHTEN-ONLY rule — the adapter can make the
+		// effective DM policy stricter (owner-only > allowlist > open > the config)
+		// but can NEVER loosen it, and a channel that doesn't opt in leaves
+		// `dmPolicy` byte-identical to the local read. Never throws.
+		const localDmPolicy = resolveDmPolicy(cfg, adapter.id);
+		const dmPolicy = consultChannelDmPolicy({
+			channelId: adapter.id,
+			base: localDmPolicy,
+			ctx: {
+				account: undefined,
+				accountId: msg.accountId?.trim() || "",
+				cfg,
+				...(msg.from?.trim() ? { peerId: msg.from.trim() } : {}),
+				peerKind: isGroup ? "group" : "direct",
+			},
+		});
 		const groupPolicy = resolveGroupPolicy(cfg, adapter.id);
 		const cfgEntry = channelAccessCfg(cfg, adapter.id);
 		// Per-account ACL — multi-account WhatsApp installs partition the

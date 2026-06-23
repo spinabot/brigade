@@ -19,7 +19,7 @@ import readline from "node:readline/promises";
 import { BUNDLED_MODULES, loadModules } from "../../agents/extensions/index.js";
 import type { ChannelAdapter, ChannelStartContext } from "../../agents/extensions/index.js";
 import type { ChannelSetupCredentialKey } from "../../agents/extensions/types.js";
-import { addAllowFrom, readAllowFrom, removeAllowFrom } from "../../agents/channels/access-control/index.js";
+import { addAllowFrom, formatAllowFrom, readAllowFrom, removeAllowFrom } from "../../agents/channels/access-control/index.js";
 import { DEFAULT_AGENT_ID, resolveAgentWorkspaceDir, resolveChannelStateDir } from "../../config/paths.js";
 import { loadConfig, saveConfig } from "../../core/config.js";
 import { isProcessAlive, readPid } from "../../core/gateway-probe.js";
@@ -881,12 +881,13 @@ export async function runChannelsAllowList(
 		process.stdout.write(`${JSON.stringify({ channel: chosen.adapter.id, allowFrom: allow }, null, 2)}\n`);
 		return 0;
 	}
-	if (allow.length === 0) {
-		process.stdout.write(`No senders are on ${chosen.adapter.id}'s allow-from list yet.\n`);
-		return 0;
-	}
-	process.stdout.write(`${chosen.adapter.label} allow-from (${allow.length}):\n`);
-	for (const id of allow) process.stdout.write(`  ${id}\n`);
+	// Shared display formatter — identical rendering to the in-chat
+	// `/allowlist list` command (both call `formatAllowFrom`).
+	const rendered = formatAllowFrom(allow, {
+		channelLabel: chosen.adapter.label,
+		emptyText: `No senders are on ${chosen.adapter.id}'s allow-from list yet.`,
+	});
+	process.stdout.write(`${rendered}\n`);
 	return 0;
 }
 

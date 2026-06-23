@@ -29,6 +29,10 @@ import { readProfiles } from "../../auth/profiles.js";
 import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { FactStore } from "../../agents/memory/records.js";
 import { discoverEligibleSkills } from "../../agents/skills/index.js";
+import {
+	collectChannelSecurityAudit,
+	listChannelSecurityAdapters,
+} from "../../agents/channels/channel-security-registry.js";
 import { readConfigOrInit } from "../../config/io.js";
 import { BRIGADE_DIR, loadConfig } from "../../core/config.js";
 import { loadBrigadeAuthStorage } from "../../core/auth-bridge.js";
@@ -70,6 +74,7 @@ export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise
 	checks.push(checkSkills());
 	checks.push(checkLogDirWritable());
 	checks.push(checkExecApprovals());
+	checks.push(await checkChannelSecurity(await safeLoadConfig()));
 	checks.push(await checkStorageMode());
 	checks.push(await checkGateway(opts));
 
@@ -534,6 +539,67 @@ async function safeLoadConfig(): Promise<Awaited<ReturnType<typeof loadConfig>> 
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Per-channel security audit — surfaces findings from any registered
+ * `ChannelSecurityAdapter` (`collectAuditFindings` / `collectWarnings`).
+ *
+ * Non-invasive by design: channel security adapters register only when a
+ * channel plugin opts in (at gateway boot via the plugin engine), so an
+ * in-process `brigade doctor` with no adapters registered reports a clean "no
+ * channel security adapters registered" — never a false warning. When adapters
+ * ARE present, the worst finding severity drives the check status (critical →
+ * fail, warn → warn, info → ok) and the message summarises the counts.
+ */
+async function checkChannelSecurity(
+	config: Awaited<ReturnType<typeof loadConfig>> | undefined,
+): Promise<CheckResult> {
+	if (listChannelSecurityAdapters().length === 0) {
+		return {
+			name: "channel security",
+			status: "ok",
+			message: "no channel security adapters registered",
+		};
+	}
+	let groups: Awaited<ReturnType<typeof collectChannelSecurityAudit>>;
+	try {
+		groups = await collectChannelSecurityAudit({
+			cfg: (config ?? {}) as Parameters<typeof collectChannelSecurityAudit>[0]["cfg"],
+		});
+	} catch (err) {
+		return {
+			name: "channel security",
+			status: "warn",
+			message: `could not collect channel security audit: ${(err as Error).message}`,
+		};
+	}
+	const findings = groups.flatMap((g) => g.findings);
+	if (findings.length === 0) {
+		const channels = groups.length > 0 ? groups.map((g) => g.channelId).join(", ") : "registered channels";
+		return {
+			name: "channel security",
+			status: "ok",
+			message: `no security findings (${channels})`,
+		};
+	}
+	const critical = findings.filter((f) => f.severity === "critical").length;
+	const warn = findings.filter((f) => f.severity === "warn").length;
+	const info = findings.filter((f) => f.severity === "info").length;
+	const parts: string[] = [];
+	if (critical > 0) parts.push(`${critical} critical`);
+	if (warn > 0) parts.push(`${warn} warn`);
+	if (info > 0) parts.push(`${info} info`);
+	// Surface the first actionable remediation as the hint, when present.
+	const firstRemediation = findings.find((f) => f.remediation)?.remediation;
+	const byChannel = groups.map((g) => `${g.channelId} (${g.findings.length})`).join(", ");
+	const status: CheckStatus = critical > 0 ? "fail" : warn > 0 ? "warn" : "ok";
+	return {
+		name: "channel security",
+		status,
+		message: `${parts.join(", ")} across ${byChannel}`,
+		...(firstRemediation ? { hint: firstRemediation } : {}),
+	};
 }
 
 const GLYPH = {

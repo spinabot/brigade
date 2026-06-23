@@ -35,6 +35,10 @@ import {
 	createInboundPipelineContext,
 } from "./inbound-pipeline.js";
 import { readChannelOwner, setChannelOwner } from "./access-control/index.js";
+import {
+	registerChannelSecurityAdapter,
+	resetChannelSecurityRegistryForTests,
+} from "./channel-security-registry.js";
 import { startChannels } from "./manager.js";
 import { BrigadeExtensionRegistry } from "../extensions/registry.js";
 import { setActiveRegistry } from "../extensions/active-registry.js";
@@ -65,6 +69,8 @@ afterEach(() => {
 	// Always clear the process-wide registry singleton so a hook registered by
 	// one test can never leak into another.
 	setActiveRegistry(undefined);
+	// Same for the channel-security registry (the supplementary DM-policy consult).
+	resetChannelSecurityRegistryForTests();
 });
 
 /**
@@ -914,5 +920,86 @@ describe("inbound-pipeline: plugin hooks wired into the live pipeline", () => {
 		assert.equal(sentEvents.length, 1, "message_sent fired exactly once, AFTER the send");
 		assert.equal(sentEvents[0]?.channel, "fake");
 		assert.match(sentEvents[0]?.text ?? "", /shipped/, "the payload carried the sent reply text");
+	});
+});
+
+describe("inbound-pipeline: ChannelSecurityAdapter supplementary DM-policy consult", () => {
+	const STRANGER = "+15557654321";
+
+	it("a registered security adapter TIGHTENS open → pairing (stranger is challenged, no turn)", async () => {
+		// Config says the loosest policy: open (anyone may DM).
+		const fake = makeFakeChannel();
+		// But the channel's security adapter returns "owner" (→ pairing). The
+		// stranger must be CHALLENGED, not let straight through.
+		registerChannelSecurityAdapter("fake", { resolveDmPolicy: () => "owner" });
+		let turnRan = false;
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN, // { channels: { fake: { dmPolicy: "open" } } }
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "should not happen" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: STRANGER,
+			from: STRANGER,
+			text: "hello",
+		});
+		assert.equal(turnRan, false, "tightened to pairing → stranger does not get a turn");
+		assert.match(fake.sent[0]?.text ?? "", /approve/i, "stranger gets the pairing challenge");
+	});
+
+	it("back-compat: NO security adapter → open policy unchanged (stranger's turn runs)", async () => {
+		const fake = makeFakeChannel();
+		// No registerChannelSecurityAdapter call → registry is empty.
+		let turnRan = false;
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "welcome" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: STRANGER,
+			from: STRANGER,
+			text: "hello",
+		});
+		assert.equal(turnRan, true, "open policy stands when no security adapter is registered");
+		assert.match(fake.sent[0]?.text ?? "", /welcome/);
+	});
+
+	it("a security adapter CANNOT loosen: config pairing + adapter 'all' stays pairing", async () => {
+		const fake = makeFakeChannel();
+		// Adapter tries to OPEN the channel up; the authoritative config (pairing)
+		// must win — the stranger is still challenged.
+		registerChannelSecurityAdapter("fake", { resolveDmPolicy: () => "all" });
+		let turnRan = false;
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: { channels: { fake: { dmPolicy: "pairing" } } } as unknown as BrigadeConfig,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "should not happen" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: STRANGER,
+			from: STRANGER,
+			text: "hello",
+		});
+		assert.equal(turnRan, false, "adapter cannot loosen pairing → stranger still challenged");
+		assert.match(fake.sent[0]?.text ?? "", /approve/i);
 	});
 });

@@ -74,8 +74,26 @@ export type ChannelSecurityContext<ResolvedAccount = unknown> = {
 	peerKind?: string;
 };
 
-/** Result of `security.resolveDmPolicy`. */
-export type ChannelSecurityDmPolicy = "owner" | "allow-from" | "all";
+/**
+ * Result of `security.resolveDmPolicy` — the AUTHOR-FACING DM-policy vocabulary
+ * ("who may DM this account"), distinct from the pipeline's engine vocabulary
+ * (`DmPolicy` = "pairing" | "allowlist" | "open" | "disabled"). The two are
+ * reconciled by `channel-security-registry.ts`, which owns the ONE total mapping
+ * and the strict TIGHTEN-ONLY precedence rule. The values ride a tightness
+ * ladder (loosest → tightest):
+ *
+ *   - `"all"`        — anyone may DM            (⇄ pipeline `open`).
+ *   - `"allow-from"` — only listed senders     (⇄ pipeline `allowlist`).
+ *   - `"owner"`      — owner + approved only;   (⇄ pipeline `pairing`) — strangers
+ *                      are challenged, i.e. owner-gated.
+ *   - `"disabled"`   — every DM dropped         (⇄ pipeline `disabled`).
+ *
+ * `"disabled"` was added so a security adapter CAN express the tightest lockdown
+ * (without it, an adapter literally could not tighten to the most-restrictive
+ * state — a real gap). A channel that takes no opinion returns `null`, leaving
+ * the central policy untouched.
+ */
+export type ChannelSecurityDmPolicy = "owner" | "allow-from" | "all" | "disabled";
 
 /* -------------------------------------------------------------------------
  * Type-discovery helpers (bivariant callbacks)
@@ -130,6 +148,19 @@ export type ChannelConfigAdapter<ResolvedAccount = unknown> = {
 		cfg: BrigadeConfig;
 		accountId?: string | null;
 	}) => Array<string | number> | undefined;
+	/**
+	 * OPTIONAL display override for the allow-from list. The `/allowlist list`
+	 * command + `brigade channels allow list` render the list through the shared
+	 * `formatAllowFrom(entries, opts?)` helper (`access-control/format-allow-from`)
+	 * by default; a channel that wants custom rendering (e.g. Slack resolving
+	 * `U123` → `@alex`) implements this and returns the finished display string.
+	 * Receives the already-resolved entries + the same options the default helper
+	 * takes. A channel that omits this hook gets the shared default rendering.
+	 */
+	formatAllowFrom?: (
+		entries: ReadonlyArray<string | number>,
+		opts?: { channelLabel?: string; emptyText?: string },
+	) => string;
 	/** Truthy iff at least one account is configured in `cfg`. */
 	hasConfiguredState?: (params: { cfg: BrigadeConfig; env?: NodeJS.ProcessEnv }) => boolean;
 	/** Truthy iff at least one account has persisted auth state on disk. */
