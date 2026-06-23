@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.2](https://github.com/spinabot/brigade/compare/brigade-v1.3.1...brigade-v1.3.2) (2026-06-23)
+
+
+### Bug Fixes
+
+* **gateway:** absorb WS teardown error in `gateway stop` shutdown RPC ([2779a8b](https://github.com/spinabot/brigade/commit/2779a8b17ce41f5506d4990c59fe9875464e3ccb))
+* **gateway:** don't crash `brigade tui` when the gateway probe times out ([7be76b2](https://github.com/spinabot/brigade/commit/7be76b210b6ace2cd553beffe81bd81c80ea5357))
+
 ## [1.3.1](https://github.com/spinabot/brigade/compare/brigade-v1.3.0...brigade-v1.3.1) (2026-06-23)
 
 
