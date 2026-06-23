@@ -84,6 +84,9 @@ import {
 import { createTelegramPlugin, type TelegramPluginHandle } from "../agents/channels/telegram/plugin.js";
 import { createPluginChannelManagerFacade } from "../agents/channels/plugin-channel-manager-facade.js";
 import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
+import { syncChannelMessagingAdaptersFromPlugins } from "../agents/channels/channel-messaging-registry.js";
+import { syncChannelSecurityAdaptersFromPlugins } from "../agents/channels/channel-security-registry.js";
+import { registerChannelMeta } from "../agents/channels/channel-meta-registry.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { listOpenRouterModels } from "../integrations/provider-discovery.js";
@@ -5055,6 +5058,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// through every channel adapter's args. Cleared on shutdown.
 		setActiveRegistry(registry);
 
+		// Channel slot registries — populate the process-wide messaging + security
+		// registries from EVERY channel that declared `b.channelMessaging(...)` /
+		// `b.channelSecurity(...)`, over the FULL registered set (bundled + user
+		// channels alike), UNCONDITIONALLY — never gated on the multi-account branch
+		// below. Without this, a channel that declares a `messaging`/`security` slot
+		// is inert: the `send_message` outbound resolver + the inbound DM-policy
+		// consult never see it. A channel that omits the slot registers nothing and
+		// keeps today's raw-id / central-policy behaviour by construction.
+		syncChannelMessagingAdaptersFromPlugins(registry.channelMessagingAdapters);
+		syncChannelSecurityAdaptersFromPlugins(registry.channelSecurityAdapters);
+
 		// Gateway methods: module-registered RPCs + two built-ins. The `system.`
 		// prefix is reserved for built-ins — a module that uses it would be
 		// silently overwritten below, so warn instead of failing quietly.
@@ -5289,6 +5303,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				multiAccountSummary.push(`telegram x${telegramAccounts.length}`);
 			}
 			const pluginById = new Map(bundledChannelPlugins.map((p) => [p.id, p] as const));
+			// Register each constructed plugin's `meta` + its `messaging`/`security`
+			// slots into the process-wide registries. These are full `ChannelPlugin`
+			// objects (carrying the slots) that are NOT registered through the
+			// `b.channelMessaging`/`b.channelSecurity` context seam, so the
+			// registry-getter sync above doesn't see them — wire them here so a
+			// multi-account plugin's declared slots are live too.
+			for (const plugin of bundledChannelPlugins) registerChannelMeta(plugin.meta);
+			syncChannelMessagingAdaptersFromPlugins(bundledChannelPlugins);
+			syncChannelSecurityAdaptersFromPlugins(bundledChannelPlugins);
 			channelPluginManager = createChannelPluginManager({
 				loadConfig: () => cfg as never,
 				listChannelPlugins: () => bundledChannelPlugins,

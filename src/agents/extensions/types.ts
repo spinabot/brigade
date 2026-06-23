@@ -31,6 +31,8 @@ import type {
 	ChannelApprovalCapability,
 	ChannelMessageAction,
 	ChannelMessageActionResult,
+	ChannelMessagingAdapter,
+	ChannelSecurityAdapter,
 } from "../channels/types.adapters.js";
 import type { ChannelCapabilities } from "../channels/types.core.js";
 import type { AnyBrigadeTool } from "../tools/types.js";
@@ -1297,6 +1299,23 @@ export interface BrigadeExtensionContext {
 	channel(adapter: ChannelAdapter): void;
 	/** Register a channel command (`/name`) handled before the LLM. */
 	channelCommand(command: ChannelCommand): void;
+	/**
+	 * Register a channel's OUTBOUND `messaging` adapter (the `ChannelPlugin.messaging`
+	 * slot) for `channelId`. Populates the channel-messaging registry at boot so the
+	 * `send_message` tool can address by name/handle/explicit target. Symmetric with
+	 * `channel(...)`, but keyed explicitly because a `ChannelMessagingAdapter` carries
+	 * no id of its own. A channel that never calls this keeps raw-id passthrough.
+	 */
+	channelMessaging(channelId: string, adapter: ChannelMessagingAdapter): void;
+	/**
+	 * Register a channel's SUPPLEMENTARY `security` adapter (the `ChannelPlugin.security`
+	 * slot) for `channelId`. Populates the channel-security registry at boot so the
+	 * inbound pipeline consults it as a TIGHTEN-ONLY DM-policy overlay (the central
+	 * access-control config stays authoritative) + surfaces its audit findings in
+	 * `brigade doctor`. Keyed explicitly (the adapter carries no id). A channel that
+	 * never calls this leaves the central policy unchanged.
+	 */
+	channelSecurity(channelId: string, adapter: ChannelSecurityAdapter): void;
 	tts(provider: SpeechProvider): void;
 	stt(provider: TranscriptionProvider): void;
 	mediaGen(provider: MediaGenProvider): void;

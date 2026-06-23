@@ -36,9 +36,18 @@ import {
 } from "./inbound-pipeline.js";
 import { readChannelOwner, setChannelOwner } from "./access-control/index.js";
 import {
+	consultChannelDmPolicy,
+	getChannelSecurityAdapter,
 	registerChannelSecurityAdapter,
 	resetChannelSecurityRegistryForTests,
+	syncChannelSecurityAdaptersFromPlugins,
 } from "./channel-security-registry.js";
+import {
+	getChannelMessagingAdapter,
+	resetChannelMessagingRegistryForTests,
+	resolveOutboundTarget,
+	syncChannelMessagingAdaptersFromPlugins,
+} from "./channel-messaging-registry.js";
 import { startChannels } from "./manager.js";
 import { BrigadeExtensionRegistry } from "../extensions/registry.js";
 import { setActiveRegistry } from "../extensions/active-registry.js";
@@ -71,6 +80,8 @@ afterEach(() => {
 	setActiveRegistry(undefined);
 	// Same for the channel-security registry (the supplementary DM-policy consult).
 	resetChannelSecurityRegistryForTests();
+	// And the channel-messaging registry (outbound target resolution).
+	resetChannelMessagingRegistryForTests();
 });
 
 /**
@@ -90,6 +101,26 @@ function mountRegistryWithHook(
 		config: {} as BrigadeConfig,
 	});
 	b.hook(event, handler as (...args: unknown[]) => unknown);
+	setActiveRegistry(reg);
+	return reg;
+}
+
+/**
+ * Mount a fresh registry as the active singleton with SEVERAL hook handlers at
+ * once (each `[event, handler]`). Used by tests that assert the interplay of two
+ * hooks (e.g. a claiming `reply_dispatch` plus an observing `message_sent`).
+ */
+function mountRegistryWithHooks(
+	hooks: Array<[BrigadeHookName, (payload: unknown) => HookResult | void | Promise<HookResult | void>]>,
+): BrigadeExtensionRegistry {
+	const reg = new BrigadeExtensionRegistry();
+	const b = reg.context({
+		agentId: "main",
+		workspaceDir: join(stateDir, "ws"),
+		cwd: join(stateDir, "ws"),
+		config: {} as BrigadeConfig,
+	});
+	for (const [event, handler] of hooks) b.hook(event, handler as (...args: unknown[]) => unknown);
 	setActiveRegistry(reg);
 	return reg;
 }
@@ -921,6 +952,161 @@ describe("inbound-pipeline: plugin hooks wired into the live pipeline", () => {
 		assert.equal(sentEvents[0]?.channel, "fake");
 		assert.match(sentEvents[0]?.text ?? "", /shipped/, "the payload carried the sent reply text");
 	});
+
+	it("a STREAMED reply fires `message_sent` AFTER the stream finalize (FIX 2)", async () => {
+		const sentEvents: Array<{ text?: string; messageId?: string }> = [];
+		let finalized: string | undefined;
+		mountRegistryWithHook("message_sent", (payload) => {
+			const p = payload as { text?: string; messageId?: string };
+			sentEvents.push({ text: p.text, messageId: p.messageId });
+		});
+		let plainSends = 0;
+		const fake = makeFakeChannel({
+			async sendText() {
+				plainSends += 1;
+			},
+			beginReplyStream() {
+				return {
+					update: () => {},
+					async finalize(t: string) {
+						finalized = t;
+						return { messageId: "stream-9" };
+					},
+					stop: () => {},
+				};
+			},
+		});
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => ({ reply: "streamed answer" }),
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.equal(finalized, "streamed answer", "the stream finalized with the full reply");
+		assert.equal(plainSends, 0, "no plain sendText when the stream delivered");
+		assert.equal(sentEvents.length, 1, "message_sent fired once after the streamed send");
+		assert.match(sentEvents[0]?.text ?? "", /streamed answer/);
+		assert.equal(sentEvents[0]?.messageId, "stream-9", "message_sent carried the stream's messageId");
+	});
+
+	it("a claiming `reply_dispatch` SUPPRESSES a STREAMED reply (no finalize, no message_sent) (FIX 2)", async () => {
+		const sentEvents: unknown[] = [];
+		let finalizeCalls = 0;
+		let stopCalls = 0;
+		mountRegistryWithHooks([
+			["reply_dispatch", () => ({ handled: true })],
+			[
+				"message_sent",
+				(payload) => {
+					sentEvents.push(payload);
+				},
+			],
+		]);
+		let turnRan = false;
+		const fake = makeFakeChannel({
+			async sendText() {
+				throw new Error("plain sendText must not run when claimed");
+			},
+			beginReplyStream() {
+				return {
+					update: () => {},
+					async finalize() {
+						finalizeCalls += 1;
+						return { messageId: "x" };
+					},
+					stop: () => {
+						stopCalls += 1;
+					},
+				};
+			},
+		});
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "suppressed streamed reply" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.equal(turnRan, true, "the turn still ran");
+		assert.equal(finalizeCalls, 0, "a claimed reply_dispatch never finalizes the stream");
+		assert.equal(stopCalls, 1, "the open stream is stopped (no leaked placeholder) when claimed");
+		assert.equal(sentEvents.length, 0, "message_sent never fires for a claimed (un-sent) reply");
+	});
+
+	it("a claiming `reply_dispatch` SUPPRESSES reasoning (deliverReasoning never runs) (FIX 3)", async () => {
+		let reasoningCalls = 0;
+		mountRegistryWithHook("reply_dispatch", () => ({ handled: true }));
+		const fake = makeFakeChannel({
+			async deliverReasoning() {
+				reasoningCalls += 1;
+			},
+		});
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => ({ reply: "<think>secret plan</think>visible answer" }),
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.equal(reasoningCalls, 0, "a claimed reply never leaks its reasoning trace");
+		assert.equal(fake.sent.length, 0, "and nothing is sent");
+	});
+
+	it("a NON-claiming `reply_dispatch` still lets reasoning + send proceed (FIX 3 ordering preserved)", async () => {
+		const order: string[] = [];
+		mountRegistryWithHook("reply_dispatch", () => {
+			order.push("reply_dispatch");
+			return; // observe only
+		});
+		const fake = makeFakeChannel({
+			async deliverReasoning() {
+				order.push("reasoning");
+			},
+			async sendText() {
+				order.push("send");
+			},
+		});
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => ({ reply: "<think>plan</think>answer" }),
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.deepEqual(
+			order,
+			["reply_dispatch", "reasoning", "send"],
+			"reply_dispatch is consulted BEFORE reasoning, which precedes the send",
+		);
+	});
 });
 
 describe("inbound-pipeline: ChannelSecurityAdapter supplementary DM-policy consult", () => {
@@ -1001,5 +1187,101 @@ describe("inbound-pipeline: ChannelSecurityAdapter supplementary DM-policy consu
 		});
 		assert.equal(turnRan, false, "adapter cannot loosen pairing → stranger still challenged");
 		assert.match(fake.sent[0]?.text ?? "", /approve/i);
+	});
+
+	it("a security adapter declared via `b.channelSecurity(...)` + boot-sync is LIVE and its consult runs (BUG 1)", async () => {
+		// Author path: a channel module declares its security slot through the
+		// extension context, NOT by calling registerChannelSecurityAdapter directly.
+		const reg = new BrigadeExtensionRegistry();
+		const b = reg.context({
+			agentId: "main",
+			workspaceDir: join(stateDir, "ws"),
+			cwd: join(stateDir, "ws"),
+			config: {} as BrigadeConfig,
+		});
+		b.channelSecurity("fake", { resolveDmPolicy: () => "owner" });
+		// Before the boot-sync the registry has NOT populated the process-wide
+		// security registry — proving the context method alone isn't enough and the
+		// boot seam is what makes it live (the exact bug).
+		assert.equal(getChannelSecurityAdapter("fake"), undefined, "not live before the boot-sync");
+		// Boot seam (mirrors core/server.ts): sync the registry's declared adapters.
+		syncChannelSecurityAdaptersFromPlugins(reg.channelSecurityAdapters);
+		assert.ok(getChannelSecurityAdapter("fake"), "live in the registry after boot-sync");
+
+		// End-to-end: the consult now tightens open → pairing through the pipeline.
+		const fake = makeFakeChannel();
+		let turnRan = false;
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "should not happen" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: STRANGER,
+			from: STRANGER,
+			text: "hello",
+		});
+		assert.equal(turnRan, false, "the slot-declared security consult tightened to pairing");
+		assert.match(fake.sent[0]?.text ?? "", /approve/i, "stranger challenged via the slot-declared adapter");
+	});
+
+	it("a messaging adapter declared via `b.channelMessaging(...)` + boot-sync resolves outbound targets (BUG 1)", async () => {
+		const reg = new BrigadeExtensionRegistry();
+		const b = reg.context({
+			agentId: "main",
+			workspaceDir: join(stateDir, "ws"),
+			cwd: join(stateDir, "ws"),
+			config: {} as BrigadeConfig,
+		});
+		// A messaging adapter that normalizes a bare handle into a concrete id.
+		b.channelMessaging("fake", {
+			parseExplicitTarget: () => null,
+			normalizeTarget: (raw) => (raw === "Alex" ? "alex#42" : raw),
+		});
+		assert.equal(getChannelMessagingAdapter("fake"), undefined, "not live before the boot-sync");
+		syncChannelMessagingAdaptersFromPlugins(reg.channelMessagingAdapters);
+		assert.ok(getChannelMessagingAdapter("fake"), "live in the registry after boot-sync");
+
+		const resolved = await resolveOutboundTarget({ channelId: "fake", to: "Alex" });
+		assert.equal(resolved.to, "alex#42", "the slot-declared messaging adapter normalized the target");
+		assert.equal(resolved.usedAdapter, true, "the resolver used the registered adapter");
+	});
+
+	it("the registry getters carry slot-declared adapters keyed by lowercased id (BUG 1)", () => {
+		const reg = new BrigadeExtensionRegistry();
+		const b = reg.context({
+			agentId: "main",
+			workspaceDir: join(stateDir, "ws"),
+			cwd: join(stateDir, "ws"),
+			config: {} as BrigadeConfig,
+		});
+		b.channelSecurity("FAKE", { resolveDmPolicy: () => "owner" });
+		b.channelMessaging("Fake", {
+			parseExplicitTarget: () => null,
+			normalizeTarget: (raw) => raw,
+		});
+		assert.deepEqual(
+			reg.channelSecurityAdapters.map((a) => a.id),
+			["fake"],
+			"security getter exposes the lowercased id for the boot-sync",
+		);
+		assert.deepEqual(
+			reg.channelMessagingAdapters.map((a) => a.id),
+			["fake"],
+			"messaging getter exposes the lowercased id for the boot-sync",
+		);
+		// And the central consult helper agrees once synced.
+		syncChannelSecurityAdaptersFromPlugins(reg.channelSecurityAdapters);
+		assert.equal(
+			consultChannelDmPolicy({ channelId: "fake", base: "open", ctx: { account: undefined, accountId: "", cfg: {} as BrigadeConfig } }),
+			"pairing",
+			"the slot-declared security adapter tightens open → pairing",
+		);
 	});
 });

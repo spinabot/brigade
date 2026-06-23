@@ -18,6 +18,7 @@ import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-a
 import type { BrigadeConfig } from "../../config/io.js";
 import type { AnyBrigadeTool } from "../tools/types.js";
 import { type BrigadeHookName, createHookRunner, type HookFireResult } from "./hook-runner.js";
+import type { ChannelMessagingAdapter, ChannelSecurityAdapter } from "../channels/types.adapters.js";
 import type {
 	BrigadeExtensionContext,
 	ChannelAdapter,
@@ -72,6 +73,8 @@ export interface PluginCapabilityIds {
 	modelProviders: string[];
 	channels: string[];
 	channelCommands: string[];
+	channelMessagingAdapters: string[];
+	channelSecurityAdapters: string[];
 	speechProviders: string[];
 	transcriptionProviders: string[];
 	mediaGenProviders: string[];
@@ -105,6 +108,8 @@ function emptyCapabilityIds(): PluginCapabilityIds {
 		modelProviders: [],
 		channels: [],
 		channelCommands: [],
+		channelMessagingAdapters: [],
+		channelSecurityAdapters: [],
 		speechProviders: [],
 		transcriptionProviders: [],
 		mediaGenProviders: [],
@@ -129,6 +134,10 @@ export class BrigadeExtensionRegistry {
 	private readonly providerAuthMethodRegs: ProviderAuthMethodRegistration[] = [];
 	private readonly channelMap = new Map<string, ChannelAdapter>();
 	private readonly channelCommandMap = new Map<string, ChannelCommand>();
+	/** OUTBOUND messaging adapters declared on a channel slot, keyed by lowercased channel id. */
+	private readonly channelMessagingMap = new Map<string, ChannelMessagingAdapter>();
+	/** SUPPLEMENTARY security adapters declared on a channel slot, keyed by lowercased channel id. */
+	private readonly channelSecurityMap = new Map<string, ChannelSecurityAdapter>();
 	private readonly speechMap = new Map<string, SpeechProvider>();
 	private readonly transcriptionMap = new Map<string, TranscriptionProvider>();
 	private readonly mediaGenMap = new Map<string, MediaGenProvider>();
@@ -204,6 +213,19 @@ export class BrigadeExtensionRegistry {
 				// case-insensitive dispatch (both sides use lowercase).
 				this.channelCommandMap.set(command.name.toLowerCase(), command);
 			},
+			channelMessaging: (channelId, adapter) => {
+				// Lowercase the key so it agrees with the channel-messaging registry's
+				// case-insensitive lookup (which normalizes the same way). A blank id
+				// is dropped — the registry would reject it anyway.
+				const id = channelId.trim().toLowerCase();
+				if (id) this.channelMessagingMap.set(id, adapter);
+			},
+			channelSecurity: (channelId, adapter) => {
+				// Lowercase the key so it agrees with the channel-security registry's
+				// case-insensitive lookup. A blank id is dropped.
+				const id = channelId.trim().toLowerCase();
+				if (id) this.channelSecurityMap.set(id, adapter);
+			},
 			tts: (provider) => {
 				this.speechMap.set(provider.id, provider);
 			},
@@ -269,6 +291,8 @@ export class BrigadeExtensionRegistry {
 			modelProviders: this.modelProviderRegs.map((p) => p.name),
 			channels: [...this.channelMap.keys()],
 			channelCommands: [...this.channelCommandMap.keys()],
+			channelMessagingAdapters: [...this.channelMessagingMap.keys()],
+			channelSecurityAdapters: [...this.channelSecurityMap.keys()],
 			speechProviders: [...this.speechMap.keys()],
 			transcriptionProviders: [...this.transcriptionMap.keys()],
 			mediaGenProviders: [...this.mediaGenMap.keys()],
@@ -327,6 +351,22 @@ export class BrigadeExtensionRegistry {
 	}
 	get channelCommands(): ChannelCommand[] {
 		return [...this.channelCommandMap.values()];
+	}
+	/**
+	 * OUTBOUND messaging adapters declared via `b.channelMessaging(id, adapter)`,
+	 * shaped `{ id, messaging }` so the boot can hand them straight to
+	 * `syncChannelMessagingAdaptersFromPlugins(...)`. Parallel to `channels`.
+	 */
+	get channelMessagingAdapters(): { id: string; messaging: ChannelMessagingAdapter }[] {
+		return [...this.channelMessagingMap.entries()].map(([id, messaging]) => ({ id, messaging }));
+	}
+	/**
+	 * SUPPLEMENTARY security adapters declared via `b.channelSecurity(id, adapter)`,
+	 * shaped `{ id, security }` so the boot can hand them straight to
+	 * `syncChannelSecurityAdaptersFromPlugins(...)`. Parallel to `channels`.
+	 */
+	get channelSecurityAdapters(): { id: string; security: ChannelSecurityAdapter }[] {
+		return [...this.channelSecurityMap.entries()].map(([id, security]) => ({ id, security }));
 	}
 	get speechProviders(): SpeechProvider[] {
 		return [...this.speechMap.values()];

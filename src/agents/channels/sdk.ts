@@ -213,10 +213,17 @@ export type {
 	BrigadeModule,
 } from "../extensions/types.js";
 
-/* ───────────────────────── contract: capability flags ───────────────────────── */
+/* ───────────────────────── contract: capability flags ─────────────────────────
+ *
+ * `ChannelCapabilities.chatTypes` is REQUIRED (every other flag is optional): a
+ * plugin MUST declare which chat shapes it handles (`"direct"` / `"group"` /
+ * `"channel"` / `"thread"`). The rest (`reactions`/`edit`/`unsend`/`reply`/`media`/…)
+ * default to "not supported" when omitted, and the central `message_action` tool
+ * pre-checks the matching flag before invoking the adapter.
+ */
 
 export type {
-	/** Static capability flags a channel advertises (`reactions`/`edit`/`unsend`/`reply`/`media`/…). */
+	/** Static capability flags a channel advertises — `chatTypes` is REQUIRED; `reactions`/`edit`/`unsend`/`reply`/`media`/… are optional. */
 	ChannelCapabilities,
 } from "./types.core.js";
 
@@ -461,8 +468,10 @@ export type {
 } from "../../config/types.js";
 
 export {
-	/** A channel's own per-account state dir (`~/.brigade/channels/<id>/<accountId>/`) — where it
-	 *  persists its auth/creds/downloaded media. Pair with `ensureDir`. */
+	/** A channel's own state dir (`~/.brigade/channels/<id>/`) — where it persists its
+	 *  auth/creds/downloaded media. Takes just the channel id; multi-account channels
+	 *  partition per account UNDER this dir themselves (`accounts/<accountId>/`). Pair
+	 *  with `ensureDir`. */
 	resolveChannelStateDir,
 	/** `mkdir -p` for a channel's state/media dirs. */
 	ensureDir,

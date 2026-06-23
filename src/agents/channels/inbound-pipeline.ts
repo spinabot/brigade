@@ -1108,6 +1108,36 @@ export async function runChannelInboundPipeline(
 		}
 		const reply = sanitizeReplyForChannel(result.reply?.trim() ?? "");
 		if (reply) {
+			// Plugin hook: `reply_dispatch` (CLAIMING). A plugin may suppress /
+			// take over the outgoing reply — if a handler claims (`{ handled:
+			// true }`), it OWNS delivery: Brigade sends nothing of its own AND
+			// emits no reasoning trace + records no last-sent message. Consulted
+			// FIRST (before reasoning, before any stream finalize / sendText) so a
+			// replaced reply never leaks its reasoning or a half-stream. Fires only
+			// when a registry is mounted; identical for the streaming +
+			// non-streaming paths below.
+			const replyRegistry = getActiveRegistry();
+			if (replyRegistry) {
+				const claim = await replyRegistry.fireHook("reply_dispatch", {
+					channel: c.adapter.id,
+					agentId: a.agentId,
+					conversationId: a.conversationId,
+					reply,
+					...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
+					...(a.accountId !== undefined ? { accountId: a.accountId } : {}),
+				});
+				if (claim.handled) {
+					log.debug("reply suppressed by plugin hook", {
+						channel: c.adapter.id,
+						conversationId: a.conversationId,
+						by: claim.by,
+					});
+					// A claimed reply means the plugin owns delivery — abandon any
+					// open stream WITHOUT finalizing so it doesn't leak a placeholder.
+					replyStream?.stop();
+					return;
+				}
+			}
 			// Reasoning lane (OPTIONAL, default OFF): when the adapter opts in, hand
 			// it the RAW reply so it can deliver a `<think>` trace as a separate
 			// prefixed message BEFORE the answer. The adapter gates on its own
@@ -1132,18 +1162,35 @@ export async function runChannelInboundPipeline(
 			// STREAMING path: when a live stream is open, FINALIZE it with the
 			// complete reply (it edits the in-progress message to the full text +
 			// rolls overflow into new messages). This replaces the single
-			// `sendText` below — the stream is now authoritative for delivery.
+			// `sendText` below — the stream is now authoritative for delivery. On a
+			// successful finalize the streamed send fires `message_sent` (VOID) just
+			// like the non-streaming path, then returns.
 			if (replyStream) {
 				try {
 					const sent = await replyStream.finalize(reply);
+					const streamedMessageId = sent && typeof sent === "object" ? sent.messageId : undefined;
 					recordLastSentMessage({
 						agentId: a.agentId,
 						channelId: c.adapter.id,
 						conversationId: a.conversationId,
-						messageId: sent && typeof sent === "object" ? sent.messageId : undefined,
+						messageId: streamedMessageId,
 						...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
 						...(a.accountId !== undefined ? { accountId: a.accountId } : {}),
 					});
+					// Plugin hook: `message_sent` (VOID) — telemetry after the streamed
+					// reply lands. Awaited so async handler work flushes; the result is
+					// ignored (void handlers can never alter or block delivery).
+					if (replyRegistry) {
+						await replyRegistry.fireHook("message_sent", {
+							channel: c.adapter.id,
+							agentId: a.agentId,
+							conversationId: a.conversationId,
+							text: reply,
+							messageId: streamedMessageId,
+							...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
+							...(a.accountId !== undefined ? { accountId: a.accountId } : {}),
+						});
+					}
 					return;
 				} catch (err) {
 					// Stream finalize failed — fall through to the non-streaming
@@ -1160,30 +1207,9 @@ export async function runChannelInboundPipeline(
 					}
 				}
 			}
-			// Plugin hook: `reply_dispatch` (CLAIMING). A plugin may suppress /
-			// take over the outgoing reply just before it is sent — if a handler
-			// claims (`{ handled: true }`), it owns delivery and Brigade does NOT
-			// call its own `sendText` (and records no last-sent message). Fires
-			// only when a registry is mounted.
-			const replyRegistry = getActiveRegistry();
-			if (replyRegistry) {
-				const claim = await replyRegistry.fireHook("reply_dispatch", {
-					channel: c.adapter.id,
-					agentId: a.agentId,
-					conversationId: a.conversationId,
-					reply,
-					...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
-					...(a.accountId !== undefined ? { accountId: a.accountId } : {}),
-				});
-				if (claim.handled) {
-					log.debug("reply suppressed by plugin hook", {
-						channel: c.adapter.id,
-						conversationId: a.conversationId,
-						by: claim.by,
-					});
-					return;
-				}
-			}
+			// NON-STREAMING path (or a stream that failed to finalize above). The
+			// `reply_dispatch` claim was already consulted at the top of this block,
+			// so a suppressed reply never reaches here.
 			// Capture the sent id (additive `{ messageId }` return) so the agent
 			// can later reference "my last message" via `message_action` without
 			// having to track ids itself. Channels that return void simply leave
