@@ -20,6 +20,7 @@ import {
 	copyFileSync,
 	existsSync,
 	mkdirSync,
+	readFileSync,
 	readdirSync,
 	writeFileSync,
 } from "node:fs";
@@ -81,12 +82,20 @@ function copyTree(src, dst) {
 	return n;
 }
 
-// 1. Build stamp — best-effort.
+// 1. Build stamp — best-effort. Records the package version (so `--version`
+//    reports the TRUTH — release-please bumps package.json, not the source
+//    constant), plus the git commit + build time.
 let head = null;
 try {
 	head = gitHead();
+	let version;
+	try {
+		version = JSON.parse(readFileSync("package.json", "utf8")).version;
+	} catch {
+		// package.json unreadable — version.ts falls back at runtime.
+	}
 	mkdirSync("dist", { recursive: true });
-	writeFileSync("dist/buildstamp.json", `${JSON.stringify({ builtAt: Date.now(), head })}\n`, "utf8");
+	writeFileSync("dist/buildstamp.json", `${JSON.stringify({ builtAt: Date.now(), head, version })}\n`, "utf8");
 } catch {
 	// Stamp is optional — a build without it just reports the bare version.
 }

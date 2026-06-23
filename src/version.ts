@@ -24,23 +24,48 @@ export interface BuildInfo {
 let cached: BuildInfo | undefined;
 
 /**
- * Resolve the running build's identity. Reads `buildstamp.json` next to this
- * compiled module (`dist/buildstamp.json`); returns just the version when no
- * stamp is present (dev / unbuilt source tree). Cached after first read.
+ * Read the real version from the package's `package.json` (one level up from
+ * this module: `dist/version.js` → `dist/../package.json` in a published
+ * install, `src/version.ts` → repo root in dev). Together with the build stamp
+ * this is the source of truth — the `VERSION` constant is only a last-resort
+ * fallback, because release-please bumps `package.json`, not the source.
+ * Best-effort: returns undefined when the file can't be read/parsed.
+ */
+function readPackageVersion(): string | undefined {
+	try {
+		const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+		const parsed = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: unknown };
+		return typeof parsed.version === "string" && parsed.version.length > 0 ? parsed.version : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Resolve the running build's identity. Version comes from the build stamp
+ * (`dist/buildstamp.json`, written at build time from `package.json`), falling
+ * back to a live `package.json` read (dev / unbuilt tree), then the bare
+ * `VERSION` constant. Commit + build time come from the stamp. Cached.
  */
 export function getBuildInfo(): BuildInfo {
 	if (cached) return cached;
 	let head: string | undefined;
 	let builtAt: number | undefined;
+	let stampedVersion: string | undefined;
 	try {
 		const stampPath = join(dirname(fileURLToPath(import.meta.url)), "buildstamp.json");
-		const parsed = JSON.parse(readFileSync(stampPath, "utf8")) as { head?: unknown; builtAt?: unknown };
+		const parsed = JSON.parse(readFileSync(stampPath, "utf8")) as {
+			head?: unknown;
+			builtAt?: unknown;
+			version?: unknown;
+		};
 		if (typeof parsed.head === "string" && parsed.head.length > 0) head = parsed.head;
 		if (typeof parsed.builtAt === "number" && Number.isFinite(parsed.builtAt)) builtAt = parsed.builtAt;
+		if (typeof parsed.version === "string" && parsed.version.length > 0) stampedVersion = parsed.version;
 	} catch {
-		// No stamp — bare version.
+		// No stamp — fall back to package.json, then the bare constant.
 	}
-	cached = { version: VERSION, head, builtAt };
+	cached = { version: stampedVersion ?? readPackageVersion() ?? VERSION, head, builtAt };
 	return cached;
 }
 
