@@ -106,6 +106,26 @@ export interface DownloadTelegramMediaArgs {
 }
 
 /**
+ * Bounded retry for the transient steps of a media download (getFile + the file
+ * fetch). Telegram's file API and the file CDN occasionally blip on a 5xx or a
+ * network reset; one or two quick retries turn a dropped attachment into a
+ * delivered one. The caller still wraps the whole thing in a try/catch that
+ * degrades to `null`, so an exhausted retry never breaks message delivery.
+ */
+export async function withMediaRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+	let lastErr: unknown;
+	for (let i = 0; i < attempts; i++) {
+		try {
+			return await fn();
+		} catch (err) {
+			lastErr = err;
+			if (i < attempts - 1) await new Promise((r) => setTimeout(r, 200 * 2 ** i));
+		}
+	}
+	throw lastErr;
+}
+
+/**
  * Download one inbound attachment to disk and return its normalized descriptor,
  * or `null` when the file couldn't be fetched (too big / network error / no
  * path). Never throws — a download glitch must not break message delivery.
@@ -114,7 +134,7 @@ export async function downloadTelegramMedia(args: DownloadTelegramMediaArgs): Pr
 	const { bot, fileId, kind, token, log } = args;
 	const doFetch = args.fetchImpl ?? fetch;
 	try {
-		const file = await bot.getFile(fileId);
+		const file = await withMediaRetry(() => bot.getFile(fileId));
 		const filePath = file?.file_path;
 		if (!filePath) {
 			log?.("telegram media skipped — getFile returned no file_path", { kind });
@@ -125,7 +145,13 @@ export async function downloadTelegramMedia(args: DownloadTelegramMediaArgs): Pr
 			return null;
 		}
 		const url = `${TELEGRAM_API_BASE}/file/bot${token}/${filePath}`;
-		const res = await doFetch(url);
+		const res = await withMediaRetry(async () => {
+			const r = await doFetch(url);
+			// Retry 5xx (transient server/CDN blip); a 4xx falls through to the
+			// !ok handler below (no point retrying a permanent client error).
+			if (!r.ok && r.status >= 500) throw new Error(`telegram media fetch failed (${r.status})`);
+			return r;
+		});
 		if (!res.ok) {
 			log?.("telegram media download failed", { kind, status: res.status });
 			return null;

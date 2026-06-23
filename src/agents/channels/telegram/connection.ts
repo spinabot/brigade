@@ -568,6 +568,30 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 			// Rate-limit the outbound API so a chatty agent never trips Telegram's
 			// flood limits — installed on the api config as a transformer.
 			bot.api.config?.use(apiThrottler());
+			// Honor Telegram's 429 `retry_after`: a rate-limited call sleeps the
+			// server-asked delay (capped at 30s) and retries instead of surfacing as
+			// a send failure. apiThrottler prevents most 429s proactively; this
+			// catches the residual ones. Bounded to 2 extra attempts so a persistent
+			// limit still surfaces to the caller rather than blocking forever.
+			bot.api.config?.use((async (
+				prev: (m: string, p: unknown, s?: AbortSignal) => Promise<unknown>,
+				method: string,
+				payload: unknown,
+				signal?: AbortSignal,
+			) => {
+				let res = (await prev(method, payload, signal)) as {
+					ok?: boolean;
+					error_code?: number;
+					parameters?: { retry_after?: number };
+				};
+				for (let attempt = 0; attempt < 2 && res?.ok === false && res.error_code === 429; attempt++) {
+					const retryAfter = res.parameters?.retry_after;
+					if (typeof retryAfter !== "number") break;
+					await new Promise((r) => setTimeout(r, Math.min(retryAfter, 30) * 1_000));
+					res = (await prev(method, payload, signal)) as typeof res;
+				}
+				return res;
+			}) as never);
 			return bot;
 		};
 		buildRunner = (bot: TelegramBotLike) =>
