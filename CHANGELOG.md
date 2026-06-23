@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.1](https://github.com/spinabot/brigade/compare/brigade-v1.3.0...brigade-v1.3.1) (2026-06-23)
+
+
+### Bug Fixes
+
+* **onboarding:** accept any provider key by validating live, not by prefix ([41592f4](https://github.com/spinabot/brigade/commit/41592f4863df91a7a66e525a1634ab131d56eae6))
+
 ## [1.3.0](https://github.com/spinabot/brigade/compare/brigade-v1.2.2...brigade-v1.3.0) (2026-06-22)
 
 
