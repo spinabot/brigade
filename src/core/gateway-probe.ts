@@ -242,9 +242,17 @@ export async function probeGateway(opts: GatewayProbeOptions = {}): Promise<Gate
       settled = true;
       try {
         ws.removeAllListeners();
+        // Tearing down a socket that hasn't finished its handshake makes `ws`
+        // emit a synchronous 'error' ("WebSocket was closed before the
+        // connection was established"). We just removed our listeners, so
+        // without a sink here Node treats it as an *unhandled* 'error' and
+        // crashes the whole process — exactly the `brigade tui` crash when the
+        // gateway is down and the probe hits its timeout. Attach a no-op error
+        // sink before closing so the teardown error is absorbed.
+        ws.on("error", () => {});
         ws.close();
       } catch {
-        // Best-effort; the listener cleanup runs anyway.
+        // Best-effort; the listener cleanup + error sink run anyway.
       }
       resolve(result);
     };
