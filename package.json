@@ -172,11 +172,11 @@
     "node": ">=22.12"
   },
   "dependencies": {
-    "@composio/core": "^0.10.0",
-    "@earendil-works/pi-agent-core": "0.79.9",
-    "@earendil-works/pi-ai": "0.79.9",
-    "@earendil-works/pi-coding-agent": "0.79.9",
-    "@earendil-works/pi-tui": "0.79.9",
+    "@composio/core": "^0.11.0",
+    "@earendil-works/pi-agent-core": "0.79.10",
+    "@earendil-works/pi-ai": "0.79.10",
+    "@earendil-works/pi-coding-agent": "0.79.10",
+    "@earendil-works/pi-tui": "0.79.10",
     "@grammyjs/runner": "^2.0.3",
     "@grammyjs/transformer-throttler": "^1.2.1",
     "@grammyjs/types": "^3.21.0",
