@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.4.0](https://github.com/spinabot/brigade/compare/brigade-v1.3.2...brigade-v1.4.0) (2026-06-23)
+
+
+### Features
+
+* **cli:** `brigade update`/`upgrade` command + unknown-command footgun guard ([5bdd727](https://github.com/spinabot/brigade/commit/5bdd727f01cb03cce22c4abae099061816ff6397))
+* **composio:** add disconnect + refresh actions to the composio tool ([b4cc620](https://github.com/spinabot/brigade/commit/b4cc62081dada81ffd105de137d82d4210cce54c))
+* **extensions:** `brigade extensions` CLI (list/doctor/init) + authoring docs ([d78d373](https://github.com/spinabot/brigade/commit/d78d3732286beefbf4cba8afee7832db22fb1fc2))
+* **extensions:** plugin SDK foundation — channel-sdk export + TypeScript drop-in loading ([b5bb7fb](https://github.com/spinabot/brigade/commit/b5bb7fbc64636e9f8abbc05d4ecc50bbcdcc06d6))
+* **plugin-sdk:** ChannelSecurityAdapter consult + doctor audit ([#6](https://github.com/spinabot/brigade/issues/6)) + formatAllowFrom ([#8](https://github.com/spinabot/brigade/issues/8)) ([0519ccf](https://github.com/spinabot/brigade/commit/0519ccfcee67934686a60c697a9b1b67e4d6313b))
+* **plugin-sdk:** native replyToId replies ([#3](https://github.com/spinabot/brigade/issues/3)) + inbound conversation resolution ([#2](https://github.com/spinabot/brigade/issues/2)b) ([7788bac](https://github.com/spinabot/brigade/commit/7788bac7c37452a9f8bacb3c1c66e90a596570ac))
+* **plugin-sdk:** parity batch 1 — 6 of 11 audit items (disjoint from channel runtime) ([4014756](https://github.com/spinabot/brigade/commit/4014756157279388bac1e01f6d0b4cd18907f092))
+* **plugin-sdk:** wire the plugin hook system into the live pipeline ([#1](https://github.com/spinabot/brigade/issues/1)) ([958195b](https://github.com/spinabot/brigade/commit/958195baa1feab2ecb69875a28aee9913640cb13))
+* **telegram:** close OpenClaw parity gaps ([6842d3e](https://github.com/spinabot/brigade/commit/6842d3ebbd87f5ff884f7498fd6cfc027acf7fbf))
+
+
+### Bug Fixes
+
+* **plugin-sdk:** clear messaging/security/meta registries on reload + document channel slot methods ([a026108](https://github.com/spinabot/brigade/commit/a026108c3bda020499391a042b4bd0c8210bd9e7))
+* **plugin-sdk:** wire messaging/security registries at boot + context methods + streaming hook parity ([437f11b](https://github.com/spinabot/brigade/commit/437f11bfe959f32e74fa51287855c6e8d6e0b4df))
+* **version:** report the real package version, not a hardcoded 0.1.0 ([71dc5c5](https://github.com/spinabot/brigade/commit/71dc5c5cc92ccba90df11486a8870461d5648ba4))
+
 ## [1.3.2](https://github.com/spinabot/brigade/compare/brigade-v1.3.1...brigade-v1.3.2) (2026-06-23)
 
 
