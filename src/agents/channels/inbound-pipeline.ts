@@ -488,6 +488,29 @@ export async function runChannelInboundPipeline(
 			return;
 		}
 
+		// Plugin hook: `inbound_claim` (CLAIMING). A plugin may take ownership of
+		// this raw inbound BEFORE Brigade's access-control gate runs — the first
+		// handler to return `{ handled: true }` claims it and we abandon the
+		// inbound entirely (no gate, no command, no dispatch). Fires only when a
+		// registry is mounted (gateway boot); a non-gateway path skips it.
+		{
+			const registry = getActiveRegistry();
+			if (registry) {
+				const claim = await registry.fireHook("inbound_claim", {
+					channel: adapter.id,
+					msg,
+				});
+				if (claim.handled) {
+					log.debug("inbound claimed by plugin hook", {
+						channel: adapter.id,
+						conversationId: msg.conversationId,
+						by: claim.by,
+					});
+					return;
+				}
+			}
+		}
+
 		// Access-control gate.
 		const isGroup = msg.isGroup === true || msg.chatType === "group";
 		const dmPolicy = resolveDmPolicy(cfg, adapter.id);
@@ -878,6 +901,32 @@ export async function runChannelInboundPipeline(
 			}
 			return;
 		}
+		// Plugin hook: `before_dispatch` (CLAIMING). A plugin may claim the turn
+		// just before it dispatches to the agent — claim → skip dispatch entirely
+		// (no reply). Fired for the immediate path here; the debounced path fires
+		// the same hook inside `flushDispatch` before its own dispatch.
+		{
+			const registry = getActiveRegistry();
+			if (registry) {
+				const claim = await registry.fireHook("before_dispatch", {
+					channel: adapter.id,
+					agentId: resolvedAgentId,
+					sessionKey,
+					text,
+					conversationId: msg.conversationId,
+					...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
+					...(msg.accountId !== undefined ? { accountId: msg.accountId } : {}),
+				});
+				if (claim.handled) {
+					log.debug("dispatch claimed by plugin hook", {
+						channel: adapter.id,
+						conversationId: msg.conversationId,
+						by: claim.by,
+					});
+					return;
+				}
+			}
+		}
 		// Immediate dispatch.
 		await dispatchTurn(ctx, {
 			text,
@@ -1060,6 +1109,30 @@ export async function runChannelInboundPipeline(
 					}
 				}
 			}
+			// Plugin hook: `reply_dispatch` (CLAIMING). A plugin may suppress /
+			// take over the outgoing reply just before it is sent — if a handler
+			// claims (`{ handled: true }`), it owns delivery and Brigade does NOT
+			// call its own `sendText` (and records no last-sent message). Fires
+			// only when a registry is mounted.
+			const replyRegistry = getActiveRegistry();
+			if (replyRegistry) {
+				const claim = await replyRegistry.fireHook("reply_dispatch", {
+					channel: c.adapter.id,
+					agentId: a.agentId,
+					conversationId: a.conversationId,
+					reply,
+					...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
+					...(a.accountId !== undefined ? { accountId: a.accountId } : {}),
+				});
+				if (claim.handled) {
+					log.debug("reply suppressed by plugin hook", {
+						channel: c.adapter.id,
+						conversationId: a.conversationId,
+						by: claim.by,
+					});
+					return;
+				}
+			}
 			// Capture the sent id (additive `{ messageId }` return) so the agent
 			// can later reference "my last message" via `message_action` without
 			// having to track ids itself. Channels that return void simply leave
@@ -1077,6 +1150,20 @@ export async function runChannelInboundPipeline(
 				...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
 				...(a.accountId !== undefined ? { accountId: a.accountId } : {}),
 			});
+			// Plugin hook: `message_sent` (VOID) — fire-and-forget telemetry after a
+			// reply lands. Awaited (so a handler's async work is flushed) but the
+			// result is ignored; void handlers can never alter or block delivery.
+			if (replyRegistry) {
+				await replyRegistry.fireHook("message_sent", {
+					channel: c.adapter.id,
+					agentId: a.agentId,
+					conversationId: a.conversationId,
+					text: reply,
+					messageId: sent && typeof sent === "object" ? sent.messageId : undefined,
+					...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
+					...(a.accountId !== undefined ? { accountId: a.accountId } : {}),
+				});
+			}
 		} else {
 			// No reply text but a stream may have been opened (and possibly already
 			// sent a placeholder) — stop it so it doesn't leak.
@@ -1093,6 +1180,30 @@ export async function runChannelInboundPipeline(
 		const conversationId = slot.baseMsg.conversationId;
 		const threadId = slot.baseMsg.threadId;
 		const accountId = slot.baseMsg.accountId;
+		// Plugin hook: `before_dispatch` (CLAIMING) — debounced path. Same hook
+		// as the immediate path above; a claim here skips the coalesced dispatch.
+		{
+			const registry = getActiveRegistry();
+			if (registry) {
+				const claim = await registry.fireHook("before_dispatch", {
+					channel: c.adapter.id,
+					agentId: slot.agentId,
+					sessionKey: slot.sessionKey,
+					text: combined,
+					conversationId,
+					...(threadId !== undefined ? { threadId } : {}),
+					...(accountId !== undefined ? { accountId } : {}),
+				});
+				if (claim.handled) {
+					log.debug("debounced dispatch claimed by plugin hook", {
+						channel: c.adapter.id,
+						conversationId,
+						by: claim.by,
+					});
+					return;
+				}
+			}
+		}
 		try {
 			await dispatchTurn(c, {
 				text: combined,

@@ -36,6 +36,10 @@ import {
 } from "./inbound-pipeline.js";
 import { readChannelOwner, setChannelOwner } from "./access-control/index.js";
 import { startChannels } from "./manager.js";
+import { BrigadeExtensionRegistry } from "../extensions/registry.js";
+import { setActiveRegistry } from "../extensions/active-registry.js";
+import type { BrigadeHookName } from "../extensions/hook-runner.js";
+import type { HookResult } from "../extensions/types.js";
 
 let stateDir: string;
 let prevStateDir: string | undefined;
@@ -58,7 +62,31 @@ afterEach(() => {
 	else process.env.BRIGADE_STATE_DIR = prevStateDir;
 	rmSync(stateDir, { recursive: true, force: true });
 	__resetConfigParseCacheForTests();
+	// Always clear the process-wide registry singleton so a hook registered by
+	// one test can never leak into another.
+	setActiveRegistry(undefined);
 });
+
+/**
+ * Mount a fresh registry as the active singleton with a single hook handler
+ * for `event`. Returns the registry so the test can read it back if needed.
+ * The `afterEach` above clears it.
+ */
+function mountRegistryWithHook(
+	event: BrigadeHookName,
+	handler: (payload: unknown) => HookResult | void | Promise<HookResult | void>,
+): BrigadeExtensionRegistry {
+	const reg = new BrigadeExtensionRegistry();
+	const b = reg.context({
+		agentId: "main",
+		workspaceDir: join(stateDir, "ws"),
+		cwd: join(stateDir, "ws"),
+		config: {} as BrigadeConfig,
+	});
+	b.hook(event, handler as (...args: unknown[]) => unknown);
+	setActiveRegistry(reg);
+	return reg;
+}
 
 function makeFakeChannel(overrides: Partial<ChannelAdapter> = {}): {
 	adapter: ChannelAdapter;
@@ -654,5 +682,167 @@ describe("inbound-pipeline: reasoning lane + general button callbacks", () => {
 			callbackQuery: { data: "stale-approval-payload", callbackId: "cb2" },
 		});
 		assert.equal(turns, 0, "an unrecognized callback is dropped silently");
+	});
+});
+
+describe("inbound-pipeline: plugin hooks wired into the live pipeline", () => {
+	it("a claiming `inbound_claim` handler SKIPS the turn entirely (no gate, no dispatch, no send)", async () => {
+		let claimedPayloadChannel: string | undefined;
+		mountRegistryWithHook("inbound_claim", (payload) => {
+			claimedPayloadChannel = (payload as { channel?: string }).channel;
+			return { handled: true };
+		});
+		let turnRan = false;
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "should not happen" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hello",
+		});
+		assert.equal(turnRan, false, "a claimed inbound never reaches the agent turn");
+		assert.equal(fake.sent.length, 0, "a claimed inbound sends nothing");
+		assert.equal(claimedPayloadChannel, "fake", "the handler saw the inbound's channel id in the payload");
+	});
+
+	it("a NON-claiming `inbound_claim` handler lets the turn proceed normally", async () => {
+		mountRegistryWithHook("inbound_claim", () => {
+			// observes but does not claim
+			return;
+		});
+		let turnRan = false;
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "normal reply" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hello",
+		});
+		assert.equal(turnRan, true, "an unclaimed inbound runs the turn");
+		assert.match(fake.sent[0]?.text ?? "", /normal reply/);
+	});
+
+	it("a claiming `before_dispatch` handler runs the gate but SKIPS dispatch (no turn, no send)", async () => {
+		mountRegistryWithHook("before_dispatch", () => ({ handled: true }));
+		let turnRan = false;
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "should not happen" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hello",
+		});
+		assert.equal(turnRan, false, "a claimed dispatch never runs the agent turn");
+		assert.equal(fake.sent.length, 0, "a claimed dispatch sends nothing");
+	});
+
+	it("a claiming `reply_dispatch` handler SUPPRESSES the outgoing send (turn still ran)", async () => {
+		let replyInPayload: string | undefined;
+		mountRegistryWithHook("reply_dispatch", (payload) => {
+			replyInPayload = (payload as { reply?: string }).reply;
+			return { handled: true };
+		});
+		let turnRan = false;
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "the reply that gets suppressed" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.equal(turnRan, true, "the turn still runs — only the send is suppressed");
+		assert.equal(fake.sent.length, 0, "a claimed reply_dispatch suppresses the adapter send");
+		assert.match(replyInPayload ?? "", /the reply that gets suppressed/, "the handler saw the reply text");
+	});
+
+	it("a NON-claiming `reply_dispatch` handler lets the reply send normally", async () => {
+		mountRegistryWithHook("reply_dispatch", () => {
+			return; // observe only
+		});
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => ({ reply: "delivered" }),
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.equal(fake.sent.length, 1, "an unclaimed reply_dispatch sends the reply");
+		assert.match(fake.sent[0]?.text ?? "", /delivered/);
+	});
+
+	it("a void `message_sent` handler FIRES after a successful send (and can never block it)", async () => {
+		const sentEvents: Array<{ channel?: string; text?: string }> = [];
+		mountRegistryWithHook("message_sent", (payload) => {
+			const p = payload as { channel?: string; text?: string };
+			sentEvents.push({ channel: p.channel, text: p.text });
+			// void handlers may throw — the runner swallows it; delivery is unaffected.
+			throw new Error("telemetry handler boom (must be swallowed)");
+		});
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => ({ reply: "shipped" }),
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.equal(fake.sent.length, 1, "the reply is delivered");
+		assert.match(fake.sent[0]?.text ?? "", /shipped/);
+		assert.equal(sentEvents.length, 1, "message_sent fired exactly once, AFTER the send");
+		assert.equal(sentEvents[0]?.channel, "fake");
+		assert.match(sentEvents[0]?.text ?? "", /shipped/, "the payload carried the sent reply text");
 	});
 });

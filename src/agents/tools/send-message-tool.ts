@@ -50,6 +50,7 @@ import { Type } from "typebox";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import { getActiveChannelManager } from "../channels/active-manager.js";
+import { getActiveRegistry } from "../extensions/active-registry.js";
 import type { ChannelApprovalRoute } from "../channels/approval-router.js";
 import { resolveOutboundTarget } from "../channels/channel-messaging-registry.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
@@ -162,7 +163,11 @@ export function makeSendMessageTool(
 					{ channel: "", to: "", textPreview: "" } as never,
 				);
 			}
-			const text = readStringParam(params, "text", { required: true });
+			// `let` (not `const`): the `message_sending` plugin hook below may
+			// rewrite the body before send (MODIFYING pattern). Earlier reads
+			// (the non-owner gate, failure-result previews) all run before that
+			// reassignment, so they see the original text unchanged.
+			let text = readStringParam(params, "text", { required: true });
 			const channelRaw = readStringParam(params, "channel");
 			const toRaw = readStringParam(params, "to");
 			const threadIdParam = readStringParam(params, "threadId");
@@ -270,6 +275,28 @@ export function makeSendMessageTool(
 						`send_message: channel "${channel}" is currently unavailable (${status.kind}). ${status.reason}${remediation}`,
 						{ channel, to, textPreview: text.slice(0, 80) } as never,
 					);
+				}
+			}
+			// Plugin hook: `message_sending` (MODIFYING). A plugin may rewrite the
+			// outgoing body / target just before the agent-initiated send — the
+			// runner shallow-merges each handler's `{ modifications }` into the
+			// payload, so a returned `text`/`to`/`threadId`/`accountId` wins. Fires
+			// only when a registry is mounted (gateway boot).
+			const sendRegistry = getActiveRegistry();
+			if (sendRegistry) {
+				const res = await sendRegistry.fireHook("message_sending", {
+					channel,
+					to,
+					text,
+					...(threadId !== undefined ? { threadId } : {}),
+					...(resolvedAccountId !== undefined ? { accountId: resolvedAccountId } : {}),
+				});
+				const mods = res.modifications;
+				if (mods) {
+					if (typeof mods.text === "string") text = mods.text;
+					if (typeof mods.to === "string") to = mods.to;
+					if (typeof mods.threadId === "string") threadId = mods.threadId;
+					if (typeof mods.accountId === "string") resolvedAccountId = mods.accountId;
 				}
 			}
 			const opts2: { threadId?: string; accountId?: string } = {};

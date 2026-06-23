@@ -16,6 +16,9 @@ import {
 	registerChannelMessagingAdapter,
 	resetChannelMessagingRegistryForTests,
 } from "../channels/channel-messaging-registry.js";
+import { BrigadeExtensionRegistry } from "../extensions/registry.js";
+import { setActiveRegistry } from "../extensions/active-registry.js";
+import type { BrigadeConfig } from "../../config/io.js";
 import { makeSendMessageTool } from "./send-message-tool.js";
 
 interface StubAdapter {
@@ -193,5 +196,71 @@ describe("send_message — OUTBOUND addressing (messaging adapter)", () => {
 		const result = await tool.execute("m4", { text: "still sends", channel: "whatsapp", to: "raw-id" } as never);
 		assert.equal(isRefused(result), false);
 		assert.equal(capture[0]?.to, "raw-id");
+	});
+});
+
+describe("send_message — `message_sending` plugin hook (MODIFYING)", () => {
+	afterEach(() => {
+		setActiveChannelManager(null);
+		setActiveRegistry(undefined);
+	});
+
+	function mountRegistryWithHook(
+		handler: (payload: unknown) => { modifications?: Record<string, unknown> } | void,
+	): void {
+		const reg = new BrigadeExtensionRegistry();
+		const b = reg.context({
+			agentId: "main",
+			workspaceDir: "/tmp/ws",
+			cwd: "/tmp/ws",
+			config: {} as BrigadeConfig,
+		});
+		b.hook("message_sending", handler as (...args: unknown[]) => unknown);
+		setActiveRegistry(reg);
+	}
+
+	it("a handler's `{ modifications: { text } }` REWRITES the outgoing body before sendText", async () => {
+		const { capture } = mount(["whatsapp"]);
+		let payloadText: string | undefined;
+		mountRegistryWithHook((payload) => {
+			payloadText = (payload as { text?: string }).text;
+			return { modifications: { text: "REWRITTEN body" } };
+		});
+		const tool = makeSendMessageTool({}); // owner
+		const result = await tool.execute("h1", {
+			text: "original body",
+			channel: "whatsapp",
+			to: "14057144199@s.whatsapp.net",
+		} as never);
+		assert.equal(isRefused(result), false);
+		assert.equal(capture.length, 1);
+		assert.equal(capture[0]?.text, "REWRITTEN body", "the modifying hook patched the body");
+		assert.equal(payloadText, "original body", "the handler observed the pre-modification body");
+	});
+
+	it("no registry mounted → body is sent unchanged (back-compat)", async () => {
+		const { capture } = mount(["whatsapp"]);
+		setActiveRegistry(undefined);
+		const tool = makeSendMessageTool({});
+		await tool.execute("h2", {
+			text: "untouched",
+			channel: "whatsapp",
+			to: "14057144199@s.whatsapp.net",
+		} as never);
+		assert.equal(capture[0]?.text, "untouched");
+	});
+
+	it("a handler returning nothing leaves the body unchanged", async () => {
+		const { capture } = mount(["whatsapp"]);
+		mountRegistryWithHook(() => {
+			return; // observe only
+		});
+		const tool = makeSendMessageTool({});
+		await tool.execute("h3", {
+			text: "stays the same",
+			channel: "whatsapp",
+			to: "14057144199@s.whatsapp.net",
+		} as never);
+		assert.equal(capture[0]?.text, "stays the same");
 	});
 });
