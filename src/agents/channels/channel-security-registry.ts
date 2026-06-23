@@ -89,9 +89,22 @@ export function syncChannelSecurityAdaptersFromPlugins(
 	}
 }
 
-/** Test-only — drop every dynamically-registered security adapter. */
-export function resetChannelSecurityRegistryForTests(): void {
+/**
+ * Drop every dynamically-registered security adapter. PUBLIC — the gateway's
+ * `stopExtensions()` calls this during a `system.reload` teardown so the
+ * registry starts clean and `startExtensions()` re-syncs ONLY the currently-
+ * loaded channels (the sync seam is `.set()`-only and never removes a slot, so
+ * without this a removed/edited channel's security adapter would leak across the
+ * reload and keep TIGHTENING DM policy — a security-relevant stale state).
+ * Idempotent.
+ */
+export function clearChannelSecurityRegistry(): void {
 	getState().byChannelId.clear();
+}
+
+/** Test-only alias of {@link clearChannelSecurityRegistry}. Kept so existing tests don't break. */
+export function resetChannelSecurityRegistryForTests(): void {
+	clearChannelSecurityRegistry();
 }
 
 /**

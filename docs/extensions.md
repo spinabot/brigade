@@ -175,3 +175,119 @@ export default defineModule({
 
 Run `brigade extensions init my-channel` to get this (and a README) generated for
 you.
+
+---
+
+## Channel slot methods
+
+`b.channel(adapter)` registers the connection worker (`start` / `stop` /
+`sendText` / …). Three further context methods let a channel opt into central
+seams **without** dragging its runtime into the send / inbound / policy paths.
+Each is keyed by `channelId` explicitly, and a channel that never calls one keeps
+today's behaviour by construction.
+
+### `b.channelMessaging(channelId, adapter)` — name / handle addressing
+
+```ts
+b.channelMessaging("my-channel", adapter);
+```
+
+Registers a `ChannelMessagingAdapter` so the `send_message` tool can turn the
+agent's loose `to` ("Alex", "@alex", "my-channel:123") into a concrete target,
+and so a name-addressed inbound collapses onto the same conversation the outbound
+side resolves to.
+
+```ts
+type ChannelMessagingAdapter = {
+  // Required. Recognize an explicit `scheme:value` / `@handle` form → split into
+  // an optional channel id + bare target. Return null when it isn't explicit.
+  parseExplicitTarget: (text: string) => { channelId?: string; target: string } | null;
+  // Required. Canonicalise a target id into the channel's stable shape. Must be idempotent.
+  normalizeTarget: (raw: string) => string;
+  // Optional. Resolve a human NAME/handle → a concrete id (a contact directory).
+  // Return null (sync or async) when it doesn't resolve.
+  targetResolver?: (name: string) => Promise<string | null> | string | null;
+  // Optional. Best-effort DM-vs-group guess for a normalized target.
+  inferTargetChatType?: (target: string) => "dm" | "group" | undefined;
+  // Optional. Human-readable label for a target, for tool results / logs.
+  formatTargetDisplay?: (target: string) => string;
+  // Optional INBOUND hook (the inverse of targetResolver). Canonicalise an
+  // incoming peer id → a stable conversation/session identity. Must be cheap,
+  // side-effect-free, and must not throw.
+  resolveInboundConversation?: (peerId: string) => string | null;
+};
+```
+
+- **Outbound** runs through `resolveOutboundTarget({ channelId, to })`:
+  `parseExplicitTarget` → optional `targetResolver` (only for name-shaped input)
+  → `normalizeTarget`. It **never throws** — a misbehaving adapter degrades to
+  the raw `to`.
+- **Inbound** runs through `resolveInboundConversation({ channelId, peerId })`
+  just before the route resolver; a `null`/empty result (or no hook) keeps the
+  raw peer id, so routing stays byte-identical.
+
+### `b.channelSecurity(channelId, adapter)` — tighten-only DM-policy consult + doctor audit
+
+```ts
+b.channelSecurity("my-channel", adapter);
+```
+
+Registers a **supplementary** `ChannelSecurityAdapter`. The authoritative
+access-control engine (config allow-from, owner bootstrap, pairing) is **not**
+replaced — this adapter sits on top of it.
+
+```ts
+type ChannelSecurityAdapter = {
+  // Optional. A supplementary DM-policy opinion ("owner" | "allow-from" | "all"
+  // | "disabled"), or null to take no opinion.
+  resolveDmPolicy?: (ctx: ChannelSecurityContext) => ChannelSecurityDmPolicy | null;
+  // Optional. Free-text warnings for `brigade doctor`.
+  collectWarnings?: (ctx: ChannelSecurityContext) => string[] | Promise<string[]>;
+  // Optional. Structured findings ({ checkId, severity, title, detail, remediation? })
+  // for `brigade doctor`.
+  collectAuditFindings?: (ctx) => ChannelSecurityAuditFinding[] | Promise<ChannelSecurityAuditFinding[]>;
+};
+```
+
+- **DM policy** is consulted via `consultChannelDmPolicy({ channelId, base, ctx })`
+  under a strict **TIGHTEN-ONLY** rule: the central `base` policy stays
+  authoritative, and the adapter may only ever move it *tighter* on the ladder
+  `open < allowlist < pairing < disabled` (author values map
+  `all→open`, `allow-from→allowlist`, `owner→pairing`, `disabled→disabled`). An
+  opinion that would loosen `base` is ignored; `null`/throw leaves `base`
+  unchanged. It **never throws**.
+- **Audit** findings are surfaced by `collectChannelSecurityAudit(...)` for
+  `brigade doctor`'s per-channel security section; a throwing adapter is skipped
+  and never breaks the doctor run.
+
+### `b.httpRoute(route)` — webhook inbound
+
+```ts
+b.httpRoute(route);
+```
+
+Mounts an `HttpRoute` on the gateway's HTTP server — the inbound path for a
+push-transport channel (Telegram webhook, Slack Events API) or any plugin
+endpoint. Register it gated on config so a default polling install exposes no
+inbound HTTP surface.
+
+```ts
+interface HttpRoute {
+  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; // any when omitted
+  path: string;                                          // e.g. "/webhooks/my-channel"
+  handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
+  // "none" (default): public — the handler verifies the provider's signature itself.
+  // "operator": the gateway gates the route on operator-auth (admin endpoints).
+  auth?: "none" | "operator";
+  match?: "exact" | "prefix";   // "exact" (default); "prefix" matches sub-paths
+  maxBodyBytes?: number;        // 413 above this; defaults to 1 MiB
+  timeoutMs?: number;           // 408 past this; defaults to 30s
+  skipSessionGuard?: boolean;   // opt out of the default-pass cross-agent guard
+}
+```
+
+Verify the provider's signature / secret header **first** (before parsing the
+body), then feed the parsed update into the started adapter's
+normalize + dedupe + dispatch path. Use `auth: "none"` **only** when the provider
+authenticates via a signed payload the handler checks itself (the gateway can't
+present operator-auth to a third-party webhook); otherwise use `auth: "operator"`.

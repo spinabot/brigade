@@ -249,6 +249,9 @@ export {
 	getChatChannelMeta,
 	/** Every channel meta currently known (built-in + dynamic). */
 	listChannelMetas,
+	/** Drop every dynamically-registered meta — the gateway calls this on reload teardown so a
+	 *  removed channel's meta doesn't leak across the reload (built-in catalog untouched). */
+	clearChannelMetaRegistry,
 } from "./channel-meta-registry.js";
 
 export {
@@ -277,6 +280,9 @@ export {
 	resolveInboundConversation,
 	/** Heuristic: does a `to` read like a human contact NAME (vs an already-concrete id)? */
 	looksLikeContactName,
+	/** Drop every dynamically-registered messaging adapter — the gateway calls this on reload teardown
+	 *  so a removed channel's adapter doesn't keep rewriting outbound targets across the reload. */
+	clearChannelMessagingRegistry,
 } from "./channel-messaging-registry.js";
 export type {
 	/** Outcome of `resolveOutboundTarget` ({ to, channelId?, usedAdapter, resolvedByName }). */
@@ -308,6 +314,9 @@ export {
 	dmPolicyTightness,
 	/** Iterate registered security adapters + collect their structured audit findings (for `brigade doctor`). */
 	collectChannelSecurityAudit,
+	/** Drop every dynamically-registered security adapter — the gateway calls this on reload teardown so
+	 *  a removed channel's adapter doesn't keep TIGHTENING DM policy across the reload (security-relevant). */
+	clearChannelSecurityRegistry,
 } from "./channel-security-registry.js";
 export type {
 	/** One channel's findings, grouped under its id, from `collectChannelSecurityAudit`. */

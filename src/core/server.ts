@@ -84,9 +84,15 @@ import {
 import { createTelegramPlugin, type TelegramPluginHandle } from "../agents/channels/telegram/plugin.js";
 import { createPluginChannelManagerFacade } from "../agents/channels/plugin-channel-manager-facade.js";
 import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
-import { syncChannelMessagingAdaptersFromPlugins } from "../agents/channels/channel-messaging-registry.js";
-import { syncChannelSecurityAdaptersFromPlugins } from "../agents/channels/channel-security-registry.js";
-import { registerChannelMeta } from "../agents/channels/channel-meta-registry.js";
+import {
+	clearChannelMessagingRegistry,
+	syncChannelMessagingAdaptersFromPlugins,
+} from "../agents/channels/channel-messaging-registry.js";
+import {
+	clearChannelSecurityRegistry,
+	syncChannelSecurityAdaptersFromPlugins,
+} from "../agents/channels/channel-security-registry.js";
+import { clearChannelMetaRegistry, registerChannelMeta } from "../agents/channels/channel-meta-registry.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { listOpenRouterModels } from "../integrations/provider-discovery.js";
@@ -5038,6 +5044,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				opts.consoleStream?.info?.(`service ${id} stop error: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		}
+		// Reset the process-wide channel slot registries (messaging / security /
+		// meta). These are populated by `startExtensions()` via a `.set()`-only sync
+		// seam that never REMOVES a slot, so an operator who removes/edits a slot-
+		// bearing channel and reloads would otherwise leak its stale adapter: a stale
+		// security adapter keeps TIGHTENING DM policy (security-relevant) and a stale
+		// messaging adapter keeps rewriting outbound targets. Clearing here means a
+		// reload starts clean and `startExtensions()` re-syncs ONLY the currently-
+		// loaded channels. Each clear is idempotent + total, so shutdown is safe too.
+		clearChannelMessagingRegistry();
+		clearChannelSecurityRegistry();
+		clearChannelMetaRegistry();
 	};
 
 	// Load the extension registry and start/mount everything it yields: channels,

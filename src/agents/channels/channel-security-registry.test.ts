@@ -16,6 +16,7 @@ import { strict as assert } from "node:assert";
 import { afterEach, describe, it } from "node:test";
 
 import {
+	clearChannelSecurityRegistry,
 	collectChannelSecurityAudit,
 	consultChannelDmPolicy,
 	dmPolicyTightness,
@@ -27,9 +28,16 @@ import {
 	securityDmPolicyToDmPolicy,
 	syncChannelSecurityAdaptersFromPlugins,
 } from "./channel-security-registry.js";
+import {
+	clearChannelMessagingRegistry,
+	resetChannelMessagingRegistryForTests,
+	resolveOutboundTarget,
+	syncChannelMessagingAdaptersFromPlugins,
+} from "./channel-messaging-registry.js";
 import type { DmPolicy } from "./access-control/types.js";
 import type { BrigadeConfig } from "../../config/types.js";
 import type {
+	ChannelMessagingAdapter,
 	ChannelSecurityAdapter,
 	ChannelSecurityContext,
 	ChannelSecurityDmPolicy,
@@ -37,6 +45,7 @@ import type {
 
 afterEach(() => {
 	resetChannelSecurityRegistryForTests();
+	resetChannelMessagingRegistryForTests();
 });
 
 const CFG = {} as BrigadeConfig;
@@ -284,5 +293,81 @@ describe("collectChannelSecurityAudit", () => {
 		// telegram threw → contributes nothing; slack still collected.
 		assert.equal(groups.length, 1);
 		assert.equal(groups[0]!.channelId, "slack");
+	});
+});
+
+/* ─────────────────────────── clear-on-reload (the stale-slot-leak fix) ───────────────────────────
+ *
+ * BUG this proves: `startExtensions()` syncs the messaging + security registries
+ * with a `.set()`-only seam that NEVER removes a slot. So when an operator
+ * removed/edited a slot-bearing channel and issued `system.reload`, the gateway's
+ * `stopExtensions()` used to leave the STALE adapter in place: a stale security
+ * adapter kept TIGHTENING DM policy (security-relevant) and a stale messaging
+ * adapter kept rewriting outbound targets. The fix has `stopExtensions()` clear
+ * all three registries on teardown — modeled here as `clear*Registry()`.
+ *
+ * This case reproduces the exact reload sequence on the registries directly
+ * (sync from a slot-bearing plugin list → clear → re-sync from the CHANGED/empty
+ * list) and asserts the removed adapter no longer participates.
+ */
+describe("clear-on-reload: a removed slot-bearing channel does not leak across a reload", () => {
+	// A messaging adapter that ALWAYS rewrites the outbound target (so a leak is
+	// detectable: a passthrough means the adapter is gone).
+	function rewritingMessaging(): ChannelMessagingAdapter {
+		return {
+			parseExplicitTarget: () => null,
+			normalizeTarget: () => "rewritten-by-stale-adapter",
+		};
+	}
+
+	it("security: a removed adapter no longer tightens; messaging: outbound passes through raw", async () => {
+		// (1) Initial boot — a "fancychat" channel ships BOTH a security adapter
+		//     (owner = pairing, i.e. tightens an open base) and a messaging adapter
+		//     (rewrites every target). `startExtensions()` syncs from the plugin list.
+		const securityAdapter: ChannelSecurityAdapter = { resolveDmPolicy: () => "owner" };
+		syncChannelSecurityAdaptersFromPlugins([{ id: "fancychat", security: securityAdapter }]);
+		syncChannelMessagingAdaptersFromPlugins([{ id: "fancychat", messaging: rewritingMessaging() }]);
+
+		// Sanity: while loaded, the security adapter TIGHTENS open → pairing and the
+		// messaging adapter rewrites the outbound target.
+		assert.equal(
+			consultChannelDmPolicy({ channelId: "fancychat", base: "open", ctx: ctx() }),
+			"pairing",
+		);
+		assert.deepEqual(listChannelSecurityAdapters(), ["fancychat"]);
+		const before = await resolveOutboundTarget({ channelId: "fancychat", to: "Alex" });
+		assert.equal(before.to, "rewritten-by-stale-adapter");
+		assert.equal(before.usedAdapter, true);
+
+		// (2) Operator removes "fancychat" and reloads. `stopExtensions()` now CLEARS
+		//     the process-wide slot registries (the fix under test) …
+		clearChannelSecurityRegistry();
+		clearChannelMessagingRegistry();
+		//     … then `startExtensions()` re-syncs from the NEW channel list, which no
+		//     longer contains "fancychat" (modeled as an empty list).
+		syncChannelSecurityAdaptersFromPlugins([]);
+		syncChannelMessagingAdaptersFromPlugins([]);
+
+		// (3) The removed adapters must be GONE: the registry no longer carries them.
+		assert.deepEqual(listChannelSecurityAdapters(), []);
+		assert.equal(getChannelSecurityAdapter("fancychat"), undefined);
+
+		// Security: `consultChannelDmPolicy(base)` returns base — NO stale tighten.
+		assert.equal(
+			consultChannelDmPolicy({ channelId: "fancychat", base: "open", ctx: ctx() }),
+			"open",
+		);
+		// Messaging: `resolveOutboundTarget` passes the raw `to` through, byte-for-byte.
+		const after = await resolveOutboundTarget({ channelId: "fancychat", to: "Alex" });
+		assert.equal(after.to, "Alex");
+		assert.equal(after.usedAdapter, false);
+	});
+
+	it("clear functions are idempotent + total (safe to call on shutdown with nothing registered)", () => {
+		// No registrations — clearing must not throw and leaves the registries empty.
+		clearChannelSecurityRegistry();
+		clearChannelMessagingRegistry();
+		assert.deepEqual(listChannelSecurityAdapters(), []);
+		assert.equal(getChannelSecurityAdapter("anything"), undefined);
 	});
 });

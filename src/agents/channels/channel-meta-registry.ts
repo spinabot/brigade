@@ -60,9 +60,21 @@ export function registerChannelMeta(meta: ChannelMeta): void {
 	getState().dynamic.set(id, meta);
 }
 
-/** Test-only — drop every dynamically-registered meta (the built-in catalog is untouched). */
-export function resetChannelMetaRegistryForTests(): void {
+/**
+ * Drop every dynamically-registered meta (the built-in catalog is untouched).
+ * PUBLIC — the gateway's `stopExtensions()` calls this during a `system.reload`
+ * teardown so the registry starts clean and the next `startExtensions()` re-
+ * registers ONLY the currently-loaded channels (registration is `.set()`-only
+ * and never removes, so without this a removed channel's meta would leak across
+ * the reload). Idempotent.
+ */
+export function clearChannelMetaRegistry(): void {
 	getState().dynamic.clear();
+}
+
+/** Test-only alias of {@link clearChannelMetaRegistry}. Kept so existing tests don't break. */
+export function resetChannelMetaRegistryForTests(): void {
+	clearChannelMetaRegistry();
 }
 
 /**

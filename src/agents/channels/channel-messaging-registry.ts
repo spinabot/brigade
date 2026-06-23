@@ -72,9 +72,21 @@ export function syncChannelMessagingAdaptersFromPlugins(
 	}
 }
 
-/** Test-only — drop every dynamically-registered messaging adapter. */
-export function resetChannelMessagingRegistryForTests(): void {
+/**
+ * Drop every dynamically-registered messaging adapter. PUBLIC — the gateway's
+ * `stopExtensions()` calls this during a `system.reload` teardown so the
+ * registry starts clean and `startExtensions()` re-syncs ONLY the currently-
+ * loaded channels (the sync seam is `.set()`-only and never removes a slot, so
+ * without this an edited/removed channel's messaging adapter would leak across
+ * the reload and keep rewriting outbound targets). Idempotent.
+ */
+export function clearChannelMessagingRegistry(): void {
 	getState().byChannelId.clear();
+}
+
+/** Test-only alias of {@link clearChannelMessagingRegistry}. Kept so existing tests don't break. */
+export function resetChannelMessagingRegistryForTests(): void {
+	clearChannelMessagingRegistry();
 }
 
 /**
