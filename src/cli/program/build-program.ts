@@ -54,6 +54,10 @@ const BOOT_OPTIONAL_PREFIXES = [
   "encrypt",
   "migrate",
   "backup",
+  // `extensions list/doctor/init` inspect the filesystem extensions dir +
+  // scaffold a starter module — they never touch the storage backend, so a
+  // down backend must not block an author diagnosing why a plugin won't load.
+  "extensions",
   // The `convex` command MANAGES the backend that convex mode depends on, so
   // it must run even when that backend is down — booting the storage layer
   // here would be circular (you can't reach a backend you're trying to start).
@@ -715,6 +719,49 @@ export function buildProgram(): Command {
     .action(async (name: string, opts: { json?: boolean }) => {
       const { runSkillsInfo } = await import("../commands/skills.js");
       await exitAfterFlush(await runSkillsInfo({ name }, { json: opts.json }));
+    });
+
+  /* ───────────────────────────── extensions ───────────────────────────── */
+  // `brigade extensions <list|doctor|init>` — author + operator surface over
+  // the extension engine. `list`/`doctor` only read the filesystem extensions
+  // dir; `init` scaffolds a starter module into it. None touch the gateway or
+  // the storage backend.
+  const extensions = program
+    .command("extensions")
+    .description("Inspect and scaffold Brigade extensions (add-on plugins)");
+
+  extensions
+    .command("list")
+    .description("List every extension (built-in + your own) with whether it loaded")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runExtensionsList } = await import("../commands/extensions.js");
+      await exitAfterFlush(await runExtensionsList({ json: opts.json }));
+    });
+
+  extensions
+    .command("doctor")
+    .description("Diagnose why one of your extensions did or didn't load")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runExtensionsDoctor } = await import("../commands/extensions.js");
+      await exitAfterFlush(await runExtensionsDoctor({ json: opts.json }));
+    });
+
+  extensions
+    .command("init <id>")
+    .description(
+      "Scaffold a starter extension into your extensions folder.\n" +
+        "  Examples:\n" +
+        "    brigade extensions init my-channel\n" +
+        "    brigade extensions init my-tool --kind tool\n" +
+        "    brigade extensions init my-search --kind provider",
+    )
+    .option("--kind <kind>", "channel | tool | provider (default: channel)", "channel")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (id: string, opts: { kind?: string; json?: boolean }) => {
+      const { runExtensionsInit } = await import("../commands/extensions.js");
+      await exitAfterFlush(await runExtensionsInit({ id, kind: opts.kind }, { json: opts.json }));
     });
 
   /* ───────────────────────────── logs ───────────────────────────── */

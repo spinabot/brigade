@@ -274,6 +274,50 @@ export function clearDiscoveryCache(): void {
 }
 
 /**
+ * Per-candidate import outcome used by the diagnostic surfaces
+ * (`brigade extensions list` / `doctor`). Reports — WITHOUT mutating any
+ * registry — whether a single candidate file imports cleanly and exports a
+ * usable module.
+ */
+export interface CandidateImportResult {
+	/** The candidate imported without throwing (or timing out). */
+	imported: boolean;
+	/** A usable BrigadeModule was found on the default/module export. */
+	hasValidModule: boolean;
+	/** The discovered module's declared id, when one was found. */
+	moduleId?: string;
+	/** Failure detail when `imported` is false (timeout / transpile / throw). */
+	error?: string;
+}
+
+/**
+ * Import a single candidate the same way `discoverUserModules` does — through
+ * the shared SDK-alias + TypeScript Jiti instance, time-boxed — and report what
+ * came back, without recording anything into a registry. This is the engine
+ * behind `brigade extensions doctor`'s "did my plugin import + export a module?"
+ * diagnosis. Callers run `checkPosixSafety` FIRST; this only runs for a
+ * candidate that passed the safety gate.
+ */
+export async function importCandidateForDiagnosis(source: string): Promise<CandidateImportResult> {
+	try {
+		const imported = (await importWithTimeout(source)) as { default?: unknown; module?: unknown };
+		const exported = imported.default ?? imported.module;
+		const candidates = Array.isArray(exported) ? exported : [exported];
+		const firstModule = candidates.find((c) => isModule(c)) as BrigadeModule | undefined;
+		if (firstModule) {
+			return { imported: true, hasValidModule: true, moduleId: firstModule.id };
+		}
+		return { imported: true, hasValidModule: false };
+	} catch (err) {
+		return {
+			imported: false,
+			hasValidModule: false,
+			error: err instanceof Error ? err.message : String(err),
+		};
+	}
+}
+
+/**
  * Discover + import user modules from `extensionsDir`. Returns the loaded
  * modules (shape-validated). Errors per candidate are logged and skipped.
  * Cached per dir for the process lifetime (see `clearDiscoveryCache`).
