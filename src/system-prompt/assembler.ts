@@ -16,6 +16,7 @@ import {
   WEB_TOOLS_GUIDANCE,
 } from "./guidance.js";
 import { renderOrgBlock } from "./org/render-org-block.js";
+import { resolveOutputFormattingDirective } from "./identity-defaults.js";
 import type { ContextFile } from "./types.js";
 import type { BootstrapPhase } from "../workspace/state.js";
 import type { OrgGraph } from "../agents/org/types.js";
@@ -518,6 +519,24 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // leaner. If a specific model regresses on fence formatting, add
   // targeted per-family guidance in `guidance.ts` rather than restoring
   // the always-on block.
+  //
+  // FIX 9 — per-channel markdown gate (additive). The block stays absent for
+  // markdown-capable channels, the CLI/TUI, unknown channels, and non-channel
+  // turns (markdown-on remains the implicit default — no regression). It is
+  // emitted ONLY when THIS turn came in over a channel whose declared meta says
+  // `markdownCapable: false`, in which case the model is told to reply in plain
+  // text so the user doesn't see literal `**markup**`. Skipped in minimal mode
+  // (sub-agent / cron) — their reply is a tool result / log line, not a
+  // channel-rendered message, so channel markdown capability is irrelevant.
+  if (!isMinimalMode) {
+    const directive = resolveOutputFormattingDirective(
+      args.channels?.currentChannel?.channelId,
+    );
+    if (directive) {
+      lines.push(directive);
+      lines.push("");
+    }
+  }
 
   // 6. ## Safety.
   // Constitution-style anti-self-preservation rules. The previous

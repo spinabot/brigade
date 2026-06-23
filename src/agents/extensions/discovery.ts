@@ -24,7 +24,7 @@
  * continues with the rest.
  */
 
-import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
@@ -219,6 +219,144 @@ function candidateEntries(extensionsDir: string): string[] {
 		}
 	}
 	return entries;
+}
+
+// ── Sidecar manifest (plugin SDK Step 5: manifest-driven lazy activation) ──
+//
+// A user module may ship a `brigade.extension.json` next to its entry so the
+// discovery planner can read activation metadata WITHOUT importing the module
+// body (the whole point of lazy activation — a non-triggered module is never
+// imported, so its top-level never runs). The sidecar lives:
+//   - for a folder module: `<dir>/brigade.extension.json` (next to its index);
+//   - for a file module:   `<basename>.brigade.extension.json` next to the file,
+//     with a fall back to a shared `brigade.extension.json` in the same dir.
+// When absent, the loader falls back to importing the module to read its
+// `manifest` field (today's behavior). A malformed / unreadable sidecar is
+// ignored (logged) and treated as absent — it never aborts discovery.
+const SIDECAR_BASENAME = "brigade.extension.json";
+
+/**
+ * Read the sidecar manifest for a candidate entry, WITHOUT importing the module.
+ * `source` is the resolved entry path (a file, or a dir's `index.*`). Returns the
+ * parsed `BrigadeModuleManifest` when a readable, well-formed sidecar exists;
+ * `undefined` otherwise (no sidecar, unreadable, malformed, or wrong shape).
+ */
+export function readSidecarManifest(source: string): BrigadeModuleManifest | undefined {
+	const dir = path.dirname(source);
+	const base = path.basename(source);
+	// Candidate sidecar locations, in precedence order: a file-specific
+	// `<name>.brigade.extension.json`, then the dir-shared `brigade.extension.json`.
+	const stem = base.replace(/\.(js|mjs|ts|mts)$/i, "");
+	const candidates = [
+		path.join(dir, `${stem}.${SIDECAR_BASENAME}`),
+		path.join(dir, SIDECAR_BASENAME),
+	];
+	for (const sidecar of candidates) {
+		let raw: string;
+		try {
+			if (!statSync(sidecar).isFile()) continue;
+			raw = readFileSync(sidecar, "utf8");
+		} catch {
+			continue; // not present / unreadable — try the next location
+		}
+		try {
+			const parsed = JSON.parse(raw) as unknown;
+			if (isManifest(parsed)) return parsed;
+			log.warn("ignored sidecar manifest — not a valid BrigadeModuleManifest (needs string id)", {
+				sidecar,
+			});
+		} catch (err) {
+			log.warn("ignored sidecar manifest — JSON parse failed", {
+				sidecar,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		// A present-but-bad sidecar at this location stops the search — we don't
+		// silently fall through to a dir-shared one when a file-specific sidecar
+		// exists but is malformed (that would mask the operator's typo).
+		return undefined;
+	}
+	return undefined;
+}
+
+/**
+ * A discovery candidate paired with its sidecar manifest (read WITHOUT importing
+ * the module body). The loader's activation planner consults `manifest` to decide
+ * whether to import + register the module at all — a non-triggered module is never
+ * imported. `manifest` is `undefined` when the candidate ships no sidecar; the
+ * loader then falls back to importing the module to read its `manifest` field.
+ */
+export interface DiscoveryCandidate {
+	/** Absolute entry path the module would be imported from. */
+	source: string;
+	/** POSIX safety verdict — `null` = passed; non-null = rejection reason. */
+	safetyReason: string | null;
+	/** Sidecar manifest, when a readable `brigade.extension.json` exists next to the entry. */
+	manifest?: BrigadeModuleManifest;
+}
+
+/**
+ * List discovery candidates under `extensionsDir` with each one's POSIX safety
+ * verdict + its sidecar manifest (read WITHOUT importing the module body). This
+ * is the lazy-activation entry point: the loader plans activation from the
+ * sidecar manifest and only imports the candidates that survive the plan. Never
+ * imports anything; never throws (an unreadable sidecar is treated as absent).
+ */
+export function listDiscoveryCandidates(extensionsDir: string): DiscoveryCandidate[] {
+	const out: DiscoveryCandidate[] = [];
+	for (const source of candidateEntries(extensionsDir)) {
+		const safetyReason = checkPosixSafety(source, extensionsDir);
+		const manifest = safetyReason ? undefined : readSidecarManifest(source);
+		out.push({ source, safetyReason, manifest });
+	}
+	return out;
+}
+
+/**
+ * Import a single candidate the same way `discoverUserModules` does — through the
+ * shared SDK-alias + TypeScript Jiti instance, time-boxed — and return the
+ * discovered module(s) plus the resolved manifest. Used by the loader's lazy
+ * path AFTER the activation planner decides (from a sidecar) that the module
+ * should load, OR when the candidate shipped no sidecar so the body must be read
+ * to recover its `manifest` field. The POSIX safety gate is the caller's
+ * responsibility (mirrors `importCandidateForDiagnosis`). Returns `[]` on
+ * import failure (logged), so a bad module never aborts the load.
+ *
+ * `sidecarManifest` (when provided) takes precedence over a body-carried manifest
+ * — the operator's declarative sidecar is authoritative.
+ */
+export async function importDiscoveredModules(
+	source: string,
+	sidecarManifest?: BrigadeModuleManifest,
+): Promise<DiscoveredModule[]> {
+	const out: DiscoveredModule[] = [];
+	try {
+		const imported = (await importWithTimeout(source)) as {
+			default?: unknown;
+			module?: unknown;
+			manifest?: unknown;
+		};
+		const exported = imported.default ?? imported.module;
+		const candidates = Array.isArray(exported) ? exported : [exported];
+		const topLevelManifest = isManifest(imported.manifest) ? imported.manifest : undefined;
+		for (const c of candidates) {
+			if (isModule(c)) {
+				const manifest =
+					sidecarManifest ??
+					topLevelManifest ??
+					(isManifest((c as BrigadeModule).manifest) ? (c as BrigadeModule).manifest : undefined);
+				out.push({ module: c, origin: "user", source, manifest });
+			} else {
+				log.warn("ignored user extension — no default BrigadeModule export", { source });
+			}
+		}
+	} catch (err) {
+		log.warn("failed to import user extension — skipping", {
+			source,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+	return out;
 }
 
 // Process-lifetime cache keyed by dir. The per-turn agent path and the gateway

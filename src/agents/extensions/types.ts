@@ -348,6 +348,17 @@ export interface ChannelPairingAdapter {
 	/** Friendly label for the sender id in the challenge card. */
 	idLabel: "phone" | "username" | "account";
 	/**
+	 * True when the channel's bot account is SEPARATE from the operator (e.g. a
+	 * Telegram bot is its own entity, so `selfId()` is the bot — never the human
+	 * operator). For these channels the operator can't be auto-detected from
+	 * `selfId()`, so ownership is BOOTSTRAPPED securely from the first CLI
+	 * `pairing approve` (gateway-machine access is the proof) and recorded in the
+	 * per-channel owner store. Ownership is never granted by merely texting the
+	 * bot. Omit/false for channels where the bot runs AS the operator (WhatsApp),
+	 * where `selfId()` already identifies them and no bootstrap is needed.
+	 */
+	botIsSeparateFromOperator?: boolean;
+	/**
 	 * Normalize an allow-from entry the operator typed before it's stored.
 	 * Default behaviour (when omitted) is identity.
 	 */
@@ -1326,12 +1337,39 @@ export interface BrigadeModuleManifest {
 	name?: string;
 	description?: string;
 	version?: string;
+	/**
+	 * Minimum Brigade version this module needs to run, as a semver string
+	 * (e.g. `"0.2.0"`). The install/compat check refuses to add a module whose
+	 * `minBrigadeVersion` is NEWER than the running Brigade — the operator would
+	 * be installing something that depends on capabilities this build doesn't
+	 * have. Absent ⇒ no floor is enforced (treated as compatible). Only the
+	 * leading `major.minor.patch` is compared; pre-release/build suffixes are
+	 * ignored, so the check stays lenient.
+	 */
+	minBrigadeVersion?: string;
+	/**
+	 * Declared plugin-API generation this module was written against (a bare
+	 * integer-ish string, e.g. `"1"`). Brigade advertises its own current
+	 * plugin-API generation; the compat check refuses a module that targets a
+	 * generation NEWER than this build understands (a forward-incompatible
+	 * module). Older generations are accepted (back-compat). Absent ⇒ unversioned
+	 * ⇒ accepted.
+	 */
+	pluginApi?: string;
 	/** Whether bundled-origin modules are active by default (defaults to true). */
 	enabledByDefault?: boolean;
 	/** Capabilities this module CONTRIBUTES — used by the future planner. */
 	provides?: {
 		tools?: string[];
 		hooks?: string[];
+		/**
+		 * Channel command names this module registers (the `name` passed to
+		 * `b.channelCommand({ name, … })`, e.g. `"weather"`). Declaring them here
+		 * lets the activation planner seed its `commands` set so a DIFFERENT
+		 * module gated on `onCommands:["weather"]` can activate when this module
+		 * provides that command — without importing either module first.
+		 */
+		commands?: string[];
 		channels?: string[];
 		providers?: string[];
 		memoryBackends?: string[];

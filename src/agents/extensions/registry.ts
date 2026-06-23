@@ -46,6 +46,81 @@ export interface RegistryContextMeta {
 	moduleConfig?: unknown;
 }
 
+/**
+ * Lifecycle state of one module on the live registry (FIX 4 — the durable
+ * `PluginRecord` state machine the CLI can read live).
+ *
+ *   - `discovered` — the loader decided to run this module (it passed gating) but
+ *     `register()` has not completed yet.
+ *   - `activated`  — `register()` completed successfully; `capabilities` lists the
+ *     capability ids this module contributed (attributed by diffing the registry
+ *     before/after its `register()`).
+ *   - `failed`     — `register()` threw (or another register-phase step failed);
+ *     `failurePhase` names where.
+ *
+ * Unlike the discovery-only `brigade extensions list`, this reflects the
+ * REGISTER phase — so an operator can see a module that imported fine but threw
+ * while registering, which discovery alone never surfaces.
+ */
+export type PluginRecordStatus = "discovered" | "activated" | "failed";
+
+/** Capability ids a module contributed, grouped by kind (empty arrays omitted-as-[]). */
+export interface PluginCapabilityIds {
+	tools: string[];
+	hooks: string[];
+	commands: string[];
+	modelProviders: string[];
+	channels: string[];
+	channelCommands: string[];
+	speechProviders: string[];
+	transcriptionProviders: string[];
+	mediaGenProviders: string[];
+	memoryCapabilities: string[];
+	contextEngines: string[];
+	compactionProviders: string[];
+	agentHarnesses: string[];
+	webSearchProviders: string[];
+	webFetchProviders: string[];
+	integrations: string[];
+	services: string[];
+	httpRoutes: string[];
+	gatewayMethods: string[];
+}
+
+/** A per-module runtime record on the live registry. */
+export interface PluginRecord {
+	id: string;
+	status: PluginRecordStatus;
+	/** When `status === "failed"`, the phase that failed (e.g. `"register"`). */
+	failurePhase?: string;
+	/** Capability ids this module registered (populated on `activated`). */
+	capabilities: PluginCapabilityIds;
+}
+
+function emptyCapabilityIds(): PluginCapabilityIds {
+	return {
+		tools: [],
+		hooks: [],
+		commands: [],
+		modelProviders: [],
+		channels: [],
+		channelCommands: [],
+		speechProviders: [],
+		transcriptionProviders: [],
+		mediaGenProviders: [],
+		memoryCapabilities: [],
+		contextEngines: [],
+		compactionProviders: [],
+		agentHarnesses: [],
+		webSearchProviders: [],
+		webFetchProviders: [],
+		integrations: [],
+		services: [],
+		httpRoutes: [],
+		gatewayMethods: [],
+	};
+}
+
 export class BrigadeExtensionRegistry {
 	private readonly toolRegs: ToolRegistration[] = [];
 	private readonly hookRegs: HookRegistration[] = [];
@@ -71,6 +146,14 @@ export class BrigadeExtensionRegistry {
 
 	/** Modules that successfully registered — the loader fills this (used for reload). */
 	readonly loadedModules: import("./types.js").BrigadeModule[] = [];
+
+	/**
+	 * Per-module runtime lifecycle records (FIX 4). The loader populates these as
+	 * it registers each module: `discovered` before `register()`, then `activated`
+	 * (with attributed capabilities) or `failed`. Insertion-ordered (Map) so the
+	 * CLI renders them in load order. Read via `pluginRecord(id)` / `pluginRecords()`.
+	 */
+	private readonly pluginRecordMap = new Map<string, PluginRecord>();
 
 	/** Build the recording context a module's `register(b)` writes into. */
 	context(meta: RegistryContextMeta): BrigadeExtensionContext {
@@ -166,6 +249,76 @@ export class BrigadeExtensionRegistry {
 				this.gatewayMethodMap.set(method.name, method);
 			},
 		};
+	}
+
+	/* ── plugin lifecycle records (FIX 4) ── */
+
+	/**
+	 * Snapshot the FULL set of currently-registered capability ids, grouped by
+	 * kind. The loader takes one of these BEFORE a module's `register()` and one
+	 * AFTER, then diffs them to attribute the newly-registered ids to that module
+	 * (see `diffCapabilityIds`). Pure read.
+	 */
+	capabilitySnapshot(): PluginCapabilityIds {
+		return {
+			tools: this.toolRegs
+				.map((t) => (t.tool ? t.tool.name : t.factory?.create({ agentId: "", sessionKey: "" }).name))
+				.filter((n): n is string => typeof n === "string"),
+			hooks: this.hookRegs.map((h) => h.event),
+			commands: this.commandRegs.map((c) => c.name),
+			modelProviders: this.modelProviderRegs.map((p) => p.name),
+			channels: [...this.channelMap.keys()],
+			channelCommands: [...this.channelCommandMap.keys()],
+			speechProviders: [...this.speechMap.keys()],
+			transcriptionProviders: [...this.transcriptionMap.keys()],
+			mediaGenProviders: [...this.mediaGenMap.keys()],
+			memoryCapabilities: [...this.memoryMap.keys()],
+			contextEngines: [...this.contextEngineMap.keys()],
+			compactionProviders: [...this.compactionProviderMap.keys()],
+			agentHarnesses: [...this.agentHarnessMap.keys()],
+			webSearchProviders: [...this.webSearchMap.keys()],
+			webFetchProviders: [...this.webFetchMap.keys()],
+			integrations: [...this.integrationMap.keys()],
+			services: [...this.serviceMap.keys()],
+			httpRoutes: [...this.httpRouteMap.keys()],
+			gatewayMethods: [...this.gatewayMethodMap.keys()],
+		};
+	}
+
+	/** Record that a module was selected to load (pre-`register()`). */
+	markModuleDiscovered(id: string): void {
+		this.pluginRecordMap.set(id, { id, status: "discovered", capabilities: emptyCapabilityIds() });
+	}
+
+	/**
+	 * Record that a module's `register()` succeeded. `capabilities` is the diff of
+	 * the registry's capability ids across the module's `register()` (what THIS
+	 * module added), produced by `diffCapabilityIds(before, after)` in the loader.
+	 */
+	markModuleActivated(id: string, capabilities: PluginCapabilityIds): void {
+		this.pluginRecordMap.set(id, { id, status: "activated", capabilities });
+	}
+
+	/** Record that a module failed during a register-phase `phase`. */
+	markModuleFailed(id: string, phase: string): void {
+		const prev = this.pluginRecordMap.get(id);
+		this.pluginRecordMap.set(id, {
+			id,
+			status: "failed",
+			failurePhase: phase,
+			capabilities: prev?.capabilities ?? emptyCapabilityIds(),
+		});
+	}
+
+	/** Live lifecycle record for one module id, or `undefined` if never seen. */
+	pluginRecord(id: string): PluginRecord | undefined {
+		const r = this.pluginRecordMap.get(id);
+		return r ? clonePluginRecord(r) : undefined;
+	}
+
+	/** All live lifecycle records, in load order. */
+	pluginRecords(): PluginRecord[] {
+		return [...this.pluginRecordMap.values()].map(clonePluginRecord);
 	}
 
 	/* ── product-level getters (the gateway consumes these) ── */
@@ -582,4 +735,44 @@ function filterByAllowDeny<T extends { id: string }>(
 		if (denySet && denySet.has(id)) return false;
 		return true;
 	});
+}
+
+/** Deep-ish clone of a PluginRecord so callers can't mutate the registry's copy. */
+function clonePluginRecord(r: PluginRecord): PluginRecord {
+	const caps = {} as PluginCapabilityIds;
+	for (const key of Object.keys(r.capabilities) as (keyof PluginCapabilityIds)[]) {
+		caps[key] = [...r.capabilities[key]];
+	}
+	return {
+		id: r.id,
+		status: r.status,
+		...(r.failurePhase !== undefined ? { failurePhase: r.failurePhase } : {}),
+		capabilities: caps,
+	};
+}
+
+/**
+ * Diff two capability-id snapshots (`before`/`after` a single module's
+ * `register()`), returning ONLY the ids the module added. Multiset-aware per
+ * kind: if `before` had one `web_search` tool and `after` has two, the new one
+ * is attributed. Used by the loader to attribute capabilities to the module that
+ * registered them for its `PluginRecord`.
+ */
+export function diffCapabilityIds(before: PluginCapabilityIds, after: PluginCapabilityIds): PluginCapabilityIds {
+	const out = {} as PluginCapabilityIds;
+	for (const key of Object.keys(after) as (keyof PluginCapabilityIds)[]) {
+		const beforeCounts = new Map<string, number>();
+		for (const id of before[key]) beforeCounts.set(id, (beforeCounts.get(id) ?? 0) + 1);
+		const added: string[] = [];
+		for (const id of after[key]) {
+			const remaining = beforeCounts.get(id) ?? 0;
+			if (remaining > 0) {
+				beforeCounts.set(id, remaining - 1); // consumed a pre-existing one
+			} else {
+				added.push(id);
+			}
+		}
+		out[key] = added;
+	}
+	return out;
 }

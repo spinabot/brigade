@@ -764,6 +764,41 @@ export function buildProgram(): Command {
       await exitAfterFlush(await runExtensionsInit({ id, kind: opts.kind }, { json: opts.json }));
     });
 
+  extensions
+    .command("add <source>")
+    .description(
+      "Install an extension from a folder, an npm package, or a git URL.\n" +
+        "  Runs a compatibility check + a security scan; you confirm before it's kept.\n" +
+        "  Examples:\n" +
+        "    brigade extensions add ./my-plugin\n" +
+        "    brigade extensions add brigade-plugin-weather@1.2.0\n" +
+        "    brigade extensions add https://github.com/acme/brigade-plugin.git\n" +
+        "    brigade extensions add ./my-plugin --force   # replace an existing one\n" +
+        "    brigade extensions add ./my-plugin --yes     # accept the scan non-interactively",
+    )
+    .option("--force", "replace an extension of the same name if one is already installed", false)
+    .option("-y, --yes", "accept the security-scan findings without prompting (non-interactive)", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (source: string, opts: { force?: boolean; yes?: boolean; json?: boolean }) => {
+      const { runExtensionsAdd } = await import("../commands/extensions.js");
+      await exitAfterFlush(
+        await runExtensionsAdd({ source, force: opts.force, yes: opts.yes }, { json: opts.json }),
+      );
+    });
+
+  extensions
+    .command("remove <id>")
+    .alias("rm")
+    .description(
+      "Delete an installed extension from your extensions folder.\n" +
+        "  Example: brigade extensions remove my-plugin",
+    )
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (id: string, opts: { json?: boolean }) => {
+      const { runExtensionsRemove } = await import("../commands/extensions.js");
+      await exitAfterFlush(await runExtensionsRemove({ id }, { json: opts.json }));
+    });
+
   /* ───────────────────────────── logs ───────────────────────────── */
   program
     .command("logs")

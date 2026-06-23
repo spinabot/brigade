@@ -2,11 +2,12 @@
  * `ChannelPlugin<R, P, A>` — the full plugin contract surface.
  *
  * Brand-scrubbed analogue of upstream's `src/channels/plugins/types.plugin.ts`.
- * The shape carries all 28 optional adapter slots; only the eight
- * lifted in `types.adapters.ts` have concrete shapes today. The
- * remaining slots are typed as `unknown` so a channel plugin can declare
- * them now and Step 16+ can tighten the types as the channel manager
- * fans out.
+ * The shape carries all 28 optional adapter slots; only the nine
+ * lifted in `types.adapters.ts` (the eight Step-16 adapters plus the
+ * OUTBOUND-addressing `messaging` adapter) have concrete shapes today.
+ * The remaining slots are typed as `unknown` so a channel plugin can
+ * declare them now and Step 16+ can tighten the types as the channel
+ * manager fans out.
  *
  * Generic parameters:
  *
@@ -32,6 +33,7 @@ import type {
 	ChannelApprovalCapability,
 	ChannelConfigAdapter,
 	ChannelGatewayAdapter,
+	ChannelMessagingAdapter,
 	ChannelOutboundAdapter,
 	ChannelSecurityAdapter,
 	ChannelLifecycleAdapter,
@@ -55,10 +57,28 @@ export type ChannelPlugin<ResolvedAccount = any, Probe = unknown, Audit = unknow
 	security?: ChannelSecurityAdapter<ResolvedAccount>;
 	lifecycle?: ChannelLifecycleAdapter;
 	status?: ChannelStatusAdapter<ResolvedAccount, Probe, Audit>;
+	/**
+	 * @deprecated DEAD SLOT — NOT consumed by the message-action path. The
+	 * `message_action` tool dispatches through the runtime
+	 * `ChannelAdapter.handleAction({ conversationId, … })`, never through this
+	 * `ChannelMessageActionAdapter`. Implementing this alone gives a channel NO
+	 * message actions. Kept only so the bundled Telegram plugin's existing
+	 * `actions` field keeps compiling; do not add it to new channels — implement
+	 * `ChannelAdapter.handleAction` and advertise the matching `capabilities` flag.
+	 */
 	actions?: ChannelMessageActionAdapter;
 	secrets?: ChannelSecretsAdapter;
 	/** Channel-native approval rendering + reply decoding (Step 17). */
 	approvalCapability?: ChannelApprovalCapability;
+	/**
+	 * OUTBOUND addressing contract — explicit-target parse + normalize + an
+	 * OPTIONAL name/handle → conversation-id resolver. Consumed by the
+	 * `send_message` tool (via `channel-messaging-registry.ts`) to turn the
+	 * agent's loose `to` ("Alex", "@alex", "telegram:123") into a concrete
+	 * target before `ChannelAdapter.sendText`. A channel that omits this slot
+	 * keeps today's raw-id-straight-to-sendText behaviour.
+	 */
+	messaging?: ChannelMessagingAdapter;
 
 	/* ─── Slots reserved for later steps ────────────────────────────── */
 	defaults?: {
@@ -83,7 +103,6 @@ export type ChannelPlugin<ResolvedAccount = any, Probe = unknown, Audit = unknow
 	conversationBindings?: unknown;
 	streaming?: unknown;
 	threading?: unknown;
-	messaging?: unknown;
 	agentPrompt?: unknown;
 	directory?: unknown;
 	resolver?: unknown;

@@ -27,7 +27,29 @@ export type {
 	SpeechProvider,
 	TranscriptionProvider,
 } from "./types.js";
-export { BrigadeExtensionRegistry, type RegistryContextMeta } from "./registry.js";
-export { clearDiscoveryCache, discoverUserModules, type DiscoveredModule } from "./discovery.js";
+export {
+	BrigadeExtensionRegistry,
+	diffCapabilityIds,
+	type PluginCapabilityIds,
+	type PluginRecord,
+	type PluginRecordStatus,
+	type RegistryContextMeta,
+} from "./registry.js";
+export {
+	clearDiscoveryCache,
+	discoverUserModules,
+	type DiscoveredModule,
+	type DiscoveryCandidate,
+	importDiscoveredModules,
+	listDiscoveryCandidates,
+	readSidecarManifest,
+} from "./discovery.js";
+export {
+	type ActivationDecision,
+	type ActivationSnapshot,
+	BUILTIN_CHANNEL_COMMAND_NAMES,
+	buildActivationSnapshot,
+	planActivation,
+} from "./activation-planner.js";
 export { loadModules, type LoadModulesArgs } from "./loader.js";
 export { BUNDLED_MODULES } from "./modules/index.js";

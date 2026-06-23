@@ -125,14 +125,23 @@
  * ──────────────────────────────────────────────────────────────────────────
  *
  *   • Inline-button approvals: set `adapter.approvalCapability.sendApprovalPrompt`
- *     (render `buildApprovalCallbackButtons(approvalId)` as native buttons whose
+ *     (render `buildApprovalCallbackButtons({ approvalId })` as native buttons whose
  *     `callback_data` is each button's `.data`). Deliver the press back as
  *     `InboundMessage.callbackQuery` — the central pipeline decodes + resolves
  *     it. Add `authorizeApprover` to refuse non-operator pressers.
- *   • Message actions (edit / delete / react / pin): implement
- *     `adapter.handleAction(...)` and advertise the matching `capabilities`
- *     flags (`edit` / `unsend` / `reactions` / `reply`). The central
- *     `message_action` tool pre-checks the flag before calling you.
+ *     NOTE: native-button approvals currently fire on the MULTI-ACCOUNT plugin
+ *     path only. A single-account `ChannelAdapter` that sets `sendApprovalPrompt`
+ *     still falls back to the text approval card today (`authorizeApprover` IS
+ *     honored on both paths) — use the plugin path for native single-account buttons.
+ *   • Message actions (edit / delete / react / pin): the CANONICAL path is the
+ *     single-account `ChannelAdapter.handleAction({ conversationId, action,
+ *     accountId?, signal? })`. Implement THAT and advertise the matching
+ *     `capabilities` flags (`edit` / `unsend` / `reactions` / `reply`); the
+ *     central `message_action` tool pre-checks the flag before calling you.
+ *     NOTE: the `ChannelPlugin.actions` typed slot (`ChannelMessageActionAdapter`,
+ *     a `{ cfg, runtime, target, … }` shape) is a DEAD slot — it is NOT consumed
+ *     by the message-action path, so it is deprecated and no longer part of this
+ *     barrel. Implementing it alone gives your channel NO message actions.
  *   • Outbound id: return `{ messageId }` from `sendText`/`sendMedia` so the
  *     agent can reference "my last message" via `message_action`.
  *   • Durable token: `connect_channel` seals tokens via `sealChannelToken`;
@@ -211,6 +220,77 @@ export type {
 	ChannelCapabilities,
 } from "./types.core.js";
 
+/* ───────────────────────── bundled channel metas (single source of truth) ───────────────────────── */
+
+export {
+	/** WhatsApp's user-facing `ChannelMeta` — import this for your plugin's `meta` field. */
+	WHATSAPP_CHANNEL_META,
+	/** Telegram's user-facing `ChannelMeta` — import this for your plugin's `meta` field. */
+	TELEGRAM_CHANNEL_META,
+	/** Every bundled channel meta in declaration order (the meta registry seeds from this). */
+	BUNDLED_CHANNEL_METAS,
+} from "./bundled-channel-metas.js";
+
+/* ───────────────────────── channel-meta registry + markdown gate ───────────────────────── */
+
+export {
+	/** Register/replace a channel's `ChannelMeta` at runtime (external/future channels). */
+	registerChannelMeta,
+	/** Look up a registered channel's full `ChannelMeta` by id/alias (undefined if unknown). */
+	getRegisteredChannelPluginMeta,
+	/** Friendlier alias of `getRegisteredChannelPluginMeta`. */
+	getChatChannelMeta,
+	/** Every channel meta currently known (built-in + dynamic). */
+	listChannelMetas,
+} from "./channel-meta-registry.js";
+
+export {
+	/** True iff a channel renders markdown (defaults ON for an unknown channel — no regression). */
+	isMarkdownCapableChannel,
+	/** Message-channel markdown gate — also treats internal/cli/tui surfaces as markdown-capable. */
+	isMarkdownCapableMessageChannel,
+} from "./markdown-capability.js";
+
+/* ───────────────────────── outbound addressing: the channel-messaging registry ───────────────────────── */
+
+export {
+	/** Register a channel's OUTBOUND `messaging` adapter (parse/normalize/resolve). The plugin
+	 *  engine calls this so `send_message` can address by name/handle/explicit target. */
+	registerChannelMessagingAdapter,
+	/** Bulk-register every plugin's `messaging` adapter (gateway bootstrap seeds with its plugin list). */
+	syncChannelMessagingAdaptersFromPlugins,
+	/** Look up a channel's registered messaging adapter by id (undefined → raw-id passthrough). */
+	getChannelMessagingAdapter,
+	/** Turn a loose `to` into a concrete outbound target via the channel's messaging adapter (or
+	 *  return the raw `to` unchanged when none is registered). Never throws. */
+	resolveOutboundTarget,
+	/** Heuristic: does a `to` read like a human contact NAME (vs an already-concrete id)? */
+	looksLikeContactName,
+} from "./channel-messaging-registry.js";
+export type {
+	/** Outcome of `resolveOutboundTarget` ({ to, channelId?, usedAdapter, resolvedByName }). */
+	ResolvedOutboundTarget,
+} from "./channel-messaging-registry.js";
+
+/* ───────────────────────── channel-exposure resolver (visibility surfaces) ───────────────────────── */
+
+export {
+	/** Resolve a channel's `meta.exposure` (+ legacy show* flags) to concrete per-surface booleans. */
+	resolveChannelExposure,
+	/** True when the channel should appear in "configured channels" views. */
+	isChannelVisibleInConfiguredLists,
+	/** True when the channel should be offered in the setup / onboarding wizard. */
+	isChannelVisibleInSetup,
+	/** True when the channel should be surfaced in generated docs / help. */
+	isChannelVisibleInDocs,
+} from "./exposure.js";
+export type {
+	/** The `ChannelMeta` subset the exposure resolver reads. */
+	ChannelExposureInput,
+	/** Concrete per-surface exposure verdict (every key resolved to a boolean). */
+	ResolvedChannelExposure,
+} from "./exposure.js";
+
 /* ───────────────────────── contract: message actions + approvals ───────────────────────── */
 
 export type {
@@ -247,7 +327,9 @@ export {
 /* ───────────────────────── shared helper: inbound dedupe ───────────────────────── */
 
 export {
-	/** Build a per-channel inbound dedupe cache (claim-once, LRU + TTL). */
+	/** Build a per-channel inbound dedupe cache (claim-once, LRU + TTL). Options:
+	 *  `{ maxEntries, ttlMs }` — the cap field is `maxEntries` (NOT `max`; a stray
+	 *  `max` type-checks but is silently ignored). */
 	createDedupeCache,
 } from "./dedupe.js";
 export type { DedupeCache, DedupeOptions } from "./dedupe.js";
@@ -316,6 +398,57 @@ export {
 	/** Provider key a channel's token is sealed under (`channel:<id>`). */
 	channelSecretProvider,
 } from "./channel-secrets.js";
+
+/* ───────────────────────── single-account essentials: config + state paths + storage mode ───────────────────────── */
+
+export type {
+	/**
+	 * The Brigade super-config every channel is handed — `ChannelAdapter.isConfigured(cfg)`,
+	 * `ChannelStartContext.cfg`, and most plugin sub-adapters are typed against it. Every channel
+	 * must be able to NAME this type, so it ships on the barrel (re-exported from the public shim).
+	 */
+	BrigadeConfig,
+} from "../../config/types.js";
+
+export {
+	/** A channel's own per-account state dir (`~/.brigade/channels/<id>/<accountId>/`) — where it
+	 *  persists its auth/creds/downloaded media. Pair with `ensureDir`. */
+	resolveChannelStateDir,
+	/** `mkdir -p` for a channel's state/media dirs. */
+	ensureDir,
+	/** OS cache dir for EPHEMERAL channel scratch (media temp), kept OUTSIDE `~/.brigade`. */
+	resolveOsCacheDir,
+} from "../../config/paths.js";
+
+export {
+	/** Storage-mode awareness — the runtime store context, or `undefined` in filesystem mode. A
+	 *  channel that persists state branches on `tryGetRuntimeContext()?.mode === "convex"`. */
+	tryGetRuntimeContext,
+} from "../../storage/runtime-context.js";
+
+export {
+	/** Load the live config off disk — a defensive fallback for `start()` when no cfg was threaded in. */
+	loadConfig,
+} from "../../core/config.js";
+
+export {
+	/** Strip Brigade's internal reasoning/markers from a reply before rendering. The inbound pipeline
+	 *  already applies this centrally — use only for a bespoke reasoning-surfacing path. */
+	sanitizeReplyForChannel,
+} from "./reply-sanitizer.js";
+
+/* ───────────────────────── central: general (non-approval) inline-button callbacks ───────────────────────── */
+
+export {
+	/** Prefix a channel stamps on a general inline button's `callback_data` so the pipeline routes the
+	 *  press back as a synthetic turn (an unprefixed, non-approval callback is dropped). Pairs with the
+	 *  approval-callback codec above — approvals vs general buttons are the two inline-button lanes. */
+	GENERAL_CALLBACK_PREFIX,
+	/** True iff a callback payload is a general (prefixed) one — distinguishes it from an approval press. */
+	isGeneralCallbackData,
+	/** Decode a general callback payload back to the value the button carried. */
+	decodeGeneralCallbackData,
+} from "./general-callback.js";
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  MULTI-ACCOUNT CHANNEL PLUGIN SURFACE
@@ -390,10 +523,22 @@ export type {
 	ChannelLifecycleAdapter,
 	/** Adapter 6 — probe + snapshot + diagnostics for `brigade status`. */
 	ChannelStatusAdapter,
-	/** Adapter 7 — tool-driven message actions (reply/react/edit/delete dispatch). */
-	ChannelMessageActionAdapter,
+	// Adapter 7 (`ChannelMessageActionAdapter`, the `ChannelPlugin.actions` slot)
+	// is intentionally NOT re-exported: it is a DEAD slot the message-action path
+	// never reads. Message actions flow through the runtime
+	// `ChannelAdapter.handleAction({ conversationId, … })` instead — see the
+	// "OPTING INTO CENTRAL CAPABILITIES → Message actions" note in the header.
 	/** Adapter 8 — secret-target registry entries for the secrets system. */
 	ChannelSecretsAdapter,
+	/**
+	 * Adapter 10 — OUTBOUND addressing: explicit-target parse + normalize + an
+	 * OPTIONAL name/handle resolver. The `send_message` tool consumes it via
+	 * `channel-messaging-registry` to turn a loose `to` into a concrete target.
+	 * A channel that omits it keeps raw-id-straight-to-sendText behaviour.
+	 */
+	ChannelMessagingAdapter,
+	/** Parsed explicit-target shape returned by `messaging.parseExplicitTarget`. */
+	ParsedExplicitTarget,
 	/**
 	 * Bivariance box for adapter callbacks that need a narrower `account` type at
 	 * the call site than the manager's generic (lets the rename through, no `as`).

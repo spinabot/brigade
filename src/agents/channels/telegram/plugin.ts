@@ -54,7 +54,6 @@ import {
 	type ChannelGatewayContext,
 	type ChannelLogoutContext,
 	type ChannelLogoutResult,
-	type ChannelMeta,
 	type ChannelOutboundTarget,
 	type ChannelPlugin,
 	type ChannelStartContext,
@@ -62,6 +61,7 @@ import {
 	type InboundPipelineContext,
 	type RunChannelTurnFn,
 	type StartChannelsArgs,
+	TELEGRAM_CHANNEL_META,
 } from "../sdk.js";
 import {
 	listTelegramAccountIds,
@@ -78,16 +78,12 @@ import { probeTelegram, type TelegramProbeResult } from "./probe.js";
 
 const log = createSubsystemLogger("channels/telegram/plugin");
 
-const TELEGRAM_META: ChannelMeta = {
-	id: TELEGRAM_CHANNEL_ID,
-	label: "Telegram",
-	selectionLabel: "Telegram",
-	docsPath: "channels/telegram",
-	blurb: "Paste a @BotFather token, DM/group chat over a Telegram bot.",
-	order: 20,
-	exposure: "public",
-	markdownCapable: true,
-};
+// Single source of truth for the channel's user-facing metadata lives in the
+// import-light `bundled-channel-metas` module (re-exported via the SDK barrel),
+// so the registry / markdown gate can read it without loading this adapter.
+// `TELEGRAM_CHANNEL_META.id` is the same canonical `"telegram"` string as
+// `TELEGRAM_CHANNEL_ID`.
+const TELEGRAM_META = TELEGRAM_CHANNEL_META;
 
 /** Per-account runtime — one started adapter + a pipeline closure. */
 interface AccountRuntime {

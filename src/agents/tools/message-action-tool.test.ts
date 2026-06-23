@@ -355,3 +355,61 @@ describe("message_action — capability pre-check", () => {
 		assert.match(String(d.error), /does not support message actions/i);
 	});
 });
+
+/**
+ * FIX 3 — message actions flow through the runtime `ChannelAdapter.handleAction`
+ * ({ conversationId, … }) and NOT through the (now-deprecated, dead)
+ * `ChannelPlugin.actions` typed adapter ({ cfg, runtime, target, … }). These
+ * tests pin the canonical dispatch contract so a future refactor can't silently
+ * resurrect the dual-`handleAction` author trap.
+ */
+describe("message_action — canonical runtime handleAction path (FIX 3)", () => {
+	it("dispatches via the `{ conversationId }` runtime shape, not the `{ target }` plugin shape", async () => {
+		// Capture the RAW params object the tool hands the adapter to prove the
+		// shape: it must carry `conversationId` (runtime ChannelAdapter contract)
+		// and must NOT carry a `target` (the dead ChannelMessageActionAdapter shape).
+		let rawParams: Record<string, unknown> | undefined;
+		const adapter: ChannelAdapter = {
+			id: "telegram",
+			label: "Telegram",
+			isConfigured: () => true,
+			async start() {},
+			async stop() {},
+			async sendText() {},
+			health: () => ({ ok: true }),
+			capabilities: ALL_CAPS,
+			handleAction: async (params) => {
+				rawParams = params as unknown as Record<string, unknown>;
+				return { ok: true, messageId: "ok-1" };
+			},
+		} as ChannelAdapter;
+		const manager: ChannelManager = {
+			get started() {
+				return ["telegram"];
+			},
+			adapter(id: string) {
+				return id === "telegram" ? adapter : undefined;
+			},
+			async startChannel(): Promise<StartChannelResult> {
+				return { ok: true, started: true };
+			},
+			async stopChannel(): Promise<StopChannelResult> {
+				return { ok: true, stopped: true };
+			},
+			async stop() {},
+		};
+		setActiveChannelManager(manager);
+
+		const tool = makeMessageActionTool({ senderIsOwner: true });
+		const res = await tool.execute("c1", {
+			channel: "telegram",
+			to: "chat-77",
+			action: { kind: "delete", messageId: "m-77" },
+		} as never);
+
+		assert.equal(parse(res).ok, true);
+		assert.ok(rawParams, "adapter.handleAction must have been called");
+		assert.equal(rawParams?.conversationId, "chat-77", "canonical shape uses conversationId");
+		assert.equal("target" in (rawParams ?? {}), false, "must NOT use the dead { target } plugin shape");
+	});
+});

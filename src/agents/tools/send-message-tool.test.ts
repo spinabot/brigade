@@ -12,6 +12,10 @@ import {
 	setActiveChannelManager,
 } from "../channels/active-manager.js";
 import type { ChannelApprovalRoute } from "../channels/approval-router.js";
+import {
+	registerChannelMessagingAdapter,
+	resetChannelMessagingRegistryForTests,
+} from "../channels/channel-messaging-registry.js";
 import { makeSendMessageTool } from "./send-message-tool.js";
 
 interface StubAdapter {
@@ -124,5 +128,70 @@ describe("send_message — senderIsOwner per-call gate", () => {
 			to: peerA.conversationId,
 		} as never);
 		assert.equal(isRefused(result), true);
+	});
+});
+
+describe("send_message — OUTBOUND addressing (messaging adapter)", () => {
+	afterEach(() => {
+		setActiveChannelManager(null);
+		resetChannelMessagingRegistryForTests();
+	});
+
+	it("BACK-COMPAT: no messaging adapter registered → raw `to` reaches sendText unchanged", async () => {
+		const { capture } = mount(["whatsapp"]);
+		const tool = makeSendMessageTool({}); // owner
+		const raw = "14057144199@s.whatsapp.net";
+		const result = await tool.execute("m1", { text: "hi", channel: "whatsapp", to: raw } as never);
+		assert.equal(isRefused(result), false);
+		assert.equal(capture.length, 1);
+		// Byte-for-byte identical to pre-FIX behaviour.
+		assert.equal(capture[0]?.to, raw);
+	});
+
+	it("resolves a human NAME → concrete id via the channel's targetResolver", async () => {
+		const { capture } = mount(["whatsapp"]);
+		registerChannelMessagingAdapter("whatsapp", {
+			parseExplicitTarget: (text) => {
+				const m = /^([a-z][a-z0-9_-]*):(.+)$/i.exec(text.trim());
+				return m ? { channelId: m[1]!.toLowerCase(), target: m[2]! } : null;
+			},
+			normalizeTarget: (raw) => raw.trim(),
+			targetResolver: (name) =>
+				name.toLowerCase() === "alex" ? "14050000000@s.whatsapp.net" : null,
+		});
+		const tool = makeSendMessageTool({}); // owner
+		const result = await tool.execute("m2", { text: "yo", channel: "whatsapp", to: "Alex" } as never);
+		assert.equal(isRefused(result), false);
+		assert.equal(capture.length, 1);
+		assert.equal(capture[0]?.to, "14050000000@s.whatsapp.net");
+	});
+
+	it("parses an explicit `scheme:value` target before sendText", async () => {
+		const { capture } = mount(["telegram"]);
+		registerChannelMessagingAdapter("telegram", {
+			parseExplicitTarget: (text) => {
+				const m = /^([a-z][a-z0-9_-]*):(.+)$/i.exec(text.trim());
+				return m ? { channelId: m[1]!.toLowerCase(), target: m[2]! } : null;
+			},
+			normalizeTarget: (raw) => raw.trim(),
+		});
+		const tool = makeSendMessageTool({});
+		const result = await tool.execute("m3", { text: "ping", channel: "telegram", to: "telegram:987" } as never);
+		assert.equal(isRefused(result), false);
+		assert.equal(capture[0]?.to, "987");
+	});
+
+	it("a misbehaving messaging adapter NEVER breaks the send (raw-id fallback)", async () => {
+		const { capture } = mount(["whatsapp"]);
+		registerChannelMessagingAdapter("whatsapp", {
+			parseExplicitTarget: () => {
+				throw new Error("kaboom");
+			},
+			normalizeTarget: (raw) => raw,
+		});
+		const tool = makeSendMessageTool({});
+		const result = await tool.execute("m4", { text: "still sends", channel: "whatsapp", to: "raw-id" } as never);
+		assert.equal(isRefused(result), false);
+		assert.equal(capture[0]?.to, "raw-id");
 	});
 });

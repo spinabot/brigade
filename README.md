@@ -13,6 +13,11 @@
 </p>
 
 <p align="center">
+  🔐 <strong>No tokens to juggle. No drama.</strong> No copy-pasting secrets, no telemetry —
+  <strong>we handle them, not you</strong>. Your API keys stay on your own machine, never sent to a middleman.
+</p>
+
+<p align="center">
   <a href="https://github.com/spinabot/brigade/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spinabot/brigade/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI status"></a>
   <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://img.shields.io/npm/v/@spinabot/brigade?style=for-the-badge&logo=npm&logoColor=white&color=CB3837" alt="npm version"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/@spinabot/brigade?style=for-the-badge&logo=nodedotjs&logoColor=white&color=5FA04E&label=node" alt="node engine"></a>
@@ -32,7 +37,7 @@ install; switch to a self-hosted Convex database when you want one. Bring any mo
 Claude, GPT, Gemini, Llama, or a local Ollama. Privileged actions wait for your
 approval, and your keys and data never leave your machine. No telemetry.
 
-It's an ecosystem, not an app: one crew you reach from the terminal and WhatsApp, and
+It's an ecosystem, not an app: one crew you reach from the terminal, WhatsApp, and Telegram, and
 from your watch, Meta smart glasses, and Meta Quest.
 
 ```bash
@@ -42,7 +47,7 @@ brigade
 
 Start it and you get a fast chat TUI. Keep going and you get isolated agents with
 their own workspaces and credentials, persistent memory, a skill system, a cron
-scheduler, sub-agent fan-out, an org hierarchy, messaging channels like WhatsApp,
+scheduler, sub-agent fan-out, an org hierarchy, messaging channels like WhatsApp and Telegram,
 1,000+ app connectors, an MCP memory server, and an optional self-hosted Convex
 backend — all under one `~/.brigade/` directory you fully own.
 
@@ -85,7 +90,7 @@ backend — all under one `~/.brigade/` directory you fully own.
 | 👥 **A real crew** | Spawn isolated agents with their own personas, credentials, and memory; wire them into an **org chart** that governs who can talk to whom. |
 | 🔌 **Bring any model** | Anthropic, OpenAI, Gemini, OpenRouter, Groq, Cerebras, xAI, DeepSeek, Mistral, local Ollama, or any OpenAI-compatible endpoint. Switch mid-conversation. |
 | 📅 **Always-on** | Run as a headless WebSocket gateway with a crash supervisor, cron jobs, and OS service install. |
-| 💬 **Channels** | Talk to your crew from WhatsApp today; the adapter contract is built for more. |
+| 💬 **Channels** | Talk to your crew from WhatsApp and Telegram today; the adapter contract is built for more. |
 | 🔗 **1,000+ connectors** | Gmail, Slack, GitHub, Notion, Calendar, Linear… via the built-in Composio tool. |
 | 🧩 **MCP** | Expose your long-term memory to any MCP client (`brigade mcp`), or connect MCP servers in. |
 | 🗄️ **Your storage** | Default filesystem mode, or an optional **fully self-hosted Convex** backend with at-rest encryption. |
@@ -174,7 +179,7 @@ holds all state and runs agents) or as a **thin client** that attaches to it.
                         ┌─────────────────┴─────────────────┐
    brigade tui ──ws──▶  │            GATEWAY  :7777          │  ◀──ws── brigade connect
    brigade chat         │  per-turn agent loop · routing    │
-   WhatsApp  ──────────▶│  tools · sub-agents · supervisor  │◀──────── cron jobs
+   WhatsApp·Telegram ──▶│  tools · sub-agents · supervisor  │◀──────── cron jobs
    MCP client ─stdio──▶ │  (brigade mcp → memory server)    │
                         └───────────────────────────────────┘
 ```
@@ -227,8 +232,10 @@ or render a 🦁 Pride chart with the `org` tool.
 
 ### 💬 Channels
 A typed channel-adapter contract with a shared inbound pipeline (access control,
-dedupe, abort triggers, approval routing). **WhatsApp** is the reference adapter
-(Baileys, QR/code pairing, multi-account, reconnect backoff).
+dedupe, abort triggers, approval routing). **WhatsApp** (Baileys, QR/code pairing,
+multi-account, reconnect backoff) and **Telegram** (Bot API token, inline-button
+approvals, owner bootstrapped on the gateway) ship today; the contract is built for
+more. See [Telegram setup](#telegram-setup-end-to-end) for the full walkthrough.
 
 ### ⏰ Cron
 Schedule recurring or one-shot work: cron expressions (with IANA timezones and
@@ -482,15 +489,52 @@ target (`--channel`, `--to`).
 
 ### `brigade channels`
 
-Connect external messaging channels — WhatsApp ships today.
+Connect external messaging channels — WhatsApp and Telegram ship today.
 
 ```bash
 brigade channels list
-brigade channels link --channel whatsapp        # pair via QR / code
-brigade channels status --channel whatsapp
-brigade channels allow list --channel whatsapp  # add / remove allowed senders
+brigade channels link --channel whatsapp         # WhatsApp: pair via QR / code
+brigade channels add  --channel telegram         # Telegram: set up a bot token
+brigade channels status --channel telegram
+brigade channels allow list --channel telegram   # add / remove allowed senders
+brigade pairing approve <code> --channel telegram # approve a waiting sender
 brigade channels disable --channel whatsapp
 ```
+
+### Telegram setup (end to end)
+
+A Telegram bot is a separate account from you, so Brigade establishes ownership on
+the **gateway** — never by whoever texts the bot first.
+
+1. **Create the bot.** In Telegram, message [@BotFather](https://t.me/BotFather),
+   send `/newbot`, and copy the API token it returns.
+2. **Add it to Brigade** (on the gateway machine), then start the gateway:
+   ```bash
+   brigade channels add --channel telegram    # paste the bot token when prompted
+   brigade gateway restart                     # load the channel
+   ```
+3. **Claim ownership.** DM your bot anything — it replies with a one-time code and
+   asks an admin to approve it. Approve it once, from the gateway:
+   ```bash
+   brigade pairing approve <code> --channel telegram
+   ```
+   The **first** approval on a Telegram bot makes you the owner. Because approving
+   requires access to the gateway machine, that access *is* the proof it's really
+   you — nobody becomes owner just by sending `/start`.
+4. **Run it from the chat.** As owner you're never challenged again, and you manage
+   everyone else from Telegram itself:
+
+   | Command | Who | What |
+   |---|---|---|
+   | `/start` · `/help` | admitted | welcome + command list |
+   | `/pending` | owner | list people waiting for approval |
+   | `/approve <code>` | owner | admit a waiting person — takes effect immediately, no restart |
+   | `/deny <code>` | owner | reject a pending request |
+   | `/allowlist add\|remove <id>` | owner | manage approved senders directly |
+   | `/whoami` · `/agent <id>` | admitted | see / pin which agent answers you |
+
+Everyone else who messages the bot gets a pairing challenge; only you (in chat) or
+the gateway CLI can let them in. Multiple bots or accounts each track their own owner.
 
 ---
 

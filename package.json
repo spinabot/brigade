@@ -149,6 +149,8 @@
     "extensions:list": "node scripts/run-brigade.mjs extensions list",
     "extensions:doctor": "node scripts/run-brigade.mjs extensions doctor",
     "extensions:init": "node scripts/run-brigade.mjs extensions init",
+    "extensions:add": "node scripts/run-brigade.mjs extensions add",
+    "extensions:remove": "node scripts/run-brigade.mjs extensions remove",
     "logs": "node scripts/run-brigade.mjs logs",
     "logs:follow": "node scripts/run-brigade.mjs logs --follow",
     "secrets:audit": "node scripts/run-brigade.mjs secrets audit",

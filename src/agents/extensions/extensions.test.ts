@@ -8,6 +8,7 @@ import { Type } from "typebox";
 
 import type { BrigadeConfig } from "../../config/io.js";
 import type { AnyBrigadeTool } from "../tools/types.js";
+import { diagnoseExtensions } from "./diagnose.js";
 import { clearDiscoveryCache, discoverUserModules } from "./discovery.js";
 import { loadModules } from "./loader.js";
 import { BrigadeExtensionRegistry } from "./registry.js";
@@ -341,6 +342,123 @@ describe("discoverUserModules — cache semantics", () => {
 			assert.equal(rescanned.length, 2);
 		} finally {
 			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+/**
+ * FIX 4 — durable PluginRecord state machine on the live registry. The loader
+ * populates a per-module record (discovered → activated/failed) with attributed
+ * capability ids, and the CLI diagnosis can overlay it when a live registry is
+ * available WITHOUT disturbing the discovery-only path.
+ */
+describe("loadModules — PluginRecord lifecycle (FIX 4)", () => {
+	it("records an activated module with the capability ids it registered", async () => {
+		const reg = await loadModules({
+			noDiscovery: true,
+			modules: [
+				defineModule({
+					id: "toolsmith",
+					register(b) {
+						b.tool(fakeTool("alpha"));
+						b.tool(fakeTool("beta"));
+						b.channel(fakeChannel("ch-x"));
+					},
+				}),
+			],
+			meta: META,
+		});
+		const rec = reg.pluginRecord("toolsmith");
+		assert.ok(rec, "record must exist");
+		assert.equal(rec?.status, "activated");
+		assert.deepEqual([...(rec?.capabilities.tools ?? [])].sort(), ["alpha", "beta"]);
+		assert.deepEqual(rec?.capabilities.channels, ["ch-x"]);
+		assert.equal(rec?.failurePhase, undefined);
+	});
+
+	it("attributes capabilities to the RIGHT module (per-module diff)", async () => {
+		const reg = await loadModules({
+			noDiscovery: true,
+			modules: [
+				defineModule({ id: "first", register: (b) => b.tool(fakeTool("one")) }),
+				defineModule({ id: "second", register: (b) => b.tool(fakeTool("two")) }),
+			],
+			meta: META,
+		});
+		assert.deepEqual(reg.pluginRecord("first")?.capabilities.tools, ["one"]);
+		assert.deepEqual(reg.pluginRecord("second")?.capabilities.tools, ["two"], "second must not inherit first's tool");
+	});
+
+	it("records a failed module with failurePhase=register", async () => {
+		const reg = await loadModules({
+			noDiscovery: true,
+			modules: [
+				defineModule({
+					id: "boom",
+					register() {
+						throw new Error("kaboom");
+					},
+				}),
+			],
+			meta: META,
+		});
+		const rec = reg.pluginRecord("boom");
+		assert.equal(rec?.status, "failed");
+		assert.equal(rec?.failurePhase, "register");
+		// A failed module must NOT be in loadedModules.
+		assert.equal(reg.loadedModules.some((m) => m.id === "boom"), false);
+	});
+
+	it("pluginRecords() returns every module's record in load order", async () => {
+		const reg = await loadModules({
+			noDiscovery: true,
+			modules: [
+				defineModule({ id: "a", register: () => undefined }),
+				defineModule({ id: "b", register: () => undefined }),
+			],
+			meta: META,
+		});
+		assert.deepEqual(reg.pluginRecords().map((r) => r.id), ["a", "b"]);
+		assert.ok(reg.pluginRecords().every((r) => r.status === "activated"));
+	});
+
+	it("the returned record is a copy — mutating it does not corrupt the registry", async () => {
+		const reg = await loadModules({
+			noDiscovery: true,
+			modules: [defineModule({ id: "m", register: (b) => b.tool(fakeTool("t")) })],
+			meta: META,
+		});
+		const rec = reg.pluginRecord("m");
+		rec?.capabilities.tools.push("INJECTED");
+		assert.deepEqual(reg.pluginRecord("m")?.capabilities.tools, ["t"], "registry copy must be untouched");
+	});
+
+	it("diagnoseExtensions overlays live status when a registry is passed (and omits it otherwise)", async () => {
+		const reg = await loadModules({
+			noDiscovery: true,
+			modules: [defineModule({ id: "live-mod", register: (b) => b.tool(fakeTool("zed")) })],
+			meta: META,
+		});
+		const dir = mkdtempSync(join(tmpdir(), "brigade-diag-"));
+		try {
+			// With the live registry: the bundled entry carries a `live` overlay.
+			const withLive = await diagnoseExtensions(
+				[defineModule({ id: "live-mod", register: () => undefined })],
+				dir,
+				reg,
+			);
+			const e = withLive.extensions.find((x) => x.id === "live-mod");
+			assert.equal(e?.live?.status, "activated");
+			assert.ok(e?.live?.capabilities.includes("tools:zed"));
+
+			// Without it: discovery-only path is unchanged — no `live` field.
+			const noLive = await diagnoseExtensions(
+				[defineModule({ id: "live-mod", register: () => undefined })],
+				dir,
+			);
+			assert.equal(noLive.extensions.find((x) => x.id === "live-mod")?.live, undefined);
+		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});

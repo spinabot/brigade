@@ -20,8 +20,8 @@
  *   5. `ChannelLifecycleAdapter`      — config-change / removal hooks.
  *   6. `ChannelStatusAdapter<R,P,A>`  — probe + snapshot for `brigade
  *      status` UX.
- *   7. `ChannelMessageActionAdapter`  — handleAction (reply, react, edit,
- *      delete tool dispatch).
+ *   7. `ChannelMessageActionAdapter`  — DEAD SLOT (not consumed); message
+ *      actions flow through the runtime `ChannelAdapter.handleAction` instead.
  *   8. `ChannelSecretsAdapter`        — secret-target registry entries.
  *
  * Every adapter is OPTIONAL on the `ChannelPlugin` slot list — a channel
@@ -325,6 +325,18 @@ export type ChannelStatusAdapter<ResolvedAccount = unknown, Probe = unknown, Aud
 
 /* -------------------------------------------------------------------------
  * Adapter 7: ChannelMessageActionAdapter — tool-driven outbound actions
+ *
+ * ⚠️ DEAD SLOT — DO NOT IMPLEMENT FOR MESSAGE ACTIONS. This typed adapter
+ * (the `ChannelPlugin.actions` slot) is NOT consumed by the live message-action
+ * path. The agent's `message_action` tool dispatches through the runtime
+ * `ChannelAdapter.handleAction({ conversationId, action, accountId?, signal? })`
+ * (see `agents/extensions/types.ts`), NOT through this `{ cfg, runtime,
+ * accountId, target, action, signal }` shape. A channel author who implements
+ * ONLY this typed adapter gets NO message actions. The CANONICAL path is the
+ * single-account `ChannelAdapter.handleAction` — implement that + advertise the
+ * matching `capabilities` flag. This type is retained only so the existing
+ * bundled Telegram plugin's harmless `actions` field keeps compiling; it is no
+ * longer part of the author-facing channel SDK barrel.
  * --------------------------------------------------------------------- */
 
 /** Discriminator for the actions the agent can take on a channel message. */
@@ -356,6 +368,12 @@ export type ChannelMessageActionResult = {
 	error?: string;
 };
 
+/**
+ * @deprecated DEAD SLOT — not read by the message-action path. Implement the
+ * runtime `ChannelAdapter.handleAction({ conversationId, action, accountId?,
+ * signal? })` instead (the `message_action` tool dispatches through THAT). See
+ * the block comment above.
+ */
 export type ChannelMessageActionAdapter = {
 	handleAction?: (params: {
 		cfg: BrigadeConfig;
@@ -485,4 +503,94 @@ export type ChannelApprovalCapability = {
 		action: "approve";
 		approvalKind: ChannelApprovalKind;
 	}) => { authorized: boolean; reason?: string };
+};
+
+/* -------------------------------------------------------------------------
+ * Adapter 10: ChannelMessagingAdapter — OUTBOUND addressing contract
+ *
+ * Fills the formerly-`unknown` `ChannelPlugin.messaging` slot with a small,
+ * practical interface for the OUTBOUND half of message addressing: turning the
+ * loose `to` the agent hands `send_message` ("Alex", "@alex", "telegram:123")
+ * into a concrete conversation/target id the runtime `ChannelAdapter.sendText`
+ * understands.
+ *
+ * The send tool runs the methods in this order when a channel opts in:
+ *   1. `parseExplicitTarget(to)` — if the agent wrote an explicit form
+ *      (`telegram:123456`, `@handle`, `whatsapp:+1555…`), pull out the target
+ *      (and an optional cross-channel id). `null` means "not an explicit form".
+ *   2. `normalizeTarget(raw)` — canonicalise whatever target we now hold (the
+ *      parsed one, or the original `to`) to the channel's id shape.
+ *   3. `targetResolver(name)` — OPTIONAL. When the `to` looks like a human
+ *      NAME/handle (not already a concrete id) AND the channel ships a contact
+ *      directory, resolve it to a real conversation id. A channel WITHOUT a
+ *      directory OMITS this method, and the caller falls back to the raw id —
+ *      so back-compat is preserved by construction.
+ *
+ * ⚠️ OUTBOUND ONLY. The INBOUND counterpart (resolving an incoming peer id back
+ * to a stable conversation/session identity) lives in the inbound pipeline and
+ * is intentionally NOT part of this adapter.
+ *
+ * Every method except `parseExplicitTarget` + `normalizeTarget` is optional;
+ * the whole adapter is optional on `ChannelPlugin` (channels opt in). A channel
+ * that omits `messaging` entirely behaves EXACTLY as today: the agent's raw
+ * `to` is handed straight to `sendText`.
+ * --------------------------------------------------------------------- */
+
+/** Result of {@link ChannelMessagingAdapter.parseExplicitTarget}. */
+export type ParsedExplicitTarget = {
+	/**
+	 * The channel id the explicit form named, when it carried one (e.g.
+	 * `telegram:123` → `"telegram"`). Omitted for channel-less forms like a
+	 * bare `@handle`, where the target is implicitly the current channel.
+	 */
+	channelId?: string;
+	/** The concrete (still un-normalized) target the explicit form addressed. */
+	target: string;
+};
+
+export type ChannelMessagingAdapter = {
+	/**
+	 * Recognize an EXPLICIT outbound target form in free text and split it into
+	 * an optional channel id + the bare target. Examples a channel might accept:
+	 *   - `telegram:123456`   → `{ channelId: "telegram", target: "123456" }`
+	 *   - `whatsapp:+15551234`→ `{ channelId: "whatsapp", target: "+15551234" }`
+	 *   - `@handle`           → `{ target: "@handle" }`
+	 * Return `null` when the text is NOT an explicit form (a plain name, or an
+	 * already-concrete id with no scheme) — the caller then treats the input as
+	 * a raw target / name and continues with `normalizeTarget` (+ resolver).
+	 */
+	parseExplicitTarget: (text: string) => ParsedExplicitTarget | null;
+
+	/**
+	 * Canonicalise a target id into the channel's stable id shape (trim, drop a
+	 * leading `@`, append a WhatsApp JID suffix, lowercase a Slack id, …). MUST
+	 * be idempotent: `normalizeTarget(normalizeTarget(x)) === normalizeTarget(x)`.
+	 * Receives whatever target the caller currently holds (the parsed explicit
+	 * target, or the original `to`).
+	 */
+	normalizeTarget: (raw: string) => string;
+
+	/**
+	 * Best-effort guess of whether a (normalized) target is a 1:1 DM or a group.
+	 * Returns `undefined` when the channel can't tell from the id alone. Purely
+	 * advisory — the send path does not require it.
+	 */
+	inferTargetChatType?: (target: string) => "dm" | "group" | undefined;
+
+	/**
+	 * OPTIONAL contact-directory hook: resolve a human NAME or handle (e.g.
+	 * "Alex", "@alex") to a concrete conversation/target id. A channel that has
+	 * a contact directory implements this; a channel WITHOUT one OMITS it, and
+	 * the send tool falls back to the raw id (no behaviour change). Return
+	 * `null` (sync or async) when the name doesn't resolve, so the caller can
+	 * decide whether to fall back or refuse.
+	 */
+	targetResolver?: (name: string) => Promise<string | null> | string | null;
+
+	/**
+	 * Human-readable label for a (normalized) target, for echoing back in tool
+	 * results / logs ("Alex (telegram:123456)"). Falls back to the raw target
+	 * when omitted.
+	 */
+	formatTargetDisplay?: (target: string) => string;
 };

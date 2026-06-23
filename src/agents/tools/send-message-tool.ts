@@ -51,6 +51,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import { getActiveChannelManager } from "../channels/active-manager.js";
 import type { ChannelApprovalRoute } from "../channels/approval-router.js";
+import { resolveOutboundTarget } from "../channels/channel-messaging-registry.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { failedTextResult, payloadTextResult, readStringParam } from "./common.js";
 import type { BrigadeTool } from "./types.js";
@@ -226,6 +227,20 @@ export function makeSendMessageTool(
 					{ channel: channel ?? "", to: to ?? "", textPreview: text.slice(0, 80) } as never,
 				);
 			}
+			// OUTBOUND addressing (FIX #2). When the SEND channel's plugin
+			// registered a `messaging` adapter (via channel-messaging-registry),
+			// turn the agent's loose `to` ("Alex", "@alex", "telegram:123") into a
+			// concrete conversation id: parse an explicit target → resolve a human
+			// name via the channel's contact directory (if it ships one) →
+			// normalize. This runs AFTER the non-owner gate above (which compared
+			// the RAW `to`/`channel` against channelContext) so a channel peer
+			// can't smuggle a cross-chat hop through an explicit-target string.
+			//
+			// BACK-COMPAT: a channel with NO messaging adapter, or a `to` that's
+			// already a concrete id, comes back byte-for-byte unchanged — the raw
+			// value flows straight to sendText exactly as before this fix.
+			const resolvedTarget = await resolveOutboundTarget({ channelId: channel, to });
+			to = resolvedTarget.to;
 			const adapter = manager.adapter(channel, resolvedAccountId);
 			if (!adapter) {
 				const started = manager.started.join(", ") || "(none)";

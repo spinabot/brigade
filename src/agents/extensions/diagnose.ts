@@ -21,6 +21,7 @@ import {
 	importCandidateForDiagnosis,
 	listExtensionSources,
 } from "./discovery.js";
+import type { BrigadeExtensionRegistry, PluginRecord } from "./registry.js";
 import type { BrigadeModule } from "./types.js";
 
 /** Where a module came from. */
@@ -52,6 +53,20 @@ export interface DiagnosedExtension {
 		/** Exported a usable module. */
 		exportedModule: boolean;
 	};
+	/**
+	 * Live REGISTER-phase status (FIX 4), present ONLY when a live registry was
+	 * passed to `diagnoseExtensions`. Discovery alone never runs `register()`, so
+	 * without a live registry this is undefined and the discovery-only path is
+	 * byte-identical to before. When present it reflects the durable
+	 * `PluginRecord`: did the module activate, fail, or just get discovered, and
+	 * which capability ids it registered.
+	 */
+	live?: {
+		status: PluginRecord["status"];
+		failurePhase?: string;
+		/** Flat list of `kind:id` strings for the capabilities the module registered. */
+		capabilities: string[];
+	};
 }
 
 /** Result of a full diagnosis pass over the bundled + user extension sets. */
@@ -80,16 +95,30 @@ function labelFromSource(source: string): string {
  * at build time). User candidates are taken through the same gate discovery uses
  * — safety check, then import, then valid-module check — and reported with the
  * first failing step as the skip reason.
+ *
+ * `liveRegistry` (optional, FIX 4) — when a caller has a LIVE registry (one that
+ * actually ran `register()`), pass it to overlay each entry's `live` field with
+ * the durable `PluginRecord` (register-phase status + attributed capabilities).
+ * Omit it (the CLI's default) and the result is byte-identical to the pure
+ * discovery pass — no `register()` is ever run here.
  */
 export async function diagnoseExtensions(
 	bundled: ReadonlyArray<BrigadeModule>,
 	extensionsDir: string,
+	liveRegistry?: BrigadeExtensionRegistry,
 ): Promise<ExtensionDiagnosis> {
 	const out: DiagnosedExtension[] = [];
 
+	const overlayLive = (entry: DiagnosedExtension): DiagnosedExtension => {
+		if (!liveRegistry) return entry;
+		const rec = liveRegistry.pluginRecord(entry.id);
+		if (!rec) return entry;
+		return { ...entry, live: pluginRecordToLive(rec) };
+	};
+
 	// Bundled set — sorted by id for a stable table.
 	for (const m of [...bundled].sort((a, b) => a.id.localeCompare(b.id))) {
-		out.push({ id: m.id, origin: "bundled", source: "(built in)", status: "loaded" });
+		out.push(overlayLive({ id: m.id, origin: "bundled", source: "(built in)", status: "loaded" }));
 	}
 
 	// User candidates — diagnosed one by one.
@@ -144,6 +173,19 @@ export async function diagnoseExtensions(
 	}
 
 	userEntries.sort((a, b) => a.id.localeCompare(b.id));
-	out.push(...userEntries);
+	out.push(...userEntries.map(overlayLive));
 	return { extensionsDir, extensions: out };
+}
+
+/** Flatten a `PluginRecord` into the diagnosis `live` view (`kind:id` capability strings). */
+function pluginRecordToLive(rec: PluginRecord): NonNullable<DiagnosedExtension["live"]> {
+	const capabilities: string[] = [];
+	for (const [kind, ids] of Object.entries(rec.capabilities)) {
+		for (const id of ids) capabilities.push(`${kind}:${id}`);
+	}
+	return {
+		status: rec.status,
+		...(rec.failurePhase !== undefined ? { failurePhase: rec.failurePhase } : {}),
+		capabilities,
+	};
 }

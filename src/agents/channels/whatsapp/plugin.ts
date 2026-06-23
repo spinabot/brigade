@@ -44,8 +44,8 @@ import type {
 	ChannelLogoutResult,
 	ChannelOutboundTarget,
 } from "../types.adapters.js";
-import type { ChannelMeta } from "../types.core.js";
 import type { ChannelPlugin } from "../types.plugin.js";
+import { WHATSAPP_CHANNEL_META } from "../bundled-channel-metas.js";
 import {
 	listWhatsAppAccountIds,
 	resolveWhatsAppAccount,
@@ -57,16 +57,11 @@ import { createWhatsAppAdapter } from "./adapter.js";
 
 const log = createSubsystemLogger("channels/whatsapp/plugin");
 
-const WHATSAPP_META: ChannelMeta = {
-	id: WHATSAPP_CHANNEL_ID,
-	label: "WhatsApp",
-	selectionLabel: "WhatsApp",
-	docsPath: "channels/whatsapp",
-	blurb: "QR-pair a phone, DM/group chat over WhatsApp Web.",
-	order: 10,
-	exposure: "public",
-	markdownCapable: true,
-};
+// Single source of truth for the channel's user-facing metadata lives in the
+// import-light `bundled-channel-metas` module (so the registry / markdown gate
+// can read it without loading this adapter). `WHATSAPP_CHANNEL_META.id` is the
+// same canonical `"whatsapp"` string as `WHATSAPP_CHANNEL_ID`.
+const WHATSAPP_META = WHATSAPP_CHANNEL_META;
 
 /** Per-account runtime — one started adapter + a pipeline closure. */
 interface AccountRuntime {

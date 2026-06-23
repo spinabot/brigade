@@ -34,8 +34,32 @@ import type { ChatType } from "./chat-type.js";
 /** Canonical, kebab-case plugin id. */
 export type ChannelId = string;
 
-/** Exposure tier — controls which setup surfaces list the channel. */
-export type ChannelExposure = "public" | "internal" | "experimental";
+/**
+ * Per-surface visibility overrides for a channel.
+ *
+ * Three independent toggles — each defaults to `true` (visible) when omitted,
+ * so a channel that says nothing is shown everywhere:
+ *
+ *   - `configured` — list this channel in "configured channels" views
+ *     (`brigade status`, account pickers). Default-true; falls back to the
+ *     legacy `meta.showConfigured` flag when this object key is absent.
+ *   - `setup`      — offer this channel in the onboarding / setup wizard.
+ *     Default-true; falls back to the legacy `meta.showInSetup` flag.
+ *   - `docs`       — surface this channel in generated docs / help. Default-true.
+ *
+ * History: an earlier Brigade revision narrowed this to a string union
+ * (`"public" | "internal" | "experimental"`), but nothing ever consumed the
+ * union — it was inert. The resolver (`resolveChannelExposure`) needs
+ * per-surface booleans to drive `isChannelVisibleInSetup` et al., so the
+ * object shape is restored (matching the upstream contract the metas were
+ * scrubbed from). The booleans compose with the existing `showConfigured` /
+ * `showInSetup` meta fields rather than replacing them.
+ */
+export type ChannelExposure = {
+	configured?: boolean;
+	setup?: boolean;
+	docs?: boolean;
+};
 
 /**
  * Static capability flags advertised by a channel plugin.

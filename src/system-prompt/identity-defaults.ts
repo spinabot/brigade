@@ -23,8 +23,22 @@
  *   - `extractIdentityName` is the single source of truth for "is the name
  *     personalised yet?" — the substitution kicks in iff that returns
  *     undefined.
+ *
+ * Per-channel markdown gate (FIX 9):
+ *   The "Brigade injects raw markdown" floor above is true for persona files
+ *   AND for the model's OWN reply formatting — historically Brigade has never
+ *   told the model to suppress markdown, so on a plain-text surface (an SMS
+ *   gateway, a webhook that shows literal `**bold**`) the user would see raw
+ *   markup. `resolveOutputFormattingDirective` closes that gap: it consults
+ *   the channel's declared `meta.markdownCapable` (via the channel-meta
+ *   registry) and returns a "plain text, no markdown" directive ONLY for a
+ *   channel that explicitly opted out (`markdownCapable: false`). For every
+ *   other channel — markdown-capable, unknown, or meta-less — it returns
+ *   `undefined`, so the assembler emits NOTHING and the historical
+ *   markdown-on behavior is preserved unchanged (no regression).
  */
 
+import { isMarkdownCapableMessageChannel } from "../agents/channels/markdown-capability.js";
 import { extractIdentityName } from "../core/system-prompt.js";
 
 /**
@@ -127,4 +141,40 @@ export function applyIdentityDefaults(
   // so we know the value didn't pass detection). Rewrite the line.
   lines[nameLineIdx] = newNameLine;
   return lines.join("\n");
+}
+
+/**
+ * The `## Output Formatting` directive injected for a PLAIN-TEXT channel.
+ *
+ * Mirrors the kind of fence/markdown guidance the assembler used to ship
+ * always-on, but FLIPPED: this tells the model to drop markdown entirely
+ * because the destination channel renders raw markup literally. Kept terse —
+ * a few imperative lines the model can absorb without parroting them back.
+ */
+const PLAIN_TEXT_OUTPUT_DIRECTIVE = [
+  "## Output Formatting",
+  "This conversation is delivered over a channel that does NOT render markdown — the user sees raw characters.",
+  "Reply in PLAIN TEXT. Do not use markdown: no `**bold**`, no `_italics_`, no `#` headings, no backtick code fences, no markdown tables or `-`/`*` bullet syntax.",
+  "Convey structure with plain prose, line breaks, and (where a list truly helps) short numbered lines like `1. ...`. Write URLs and code inline as bare text.",
+].join("\n");
+
+/**
+ * Resolve the per-turn output-formatting directive for a destination channel.
+ *
+ * Returns the plain-text directive string ONLY when the channel has explicitly
+ * declared `markdownCapable: false` (looked up through the channel-meta
+ * registry by {@link isMarkdownCapableMessageChannel}). For a markdown-capable
+ * channel, an unknown channel, the CLI/TUI, or no channel at all, returns
+ * `undefined` — the caller then emits nothing and Brigade's historical
+ * markdown-on default is preserved (no regression for existing channels).
+ *
+ * This is the consumption site the FIX-9 markdown gate was built for: the
+ * assembler calls it and pushes the returned block (when present) into the
+ * `## Output Formatting` slot.
+ */
+export function resolveOutputFormattingDirective(
+  channelId: string | null | undefined,
+): string | undefined {
+  if (isMarkdownCapableMessageChannel(channelId)) return undefined;
+  return PLAIN_TEXT_OUTPUT_DIRECTIVE;
 }
