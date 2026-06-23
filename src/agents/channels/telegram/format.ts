@@ -264,3 +264,41 @@ export function telegramHtmlIsEmpty(html: string): boolean {
 		.replace(/&quot;/g, '"');
 	return decoded.trim().length === 0;
 }
+
+/** Telegram's hard limit on a media caption (UTF-16 code units). */
+export const TELEGRAM_CAPTION_LIMIT = 1024;
+
+/**
+ * Split an over-long media caption into the part that rides along WITH the media
+ * (≤1024 chars — Telegram's hard `caption` limit) and the remainder to deliver
+ * as a follow-up text message. A caption longer than 1024 otherwise fails the
+ * whole media send with a 400, so the overflow is preserved instead of dropped.
+ *
+ * Prefers to break at the last paragraph / line / space boundary in the back
+ * half of the window so a word or sentence isn't sliced mid-token; falls back to
+ * a hard cut at the limit when no boundary is available. Plain-text only (the
+ * caption carries no `parse_mode`), so there are no HTML entities to straddle.
+ */
+export function splitTelegramCaption(
+	caption: string,
+	limit: number = TELEGRAM_CAPTION_LIMIT,
+): { head: string; rest: string } {
+	if (caption.length <= limit) return { head: caption, rest: "" };
+	const window = caption.slice(0, limit);
+	let cut = -1;
+	for (const sep of ["\n\n", "\n", " "]) {
+		const idx = window.lastIndexOf(sep);
+		// Only honour a boundary in the back half — a break near the start would
+		// strand most of the caption in the follow-up message.
+		if (idx > limit / 2) {
+			cut = idx;
+			break;
+		}
+	}
+	if (cut === -1) cut = limit; // no usable boundary — hard cut at the limit
+	const head = caption.slice(0, cut).replace(/\s+$/, "");
+	const rest = caption.slice(cut).replace(/^\s+/, "");
+	// Defensive: an all-whitespace prefix could empty the head — hard-slice then.
+	if (!head) return { head: caption.slice(0, limit), rest: caption.slice(limit) };
+	return { head, rest };
+}

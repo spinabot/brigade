@@ -35,6 +35,7 @@
  */
 
 import {
+	chunkText,
 	createDedupeCache,
 	nextBackoffDelay,
 	type InboundForwardContext,
@@ -43,6 +44,7 @@ import {
 	type OutboundMedia,
 } from "../sdk.js";
 import { maskProxyUrl } from "./account-config.js";
+import { splitTelegramCaption, TELEGRAM_CAPTION_LIMIT } from "./format.js";
 import { resolveTelegramAllowedUpdates } from "./allowed-updates.js";
 import { buildSocksDispatcher, isSocksProxyScheme } from "./socks-dispatcher.js";
 import {
@@ -91,6 +93,9 @@ export function telegramBackoffDelay(attempt: number): number {
 		jitter: RECONNECT_JITTER,
 	});
 }
+
+/** Telegram's hard limit on a single text message body (UTF-16 code units). */
+const TELEGRAM_MESSAGE_LIMIT = 4096;
 
 /* ───────────────────────── normalized inbound shape ───────────────────────── */
 
@@ -407,6 +412,10 @@ export interface TelegramPollSpec {
 export interface TelegramSendTextOpts {
 	/** When true the text is already Telegram HTML and sent with `parse_mode: HTML`. */
 	html?: boolean;
+	/** Suppress the recipient notification for this send (`disable_notification`). */
+	silent?: boolean;
+	/** Set false to disable link preview/unfurling (`link_preview_options.is_disabled`). */
+	linkPreview?: boolean;
 	/** Forum-topic thread id. */
 	threadId?: string;
 	/**
@@ -422,6 +431,8 @@ export interface TelegramSendTextOpts {
 export interface TelegramSendMediaOpts {
 	/** Forum-topic thread id. */
 	threadId?: string;
+	/** Suppress the recipient notification for this send (`disable_notification`). */
+	silent?: boolean;
 }
 
 /** Optional `createForumTopic` knobs (icon color / custom emoji). */
@@ -1127,6 +1138,8 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 		const params: Record<string, unknown> = {};
 		if (opts?.html) params.parse_mode = "HTML";
 		if (opts?.threadId) params.message_thread_id = Number(opts.threadId);
+		if (opts?.silent) params.disable_notification = true;
+		if (opts?.linkPreview === false) params.link_preview_options = { is_disabled: true };
 		// Native reply: quote the target message. `allow_sending_without_reply`
 		// keeps the send succeeding even if the quoted message was deleted.
 		if (opts?.replyToMessageId) {
@@ -1173,7 +1186,21 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 		const input = await buildTelegramInputFile(media);
 		const params: Record<string, unknown> = {};
 		if (opts?.threadId) params.message_thread_id = Number(opts.threadId);
-		if (media.caption) params.caption = media.caption;
+		if (opts?.silent) params.disable_notification = true;
+		// Telegram caps a media caption at 1024 chars; a longer one 400s the whole
+		// send. Split it — the head rides as the caption, the remainder is delivered
+		// as a follow-up text message (chunked at 4096) once the media lands, so a
+		// long caption is preserved instead of failing or being silently dropped.
+		let captionOverflow = "";
+		if (media.caption) {
+			if (media.caption.length > TELEGRAM_CAPTION_LIMIT) {
+				const split = splitTelegramCaption(media.caption);
+				params.caption = split.head;
+				captionOverflow = split.rest;
+			} else {
+				params.caption = media.caption;
+			}
+		}
 		const api = b.api;
 		const send = async (p: Record<string, unknown>): Promise<void> => {
 			switch (media.kind) {
@@ -1202,9 +1229,27 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 			if (opts?.threadId && /message thread not found/i.test(errorText(err))) {
 				const { message_thread_id: _omit, ...rest } = params;
 				await send(rest);
-				return;
+			} else {
+				throw err;
 			}
-			throw err;
+		}
+		// Flush any caption overflow as plain follow-up text once the media is sent.
+		if (captionOverflow) {
+			const followParams: Record<string, unknown> = {};
+			if (opts?.threadId) followParams.message_thread_id = Number(opts.threadId);
+			if (opts?.silent) followParams.disable_notification = true;
+			for (const chunk of chunkText(captionOverflow, { limit: TELEGRAM_MESSAGE_LIMIT })) {
+				try {
+					await b.api.sendMessage(chatId, chunk, followParams);
+				} catch (err) {
+					if (followParams.message_thread_id && /message thread not found/i.test(errorText(err))) {
+						const { message_thread_id: _omit, ...rest } = followParams;
+						await b.api.sendMessage(chatId, chunk, rest);
+					} else {
+						throw err;
+					}
+				}
+			}
 		}
 	};
 

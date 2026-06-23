@@ -316,6 +316,17 @@ export interface OutboundSendOptions {
 	 * NO `replyToId` behaves EXACTLY as before — the quote is purely additive.
 	 */
 	replyToId?: string;
+	/**
+	 * Suppress the recipient's notification for this send (Telegram
+	 * `disable_notification`). Channels without a silent mode ignore it. Additive.
+	 */
+	silent?: boolean;
+	/**
+	 * Set `false` to disable link-preview/unfurling for this send (Telegram
+	 * `link_preview_options.is_disabled`). `undefined`/`true` keeps the channel's
+	 * normal preview behavior. Channels without preview control ignore it.
+	 */
+	linkPreview?: boolean;
 }
 
 /**

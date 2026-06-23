@@ -301,6 +301,11 @@ export function createTelegramAdapter(opts: CreateTelegramAdapterOptions = {}): 
 			// to the FIRST chunk only — quoting every chunk of a long reply would
 			// render a chain of quoted messages. Omitted → unquoted send (unchanged).
 			const replyToMessageId = opts?.replyToId;
+			// Send options honored on every chunk: silent notification + link-preview
+			// toggle. Purely additive — undefined keeps the prior behavior byte-for-byte.
+			const sendExtras: { threadId?: string; silent?: boolean; linkPreview?: boolean } = { threadId };
+			if (opts?.silent) sendExtras.silent = true;
+			if (opts?.linkPreview !== undefined) sendExtras.linkPreview = opts.linkPreview;
 			// Chunk on the RAW markdown so fences/paragraphs aren't shredded, then
 			// convert each chunk to Telegram HTML and send. A chunk whose HTML is
 			// empty (syntax-only) or that Telegram rejects with a parse error is
@@ -314,18 +319,18 @@ export function createTelegramAdapter(opts: CreateTelegramAdapterOptions = {}): 
 				if (telegramHtmlIsEmpty(html)) {
 					// Nothing renderable — send the raw chunk as plain text (if it has any).
 					if (chunk.trim().length > 0) {
-						await connection.sendText(conversationId, chunk, { threadId, ...replyOpt });
+						await connection.sendText(conversationId, chunk, { ...sendExtras, ...replyOpt });
 						first = false;
 					}
 					continue;
 				}
 				try {
-					await connection.sendText(conversationId, html, { html: true, threadId, ...replyOpt });
+					await connection.sendText(conversationId, html, { ...sendExtras, html: true, ...replyOpt });
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					if (PARSE_ERROR_RE.test(msg) && chunk.trim().length > 0) {
 						// HTML failed to parse — fall back to the plain chunk.
-						await connection.sendText(conversationId, chunk, { threadId, ...replyOpt });
+						await connection.sendText(conversationId, chunk, { ...sendExtras, ...replyOpt });
 					} else {
 						throw err;
 					}

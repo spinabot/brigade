@@ -1,7 +1,13 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { escapeTelegramHtml, markdownToTelegramHtml, telegramHtmlIsEmpty } from "./format.js";
+import {
+	escapeTelegramHtml,
+	markdownToTelegramHtml,
+	splitTelegramCaption,
+	TELEGRAM_CAPTION_LIMIT,
+	telegramHtmlIsEmpty,
+} from "./format.js";
 
 describe("markdownToTelegramHtml", () => {
 	it("escapes &, <, > in plain text", () => {
@@ -119,5 +125,51 @@ describe("telegramHtmlIsEmpty", () => {
 	it("treats an escaped entity as visible content", () => {
 		// "&amp;" decodes to "&" which is non-space → not empty.
 		assert.equal(telegramHtmlIsEmpty("&amp;"), false);
+	});
+});
+
+describe("splitTelegramCaption", () => {
+	it("returns the caption whole when ≤ the 1024 limit", () => {
+		const cap = "x".repeat(TELEGRAM_CAPTION_LIMIT);
+		const { head, rest } = splitTelegramCaption(cap);
+		assert.equal(head, cap);
+		assert.equal(rest, "");
+	});
+
+	it("hard-cuts at the limit when there is no boundary; head never exceeds the limit", () => {
+		const cap = "a".repeat(2000);
+		const { head, rest } = splitTelegramCaption(cap);
+		assert.equal(head.length, TELEGRAM_CAPTION_LIMIT);
+		assert.equal(rest.length, 2000 - TELEGRAM_CAPTION_LIMIT);
+		assert.equal(head + rest, cap);
+	});
+
+	it("prefers a line boundary in the back half of the window", () => {
+		const a = "a".repeat(900);
+		const b = "b".repeat(400);
+		const { head, rest } = splitTelegramCaption(`${a}\n${b}`);
+		assert.equal(head, a);
+		assert.equal(rest, b);
+		assert.ok(head.length <= TELEGRAM_CAPTION_LIMIT);
+	});
+
+	it("breaks at a space when no newline is available", () => {
+		const a = "a".repeat(1000);
+		const b = "b".repeat(200);
+		const { head, rest } = splitTelegramCaption(`${a} ${b}`);
+		assert.equal(head, a);
+		assert.equal(rest, b);
+	});
+
+	it("ignores a front-half boundary (would strand the caption) and hard-cuts", () => {
+		const cap = `word ${"z".repeat(2000)}`;
+		const { head } = splitTelegramCaption(cap);
+		assert.equal(head.length, TELEGRAM_CAPTION_LIMIT);
+	});
+
+	it("honors a custom limit", () => {
+		const { head, rest } = splitTelegramCaption("hello world foo", 8);
+		assert.equal(head, "hello");
+		assert.equal(rest, "world foo");
 	});
 });
