@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.6.0](https://github.com/spinabot/brigade/compare/brigade-v1.5.0...brigade-v1.6.0) (2026-06-24)
+
+
+### Features
+
+* **slack:** pass agent-authored Slack tokens through outbound formatting ([98282b7](https://github.com/spinabot/brigade/commit/98282b7ade35a55834c6eabf62c0493e1893b464))
+* **slack:** per-account Events webhook (multi-workspace) + proxy + liveness ([9a3659f](https://github.com/spinabot/brigade/commit/9a3659fc297856c87b57324fd79ac650ae759ede))
+* **slack:** resolve user ids to display names (sender, mentions, reactions) ([4088e1a](https://github.com/spinabot/brigade/commit/4088e1a9d205c9e5b337fefc2f9809ee76b31129))
+* **slack:** scaffold channel foundation — deps + account-config + mrkdwn formatter ([3690073](https://github.com/spinabot/brigade/commit/3690073b4969663ba2cee1447bc63f4f5dda5c1f))
+* **slack:** Slack channel end-to-end — Socket Mode + Events API ([da31f02](https://github.com/spinabot/brigade/commit/da31f02b9dc2e99cee6575e9bca02997433914f7))
+* **slack:** thread-history backfill + single-account approval buttons + reaction-clear + directory ([c65021a](https://github.com/spinabot/brigade/commit/c65021a8da5e3b480b41e120ec8b3d885fd4f38a))
+
+
+### Bug Fixes
+
+* **slack:** address 60-agent adversarial review — dedupe, mrkdwn, SSRF, webhook, auth ([aa98dc5](https://github.com/spinabot/brigade/commit/aa98dc533908e5b8f937413936f09909f1f4de4c))
+* **slack:** emulate typing via hourglass reaction + bot-id sender fallback ([bc689c2](https://github.com/spinabot/brigade/commit/bc689c2116828fd421682c81ca76fa653b6ad590))
+
 ## [1.5.0](https://github.com/spinabot/brigade/compare/brigade-v1.4.0...brigade-v1.5.0) (2026-06-24)
 
 
