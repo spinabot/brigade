@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1](https://github.com/spinabot/brigade/compare/brigade-v1.6.0...brigade-v1.6.1) (2026-06-24)
+
+
+### Bug Fixes
+
+* **runtime:** sub-agent key fallback + opt-in cron elevation + /approve recognition + WhatsApp pairing card ([b9543fd](https://github.com/spinabot/brigade/commit/b9543fd5f976c15d7985fc16796628a57a058788))
+
 ## [1.6.0](https://github.com/spinabot/brigade/compare/brigade-v1.5.0...brigade-v1.6.0) (2026-06-24)
 
 
