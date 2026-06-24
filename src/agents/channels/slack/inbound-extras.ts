@@ -122,7 +122,7 @@ function isBinaryContent(text: string): boolean {
  * escapes only those three in message text; everything else is literal. Applied
  * AFTER token expansion so the angle-bracket tokens (`<…>`) parse first.
  */
-function unescapeSlackEntities(text: string): string {
+export function unescapeSlackEntities(text: string): string {
 	return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 }
 

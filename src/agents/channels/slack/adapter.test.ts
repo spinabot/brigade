@@ -16,6 +16,7 @@ interface FakeConnCalls {
 	edits: Array<{ channel: string; messageId: string; text: string }>;
 	deletes: Array<{ channel: string; messageId: string }>;
 	reactions: Array<{ channel: string; messageId: string; emoji: string }>;
+	reactionsCleared: Array<{ channel: string; messageId: string }>;
 	fed: Array<{ kind: string; payload: unknown }>;
 }
 
@@ -31,7 +32,7 @@ function makeFakeConnectImpl(): {
 	let handle: FakeConnHandle | null = null;
 	const connectImpl = async (args: ConnectSlackArgs): Promise<SlackConnection> => {
 		const state = { connected: true, tokenInvalid: false };
-		const calls: FakeConnCalls = { sentText: [], sentInteractive: [], edits: [], deletes: [], reactions: [], fed: [] };
+		const calls: FakeConnCalls = { sentText: [], sentInteractive: [], edits: [], deletes: [], reactions: [], reactionsCleared: [], fed: [] };
 		let seq = 0;
 		const conn: SlackConnection = {
 			selfId: () => "UBOT",
@@ -54,6 +55,9 @@ function makeFakeConnectImpl(): {
 				calls.reactions.push({ channel, messageId, emoji });
 			},
 			removeReaction: async () => {},
+			removeOwnReactions: async (channel, messageId) => {
+				calls.reactionsCleared.push({ channel, messageId });
+			},
 			editMessageText: async (channel, messageId, text) => {
 				calls.edits.push({ channel, messageId, text });
 			},
@@ -194,6 +198,27 @@ describe("createSlackAdapter — outbound", () => {
 		const calls = handle()!.calls;
 		assert.equal(calls.edits[0]?.text, "new _x_");
 		assert.equal(calls.deletes[0]?.messageId, "2.0");
+		assert.equal(calls.reactions[0]?.emoji, "tada");
+	});
+
+	it("handleAction react with an EMPTY emoji clears the bot's own reactions; non-empty adds", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createSlackAdapter({ connectImpl }) as SlackAdapter;
+		a.isConfigured(enabledCfg(), {});
+		await a.start(makeStartCtx(() => {}));
+		// Empty emoji → clear (removeOwnReactions), not a react add.
+		const cleared = await a.handleAction!({ conversationId: "C1", action: { kind: "react", messageId: "7.0", emoji: "" } });
+		assert.equal(cleared.ok, true);
+		const calls = handle()!.calls;
+		assert.equal(calls.reactionsCleared.length, 1);
+		assert.equal(calls.reactionsCleared[0]?.messageId, "7.0");
+		assert.equal(calls.reactions.length, 0, "empty emoji must NOT add a reaction");
+		// Whitespace-only is also treated as clear.
+		await a.handleAction!({ conversationId: "C1", action: { kind: "react", messageId: "7.1", emoji: "   " } });
+		assert.equal(calls.reactionsCleared.length, 2);
+		// A real emoji still adds.
+		await a.handleAction!({ conversationId: "C1", action: { kind: "react", messageId: "8.0", emoji: "tada" } });
+		assert.equal(calls.reactions.length, 1);
 		assert.equal(calls.reactions[0]?.emoji, "tada");
 	});
 

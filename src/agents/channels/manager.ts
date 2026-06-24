@@ -253,10 +253,28 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 			// Register the adapter's outbound surface so a gated tool call inside
 			// a channel-routed turn surfaces the prompt INTO this conversation.
 			// Single-account adapters land on the default-account dispatcher slot.
+			//
+			// When the adapter exposes a NATIVE approval capability (Slack Block Kit
+			// buttons, Telegram inline buttons), forward it + a `getApprovalContext`
+			// so `dispatchChannelApproval` renders the prompt with native buttons
+			// instead of the plain-text card. Mirrors the multi-account plugin path
+			// (slack/plugin.ts). This ONE central site lights up native approval
+			// buttons for every single-account adapter that advertises the capability;
+			// adapters without one (WhatsApp) keep the text prompt unchanged. The
+			// `runtime` is empty here (the legacy manager has no per-account runtime —
+			// Slack's `sendApprovalPrompt` doesn't read it); `cfg` is the live config
+			// snapshot, refreshed by a runtime `startChannel`.
+			const approvalCapability = adapter.approvalCapability;
 			registerChannelApprovalDispatcher(adapter.id, {
 				sendText: (conversationId, text, opts) =>
 					adapter.sendText(conversationId, text, opts),
 				prettyName: adapter.label,
+				...(approvalCapability
+					? {
+							approvalCapability,
+							getApprovalContext: () => ({ runtime: {}, cfg: activeConfig }),
+						}
+					: {}),
 			});
 			log.info("channel started", { channel: adapter.id, label: adapter.label });
 			return { ok: true, started: true, message: `channel "${adapter.id}" started` };

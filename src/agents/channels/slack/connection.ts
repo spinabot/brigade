@@ -45,6 +45,7 @@ import {
 } from "../sdk.js";
 import {
 	buildSlackSenderName,
+	expandSlackTokens,
 	extractSlackMentions,
 	extractSlackReplyContext,
 	extractSlackText,
@@ -52,6 +53,7 @@ import {
 	resolveInboundFiles,
 	slackChannelType,
 	slackThreadId,
+	unescapeSlackEntities,
 	type SlackMessageEvent,
 	type SlackReactionEvent,
 } from "./inbound-extras.js";
@@ -97,6 +99,20 @@ const SLACK_MESSAGE_LIMIT = 8_000;
  * reference Slack channel uses.
  */
 const TYPING_REACTION = "hourglass_flowing_sand";
+
+/**
+ * Thread-history backfill bounds. When the bot is @-mentioned into a
+ * pre-existing thread it has the parent ts but none of the prior text, so the
+ * first inbound on that thread fetches up to {@link THREAD_BACKFILL_LIMIT}
+ * messages via `conversations.replies` and folds the ones PRECEDING the current
+ * message into `replyTo.body` as a compact excerpt. The excerpt is hard-capped
+ * at {@link THREAD_BACKFILL_MAX_CHARS} so a long thread can't blow up the prompt
+ * (the central pipeline ALSO slices `replyTo.body` to 200, but we bound here too
+ * so we never carry more than needed). Best-effort: any fetch error is swallowed
+ * and delivery proceeds with `body` undefined.
+ */
+const THREAD_BACKFILL_LIMIT = 15;
+const THREAD_BACKFILL_MAX_CHARS = 1_200;
 
 /* ───────────────────────── normalized inbound shape ───────────────────────── */
 
@@ -183,9 +199,34 @@ export interface SlackWebClientLike extends SlackUploadApi {
 	reactions: {
 		add(args: Record<string, unknown>): Promise<SlackApiResponse>;
 		remove(args: Record<string, unknown>): Promise<SlackApiResponse>;
+		/**
+		 * Read the reactions on a message (each carries the emoji `name` + the
+		 * `users` who added it). Used by `removeOwnReactions` to find which
+		 * reactions the bot itself placed so a "clear" can remove them — Slack
+		 * `reactions.remove` needs a specific name, so there's no blanket clear.
+		 * Optional so test fakes that don't drive reaction-clear still satisfy this
+		 * shape; the real `WebClient` always provides it.
+		 */
+		get?(args: {
+			channel: string;
+			timestamp: string;
+		}): Promise<SlackApiResponse & { message?: { reactions?: Array<{ name?: string; users?: string[] }> } }>;
 	};
 	conversations: {
 		open(args: Record<string, unknown>): Promise<SlackApiResponse & { channel?: { id?: string } }>;
+		/**
+		 * Fetch the messages of a thread (the parent + its replies). Used by the
+		 * thread-history backfill: when the bot is @-mentioned INTO a pre-existing
+		 * thread it sees only the parent ts, so this pulls the prior messages to
+		 * give the agent the conversation it just walked into. Optional so the many
+		 * test fakes that don't drive backfill still satisfy this shape; the real
+		 * `WebClient` always provides it.
+		 */
+		replies?(args: {
+			channel: string;
+			ts: string;
+			limit?: number;
+		}): Promise<SlackApiResponse & { messages?: Array<{ user?: string; bot_id?: string; text?: string; ts?: string }> }>;
 	};
 }
 
@@ -342,6 +383,16 @@ export interface SlackConnection {
 	react(channel: string, messageId: string, emoji: string): Promise<void>;
 	/** Remove a reaction from a message. Best-effort. */
 	removeReaction(channel: string, messageId: string, emoji: string): Promise<void>;
+	/**
+	 * Remove EVERY reaction the bot itself placed on a message. Slack has no
+	 * blanket "clear reactions" call (and a non-bot user's reactions aren't ours
+	 * to touch), so this reads `reactions.get`, finds the reactions whose `users`
+	 * include the bot's own id, and `reactions.remove`s each. Best-effort: a
+	 * missing slice / fetch error / `no_reaction` is swallowed. This is what the
+	 * central `message_action` "react" with an EMPTY emoji maps to (parity with
+	 * WhatsApp/Telegram, where empty = clear).
+	 */
+	removeOwnReactions(channel: string, messageId: string): Promise<void>;
 	/** Edit a previously-sent message's text. */
 	editMessageText(channel: string, messageId: string, text: string, opts?: SlackSendTextOpts): Promise<void>;
 	/** Delete a message. */
@@ -539,6 +590,14 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 	// reacts to. Updated when a user message routes; read by `setComposing`.
 	const lastInboundTs = new Map<string, string>();
 
+	// Threads whose history has already been backfilled into `replyTo.body`
+	// (keyed `channel:thread_ts`). The FIRST reply the bot sees on a thread it
+	// was mentioned into pulls the prior messages; subsequent replies on the
+	// SAME thread skip the fetch (the agent already has — or will accumulate —
+	// the context via the session transcript). Per-connection lifetime, same
+	// posture as `lastInboundTs`.
+	const backfilledThreads = new Set<string>();
+
 	// Background id→display-name directory (built lazily once `web` is live, in
 	// BOTH socket + events mode). Resolves Slack user ids to human names so the
 	// agent sees "Alex" instead of "U07ABC" in the sender name, `<@…>` mentions,
@@ -641,11 +700,79 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 	};
 
 	/**
+	 * Fetch the prior messages of `threadId` and format the ones PRECEDING
+	 * `currentTs` into a compact excerpt for `replyTo.body`. Best-effort: returns
+	 * undefined on any failure (no `conversations.replies` slice, fetch error,
+	 * empty thread) so the caller always proceeds to deliver. Each line is
+	 * `name: text` — the sender name resolved from the background user directory
+	 * when cached (else the raw id), the text token-expanded the same way inbound
+	 * text is. The bot's own messages are kept (they're part of the thread the
+	 * agent walked into). Bounded to {@link THREAD_BACKFILL_MAX_CHARS}.
+	 */
+	const fetchThreadExcerpt = async (
+		channel: string,
+		threadId: string,
+		currentTs: string | undefined,
+	): Promise<string | undefined> => {
+		const w = web;
+		const repliesFn = w?.conversations.replies;
+		if (!w || typeof repliesFn !== "function") return undefined;
+		let res: Awaited<ReturnType<NonNullable<SlackWebClientLike["conversations"]["replies"]>>>;
+		try {
+			res = await repliesFn.call(w.conversations, { channel, ts: threadId, limit: THREAD_BACKFILL_LIMIT });
+		} catch (err) {
+			safeLog("slack thread backfill failed (best-effort)", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return undefined;
+		}
+		if (!res?.ok || !Array.isArray(res.messages) || res.messages.length === 0) return undefined;
+		const dir = ensureDirectory();
+		const lines: string[] = [];
+		for (const m of res.messages) {
+			// Only messages BEFORE the one we're routing — the current message is the
+			// agent's input, not prior context. A reply event always carries a ts, so
+			// when currentTs is set we stop at it; missing ts entries are skipped.
+			const mts = typeof m.ts === "string" ? m.ts : "";
+			if (currentTs && mts && mts >= currentTs) continue;
+			const rawText = typeof m.text === "string" ? m.text : "";
+			if (!rawText) continue;
+			const resolveName = dir ? (id: string): string | undefined => dir.resolveNameSync(id) : undefined;
+			const text = unescapeSlackEntities(expandSlackTokens(rawText, resolveName)).replace(/\s+/g, " ").trim();
+			if (!text) continue;
+			const userId = typeof m.user === "string" ? m.user : "";
+			if (dir && userId) dir.prime(userId);
+			const name =
+				(userId && dir ? dir.resolveNameSync(userId) : undefined) ||
+				userId ||
+				(typeof m.bot_id === "string" ? m.bot_id : "") ||
+				"unknown";
+			lines.push(`${name}: ${text}`);
+		}
+		if (lines.length === 0) return undefined;
+		let excerpt = lines.join("\n");
+		if (excerpt.length > THREAD_BACKFILL_MAX_CHARS) {
+			// Keep the TAIL (most recent context) — trim from the front.
+			excerpt = `…${excerpt.slice(excerpt.length - THREAD_BACKFILL_MAX_CHARS)}`;
+		}
+		return excerpt;
+	};
+
+	/**
 	 * Handle a `message` / `app_mention` event. ACK is done by the socket handler
 	 * BEFORE this runs. Filters the bot's own echoes + system subtypes, dedupes,
 	 * normalizes, and routes through `onMessage` (an edit flagged `edited`).
+	 *
+	 * ASYNC because of the thread-history backfill: `normalize` stays SYNC, but
+	 * when the inbound is a threaded reply (a thread we haven't backfilled yet)
+	 * this fetches the prior thread messages via `conversations.replies` and folds
+	 * them into `normalized.replyTo.body` BEFORE handing off to `onMessage`, so the
+	 * agent sees the conversation it was just @-mentioned into. Runs PRE-central-ACL
+	 * (same posture as the reference channel); the fetch uses the bot token on a
+	 * thread the bot is already in, and is fully best-effort + bounded so it can
+	 * never block (or fail) delivery.
 	 */
-	const handleMessageEvent = (event: SlackMessageEvent, teamId: string | undefined): void => {
+	const handleMessageEvent = async (event: SlackMessageEvent, teamId: string | undefined): Promise<void> => {
 		try {
 			// Liveness: any inbound message event proves the connection is alive,
 			// even one we ultimately skip (echo / system subtype).
@@ -665,6 +792,18 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 			if (dedupeKey && !eventDedupe.claim(dedupeKey)) return; // already seen
 			const normalized = normalize(event, teamId, { edited: subtype === "message_changed" });
 			if (!normalized) return;
+			// Thread-history backfill — only when this is a threaded reply that quotes
+			// a parent (replyTo present) AND we haven't already backfilled this thread.
+			// `extractSlackReplyContext` leaves `body` undefined; we fill it with a
+			// compact excerpt of the prior messages so the agent has the prior context.
+			if (normalized.threadId && normalized.replyTo && !normalized.replyTo.body) {
+				const threadKey = `${normalized.conversationId}:${normalized.threadId}`;
+				if (!backfilledThreads.has(threadKey)) {
+					backfilledThreads.add(threadKey);
+					const excerpt = await fetchThreadExcerpt(normalized.conversationId, normalized.threadId, normalized.messageId);
+					if (excerpt) normalized.replyTo = { ...normalized.replyTo, body: excerpt };
+				}
+			}
 			args.onMessage(normalized);
 			// Remember the user's last message ts so setComposing can react to it.
 			if (normalized.messageId) lastInboundTs.set(normalized.conversationId, normalized.messageId);
@@ -808,7 +947,7 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 			const teamId = typeof a.body?.team_id === "string" ? a.body.team_id : undefined;
 			const event = (a.event ?? a.body?.event) as SlackMessageEvent | SlackReactionEvent | undefined;
 			if (!event) return;
-			handleMessageEvent(event as SlackMessageEvent, teamId);
+			await handleMessageEvent(event as SlackMessageEvent, teamId);
 		};
 		const onReaction = async (a: SocketEventArgs): Promise<void> => {
 			try {
@@ -1084,6 +1223,35 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		}
 	};
 
+	const removeOwnReactions: SlackConnection["removeOwnReactions"] = async (channel, messageId) => {
+		const w = requireLive();
+		const getFn = w.reactions.get;
+		if (typeof getFn !== "function") return; // no slice → nothing we can clear
+		let reactions: Array<{ name?: string; users?: string[] }> = [];
+		try {
+			const res = await getFn.call(w.reactions, { channel, timestamp: messageId });
+			reactions = Array.isArray(res?.message?.reactions) ? res.message!.reactions! : [];
+		} catch (err) {
+			// A read failure is cosmetic — nothing to clear if we can't see them.
+			safeLog("slack reactions.get failed (cosmetic)", { error: err instanceof Error ? err.message : String(err) });
+			return;
+		}
+		const self = selfId;
+		for (const r of reactions) {
+			const name = typeof r.name === "string" ? r.name : "";
+			// Only the bot's OWN reactions are ours to clear — a user's reaction on
+			// the same message is left untouched. When we don't know our own id
+			// (never connected), skip rather than risk removing someone else's.
+			if (!name || !self || !Array.isArray(r.users) || !r.users.includes(self)) continue;
+			try {
+				await w.reactions.remove({ channel, timestamp: messageId, name });
+			} catch (err) {
+				if (errorCode(err) === "no_reaction") continue;
+				safeLog("slack remove own reaction failed (cosmetic)", { error: err instanceof Error ? err.message : String(err) });
+			}
+		}
+	};
+
 	const editMessageText: SlackConnection["editMessageText"] = async (channel, messageId, text, _opts) => {
 		const w = requireLive();
 		expectOk(await w.chat.update({ channel, ts: messageId, text, mrkdwn: true }), "chat.update");
@@ -1129,7 +1297,10 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 			const re = event as SlackReactionEvent;
 			eventDedupe.release(`react:${re.user}:${re.reaction}:${re.item?.ts}`);
 		} else {
-			handleMessageEvent(event as SlackMessageEvent, teamId);
+			// Fire-and-forget: handleMessageEvent is async (thread backfill) but
+			// feedEvent is the sync webhook entry point. The handler swallows its own
+			// errors; guard the promise so an unexpected rejection can't go unhandled.
+			void handleMessageEvent(event as SlackMessageEvent, teamId).catch(() => {});
 		}
 	};
 
@@ -1160,6 +1331,7 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		sendMedia,
 		react,
 		removeReaction,
+		removeOwnReactions,
 		editMessageText,
 		deleteMessage,
 		openDirectMessage,

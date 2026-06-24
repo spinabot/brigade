@@ -490,7 +490,15 @@ export function createSlackAdapter(opts: CreateSlackAdapterOptions = {}): Channe
 						await connection.deleteMessage(p.conversationId, a.messageId);
 						return { ok: true, messageId: a.messageId };
 					case "react":
-						await connection.react(p.conversationId, a.messageId, a.emoji);
+						// An EMPTY emoji means "clear" (parity with WhatsApp/Telegram). Slack
+						// has no blanket clear + multiple reactions per message, so clear =
+						// remove the bot's OWN reactions on this message; a non-empty emoji
+						// adds as before.
+						if (a.emoji.trim() === "") {
+							await connection.removeOwnReactions(p.conversationId, a.messageId);
+						} else {
+							await connection.react(p.conversationId, a.messageId, a.emoji);
+						}
 						return { ok: true, messageId: a.messageId };
 					case "reply": {
 						// A reply is just a threaded send; surface the new id.

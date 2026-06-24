@@ -1083,6 +1083,64 @@ describe("startChannels", () => {
 		resetChannelApprovalRouterForTests();
 	});
 
+	it("registers a single-account adapter's approvalCapability so dispatch renders NATIVE buttons (Fix C)", async () => {
+		// A single-account adapter (Slack/Telegram on the legacy manager path) that
+		// exposes a native approvalCapability must have it forwarded to the
+		// dispatcher — without this it gets the plain TEXT prompt, not buttons.
+		const { dispatchChannelApproval, resetChannelApprovalRouterForTests } = await import("./approval-router.js");
+		resetChannelApprovalRouterForTests();
+		const nativeCalls: Array<{ conversationId: string; approvalId: string }> = [];
+		const textSends: string[] = [];
+		const f = makeFakeChannel({
+			// The adapter advertises a native prompt (Block Kit / inline buttons).
+			approvalCapability: {
+				async sendApprovalPrompt(params) {
+					nativeCalls.push({ conversationId: params.conversationId, approvalId: params.approvalId });
+				},
+				authorizeApprover: () => ({ authorized: true }),
+			},
+			async sendText(conversationId, text) {
+				textSends.push(text);
+			},
+		});
+		const mgr = await startChannels({ adapters: [f.adapter], config: CONFIG, agentId: "main", runTurn: async () => ({ reply: "" }) });
+		assert.deepEqual(mgr.started, ["fake"]);
+		// Raise an approval routed to this channel → the dispatcher must use the
+		// NATIVE path (sendApprovalPrompt), not the text card.
+		const dispatched = await dispatchChannelApproval({
+			request: { id: "exec-1", command: "ls -la", toolName: "bash", timeoutMs: 60_000, decisions: ["allow-once", "allow-always", "deny"] as const },
+			route: { channelId: "fake", conversationId: "c-room", agentId: "main" },
+			resolveOnBridge: () => {},
+		});
+		assert.equal(dispatched, true);
+		assert.equal(nativeCalls.length, 1, "native button prompt was used");
+		assert.equal(nativeCalls[0]?.approvalId, "exec-1");
+		assert.equal(textSends.length, 0, "the text card was NOT used");
+		await mgr.stop();
+		resetChannelApprovalRouterForTests();
+	});
+
+	it("an adapter WITHOUT approvalCapability still gets the text prompt (Fix C — no regression)", async () => {
+		const { dispatchChannelApproval, resetChannelApprovalRouterForTests } = await import("./approval-router.js");
+		resetChannelApprovalRouterForTests();
+		const textSends: string[] = [];
+		const f = makeFakeChannel({
+			async sendText(conversationId, text) {
+				textSends.push(text);
+			},
+		});
+		const mgr = await startChannels({ adapters: [f.adapter], config: CONFIG, agentId: "main", runTurn: async () => ({ reply: "" }) });
+		const dispatched = await dispatchChannelApproval({
+			request: { id: "exec-2", command: "whoami", toolName: "bash", timeoutMs: 60_000, decisions: ["allow-once", "allow-always", "deny"] as const },
+			route: { channelId: "fake", conversationId: "c-room", agentId: "main" },
+			resolveOnBridge: () => {},
+		});
+		assert.equal(dispatched, true);
+		assert.equal(textSends.length, 1, "text prompt path used for a capability-less adapter");
+		await mgr.stop();
+		resetChannelApprovalRouterForTests();
+	});
+
 	it("two inbounds with same conversationId but different accountIds use distinct sessionKeys + opts.accountId on the reply", async () => {
 		// Per-account-channel-peer dmScope produces distinct session keys for
 		// the same conversation on two different accounts; the manager must

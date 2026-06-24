@@ -74,15 +74,35 @@ interface FakeWeb extends SlackWebClientLike {
 	reactionsAdded: Array<Record<string, unknown>>;
 	reactionsRemoved: Array<Record<string, unknown>>;
 	opened: Array<Record<string, unknown>>;
+	/** Calls to conversations.replies (Fix B thread backfill). */
+	repliesCalls: Array<{ channel: string; ts: string; limit?: number }>;
+	/** Calls to reactions.get (Fix D reaction-clear). */
+	reactionsGetCalls: Array<{ channel: string; timestamp: string }>;
 }
 
-function makeFakeWeb(over: { authOk?: boolean; authError?: string } = {}): FakeWeb {
+/** Options the fake web honours. `repliesMessages` / `reactionsGet` feed the
+ * Fix B (thread backfill) + Fix D (reaction-clear) paths; `repliesError` makes
+ * `conversations.replies` throw so the best-effort skip can be asserted. */
+interface FakeWebOver {
+	authOk?: boolean;
+	authError?: string;
+	/** Messages `conversations.replies` returns (thread parent + replies). */
+	repliesMessages?: Array<{ user?: string; bot_id?: string; text?: string; ts?: string }>;
+	/** When true, `conversations.replies` throws (best-effort skip). */
+	repliesError?: boolean;
+	/** Reactions `reactions.get` returns for the target message. */
+	reactionsGet?: Array<{ name?: string; users?: string[] }>;
+}
+
+function makeFakeWeb(over: FakeWebOver = {}): FakeWeb {
 	const posts: FakeWeb["posts"] = [];
 	const updates: FakeWeb["updates"] = [];
 	const deletes: FakeWeb["deletes"] = [];
 	const reactionsAdded: FakeWeb["reactionsAdded"] = [];
 	const reactionsRemoved: FakeWeb["reactionsRemoved"] = [];
 	const opened: FakeWeb["opened"] = [];
+	const repliesCalls: FakeWeb["repliesCalls"] = [];
+	const reactionsGetCalls: FakeWeb["reactionsGetCalls"] = [];
 	let postSeq = 0;
 	return {
 		posts,
@@ -91,6 +111,8 @@ function makeFakeWeb(over: { authOk?: boolean; authError?: string } = {}): FakeW
 		reactionsAdded,
 		reactionsRemoved,
 		opened,
+		repliesCalls,
+		reactionsGetCalls,
 		auth: {
 			async test() {
 				if (over.authOk === false) return { ok: false, error: over.authError ?? "invalid_auth" };
@@ -120,11 +142,20 @@ function makeFakeWeb(over: { authOk?: boolean; authError?: string } = {}): FakeW
 				reactionsRemoved.push(args);
 				return { ok: true };
 			},
+			async get(args) {
+				reactionsGetCalls.push(args);
+				return { ok: true, message: { reactions: over.reactionsGet ?? [] } };
+			},
 		},
 		conversations: {
 			async open(args) {
 				opened.push(args);
 				return { ok: true, channel: { id: "D123" } };
+			},
+			async replies(args) {
+				repliesCalls.push(args);
+				if (over.repliesError) throw new Error("ratelimited");
+				return { ok: true, messages: over.repliesMessages ?? [] };
 			},
 		},
 		files: {
@@ -238,7 +269,7 @@ describe("connectSlack — display-name resolution", () => {
 });
 
 describe("connectSlack — inbound routing", () => {
-	async function connect(over: { authOk?: boolean; authError?: string } = {}) {
+	async function connect(over: FakeWebOver = {}) {
 		const socket = makeFakeSocket();
 		const web = makeFakeWeb(over);
 		const messages: SlackInboundMessage[] = [];
@@ -415,6 +446,75 @@ describe("connectSlack — inbound routing", () => {
 		assert.equal(messages[0]?.text, "/status foo");
 	});
 
+	/* ── Fix B: thread-history backfill ── */
+
+	it("backfills replyTo.body with prior thread messages when @-mentioned into a pre-existing thread", async () => {
+		const { socket, web, messages } = await connect({
+			repliesMessages: [
+				{ user: "U9", text: "kicking off the thread", ts: "20.0" },
+				{ user: "U8", text: "some context here", ts: "20.1" },
+				// The current message itself is in the replies list — must NOT appear.
+				{ user: "U2", text: "the reply we route", ts: "20.5" },
+			],
+		});
+		// A threaded reply: thread_ts (20.0) differs from ts (20.5) → genuine reply.
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", channel_type: "channel", text: "<@UBOT> help", ts: "20.5", thread_ts: "20.0" }, "T1");
+		await flush();
+		assert.equal(messages.length, 1);
+		assert.equal(web.repliesCalls.length, 1, "fetched the thread once");
+		assert.equal(web.repliesCalls[0]?.channel, "C1");
+		assert.equal(web.repliesCalls[0]?.ts, "20.0");
+		const body = messages[0]?.replyTo?.body ?? "";
+		assert.match(body, /U9: kicking off the thread/);
+		assert.match(body, /U8: some context here/);
+		assert.ok(!body.includes("the reply we route"), "current message excluded from the excerpt");
+	});
+
+	it("does NOT re-fetch the SAME thread on a second reply", async () => {
+		const { socket, web, messages } = await connect({
+			repliesMessages: [{ user: "U9", text: "root", ts: "21.0" }],
+		});
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", channel_type: "channel", text: "first", ts: "21.5", thread_ts: "21.0" }, "T1");
+		await flush();
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", channel_type: "channel", text: "second", ts: "21.6", thread_ts: "21.0" }, "T1");
+		await flush();
+		assert.equal(messages.length, 2);
+		assert.equal(web.repliesCalls.length, 1, "thread fetched once, not per reply");
+		// The first reply got the backfill; the second did not re-fetch (body undefined).
+		assert.ok((messages[0]?.replyTo?.body ?? "").includes("U9: root"));
+		assert.equal(messages[1]?.replyTo?.body, undefined);
+	});
+
+	it("does NOT fetch for a non-threaded (top-level) message", async () => {
+		const { socket, web, messages } = await connect({ repliesMessages: [{ user: "U9", text: "x", ts: "1.0" }] });
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", channel_type: "channel", text: "<@UBOT> hi", ts: "22.0" }, "T1");
+		await flush();
+		assert.equal(messages.length, 1);
+		assert.equal(web.repliesCalls.length, 0, "no thread → no fetch");
+		assert.equal(messages[0]?.replyTo, undefined);
+	});
+
+	it("does NOT fetch for a thread ROOT message (thread_ts === ts)", async () => {
+		const { socket, web, messages } = await connect({ repliesMessages: [{ user: "U9", text: "x", ts: "23.0" }] });
+		// The root of a thread carries thread_ts === ts — it's not a reply.
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", channel_type: "channel", text: "root", ts: "23.0", thread_ts: "23.0" }, "T1");
+		await flush();
+		assert.equal(messages.length, 1);
+		assert.equal(web.repliesCalls.length, 0);
+		assert.equal(messages[0]?.replyTo, undefined);
+	});
+
+	it("a conversations.replies error still delivers the message (body undefined)", async () => {
+		const { socket, web, messages } = await connect({ repliesError: true });
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", channel_type: "channel", text: "<@UBOT> help", ts: "24.5", thread_ts: "24.0" }, "T1");
+		await flush();
+		assert.equal(messages.length, 1, "delivery is never blocked by a backfill failure");
+		assert.equal(web.repliesCalls.length, 1);
+		assert.equal(messages[0]?.replyTo?.body, undefined);
+		// The parent id is still surfaced even when the body couldn't be fetched.
+		assert.equal(messages[0]?.replyTo?.messageId, "24.0");
+	});
+
 	it("goes terminal on an invalid_auth at boot", async () => {
 		const { conn, tokenInvalid } = await connect({ authOk: false, authError: "invalid_auth" });
 		assert.equal(conn.isTokenInvalid(), true);
@@ -453,9 +553,9 @@ describe("connectSlack — inbound routing", () => {
 });
 
 describe("connectSlack — outbound", () => {
-	async function connected() {
+	async function connected(over: FakeWebOver = {}) {
 		const socket = makeFakeSocket();
-		const web = makeFakeWeb();
+		const web = makeFakeWeb(over);
 		const conn = await connectSlack({
 			botToken: "xoxb-AAA",
 			appToken: "xapp-BBB",
@@ -505,6 +605,32 @@ describe("connectSlack — outbound", () => {
 		await conn.react("C1", "3.0", ":tada:");
 		assert.equal(web.reactionsAdded[0]?.name, "tada");
 		assert.equal(web.reactionsAdded[0]?.timestamp, "3.0");
+	});
+
+	/* ── Fix D: reaction-clear (remove only the bot's OWN reactions) ── */
+
+	it("removeOwnReactions removes only the reactions the bot placed", async () => {
+		const { web, conn } = await connected({
+			reactionsGet: [
+				// The bot (UBOT) reacted with these two…
+				{ name: "thumbsup", users: ["UBOT", "U2"] },
+				{ name: "eyes", users: ["UBOT"] },
+				// …but this one is someone else's only — must be left alone.
+				{ name: "tada", users: ["U2", "U3"] },
+			],
+		});
+		await conn.removeOwnReactions("C1", "4.0");
+		assert.equal(web.reactionsGetCalls.length, 1);
+		assert.equal(web.reactionsGetCalls[0]?.timestamp, "4.0");
+		const removedNames = web.reactionsRemoved.map((r) => r.name).sort();
+		assert.deepEqual(removedNames, ["eyes", "thumbsup"], "only the bot's own reactions removed");
+		assert.ok(!removedNames.includes("tada"), "another user's reaction untouched");
+	});
+
+	it("removeOwnReactions is a no-op when the bot has no reactions on the message", async () => {
+		const { web, conn } = await connected({ reactionsGet: [{ name: "tada", users: ["U2"] }] });
+		await conn.removeOwnReactions("C1", "5.0");
+		assert.equal(web.reactionsRemoved.length, 0);
 	});
 
 	it("opens a DM and returns the channel id", async () => {

@@ -58,6 +58,13 @@ export {
 	type SlackConnection,
 	type SlackInboundMessage,
 } from "./connection.js";
+export {
+	listSlackDirectoryPeers,
+	listSlackDirectoryGroups,
+	type SlackDirectoryEntry,
+	type SlackDirectoryQuery,
+	type SlackDirectoryWebClientLike,
+} from "./directory-live.js";
 export { markdownToSlackMrkdwn, slackMrkdwnIsEmpty, escapeSlackMrkdwn } from "./format.js";
 export { createSlackPlugin, type SlackPluginDeps, type SlackPluginHandle } from "./plugin.js";
 export { probeSlack, type SlackProbeResult, type SlackProbeBot, type SlackProbeTeam } from "./probe.js";
