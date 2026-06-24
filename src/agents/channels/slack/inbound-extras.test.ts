@@ -28,6 +28,20 @@ describe("expandSlackTokens", () => {
 		assert.equal(expandSlackTokens("hi <@U123>"), "hi @U123");
 	});
 
+	it("resolves a bare user mention via the directory resolver", () => {
+		const names = new Map([["U123", "Alex"]]);
+		assert.equal(expandSlackTokens("hi <@U123>", (id) => names.get(id)), "hi @Alex");
+	});
+
+	it("keeps the inline label over the resolver", () => {
+		const names = new Map([["U123", "Alex"]]);
+		assert.equal(expandSlackTokens("hi <@U123|raw>", (id) => names.get(id)), "hi @raw");
+	});
+
+	it("falls back to the id when the resolver has no name", () => {
+		assert.equal(expandSlackTokens("hi <@U123>", () => undefined), "hi @U123");
+	});
+
 	it("expands a channel mention", () => {
 		assert.equal(expandSlackTokens("see <#C1|general>"), "see #general");
 		assert.equal(expandSlackTokens("see <#C1>"), "see #C1");
@@ -47,6 +61,11 @@ describe("expandSlackTokens", () => {
 describe("extractSlackText", () => {
 	it("expands tokens and unescapes entities", () => {
 		assert.equal(extractSlackText(ev({ text: "yo <@U9|sam> &amp; &lt;x&gt;" })), "yo @sam & <x>");
+	});
+
+	it("resolves bare mentions through the directory resolver", () => {
+		const names = new Map([["U9", "Sam"]]);
+		assert.equal(extractSlackText(ev({ text: "yo <@U9>" }), (id) => names.get(id)), "yo @Sam");
 	});
 
 	it("drops binary/control-byte payloads", () => {
@@ -122,6 +141,15 @@ describe("buildSlackSenderName", () => {
 	it("prefers a legacy username, else the user id", () => {
 		assert.equal(buildSlackSenderName(ev({ user: "U7" })), "U7");
 		assert.equal(buildSlackSenderName(ev({ username: "webhook" } as Partial<SlackMessageEvent>)), "webhook");
+	});
+
+	it("resolves the user id to a display name when the directory has it", () => {
+		const names = new Map([["U7", "Alex"]]);
+		assert.equal(buildSlackSenderName(ev({ user: "U7" }), (id) => names.get(id)), "Alex");
+	});
+
+	it("falls back to the id when the resolver returns nothing", () => {
+		assert.equal(buildSlackSenderName(ev({ user: "U7" }), () => undefined), "U7");
 	});
 });
 

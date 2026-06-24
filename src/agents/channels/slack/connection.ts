@@ -56,6 +56,7 @@ import {
 	type SlackReactionEvent,
 } from "./inbound-extras.js";
 import { downloadSlackFile, uploadSlackFile, type SlackUploadApi } from "./media.js";
+import { createSlackUserDirectory, type SlackUserDirectory } from "./user-directory.js";
 
 /* ───────────────────────── reconnect backoff ───────────────────────── */
 // Shares the neutral `nextBackoffDelay` curve with every other channel (see
@@ -164,6 +165,13 @@ type SlackApiResponse = { ok?: boolean; error?: string; [key: string]: unknown }
 export interface SlackWebClientLike extends SlackUploadApi {
 	auth: {
 		test(): Promise<SlackApiResponse & { user_id?: string; user?: string; team_id?: string; team?: string; bot_id?: string }>;
+	};
+	// Optional so the many test fakes that don't drive name-resolution still
+	// satisfy this shape; the real `WebClient` always provides it.
+	users?: {
+		info(args: {
+			user: string;
+		}): Promise<SlackApiResponse & { user?: { id?: string; name?: string; real_name?: string; profile?: { display_name?: string; real_name?: string } } }>;
 	};
 	chat: {
 		postMessage(args: Record<string, unknown>): Promise<SlackApiResponse & { ts?: string; channel?: string }>;
@@ -463,6 +471,17 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 	// reacts to. Updated when a user message routes; read by `setComposing`.
 	const lastInboundTs = new Map<string, string>();
 
+	// Background id→display-name directory (built lazily once `web` is live, in
+	// BOTH socket + events mode). Resolves Slack user ids to human names so the
+	// agent sees "Alex" instead of "U07ABC" in the sender name, `<@…>` mentions,
+	// and reaction notes. Non-blocking: prime() warms the cache off the hot path,
+	// resolveNameSync() reads whatever is cached (see user-directory.ts).
+	let userDirectory: SlackUserDirectory | null = null;
+	const ensureDirectory = (): SlackUserDirectory | null => {
+		if (!userDirectory && web) userDirectory = createSlackUserDirectory({ web, log: safeLog });
+		return userDirectory;
+	};
+
 	/** Normalize one Slack message event into the deferred-media inbound shape. */
 	const normalize = (event: SlackMessageEvent, teamId: string | undefined, opts?: { edited?: boolean }): SlackInboundMessage | null => {
 		// An edit (message_changed) carries the new message under `message`; the
@@ -470,13 +489,22 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		const inner = event.subtype === "message_changed" && event.message ? event.message : event;
 		const channel = typeof event.channel === "string" ? event.channel : typeof inner.channel === "string" ? inner.channel : "";
 		if (!channel) return null;
-		const text = extractSlackText(event);
+		// Background id→name directory: read whatever is cached for THIS message,
+		// then prime the sender + everyone they @-mentioned so the names resolve
+		// next time (first contact shows the id; later messages show the name).
+		const dir = ensureDirectory();
+		const resolveName = dir ? (id: string): string | undefined => dir.resolveNameSync(id) : undefined;
+		const text = extractSlackText(event, resolveName);
 		const chatType = slackChannelType({ channel_type: event.channel_type, channel });
 		const threadId = slackThreadId(inner);
 		const mentions = extractSlackMentions(event, selfId ?? undefined);
 		const replyTo = extractSlackReplyContext(event);
-		const fromName = buildSlackSenderName(event);
+		const fromName = buildSlackSenderName(event, resolveName);
 		const fromId = typeof inner.user === "string" ? inner.user : typeof inner.bot_id === "string" ? inner.bot_id : channel;
+		if (dir) {
+			dir.prime(typeof inner.user === "string" ? inner.user : undefined);
+			for (const id of mentions) dir.prime(id);
+		}
 		const ts = typeof inner.ts === "string" ? inner.ts : typeof event.ts === "string" ? event.ts : undefined;
 
 		// DEFERRED media — captured by reference, not downloaded. The thunk is only
@@ -588,9 +616,15 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		if (!channel || !target || !emoji) return null;
 		const fromId = typeof event.user === "string" ? event.user : channel;
 		if (selfId && fromId === selfId) return null; // the bot's own reaction
+		// Resolve the reactor's display name (background-primed) so the synthesized
+		// note reads "Alex reacted :+1:" instead of the raw id.
+		const dir = ensureDirectory();
+		if (dir && typeof event.user === "string") dir.prime(event.user);
+		const fromName = dir && typeof event.user === "string" ? dir.resolveNameSync(event.user) : undefined;
 		return {
 			conversationId: channel,
 			from: fromId,
+			...(fromName ? { fromName } : {}),
 			text: "",
 			// A reaction event doesn't carry channel_type; infer from the id prefix.
 			chatType: channel.startsWith("D") ? "direct" : "group",

@@ -174,6 +174,69 @@ describe("redactSlackToken", () => {
 	});
 });
 
+describe("connectSlack — display-name resolution", () => {
+	/** A fake web whose `users.info` resolves U2 → "Alex" (others → their id). */
+	function webWithDirectory(): FakeWeb {
+		const web = makeFakeWeb();
+		web.users = {
+			async info({ user }: { user: string }) {
+				return { ok: true, user: { profile: { display_name: user === "U2" ? "Alex" : user } } };
+			},
+		};
+		return web;
+	}
+
+	it("resolves the sender + bare mention to names once the directory primes", async () => {
+		const socket = makeFakeSocket();
+		const web = webWithDirectory();
+		const messages: SlackInboundMessage[] = [];
+		const conn = await connectSlack({
+			botToken: "xoxb-AAA",
+			appToken: "xapp-BBB",
+			webClientFactory: () => web,
+			socketModeFactory: () => socket,
+			sleepImpl: async () => {},
+			log: () => {},
+			onMessage: (m) => messages.push(m),
+		});
+		// First contact from U2: nothing cached yet → the name falls back to the id,
+		// but this message PRIMES U2 in the background.
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", channel_type: "channel", text: "hello <@U2>", ts: "1.1" }, "T1");
+		await flush();
+		assert.equal(messages[0]?.fromName, "U2");
+		assert.equal(messages[0]?.text, "hello @U2");
+		// Second message from U2: the prime has settled → the name resolves.
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", channel_type: "channel", text: "again <@U2>", ts: "1.2" }, "T1");
+		await flush();
+		assert.equal(messages[1]?.fromName, "Alex");
+		assert.equal(messages[1]?.text, "again @Alex");
+		await conn.close();
+	});
+
+	it("resolves the reactor's name for the synthesized reaction note", async () => {
+		const socket = makeFakeSocket();
+		const web = webWithDirectory();
+		const reactions: SlackInboundMessage[] = [];
+		const conn = await connectSlack({
+			botToken: "xoxb-AAA",
+			appToken: "xapp-BBB",
+			webClientFactory: () => web,
+			socketModeFactory: () => socket,
+			sleepImpl: async () => {},
+			log: () => {},
+			onMessage: () => {},
+			onReaction: (m) => reactions.push(m),
+		});
+		// First reaction primes U2 (no name yet); the second resolves to "Alex".
+		socket.emitEvent("reaction_added", { type: "reaction_added", user: "U2", reaction: "thumbsup", item: { type: "message", channel: "C1", ts: "5.0" } }, "T1");
+		await flush();
+		socket.emitEvent("reaction_added", { type: "reaction_added", user: "U2", reaction: "tada", item: { type: "message", channel: "C1", ts: "6.0" } }, "T1");
+		await flush();
+		assert.equal(reactions[1]?.fromName, "Alex");
+		await conn.close();
+	});
+});
+
 describe("connectSlack — inbound routing", () => {
 	async function connect(over: { authOk?: boolean; authError?: string } = {}) {
 		const socket = makeFakeSocket();

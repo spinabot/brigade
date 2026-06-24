@@ -138,7 +138,7 @@ function unescapeSlackEntities(text: string): string {
  * Unknown `<…>` tokens collapse to their inner display text (after `|`) or are
  * stripped of the angle brackets. Pure + deterministic.
  */
-export function expandSlackTokens(text: string): string {
+export function expandSlackTokens(text: string, resolveName?: (id: string) => string | undefined): string {
 	return text.replace(/<([^>]*)>/g, (_whole, inner: string) => {
 		if (!inner) return "";
 		const bar = inner.indexOf("|");
@@ -148,7 +148,11 @@ export function expandSlackTokens(text: string): string {
 		// User mention: <@U123> / <@U123|alex>
 		if (first === "@") {
 			const id = head.slice(1);
-			return label ? `@${label}` : `@${id}`;
+			// Inline label wins; else a resolved display name (from the user
+			// directory, when one is supplied); else the bare id.
+			if (label) return `@${label}`;
+			const resolved = resolveName?.(id);
+			return resolved ? `@${resolved}` : `@${id}`;
 		}
 		// Channel mention: <#C123|general> / <#C123>
 		if (first === "#") {
@@ -174,12 +178,12 @@ export function expandSlackTokens(text: string): string {
  * envelope surfaces the EDITED text (`event.message.text`). Binary blobs are
  * dropped to "".
  */
-export function extractSlackText(event: SlackMessageEvent): string {
+export function extractSlackText(event: SlackMessageEvent, resolveName?: (id: string) => string | undefined): string {
 	// An edit (message_changed) carries the new text on the nested `message`.
 	const source = event.subtype === "message_changed" && event.message ? event.message : event;
 	const raw = typeof source.text === "string" ? source.text : "";
 	if (!raw || isBinaryContent(raw)) return "";
-	return unescapeSlackEntities(expandSlackTokens(raw)).trim();
+	return unescapeSlackEntities(expandSlackTokens(raw, resolveName)).trim();
 }
 
 /** Slack `channel_type` → Brigade chat type. `im` → direct; everything else → group. */
@@ -242,16 +246,25 @@ export function extractSlackMentions(event: SlackMessageEvent, botUserId?: strin
 }
 
 /**
- * A short display name for the sender. Slack message events carry only the user
- * id (`U…`) — display-name resolution needs a `users.info` call the connection
- * layer doesn't make on the hot path — so the readable name is the user id. A
- * bot-posted message with a `username` (legacy webhook posts) surfaces that.
+ * A short display name for the sender. A legacy bot-posted `username` wins; else
+ * a resolved display name (when a `resolveName` reader from the user directory is
+ * supplied AND it has already cached the sender's name); else the raw user id
+ * (`U…`) — display-name resolution needs a `users.info` call that the directory
+ * primes in the background, so the first message from a never-seen user surfaces
+ * the id and later messages surface the name.
  */
-export function buildSlackSenderName(event: SlackMessageEvent): string | undefined {
+export function buildSlackSenderName(
+	event: SlackMessageEvent,
+	resolveName?: (id: string) => string | undefined,
+): string | undefined {
 	const source = event.subtype === "message_changed" && event.message ? event.message : event;
 	const username = typeof source["username"] === "string" ? (source["username"] as string) : "";
 	if (username) return username;
 	const user = typeof source.user === "string" ? source.user : "";
+	if (user) {
+		const resolved = resolveName?.(user);
+		if (resolved) return resolved;
+	}
 	return user || undefined;
 }
 
