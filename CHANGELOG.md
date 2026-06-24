@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.5.0](https://github.com/spinabot/brigade/compare/brigade-v1.4.0...brigade-v1.5.0) (2026-06-24)
+
+
+### Features
+
+* **telegram:** coalesce media-group albums into one inbound + handle chat migration ([ca61cb2](https://github.com/spinabot/brigade/commit/ca61cb21ecf2a1a6980ba844e9dc68483606eb41))
+* **telegram:** media-download retry + honor 429 retry_after ([7097c1b](https://github.com/spinabot/brigade/commit/7097c1b37cf6e013774eb3876e0c2c28fb82ffed))
+* **telegram:** send GIFs inline via sendAnimation (vs a static photo) ([a032470](https://github.com/spinabot/brigade/commit/a0324708f04e3449aeaba76c594f739c5569870b))
+* **telegram:** surface location/venue/contact/poll as text + enrich reply context ([3cd0c08](https://github.com/spinabot/brigade/commit/3cd0c0877c458de67bf92099b31c491e8b972cf9))
+
+
+### Bug Fixes
+
+* **telegram:** split &gt;1024-char media captions + honor silent/linkPreview ([c3f61d6](https://github.com/spinabot/brigade/commit/c3f61d6692cf808486e3579dfe08b3e40d91084f))
+
 ## [1.4.0](https://github.com/spinabot/brigade/compare/brigade-v1.3.2...brigade-v1.4.0) (2026-06-23)
 
 
