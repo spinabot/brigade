@@ -50,6 +50,12 @@ const BOOT_OPTIONAL_PREFIXES = [
   "gateway uninstall",
   "gateway restart",
   "gateway supervise",
+  // `expose status/stop` just read the tunnel state file + a pid — they must
+  // work even when the storage backend is down (e.g. to tear down a tunnel).
+  "expose status",
+  "expose stop",
+  "bloody benchmark status",
+  "bloody benchmark stop",
   "store",
   "encrypt",
   "migrate",
@@ -390,6 +396,89 @@ export function buildProgram(): Command {
         );
       },
     );
+
+  /* ───────────────────────── expose (public tunnel) ───────────────────────── */
+  // `brigade expose` publishes the gateway to the public internet through a
+  // token-checking auth-proxy + a tunnel provider (cloudflare default). The
+  // raw gateway stays loopback-only; only the authed proxy is tunnelled.
+  // `brigade bloody benchmark` is an alias for the same thing.
+  type ExposeOpts = {
+    provider?: string;
+    token?: string;
+    insecure?: boolean;
+    open?: boolean;
+    relay?: string;
+    command?: string;
+    port?: number;
+    verbose?: boolean;
+    json?: boolean;
+  };
+
+  // Shared option set so `expose` and `bloody benchmark` stay identical.
+  const addExposeOptions = (cmd: Command): Command =>
+    cmd
+      .option("--provider <name>", "tunnel provider: cloudflare | bore | custom (default: cloudflare)")
+      .option("--token <token>", "bearer token required on the public URL (auto-generated + saved if omitted)")
+      .option("--open", "expose with NO token — anyone with the URL gets in (simplest, least safe)", false)
+      .option("--insecure", "alias for --open (NO token gate)", false)
+      .option("--relay <addr>", "self-hosted relay address (bore/custom providers)")
+      .option("--command <cmd>", "custom provider command template; {port} is replaced with the proxy port")
+      .option("-p, --port <port>", "gateway port to expose (default: config gateway.port or 7777)", (v) => parseInt(v, 10))
+      .option("-V, --verbose", "stream tunnel provider logs", false);
+
+  const runExpose = async (opts: ExposeOpts): Promise<void> => {
+    const { runExposeCommand } = await import("../commands/expose.js");
+    await runExposeCommand(opts);
+    await new Promise<void>(() => {}); // hold the tunnel open until Ctrl-C
+  };
+
+  const expose = addExposeOptions(
+    program.command("expose").description("Expose the gateway to the public internet via a secure tunnel"),
+  ).action(runExpose);
+
+  expose
+    .command("status")
+    .description("Show the active tunnel (URL, provider, uptime)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .option("--show-link", "reveal the full access link (includes the private key)", false)
+    .action(async (opts: { json?: boolean; showLink?: boolean }) => {
+      const { runExposeStatusCommand } = await import("../commands/expose.js");
+      await exitAfterFlush(await runExposeStatusCommand(opts));
+    });
+
+  expose
+    .command("stop")
+    .description("Tear down the active tunnel")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runExposeStopCommand } = await import("../commands/expose.js");
+      await exitAfterFlush(await runExposeStopCommand(opts));
+    });
+
+  // Easter-egg alias: `brigade bloody benchmark [status|stop]` ≡ `brigade expose …`.
+  const bloody = program
+    .command("bloody")
+    .description("Alias group — `brigade bloody benchmark` opens a public tunnel (= `brigade expose`)");
+  const benchmark = addExposeOptions(
+    bloody.command("benchmark").description("Expose the gateway to the public internet (alias for `brigade expose`)"),
+  ).action(runExpose);
+  benchmark
+    .command("status")
+    .description("Show the active tunnel")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .option("--show-link", "reveal the full access link (includes the private key)", false)
+    .action(async (opts: { json?: boolean; showLink?: boolean }) => {
+      const { runExposeStatusCommand } = await import("../commands/expose.js");
+      await exitAfterFlush(await runExposeStatusCommand(opts));
+    });
+  benchmark
+    .command("stop")
+    .description("Tear down the active tunnel")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runExposeStopCommand } = await import("../commands/expose.js");
+      await exitAfterFlush(await runExposeStopCommand(opts));
+    });
 
   /* ─────────────────────────────── connect ─────────────────────────────── */
 

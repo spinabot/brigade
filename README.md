@@ -24,6 +24,22 @@
 </p>
 
 <p align="center">
+  🩸💥 <strong>NEW in v1.9.0 — <code>brigade bloody benchmark</code></strong> 💥🩸
+</p>
+<p align="center">
+  <em>One command. Your whole crew, <strong>live to the world.</strong></em><br/>
+  It drags your localhost gateway out into daylight through a blood-red Cloudflare tunnel — HTTPS at
+  the edge, no account, no setup. A private access key is minted and <strong>handled for you</strong>:
+  you never see it, and anyone who stumbles onto the URL just bleeds out on a <code>401</code>. 🩸
+  <br/>
+  Too squeamish for the name? It also answers to the polite <code>brigade expose</code>.
+</p>
+
+<p align="center">
+  <code>brigade bloody&nbsp;benchmark</code> &nbsp;·&nbsp; <code>brigade expose</code> &nbsp;·&nbsp; <code>brigade expose stop</code> &nbsp;🩸
+</p>
+
+<p align="center">
   <a href="https://github.com/spinabot/brigade/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spinabot/brigade/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI status"></a>
   <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://img.shields.io/npm/v/@spinabot/brigade?style=for-the-badge&logo=npm&logoColor=white&color=CB3837" alt="npm version"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/@spinabot/brigade?style=for-the-badge&logo=nodedotjs&logoColor=white&color=5FA04E&label=node" alt="node engine"></a>
