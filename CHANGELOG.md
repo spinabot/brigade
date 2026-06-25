@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.8.0](https://github.com/spinabot/brigade/compare/brigade-v1.7.0...brigade-v1.8.0) (2026-06-25)
+
+
+### Features
+
+* **bluebubbles:** full OpenClaw parity — close all 12 audited gaps ([7bb35f1](https://github.com/spinabot/brigade/commit/7bb35f1108c2fa532057e6cf1267ea223ae047f0))
+* **bluebubbles:** full parity — typing, mark-read, group admin, catch-up, contact names ([d65e499](https://github.com/spinabot/brigade/commit/d65e499ae6946f8d5a1b3262e828c463592f7a75))
+* **bluebubbles:** iMessage via the BlueBubbles server (REST-out + webhook-in) ([231c208](https://github.com/spinabot/brigade/commit/231c208ff12cffdaac858407c042ed6983ba853b))
+* **imessage:** full OpenClaw parity — close all audited gaps ([1e356d2](https://github.com/spinabot/brigade/commit/1e356d2747aa25d7e2ca9a45caccd00a00dc2ea4))
+* **imessage:** native iMessage channel via the imsg CLI JSON-RPC subprocess ([ff4c919](https://github.com/spinabot/brigade/commit/ff4c9196a0f1342b3f9d567e373d7859fd0851f9))
+* **tools:** enforce per-group tool policy in the turn executor ([629ec25](https://github.com/spinabot/brigade/commit/629ec2530cdff13b8b60802eccf418f53771e8b0))
+
+
+### Bug Fixes
+
+* **imessage,bluebubbles:** close adversarial-sweep findings ([f54a17e](https://github.com/spinabot/brigade/commit/f54a17ecbb77e0a361d42a65af7f3efcfc6ef477))
+
 ## [1.7.0](https://github.com/spinabot/brigade/compare/brigade-v1.6.1...brigade-v1.7.0) (2026-06-25)
 
 
