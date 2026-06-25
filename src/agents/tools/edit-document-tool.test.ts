@@ -22,7 +22,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 
-import { unzipSync, strFromU8 } from "fflate";
+import { unzipSync, zipSync, strFromU8, strToU8 } from "fflate";
 
 import { makeMakeDocumentTool, type MakeDocumentDetails } from "./make-document-tool.js";
 import {
@@ -184,6 +184,48 @@ describe("edit_document — xlsx", () => {
 		const wb = new ExcelJS.Workbook();
 		await wb.xlsx.load(fs.readFileSync(src) as never);
 		assert.ok((wb.getWorksheet("A")?.rowCount ?? 0) >= 3);
+	});
+
+	it("set_cells writes a formula cell (<f> element) that reads back as a formula", async () => {
+		const src = await makeDoc(
+			"xlsx",
+			{ sheets: [{ name: "S", rows: [[1], [2], [3]] }] },
+			"f.xlsx",
+		);
+		const r = (await ed().execute("e", {
+			source: src,
+			action: "set_cells",
+			sheet: "S",
+			cells: [{ ref: "A4", value: { formula: "SUM(A1:A3)" } }, { ref: "B1", value: 0.25, numFmt: "0.00%" }],
+		})) as AgentToolResult<EditDocumentDetails>;
+		assert.equal(det(r).cellsSet, 2);
+		// The raw sheet XML carries an <f> formula element.
+		const sheetXml = strFromU8(
+			unzipSync(new Uint8Array(fs.readFileSync(src)))["xl/worksheets/sheet1.xml"] as Uint8Array,
+		);
+		assert.match(sheetXml, /<f>SUM\(A1:A3\)<\/f>/, "an <f> formula element is written");
+		// And exceljs reads it back as a formula-typed cell.
+		const ExcelJS = (await import("exceljs")).default;
+		const wb = new ExcelJS.Workbook();
+		await wb.xlsx.load(fs.readFileSync(src) as never);
+		const cell = wb.getWorksheet("S")?.getCell("A4");
+		assert.equal(cell?.type, ExcelJS.ValueType.Formula, "cell reads back as a formula");
+		assert.equal((cell?.value as { formula?: string })?.formula, "SUM(A1:A3)");
+		assert.equal(wb.getWorksheet("S")?.getCell("B1").numFmt, "0.00%", "per-cell numFmt applied");
+	});
+
+	it("append_rows accepts a formula cell object", async () => {
+		const src = await makeDoc("xlsx", { sheets: [{ name: "S", rows: [[10], [20]] }] }, "fa.xlsx");
+		await ed().execute("e", {
+			source: src,
+			action: "append_rows",
+			sheet: "S",
+			rows: [[{ formula: "SUM(A1:A2)" }]],
+		});
+		const sheetXml = strFromU8(
+			unzipSync(new Uint8Array(fs.readFileSync(src)))["xl/worksheets/sheet1.xml"] as Uint8Array,
+		);
+		assert.match(sheetXml, /<f>SUM\(A1:A2\)<\/f>/);
 	});
 
 	it("set_cells without cells → clean error", async () => {
@@ -415,5 +457,95 @@ describe("replaceInRunText", () => {
 		const { xml: out, count } = replaceInRunText(xml, "ZZZ", "x");
 		assert.equal(count, 0);
 		assert.equal(out, xml);
+	});
+
+	it("replaces a target that is SPLIT across consecutive runs (was 0 before)", () => {
+		// Word fragments a word into several runs; the join must catch it.
+		const xml =
+			'<w:p><w:r><w:t>Hello </w:t></w:r><w:r><w:t>FIN</w:t></w:r><w:r><w:t>DME</w:t></w:r><w:r><w:t> world</w:t></w:r></w:p>';
+		const { xml: out, count } = replaceInRunText(xml, "FINDME", "REPLACED");
+		assert.equal(count, 1, "the cross-run match is found");
+		assert.match(out, /REPLACED/);
+		assert.doesNotMatch(out, /FIN<\/w:t>/);
+		assert.doesNotMatch(out, />DME</);
+		// Surrounding runs survive.
+		assert.match(out, /Hello /);
+		assert.match(out, / world/);
+	});
+
+	it("a match split across runs that previously returned zero now replaces", () => {
+		const xml = "<w:p><w:r><w:t>foo</w:t></w:r><w:r><w:t>bar</w:t></w:r></w:p>";
+		// "oob" spans run1 ("foo") + run2 ("bar"): old per-run matcher saw 0.
+		const { count } = replaceInRunText(xml, "oob", "X");
+		assert.equal(count, 1);
+	});
+
+	it("does not match across a paragraph boundary", () => {
+		const xml =
+			"<w:p><w:r><w:t>foo</w:t></w:r></w:p><w:p><w:r><w:t>bar</w:t></w:r></w:p>";
+		const { count } = replaceInRunText(xml, "foobar", "X");
+		assert.equal(count, 0, "runs in different paragraphs are not joined");
+	});
+});
+
+/* ─────────────────────────── fill_template (mail-merge) ─────────────────────────── */
+
+describe("edit_document — fill_template", () => {
+	it("fills a {{client}} placeholder split across runs in a docx", async () => {
+		// Build a docx whose placeholder is fragmented across runs, the realistic case.
+		const src = await makeDoc(
+			"docx",
+			{ sections: [{ paragraphs: ["Dear PLACEHOLDER, welcome."] }] },
+			"tmpl.docx",
+		);
+		// Fragment the placeholder into runs so we exercise the cross-run path.
+		const before = unzipSync(new Uint8Array(fs.readFileSync(src)));
+		let xml = strFromU8(before["word/document.xml"] as Uint8Array);
+		xml = xml.replace(
+			/<w:r>(?:(?!<\/w:r>).)*PLACEHOLDER(?:(?!<\/w:r>).)*<\/w:r>/s,
+			'<w:r><w:t>{{</w:t></w:r><w:r><w:t>cli</w:t></w:r><w:r><w:t>ent}}</w:t></w:r>',
+		);
+		before["word/document.xml"] = strToU8(xml);
+		fs.writeFileSync(src, zipSync(before));
+
+		const r = (await ed().execute("e", {
+			source: src,
+			action: "fill_template",
+			values: { "{{client}}": "Acme Corp", "{{missing}}": "nope" },
+		})) as AgentToolResult<EditDocumentDetails>;
+		const d = det(r);
+		assert.equal(d.ok, true);
+		assert.deepEqual(d.tokensFilled, ["{{client}}"], "client token reported filled");
+		assert.deepEqual(d.tokensNotFound, ["{{missing}}"], "missing token reported");
+		const after = strFromU8(
+			unzipSync(new Uint8Array(fs.readFileSync(src)))["word/document.xml"] as Uint8Array,
+		);
+		assert.match(after, /Acme Corp/);
+		assert.doesNotMatch(after, /\{\{client\}\}/);
+	});
+
+	it("fills placeholders in a pptx and reports not-found tokens", async () => {
+		const src = await makeDoc("pptx", { slides: [{ title: "Q3 for {{company}}" }] }, "tmpl.pptx");
+		const r = (await ed().execute("e", {
+			source: src,
+			action: "fill_template",
+			values: { "{{company}}": "Globex", "{{nope}}": "x" },
+		})) as AgentToolResult<EditDocumentDetails>;
+		const d = det(r);
+		assert.equal(d.ok, true);
+		assert.deepEqual(d.tokensFilled, ["{{company}}"]);
+		assert.deepEqual(d.tokensNotFound, ["{{nope}}"]);
+		const slide1 = strFromU8(
+			unzipSync(new Uint8Array(fs.readFileSync(src)))["ppt/slides/slide1.xml"] as Uint8Array,
+		);
+		assert.match(slide1, /Globex/);
+	});
+
+	it("fill_template without values → clean error", async () => {
+		const src = await makeDoc("docx", { sections: [{ paragraphs: ["x"] }] }, "tmpl-e.docx");
+		await assert.rejects(
+			() => ed().execute("e", { source: src, action: "fill_template" }),
+			(err: unknown) => err instanceof BrigadeToolInputError && /values/i.test((err as Error).message),
+		);
 	});
 });

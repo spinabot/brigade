@@ -119,6 +119,41 @@ describe("make_document — xlsx", () => {
 		const sheetParts = Object.keys(entries).filter((n) => /^xl\/worksheets\/sheet\d+\.xml$/.test(n));
 		assert.equal(sheetParts.length, 2, "two worksheet parts");
 	});
+
+	it("writes a formula cell (<f> element) + per-column number formats", async () => {
+		const out = path.join(workspace, "calc.xlsx");
+		const r = (await tool().execute("c", {
+			format: "xlsx",
+			outputPath: out,
+			content: {
+				sheets: [
+					{
+						name: "Calc",
+						header: ["Item", "Amount"],
+						rows: [
+							["a", 10],
+							["b", 20],
+							["Total", { formula: "SUM(B2:B3)" } as never],
+						],
+						numberFormats: [null, "#,##0.00"] as never,
+					},
+				],
+			},
+		})) as Result;
+		assert.equal(details(r).ok, true);
+		const entries = unzipSync(new Uint8Array(fs.readFileSync(out)));
+		const sheetXml = strFromU8(entries["xl/worksheets/sheet1.xml"] as Uint8Array);
+		assert.match(sheetXml, /<f>SUM\(B2:B3\)<\/f>/, "an <f> formula element is written");
+		// And exceljs reads the formula + the column number format back.
+		const ExcelJS = (await import("exceljs")).default;
+		const wb = new ExcelJS.Workbook();
+		await wb.xlsx.load(fs.readFileSync(out) as never);
+		const ws = wb.getWorksheet("Calc");
+		const total = ws?.getCell("B4");
+		assert.equal(total?.type, ExcelJS.ValueType.Formula, "formula cell round-trips");
+		assert.equal((total?.value as { formula?: string })?.formula, "SUM(B2:B3)");
+		assert.equal(ws?.getCell("B2").numFmt, "#,##0.00", "column number format applied to data");
+	});
 });
 
 /* ─────────────────────────── pptx ─────────────────────────── */
@@ -144,6 +179,31 @@ describe("make_document — pptx", () => {
 		assert.equal(slideParts.length, 2, "two slide parts");
 		const slide1 = strFromU8(entries["ppt/slides/slide1.xml"] as Uint8Array);
 		assert.match(slide1, /SLIDEWORD/);
+	});
+
+	it("adds a bar chart to a slide (produces a chart part)", async () => {
+		const out = path.join(workspace, "chart.pptx");
+		const r = (await tool().execute("c", {
+			format: "pptx",
+			outputPath: out,
+			content: {
+				slides: [
+					{
+						title: "Revenue",
+						chart: {
+							type: "bar",
+							title: "By quarter",
+							categories: ["Q1", "Q2", "Q3"],
+							series: [{ name: "Rev", values: [10, 20, 15] }],
+						},
+					},
+				],
+			} as never,
+		})) as Result;
+		assert.equal(details(r).ok, true);
+		const entries = unzipSync(new Uint8Array(fs.readFileSync(out)));
+		const chartParts = Object.keys(entries).filter((n) => /^ppt\/charts\/chart\d+\.xml$/.test(n));
+		assert.ok(chartParts.length >= 1, "a chart part is embedded");
 	});
 });
 
@@ -182,6 +242,26 @@ describe("make_document — pdf", () => {
 		assert.equal(details(r).ok, true);
 		const { PDFDocument } = await import("@cantoo/pdf-lib");
 		assert.ok((await PDFDocument.load(fs.readFileSync(out))).getPageCount() >= 1);
+	});
+
+	it("renders Latin/Greek/Cyrillic/accents via the embedded Unicode font (no ? on re-extract)", async () => {
+		const out = path.join(workspace, "unicode.pdf");
+		const sample = "Café Ωμέγα Привет";
+		const r = (await tool().execute("c", {
+			format: "pdf",
+			outputPath: out,
+			content: { title: sample, pages: [{ paragraphs: [sample] }] },
+		})) as Result;
+		assert.equal(details(r).ok, true);
+		// Re-extract the text layer and prove the accented/Greek/Cyrillic glyphs
+		// survived (the old WinAnsi strip would have turned them all into "?").
+		const { getDocumentProxy, extractText } = await import("unpdf");
+		const proxy = await getDocumentProxy(new Uint8Array(fs.readFileSync(out)));
+		const { text } = await extractText(proxy, { mergePages: true });
+		assert.ok(text.includes("Café"), `accented Latin present: ${JSON.stringify(text)}`);
+		assert.ok(text.includes("Ωμέγα"), "Greek present");
+		assert.ok(text.includes("Привет"), "Cyrillic present");
+		assert.ok(!text.includes("?"), `no '?' fallback in: ${JSON.stringify(text)}`);
 	});
 });
 

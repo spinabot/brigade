@@ -37,10 +37,16 @@ import type { AgentToolResult, BrigadeTool } from "./types.js";
 import {
 	acquireImageForEmbed,
 	defaultOutputName,
+	embedUnicodeFont,
+	isFormulaCell,
 	resolveOutputPath,
+	sanitizeForFont,
+	toExcelCellValue,
 	writeDocFile,
+	type DocCellInput,
 	type DocFormat,
 	type ImageLoader,
+	type PdfFontLike,
 } from "./doc-shared.js";
 
 /* ─────────────────────────── params ─────────────────────────── */
@@ -75,18 +81,51 @@ const PdfPage = Type.Object({
 	image: Type.Optional(ImageRef),
 });
 
+/** A formula cell: `{ formula: "SUM(B2:B10)" }` (no leading "="). */
+const FormulaCell = Type.Object({
+	formula: Type.String({ description: 'An Excel formula WITHOUT the leading "=" (e.g. "SUM(B2:B10)").' }),
+	numFmt: Type.Optional(Type.String({ description: 'Optional number format for this cell (e.g. "#,##0.00").' })),
+});
+
+/** A cell value: a string, a number, or a formula object. */
+const XlsxCellValue = Type.Union([Type.String(), Type.Number(), FormulaCell]);
+
 const XlsxSheet = Type.Object({
 	name: Type.Optional(Type.String({ description: "Sheet name (default Sheet1, Sheet2, …)." })),
 	header: Type.Optional(Type.Array(Type.String(), { description: "Optional header row (bolded)." })),
-	rows: Type.Array(Type.Array(Type.Union([Type.String(), Type.Number()])), {
-		description: "Data rows; each cell is a string or number.",
+	rows: Type.Array(Type.Array(XlsxCellValue), {
+		description:
+			'Data rows; each cell is a string, a number, or a formula object { formula: "SUM(A1:A3)", numFmt? }.',
 	}),
+	numberFormats: Type.Optional(
+		Type.Array(Type.Union([Type.String(), Type.Null()]), {
+			description:
+				'Optional per-column number formats, by column index (e.g. ["@", "#,##0.00", "0%"]). null/"" leaves a column default.',
+		}),
+	),
+});
+
+/** A single named data series for a chart. */
+const ChartSeries = Type.Object({
+	name: Type.Optional(Type.String({ description: "Series label (legend)." })),
+	values: Type.Array(Type.Number(), { description: "Numeric values, aligned to `categories`." }),
+});
+
+/** A chart placed on a slide (bar / line / pie). */
+const ChartSpec = Type.Object({
+	type: Type.Union([Type.Literal("bar"), Type.Literal("line"), Type.Literal("pie")], {
+		description: "Chart type: bar, line, or pie.",
+	}),
+	title: Type.Optional(Type.String({ description: "Chart title." })),
+	categories: Type.Array(Type.String(), { description: "Category (x-axis) labels." }),
+	series: Type.Array(ChartSeries, { description: "One or more data series (pie uses the first)." }),
 });
 
 const PptxSlide = Type.Object({
 	title: Type.Optional(Type.String({ description: "Slide title." })),
 	bullets: Type.Optional(Type.Array(Type.String(), { description: "Slide bullet points." })),
 	image: Type.Optional(ImageRef),
+	chart: Type.Optional(ChartSpec),
 	notes: Type.Optional(Type.String({ description: "Speaker notes." })),
 });
 
@@ -326,19 +365,35 @@ async function buildXlsx(content: Content): Promise<{ bytes: Buffer; sheets: num
 	workbook.creator = "Brigade";
 	workbook.created = new Date();
 
+	type SheetSpec = NonNullable<Content["sheets"]>[number];
 	const sheets = Array.isArray(content.sheets) ? content.sheets : [];
-	const effective = sheets.length > 0 ? sheets : [{ rows: [] as Array<Array<string | number>> }];
+	const effective: SheetSpec[] = sheets.length > 0 ? sheets : [{ rows: [] } as SheetSpec];
 	let idx = 0;
 	for (const sheet of effective) {
 		idx += 1;
 		const name = sanitizeSheetName(sheet.name, idx);
 		const ws = workbook.addWorksheet(name);
+		// Optional per-column number formats applied to data rows below.
+		const columnFormats = Array.isArray((sheet as { numberFormats?: unknown }).numberFormats)
+			? ((sheet as { numberFormats?: Array<string | null> }).numberFormats ?? [])
+			: [];
 		if (Array.isArray(sheet.header) && sheet.header.length > 0) {
 			const headerRow = ws.addRow(sheet.header.map((h) => String(h ?? "")));
 			headerRow.font = { bold: true };
 		}
-		for (const row of sheet.rows ?? []) {
-			ws.addRow((row ?? []).map((c) => (typeof c === "number" ? c : String(c ?? ""))));
+		const dataRows = (sheet.rows ?? []) as DocCellInput[][];
+		for (const row of dataRows) {
+			const added = ws.addRow([]);
+			(row ?? []).forEach((c, colIdx) => {
+				const cell = added.getCell(colIdx + 1);
+				cell.value = toExcelCellValue(c as DocCellInput);
+				// Per-cell numFmt (formula objects may carry one) wins over the column.
+				const cellFmt = isFormulaCell(c) && typeof c.numFmt === "string" ? c.numFmt : undefined;
+				const colFmt = typeof columnFormats[colIdx] === "string" ? columnFormats[colIdx] : undefined;
+				const fmt = cellFmt || colFmt;
+				if (fmt) cell.numFmt = fmt;
+			});
+			added.commit();
 		}
 	}
 
@@ -397,6 +452,9 @@ async function buildPptx(
 				h: height / 96,
 			});
 		}
+		if (spec.chart && typeof slide.addChart === "function") {
+			addSlideChart(slide, spec.chart);
+		}
 		if (spec.notes && spec.notes.trim() && typeof slide.addNotes === "function") {
 			slide.addNotes(spec.notes.trim());
 		}
@@ -406,10 +464,45 @@ async function buildPptx(
 	return { bytes: Buffer.isBuffer(out) ? out : Buffer.from(out as ArrayBuffer), slides: effective.length };
 }
 
+/** A chart spec from the slide content. */
+type ChartContent = NonNullable<Static<typeof PptxSlide>["chart"]>;
+
+/**
+ * Add a bar / line / pie chart to a slide via pptxgenjs `addChart`. The data is
+ * shaped as pptxgenjs expects (one `{ name, labels, values }` per series); pie
+ * uses the first series only. Malformed series (empty values) are dropped, and a
+ * chart with nothing left to draw is skipped (never throws).
+ */
+function addSlideChart(slide: PptxSlideLike, chart: ChartContent): void {
+	if (!slide.addChart) return;
+	const categories = (chart.categories ?? []).map((c) => String(c ?? ""));
+	const allSeries = (chart.series ?? [])
+		.filter((s) => Array.isArray(s.values) && s.values.length > 0)
+		.map((s, i) => ({
+			name: typeof s.name === "string" && s.name.trim() ? s.name.trim() : `Series ${i + 1}`,
+			labels: categories,
+			values: s.values.map((v) => (typeof v === "number" && Number.isFinite(v) ? v : 0)),
+		}));
+	if (allSeries.length === 0) return;
+	// Pie shows a single series; bar/line show all.
+	const data = chart.type === "pie" ? allSeries.slice(0, 1) : allSeries;
+	const opts: Record<string, unknown> = {
+		x: 0.7,
+		y: 1.6,
+		w: 8.6,
+		h: 4.4,
+		showLegend: data.length > 1 || chart.type === "pie",
+		showTitle: Boolean(chart.title && chart.title.trim()),
+		...(chart.title && chart.title.trim() ? { title: chart.title.trim() } : {}),
+	};
+	slide.addChart(chart.type, data, opts);
+}
+
 /** Structural subset of the pptxgenjs API we drive. */
 interface PptxSlideLike {
 	addText(text: unknown, opts: Record<string, unknown>): void;
 	addImage(opts: Record<string, unknown>): void;
+	addChart?(type: string, data: unknown, opts: Record<string, unknown>): void;
 	addNotes?(notes: string): void;
 }
 interface PptxLike {
@@ -427,8 +520,22 @@ async function buildPdf(
 	const pdfLib = await import("@cantoo/pdf-lib");
 	const { PDFDocument, StandardFonts, rgb } = pdfLib;
 	const pdf = await PDFDocument.create();
-	const font = await pdf.embedFont(StandardFonts.Helvetica);
-	const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+	// Prefer the bundled Unicode font (DejaVu Sans) so Latin/Greek/Cyrillic/accents
+	// render; fall back to the WinAnsi standard fonts only if the asset is missing.
+	let font: PdfFontLike;
+	let bold: PdfFontLike;
+	let unicodeFont = false;
+	try {
+		const uni = await embedUnicodeFont(pdf);
+		// DejaVu Sans ships as a single face here; use it for both weights (bold is
+		// approximated by the heading size, not a separate bold asset).
+		font = uni;
+		bold = uni;
+		unicodeFont = true;
+	} catch {
+		font = await pdf.embedFont(StandardFonts.Helvetica);
+		bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+	}
 
 	const PAGE_W = 612;
 	const PAGE_H = 792;
@@ -452,10 +559,19 @@ async function buildPdf(
 	const drawLines = (text: string, size: number, useBold: boolean) => {
 		const f = useBold ? bold : font;
 		for (const raw of String(text ?? "").split(/\r?\n/)) {
-			const wrapped = wrapText(raw, f, size, usableW);
+			// Strip only glyphs the chosen font lacks (with the Unicode font that
+			// is just CJK/emoji; with the standard-font fallback it is non-WinAnsi).
+			const safe = unicodeFont ? sanitizeForFont(raw, f) : stripUnsupportedGlyphs(raw);
+			const wrapped = wrapText(safe, f, size, usableW);
 			for (const line of wrapped) {
 				ensure(size + 4);
-				page.drawText(line, { x: MARGIN, y: cursorY - size, size, font: f, color: rgb(0, 0, 0) });
+				page.drawText(line, {
+					x: MARGIN,
+					y: cursorY - size,
+					size,
+					font: f as NonNullable<Parameters<typeof page.drawText>[1]>["font"],
+					color: rgb(0, 0, 0),
+				});
 				cursorY -= size + 4;
 			}
 			// Preserve blank lines as paragraph spacing.
@@ -500,14 +616,18 @@ async function buildPdf(
 	return { bytes: Buffer.from(out), pages: pdf.getPageCount() };
 }
 
-/** Greedy word-wrap to fit `maxWidth` at `size` for `font`. Hard-breaks overlong tokens. */
+/**
+ * Greedy word-wrap to fit `maxWidth` at `size` for `font`. Hard-breaks overlong
+ * tokens. The caller is responsible for glyph sanitation (so the Unicode-font
+ * path keeps Latin/Greek/Cyrillic that the WinAnsi strip would have dropped).
+ */
 function wrapText(
 	text: string,
 	font: { widthOfTextAtSize: (s: string, size: number) => number },
 	size: number,
 	maxWidth: number,
 ): string[] {
-	const sanitized = stripUnsupportedGlyphs(text);
+	const sanitized = String(text ?? "");
 	if (sanitized.trim().length === 0) return [];
 	const words = sanitized.split(/\s+/).filter((w) => w.length > 0);
 	const lines: string[] = [];

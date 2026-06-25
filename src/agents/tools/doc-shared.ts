@@ -37,6 +37,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { guardedFetch, SsrfBlockedError } from "../../infra/net/fetch-guard.js";
 import { validateOutboundMediaPath } from "../../security/media-path-guard.js";
@@ -396,6 +397,167 @@ const defaultImageLoader: ImageLoader = async (bytes: Buffer): Promise<LoadedDoc
 		},
 	};
 };
+
+/* ─────────────────────────── xlsx cell values ─────────────────────────── */
+
+/** A formula cell as accepted by the document tools. */
+export interface FormulaCellInput {
+	formula: string;
+	numFmt?: string;
+}
+
+/** A raw cell value the tools accept: string, number, or a formula object. */
+export type DocCellInput = string | number | FormulaCellInput | null | undefined;
+
+/** True when `v` is a `{ formula }` object (and not null / an array). */
+export function isFormulaCell(v: unknown): v is FormulaCellInput {
+	return (
+		typeof v === "object" &&
+		v !== null &&
+		!Array.isArray(v) &&
+		typeof (v as { formula?: unknown }).formula === "string" &&
+		(v as { formula: string }).formula.trim().length > 0
+	);
+}
+
+/** What exceljs accepts as a `cell.value`: a primitive or a `{ formula }` object. */
+export type ExcelCellValue = string | number | { formula: string };
+
+/**
+ * Coerce a tool cell value into the shape exceljs's `cell.value` expects:
+ *   - `{ formula }`  → `{ formula }` (the leading "=" is stripped if present)
+ *   - number         → number
+ *   - everything else → String(value)
+ */
+export function toExcelCellValue(v: DocCellInput): ExcelCellValue {
+	if (isFormulaCell(v)) {
+		return { formula: v.formula.trim().replace(/^=+/, "") };
+	}
+	if (typeof v === "number") return v;
+	return String(v ?? "");
+}
+
+/* ─────────────────────────── unicode PDF font ─────────────────────────── */
+
+/**
+ * A Unicode TrueType font (DejaVu Sans) embedded into a `@cantoo/pdf-lib`
+ * document so created PDFs + stamps render Latin / Latin-supplement / Greek /
+ * Cyrillic / accents instead of the WinAnsi-only standard fonts (which throw or
+ * tofu on anything outside their set).
+ *
+ * The font asset ships gzipped at `assets/DejaVuSans.ttf.gz` (Bitstream Vera /
+ * public-domain-equivalent license). It is decompressed once and cached as raw
+ * TTF bytes for the process lifetime; `fontkit` is registered + the font is
+ * embedded (with subsetting) PER document, since a pdf-lib `PDFFont` is bound to
+ * the document it was embedded into.
+ *
+ * CJK / emoji are NOT covered by DejaVu Sans and still fall back to "?" via
+ * {@link sanitizeForFont}; Latin/Greek/Cyrillic/accented text renders correctly.
+ */
+
+/** Lazily-decompressed DejaVu Sans TTF bytes (cached for the process). */
+let cachedUnicodeFontBytes: Buffer | undefined;
+/** In-flight decompression promise so concurrent callers share one gunzip. */
+let unicodeFontBytesPromise: Promise<Buffer> | undefined;
+
+/** Absolute path to the gzipped font asset (resolved relative to this module). */
+function unicodeFontAssetPath(): string {
+	const here = path.dirname(fileURLToPath(import.meta.url));
+	return path.join(here, "assets", "DejaVuSans.ttf.gz");
+}
+
+/**
+ * Read + gunzip the bundled DejaVu Sans TTF (cached). Throws
+ * `BrigadeToolInputError` if the asset is missing or unreadable so the caller
+ * can fall back to a standard font instead of leaking a raw throw.
+ */
+export async function loadUnicodeFontBytes(): Promise<Buffer> {
+	if (cachedUnicodeFontBytes) return cachedUnicodeFontBytes;
+	if (!unicodeFontBytesPromise) {
+		unicodeFontBytesPromise = (async () => {
+			const { gunzipSync } = await import("fflate");
+			let gz: Buffer;
+			try {
+				gz = await fsp.readFile(unicodeFontAssetPath());
+			} catch {
+				throw new BrigadeToolInputError("the bundled Unicode PDF font asset is missing.");
+			}
+			let ttf: Uint8Array;
+			try {
+				ttf = gunzipSync(new Uint8Array(gz));
+			} catch {
+				throw new BrigadeToolInputError("the bundled Unicode PDF font asset is corrupt.");
+			}
+			cachedUnicodeFontBytes = Buffer.from(ttf);
+			return cachedUnicodeFontBytes;
+		})();
+	}
+	try {
+		return await unicodeFontBytesPromise;
+	} catch (err) {
+		// Reset the cache so a transient failure can be retried on the next call.
+		unicodeFontBytesPromise = undefined;
+		throw err;
+	}
+}
+
+/** Minimal structural view of the pieces of `@cantoo/pdf-lib` we drive here. */
+interface PdfDocLike {
+	registerFontkit(fk: unknown): void;
+	embedFont(bytes: Uint8Array, opts?: { subset?: boolean }): Promise<PdfFontLike>;
+}
+
+/** Minimal structural view of an embedded pdf-lib font. */
+export interface PdfFontLike {
+	widthOfTextAtSize(text: string, size: number): number;
+	heightAtSize?(size: number): number;
+}
+
+/**
+ * Register fontkit on `pdf` and embed the bundled DejaVu Sans (subset), returning
+ * the embedded font. Embeds PER document (a pdf-lib font is document-bound).
+ * `registerFontkit` is idempotent, so calling it once per document is safe.
+ */
+export async function embedUnicodeFont(pdf: PdfDocLike): Promise<PdfFontLike> {
+	const ttf = await loadUnicodeFontBytes();
+	const fk = await import("@pdf-lib/fontkit");
+	const fontkit = (fk as { default?: unknown }).default ?? fk;
+	pdf.registerFontkit(fontkit);
+	return pdf.embedFont(new Uint8Array(ttf), { subset: true });
+}
+
+/**
+ * Replace characters the embedded font cannot render (e.g. CJK ideographs,
+ * emoji) with "?" so a stray glyph never turns a valid draw into a fontkit
+ * encode throw. DejaVu Sans covers Latin / Latin-1 / Latin Extended / Greek /
+ * Cyrillic + common punctuation, so those pass through untouched.
+ *
+ * `font` is the embedded fontkit-backed font; we ask it per character whether a
+ * glyph exists. When the font handle can't answer (older fontkit), we keep the
+ * character (the font is a broad Unicode face, so false-strips are worse than a
+ * rare tofu).
+ */
+export function sanitizeForFont(text: string, font: PdfFontLike): string {
+	const probe = (font as { widthOfTextAtSize?: (s: string, n: number) => number }).widthOfTextAtSize;
+	if (typeof probe !== "function") return String(text ?? "");
+	let out = "";
+	for (const ch of String(text ?? "")) {
+		// Always keep the whitespace/control chars the drawers handle themselves.
+		if (ch === "\n" || ch === "\r" || ch === "\t" || ch === " ") {
+			out += ch;
+			continue;
+		}
+		let ok = false;
+		try {
+			// A glyph the font lacks measures as 0 width (no advance) in fontkit.
+			ok = font.widthOfTextAtSize(ch, 1000) > 0;
+		} catch {
+			ok = false;
+		}
+		out += ok ? ch : "?";
+	}
+	return out;
+}
 
 /* ─────────────────────────── misc ─────────────────────────── */
 
