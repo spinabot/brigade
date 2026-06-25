@@ -1,15 +1,25 @@
 /**
- * `brigade update` (alias `upgrade`) — pull the latest published Brigade from
- * npm and report old → new version.
+ * `brigade update` (alias `upgrade`) — bring Brigade to the latest code and
+ * restart the running gateway so the new code is actually live.
  *
- * Brigade ships as the global npm package `@spinabot/brigade`, so "updating" is
- * just `npm i -g <pkg>@latest`. This command wraps that with: current-vs-latest
- * version reporting, an `--check` dry-run, a "no `npm` on PATH" guard, and a
- * source-checkout detector — running it from a dev clone would install a SECOND,
- * conflicting global copy, so we refuse and print the git workflow instead.
+ * TWO install shapes, auto-detected:
+ *   - NPM GLOBAL (`@spinabot/brigade` installed via `npm i -g`): `npm i -g
+ *     <pkg>@latest`, then restart the gateway.
+ *   - SOURCE CHECKOUT (a dev clone with `.git` + `src/`, e.g. F:\Brigade): we do
+ *     NOT npm-install (that would create a second, conflicting global copy).
+ *     Instead we perform the real source workflow END TO END:
+ *        git pull --ff-only   (only when the tree is clean + behind upstream;
+ *                              a dirty tree is left untouched and built as-is)
+ *        npm install          (deps may have changed)
+ *        npm run build        (recompile src → dist — Brigade runs from dist)
+ *        brigade gateway restart
+ *     i.e. the steps we used to just print, now executed.
  *
- * After a successful upgrade the running gateway daemon is still on the OLD
- * code, so we remind the operator to `brigade gateway restart`.
+ * Flags: `--check` (report only, change nothing) · `--no-restart` (do the update
+ * but leave the gateway for a manual restart).
+ *
+ * The subprocess runner is injectable (`opts.run`) so the whole flow is unit-
+ * testable without spawning git/npm/node.
  */
 
 import { spawnSync } from "node:child_process";
@@ -26,6 +36,36 @@ interface PackageInfo {
 	version: string;
 	root: string;
 }
+
+/** Result of one spawned command. */
+interface RunResult {
+	code: number;
+	stdout: string;
+	stderr: string;
+}
+
+/** Spawn a command. `capture` pipes stdout/stderr; otherwise it streams to the
+ *  operator's terminal. `shell:true` lets bare `npm`/`git` resolve to `.cmd` on
+ *  Windows; an explicit interpreter path (node) is spawned without a shell. */
+export type CommandRunner = (
+	cmd: string,
+	args: string[],
+	opts: { cwd?: string; capture?: boolean; shell?: boolean },
+) => RunResult;
+
+const defaultRunner: CommandRunner = (cmd, args, opts) => {
+	const res = spawnSync(cmd, args, {
+		cwd: opts.cwd,
+		shell: opts.shell ?? true,
+		encoding: "utf8",
+		stdio: opts.capture ? ["ignore", "pipe", "pipe"] : "inherit",
+	});
+	return {
+		code: res.status ?? 1,
+		stdout: (res.stdout ?? "").trim(),
+		stderr: (res.stderr ?? "").trim(),
+	};
+};
 
 /** Walk up from this module to the package.json that owns it. */
 function resolvePackageInfo(): PackageInfo {
@@ -47,84 +87,161 @@ function resolvePackageInfo(): PackageInfo {
 	return { name: FALLBACK_PKG, version: "0.0.0", root: dir };
 }
 
-/** A package directory that carries `.git` + `src/` is a dev checkout, not a
- *  global install — `npm i -g` from here would create a conflicting copy. */
+/** A package dir with `.git` + `src/` is a dev checkout, not a global install. */
 function isSourceCheckout(root: string): boolean {
 	return existsSync(join(root, ".git")) && existsSync(join(root, "src"));
 }
 
-/** `npm` is `npm.cmd` on Windows — `shell: true` lets the bare name resolve. */
-function runNpm(args: string[], opts: { capture?: boolean } = {}): { code: number; stdout: string } {
-	const res = spawnSync("npm", args, {
-		shell: true,
-		encoding: "utf8",
-		stdio: opts.capture ? ["ignore", "pipe", "pipe"] : "inherit",
-	});
-	return { code: res.status ?? 1, stdout: (res.stdout ?? "").trim() };
+const out = (s: string): void => void process.stdout.write(s);
+const err = (s: string): void => void process.stderr.write(s);
+const step = (s: string): void => out(`${chalk.cyan("→")} ${s}\n`);
+
+export interface UpdateOptions {
+	check?: boolean;
+	/** Skip the final `gateway restart`. */
+	noRestart?: boolean;
+	/** TEST SEAM — inject the subprocess runner. */
+	run?: CommandRunner;
+	/** TEST SEAM — override the resolved package root/info. */
+	pkg?: PackageInfo;
 }
 
-export async function runUpdateCommand(opts: { check?: boolean } = {}): Promise<number> {
-	const pkg = resolvePackageInfo();
-
-	// Refuse to npm-install over a working source tree — guide to git instead.
-	if (isSourceCheckout(pkg.root)) {
-		process.stdout.write(
-			`${chalk.yellow("You're running Brigade from a source checkout")} (${pkg.root}).\n` +
-				"Update it with git instead of npm:\n\n" +
-				`  ${chalk.bold("git pull")}\n` +
-				`  ${chalk.bold("npm install")}\n` +
-				`  ${chalk.bold("npm run build")}\n` +
-				`  ${chalk.bold("brigade gateway restart")}\n`,
+/** Restart the running gateway so the freshly-built/installed code goes live. */
+function restartGateway(run: CommandRunner, source: boolean, root: string): void {
+	step("brigade gateway restart");
+	const r = source
+		? run(process.execPath, [join(root, "brigade.mjs"), "gateway", "restart"], { cwd: root, shell: false })
+		: run("brigade", ["gateway", "restart"], { shell: true });
+	if (r.code !== 0) {
+		err(
+			`${chalk.yellow("⚠ Couldn't restart the gateway automatically.")} ` +
+				`Restart it yourself to load the new code: ${chalk.bold("brigade gateway restart")}\n`,
 		);
+	}
+}
+
+/** SOURCE-checkout update: git pull (when safe) → npm install → build → restart. */
+function updateSourceCheckout(pkg: PackageInfo, opts: UpdateOptions, run: CommandRunner): number {
+	const root = pkg.root;
+	out(`${chalk.dim("source checkout:")} ${root}   ${chalk.dim("current:")} ${pkg.version}\n`);
+
+	// Does the branch track an upstream? (rev-parse errors when it doesn't.)
+	const hasUpstream =
+		run("git", ["-C", root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], { capture: true }).code === 0;
+	if (hasUpstream) run("git", ["-C", root, "fetch", "--quiet"], { capture: true });
+
+	const dirty = run("git", ["-C", root, "status", "--porcelain"], { capture: true }).stdout.length > 0;
+	const behind = hasUpstream
+		? Number.parseInt(run("git", ["-C", root, "rev-list", "--count", "HEAD..@{u}"], { capture: true }).stdout || "0", 10)
+		: 0;
+
+	if (opts.check) {
+		if (!hasUpstream) out(`${chalk.dim("no upstream tracking branch — can't check remote.")}\n`);
+		else if (behind > 0)
+			out(`${chalk.yellow(`↑ ${behind} commit(s) behind upstream.`)} Run ${chalk.bold("brigade update")} to pull, rebuild + restart.\n`);
+		else out(`${chalk.green("✓ Up to date with upstream.")} (Run ${chalk.bold("brigade update")} to rebuild + restart anyway.)\n`);
 		return 0;
 	}
 
-	// Need npm on PATH for both the version probe and the install.
-	if (runNpm(["--version"], { capture: true }).code !== 0) {
-		process.stderr.write(
+	// 1) git pull — only fast-forward, only when clean. Never clobber local work.
+	if (!hasUpstream) {
+		out(`${chalk.dim("• no upstream — skipping git pull; rebuilding the working tree as-is.")}\n`);
+	} else if (dirty) {
+		out(
+			`${chalk.yellow("• uncommitted changes present — skipping git pull")} (your work is left untouched); ` +
+				`rebuilding the working tree as-is.\n`,
+		);
+	} else if (behind > 0) {
+		step(`git pull --ff-only  (${behind} commit(s) behind)`);
+		const pull = run("git", ["-C", root, "pull", "--ff-only"], {});
+		if (pull.code !== 0) {
+			err(
+				`${chalk.red("✗ git pull failed")} (the branch may have diverged from upstream). ` +
+					`Resolve it manually, then re-run.\n`,
+			);
+			return pull.code;
+		}
+	} else {
+		out(`${chalk.dim("• already up to date with upstream — rebuilding to apply any local commits.")}\n`);
+	}
+
+	// 2) npm install — deps may have changed.
+	step("npm install");
+	const install = run("npm", ["install"], { cwd: root });
+	if (install.code !== 0) {
+		err(`${chalk.red("✗ npm install failed.")} Fix the error above, then re-run ${chalk.bold("brigade update")}.\n`);
+		return install.code;
+	}
+
+	// 3) npm run build — recompile src → dist (Brigade runs dist, not src).
+	step("npm run build");
+	const build = run("npm", ["run", "build"], { cwd: root });
+	if (build.code !== 0) {
+		err(
+			`${chalk.red("✗ Build failed — NOT restarting the gateway")} (it keeps running the previous good build). ` +
+				`Fix the error above, then re-run ${chalk.bold("brigade update")}.\n`,
+		);
+		return build.code;
+	}
+
+	// 4) restart so the new dist is live.
+	if (opts.noRestart) {
+		out(`${chalk.green("✓ Built.")} ${chalk.dim("(--no-restart)")} Run ${chalk.bold("brigade gateway restart")} to go live.\n`);
+		return 0;
+	}
+	restartGateway(run, true, root);
+	out(`${chalk.green("✓ Brigade updated + gateway restarted — running the latest code.")}\n`);
+	return 0;
+}
+
+/** NPM-GLOBAL update: npm i -g <pkg>@latest → restart. */
+function updateNpmGlobal(pkg: PackageInfo, opts: UpdateOptions, run: CommandRunner): number {
+	if (run("npm", ["--version"], { capture: true }).code !== 0) {
+		err(
 			`${chalk.red("✗ npm wasn't found on your PATH.")} Install Node.js (which bundles npm), then re-run, ` +
 				`or update manually: ${chalk.bold(`npm i -g ${pkg.name}@latest`)}\n`,
 		);
 		return 1;
 	}
 
-	// Latest published version (best-effort — offline / registry hiccup is non-fatal).
-	const view = runNpm(["view", pkg.name, "version"], { capture: true });
+	const view = run("npm", ["view", pkg.name, "version"], { capture: true });
 	const latest = view.code === 0 ? view.stdout.split("\n").pop()?.trim() : undefined;
-
-	process.stdout.write(`${chalk.dim("current:")} ${pkg.version}${latest ? `   ${chalk.dim("latest:")} ${latest}` : ""}\n`);
+	out(`${chalk.dim("current:")} ${pkg.version}${latest ? `   ${chalk.dim("latest:")} ${latest}` : ""}\n`);
 
 	if (latest && latest === pkg.version) {
-		process.stdout.write(`${chalk.green("✓ Already on the latest version.")}\n`);
+		out(`${chalk.green("✓ Already on the latest version.")}\n`);
 		return 0;
 	}
-
 	if (opts.check) {
-		if (latest) {
-			process.stdout.write(
-				`${chalk.yellow(`↑ ${pkg.version} → ${latest} available.`)} Run ${chalk.bold("brigade update")} to upgrade.\n`,
-			);
-		} else {
-			process.stderr.write("Couldn't reach the npm registry to check the latest version.\n");
+		if (latest) out(`${chalk.yellow(`↑ ${pkg.version} → ${latest} available.`)} Run ${chalk.bold("brigade update")} to upgrade.\n`);
+		else {
+			err("Couldn't reach the npm registry to check the latest version.\n");
 			return 1;
 		}
 		return 0;
 	}
 
-	// Do the upgrade — stream npm's output so the operator sees progress.
-	process.stdout.write(`\n${chalk.dim(`$ npm i -g ${pkg.name}@latest`)}\n`);
-	const install = runNpm(["i", "-g", `${pkg.name}@latest`]);
+	step(`npm i -g ${pkg.name}@latest`);
+	const install = run("npm", ["i", "-g", `${pkg.name}@latest`], {});
 	if (install.code !== 0) {
-		process.stderr.write(
-			`\n${chalk.red("✗ Upgrade failed.")} If it's a permissions error, retry with elevated rights ` +
+		err(
+			`${chalk.red("✗ Upgrade failed.")} If it's a permissions error, retry with elevated rights ` +
 				`(sudo / an Administrator shell), or run: ${chalk.bold(`npm i -g ${pkg.name}@latest`)}\n`,
 		);
 		return install.code;
 	}
 
-	process.stdout.write(
-		`\n${chalk.green("✓ Brigade updated.")} ` +
-			`Restart the gateway to run the new code: ${chalk.bold("brigade gateway restart")}\n`,
-	);
+	if (opts.noRestart) {
+		out(`${chalk.green("✓ Brigade updated.")} ${chalk.dim("(--no-restart)")} Run ${chalk.bold("brigade gateway restart")} to go live.\n`);
+		return 0;
+	}
+	restartGateway(run, false, pkg.root);
+	out(`${chalk.green("✓ Brigade updated + gateway restarted — running the latest code.")}\n`);
 	return 0;
+}
+
+export async function runUpdateCommand(opts: UpdateOptions = {}): Promise<number> {
+	const pkg = opts.pkg ?? resolvePackageInfo();
+	const run = opts.run ?? defaultRunner;
+	return isSourceCheckout(pkg.root) ? updateSourceCheckout(pkg, opts, run) : updateNpmGlobal(pkg, opts, run);
 }

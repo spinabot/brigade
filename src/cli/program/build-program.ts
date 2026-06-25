@@ -551,15 +551,21 @@ export function buildProgram(): Command {
     .command("update", { isDefault: false })
     .aliases(["upgrade"])
     .description(
-      "Update Brigade to the latest published version (npm).\n" +
+      "Update Brigade to the latest code + restart the gateway.\n" +
+        "  Auto-detects how Brigade is installed:\n" +
+        "    • npm global   → npm i -g @spinabot/brigade@latest, then restart\n" +
+        "    • source clone → git pull (when clean) + npm install + build, then restart\n" +
         "  Examples:\n" +
-        "    brigade update          # upgrade to the latest release\n" +
-        "    brigade update --check  # just report if a newer version exists",
+        "    brigade update               # update + restart the gateway\n" +
+        "    brigade update --check       # just report if newer code is available\n" +
+        "    brigade update --no-restart  # update but leave the gateway for a manual restart",
     )
-    .option("--check", "report current vs latest without installing", false)
-    .action(async (opts: { check?: boolean }) => {
+    .option("--check", "report current vs latest without changing anything", false)
+    .option("--no-restart", "update but don't restart the gateway")
+    .action(async (opts: { check?: boolean; restart?: boolean }) => {
       const { runUpdateCommand } = await import("../commands/update.js");
-      await exitAfterFlush(await runUpdateCommand({ check: opts.check }));
+      // Commander maps `--no-restart` to `restart: false`.
+      await exitAfterFlush(await runUpdateCommand({ check: opts.check, noRestart: opts.restart === false }));
     });
 
   /* ─────────────────────────────── config ─────────────────────────────── */
