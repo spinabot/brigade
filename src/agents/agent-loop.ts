@@ -628,6 +628,17 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       a2aPolicy,
       spawnedKeys,
     },
+    // Resolved turn-model context so `analyze_media` knows whether the active
+    // model can consume an IMAGE block (text-only model → it returns a clear
+    // "switch to a vision model" note instead of an unviewable block).
+    ...((args.provider !== undefined || args.modelId !== undefined)
+      ? {
+          modelContext: {
+            ...(args.provider !== undefined ? { provider: args.provider } : {}),
+            ...(args.modelId !== undefined ? { modelId: args.modelId } : {}),
+          },
+        }
+      : {}),
     subagentContext: {
       parentSessionKey: resolved.sessionKey,
       callerDepth: callerSubagentDepth,

@@ -192,6 +192,17 @@ export function assembleBrigadeToolset(opts: {
 		a2aPolicy?: import("./tools/sessions/shared.js").AgentToAgentPolicy;
 		spawnedKeys?: ReadonlySet<string>;
 	};
+	/**
+	 * Resolved turn-model context — provider + modelId of the model driving
+	 * this turn. Threaded into `analyze_media` so it can decide whether
+	 * returning an IMAGE block is meaningful for the active model. Optional;
+	 * omitted on legacy / test call sites.
+	 */
+	modelContext?: {
+		provider?: string;
+		modelId?: string;
+		imageInput?: boolean;
+	};
 }): BrigadeToolset {
 	const senderIsOwner = opts.senderIsOwner ?? true;
 	const rawCustomTools = createBrigadeTools({
@@ -212,6 +223,7 @@ export function assembleBrigadeToolset(opts: {
 		...(opts.sessionToolAccess !== undefined
 			? { sessionToolAccess: opts.sessionToolAccess }
 			: {}),
+		...(opts.modelContext !== undefined ? { modelContext: opts.modelContext } : {}),
 	});
 	// Wrap every tool — `wrapOwnerOnlyToolExecution` is a no-op for the owner
 	// AND for non-ownerOnly tools, so the cost is one identity-check per tool.

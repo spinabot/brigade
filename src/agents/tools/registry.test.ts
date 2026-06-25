@@ -10,9 +10,10 @@ import { createBrigadeTools, listBrigadeToolNames } from "./registry.js";
 // Point it at a tempdir so the tools are real but isolated.
 let tmpWorkspace: string;
 
-// The Composio key, if exported in the dev/CI shell, would mount a 13th tool
-// and break the exact-count assertions below. These tests assert the baseline
-// (no-Composio) surface, so neutralize it for the run.
+// The Composio key, if exported in the dev/CI shell, would alter the composio
+// tool's runtime state and could perturb the exact-count assertions below.
+// These tests assert the baseline (no-Composio-key) surface, so neutralize it
+// for the run.
 const prevComposioKey = process.env.COMPOSIO_API_KEY;
 delete process.env.COMPOSIO_API_KEY;
 
@@ -51,10 +52,11 @@ describe("createBrigadeTools — Primitive #4 (memory) + agents_list + manage_ag
 			else process.env.BRIGADE_STATE_DIR = prev;
 			fs.rmSync(stateDir, { recursive: true, force: true });
 		}
-		assert.equal(tools.length, 16);
+		assert.equal(tools.length, 17);
 		const names = tools.map((t) => t.name).sort();
 		assert.deepEqual(names, [
 			"agents_list",
+			"analyze_media",
 			"composio",
 			"connect_channel",
 			"find",

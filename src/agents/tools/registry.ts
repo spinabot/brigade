@@ -36,6 +36,7 @@ import { makeCronTool } from "./cron-tool.js";
 import { makeManageAgentTool } from "./manage-agent-tool.js";
 import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
+import { makeAnalyzeMediaTool } from "./analyze-media-tool.js";
 import { makeManageAccessTool } from "./manage-access-tool.js";
 import { makeManageChannelAccessTool } from "./manage-channel-access-tool.js";
 import { makeConnectChannelTool } from "./connect-channel-tool.js";
@@ -143,6 +144,18 @@ export interface CreateBrigadeToolsOptions {
 	 * narrow per-call gate kicks in.
 	 */
 	senderIsOwner?: boolean;
+	/**
+	 * Resolved turn-model context (provider + modelId of the model driving this
+	 * turn). Threaded into `analyze_media` so it can decide whether returning an
+	 * IMAGE content block is meaningful (a text-only model can't consume one).
+	 * Optional — when omitted (tests / legacy call sites) the tool assumes the
+	 * model is vision-capable but annotates the uncertainty.
+	 */
+	modelContext?: {
+		provider?: string;
+		modelId?: string;
+		imageInput?: boolean;
+	};
 	/**
 	 * Per-turn session metadata (Step 11's `SessionContext`). When supplied,
 	 * `createBrigadeTools` includes the four sessions tools
@@ -255,6 +268,20 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// a billed generation got silently dropped that way in production).
 		// Owner-gated: each call is billed.
 		makeGenerateImageTool(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		// analyze_media — read-capability media + document understanding. The
+		// model hands it a local path or URL (+ a question) and it RESOLVES the
+		// input into content the CURRENT turn's model analyzes: images become an
+		// image content block (when the model is vision-capable), PDF/DOCX/PPTX/
+		// XLSX/HTML are extracted to text/markdown, video is reported unsupported
+		// (Pi's tool-result content channel is text+image only — no aux-model
+		// runtime, no video/document block). NOT owner-only (read), but the
+		// local-path guard + SSRF guard run for every sender. `modelContext` lets
+		// it skip attaching an image a text-only model can't see.
+		makeAnalyzeMediaTool({
+			...(opts.workspaceDir !== undefined ? { workspaceDir: opts.workspaceDir } : {}),
+			...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+			...(opts.modelContext !== undefined ? { modelContext: opts.modelContext } : {}),
+		}),
 		// manage_provider — owner-only credential + per-agent model surface.
 		// Exists so a pasted API key lands in the canonical 0600 credential
 		// store (never .env / workspace files / config / chat echoes) and so
