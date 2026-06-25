@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.11.1](https://github.com/spinabot/brigade/compare/brigade-v1.11.0...brigade-v1.11.1) (2026-06-25)
+
+
+### Bug Fixes
+
+* **deps:** pin patched undici + uuid via overrides — 0 npm audit vulnerabilities ([19949d6](https://github.com/spinabot/brigade/commit/19949d6e0220d945ccc887b61e58617418dbcc36))
+* **update:** honest gateway-restart reporting + quieter upgrade output ([0dc185e](https://github.com/spinabot/brigade/commit/0dc185eed639d7b79ef4189fb1e8913a2df6a9f0))
+
 ## [1.11.0](https://github.com/spinabot/brigade/compare/brigade-v1.10.0...brigade-v1.11.0) (2026-06-25)
 
 
