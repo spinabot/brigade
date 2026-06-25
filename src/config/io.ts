@@ -184,6 +184,30 @@ export interface BrigadeGatewayConfig {
   bind?: "loopback" | "lan" | "auto" | "custom" | "tailnet";
   auth?: { mode?: "none" | "token" | "password"; token?: string; password?: string };
   tailscale?: { mode?: "off" | "serve" | "funnel"; resetOnExit?: boolean };
+  /**
+   * `brigade expose` ( = `brigade bloody benchmark` ) settings. Tunnels the
+   * gateway to the public internet WITHOUT changing its localhost bind: a
+   * token-checking auth-proxy stands in front of the gateway and only that
+   * proxy is published. The gateway WS itself stays unauthenticated +
+   * loopback-only (the `startServer` localhost guard is untouched). See
+   * `src/core/tunnel/`.
+   */
+  tunnel?: {
+    /** Tunnel backend. `cloudflare` = anonymous TryCloudflare quick tunnel
+     *  (zero-config, auto-managed binary). `bore` = the OSS `bore` client
+     *  (self-hostable relay). `custom` = a user-supplied command template. */
+    provider?: "cloudflare" | "bore" | "custom";
+    /** Shared bearer token required on the public URL. Auto-generated on the
+     *  first `brigade expose` and persisted here. Never sent to the gateway
+     *  itself — the auth-proxy enforces it. */
+    token?: string;
+    /** Self-hosted relay address for the `bore` / `custom` providers
+     *  (e.g. `bore.example.com`). Defaults to the provider's public relay. */
+    relay?: string;
+    /** `custom` provider command template; `{port}` is replaced with the
+     *  local auth-proxy port (e.g. `ssh -R 80:localhost:{port} nokey@localhost.run`). */
+    command?: string;
+  };
   controlUi?: { allowInsecureAuth?: boolean };
   nodes?: { denyCommands?: string[]; allowCommands?: string[] };
   [key: string]: unknown;
