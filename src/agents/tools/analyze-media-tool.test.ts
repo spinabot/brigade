@@ -37,6 +37,12 @@ import {
 	type AnalyzeMediaDetails,
 	type MakeAnalyzeMediaToolOptions,
 } from "./analyze-media-tool.js";
+import {
+	extractOoxmlImages,
+	resolveSlideOrder,
+	resolveRelTarget,
+	parseRelationships,
+} from "./ooxml-images.js";
 import type { AgentToolResult } from "./types.js";
 import type {
 	MediaUnderstandingConfig,
@@ -1494,5 +1500,387 @@ describe("analyze_media — result cache", () => {
 		await tool.execute("c1", { source: "/ws/clip.mp4" });
 		assert.equal(reads, 0, "no cache read when disabled");
 		assert.equal(writes, 0, "no cache write when disabled");
+	});
+});
+
+/* ─────────────────────── embedded OOXML images (includeImages, default-on) ─────────────────────── */
+
+/**
+ * Build a .pptx whose slides reference embedded `../media/*` images through the
+ * real OOXML relationship graph (presentation.xml → presentation.xml.rels →
+ * slideK.xml → slideK.xml.rels → ../media/imageX.ext), so the slide→image
+ * mapping + `pages` slide-scoping are exercised against the actual resolver.
+ *
+ * `slides` lists, per slide (in presentation order), the media filenames that
+ * slide references (e.g. `["image1.png"]`). Each named media file is written
+ * with `mediaBytes` (default a few bytes — a fake downscaler echoes them, so the
+ * bytes need not be a real decodable image).
+ */
+function buildPptxWithImages(
+	slides: string[][],
+	mediaBytes: Record<string, Buffer> = {},
+): Buffer {
+	const files: Record<string, Uint8Array> = {
+		"[Content_Types].xml": strToU8('<?xml version="1.0"?><Types/>'),
+	};
+	// presentation.xml lists slides in order via <p:sldId r:id="rIdN"/>; the
+	// presentation rels map each rId → its slide part.
+	const sldIds: string[] = [];
+	const presRels: string[] = [];
+	const allMedia = new Set<string>(Object.keys(mediaBytes));
+	for (let i = 0; i < slides.length; i++) {
+		const k = i + 1;
+		const rId = `rId${k}`;
+		sldIds.push(`<p:sldId id="${256 + i}" r:id="${rId}"/>`);
+		presRels.push(
+			`<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${k}.xml"/>`,
+		);
+		// The slide body text.
+		files[`ppt/slides/slide${k}.xml`] = strToU8(
+			`<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:p><a:r><a:t>Slide ${k} body</a:t></a:r></a:p></p:sld>`,
+		);
+		// The slide's rels → its media images (+ one non-media rel to prove filtering).
+		const rels: string[] = [
+			`<Relationship Id="rIdL" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>`,
+		];
+		slides[i]?.forEach((media, j) => {
+			rels.push(
+				`<Relationship Id="rIdImg${j}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${media}"/>`,
+			);
+			allMedia.add(media);
+		});
+		files[`ppt/slides/_rels/slide${k}.xml.rels`] = strToU8(
+			`<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${rels.join("")}</Relationships>`,
+		);
+	}
+	files["ppt/presentation.xml"] = strToU8(
+		`<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst>${sldIds.join("")}</p:sldIdLst></p:presentation>`,
+	);
+	files["ppt/_rels/presentation.xml.rels"] = strToU8(
+		`<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${presRels.join("")}</Relationships>`,
+	);
+	// Write the media bytes (default a tiny stand-in for any media not given bytes).
+	for (const media of allMedia) {
+		files[`ppt/media/${media}`] = new Uint8Array(mediaBytes[media] ?? Buffer.from([1, 2, 3, 4]));
+	}
+	return Buffer.from(zipSync(files));
+}
+
+/** Build a .docx with `word/document.xml` text + embedded `word/media/*` images. */
+function buildDocxWithImages(text: string, media: Record<string, Buffer>): Buffer {
+	const docXml = `<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:p><w:r><w:t>${text}</w:t></w:r></w:p></w:body></w:document>`;
+	const files: Record<string, Uint8Array> = {
+		"[Content_Types].xml": strToU8('<?xml version="1.0"?><Types/>'),
+		"word/document.xml": strToU8(docXml),
+	};
+	for (const [name, bytes] of Object.entries(media)) {
+		files[`word/media/${name}`] = new Uint8Array(bytes);
+	}
+	return Buffer.from(zipSync(files));
+}
+
+/**
+ * A fake downscaler that ECHOES the input bytes + mime verbatim (so test
+ * fixtures don't need real decodable images). Records every call so a test can
+ * assert how many images were downscaled + with what budget.
+ */
+function echoDownscale(): {
+	fn: NonNullable<MakeAnalyzeMediaToolOptions["downscaleImage"]>;
+	calls: Array<{ size: number; budget: number; mime?: string }>;
+} {
+	const calls: Array<{ size: number; budget: number; mime?: string }> = [];
+	const fn: NonNullable<MakeAnalyzeMediaToolOptions["downscaleImage"]> = async (bytes, opts) => {
+		calls.push({ size: bytes.length, budget: opts.maxBytes, ...(opts.sourceMime ? { mime: opts.sourceMime } : {}) });
+		return {
+			bytes,
+			mimeType: (opts.sourceMime?.split(";")[0]?.trim().toLowerCase() || "image/png"),
+			width: 100,
+			height: 100,
+			resized: false,
+			rotated: false,
+		};
+	};
+	return { fn, calls };
+}
+
+describe("analyze_media — embedded OOXML images (default-on)", () => {
+	it("pptx with embedded PNGs across slides → image blocks + text, NO flag needed", async () => {
+		// Three slides, one PNG each. Default behaviour (includeImages unset) on a
+		// vision model must return the slide text AND the embedded pictures.
+		const deck = buildPptxWithImages([["image1.png"], ["image2.png"], ["image3.png"]]);
+		const { fn: ds, calls: dsCalls } = echoDownscale();
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" }, // vision-capable
+			acquireLocal: async () => ({ bytes: deck, truncated: false }),
+			resultCache: false,
+			downscaleImage: ds,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/deck.pptx", question: "go through the wireframes" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.returned, "image", "image blocks present → returned:image");
+		const imgs = imageBlocks(r);
+		assert.equal(imgs.length, 3, "one image block per slide");
+		const t = textOf(r);
+		// Text is STILL there alongside the images.
+		assert.match(t, /Slide 1 body/);
+		assert.match(t, /Slide 3 body/);
+		// Images are labeled by slide.
+		assert.match(t, /slide 1 image 1/);
+		assert.match(t, /slide 2 image 1/);
+		assert.match(t, /slide 3 image 1/);
+		// Each embedded image was routed through the downscale path (context-sized).
+		assert.equal(dsCalls.length, 3);
+		assert.equal(dsCalls[0]?.budget, DEFAULT_IMAGE_MAX_BYTES);
+	});
+
+	it("pages:'8-13' → only the in-range slides' images (slide→media via rels)", async () => {
+		// 13 slides; slides 8..13 each carry a DISTINCT media file. Scoping to 8-13
+		// must return exactly those six and exclude slides 1-7.
+		const slides: string[][] = [];
+		for (let i = 1; i <= 13; i++) slides.push([`image${i}.png`]);
+		const deck = buildPptxWithImages(slides);
+		const { fn: ds } = echoDownscale();
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async () => ({ bytes: deck, truncated: false }),
+			resultCache: false,
+			downscaleImage: ds,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/deck.pptx", pages: "8-13" })) as Result;
+		const imgs = imageBlocks(r);
+		assert.equal(imgs.length, 6, "exactly slides 8..13 → six images");
+		const t = textOf(r);
+		assert.match(t, /slide 8 image 1/);
+		assert.match(t, /slide 13 image 1/);
+		assert.ok(!/slide 7 image/.test(t), "slide 7 image excluded by the range");
+		assert.ok(!/slide 1 image/.test(t), "slide 1 image excluded by the range");
+	});
+
+	it("includeImages:false → text only, byte-identical to the no-image path (no blocks)", async () => {
+		const deck = buildPptxWithImages([["image1.png"], ["image2.png"]]);
+		let downscaleCalled = false;
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async () => ({ bytes: deck, truncated: false }),
+			resultCache: false,
+			downscaleImage: async (b) => {
+				downscaleCalled = true;
+				return { bytes: b, mimeType: "image/png", width: 1, height: 1, resized: false, rotated: false };
+			},
+		});
+		const r = (await tool.execute("c1", { source: "/ws/deck.pptx", includeImages: false })) as Result;
+		assert.equal(imageBlocks(r).length, 0, "no image blocks when opted out");
+		assert.equal(r.details.returned, "text");
+		assert.equal(downscaleCalled, false, "embedded-image path not entered at all");
+		// Compare to the existing text-only extractor output for the same deck text.
+		const t = textOf(r);
+		assert.match(t, /Slide 1 body/);
+		assert.match(t, /Slide 2 body/);
+		assert.ok(!/embedded image/i.test(t), "no embedded-image notes in text-only mode");
+	});
+
+	it("unsupported .wdp embed → skipped with a note, NOT a throw (the real hdphoto1.wdp case)", async () => {
+		// Slide 1 references a .wdp (JPEG-XR / HD Photo) which jimp can't decode.
+		// It must be SKIPPED with a note, and the text result still stands.
+		const deck = buildPptxWithImages([["hdphoto1.wdp"], ["image2.png"]]);
+		const { fn: ds } = echoDownscale();
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async () => ({ bytes: deck, truncated: false }),
+			resultCache: false,
+			downscaleImage: ds,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/deck.pptx" })) as Result;
+		assert.equal(r.details.ok, true, "still ok — never throws on an unsupported embed");
+		const imgs = imageBlocks(r);
+		assert.equal(imgs.length, 1, "only the decodable .png is shown");
+		const t = textOf(r);
+		assert.match(t, /skipped \(unsupported format\)/i);
+		assert.match(t, /Slide 1 body/, "text extraction unaffected");
+	});
+
+	it("over-cap deck → first N images + a 'showing N of M' note", async () => {
+		// One slide carrying 25 distinct PNGs; the cap is 20 → show 20, note "of 25".
+		const many = Array.from({ length: 25 }, (_, i) => `image${i + 1}.png`);
+		const deck = buildPptxWithImages([many]);
+		const { fn: ds } = echoDownscale();
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async () => ({ bytes: deck, truncated: false }),
+			resultCache: false,
+			downscaleImage: ds,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/deck.pptx" })) as Result;
+		assert.equal(imageBlocks(r).length, 20, "capped to 20 image blocks");
+		assert.match(textOf(r), /showing 20 of 25 embedded images/i);
+		assert.match(textOf(r), /pass `pages=` to scope/i);
+	});
+
+	it("text-only model + provider key → embeds routed to the provider (TEXT, never raw blocks, never bash)", async () => {
+		const deck = buildPptxWithImages([["image1.png"], ["image2.png"]]);
+		const { run, calls } = stubRunner("A login wireframe.", "anthropic", "claude-sonnet-4-5");
+		const { fn: ds } = echoDownscale();
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { imageInput: false, modelId: "text-only-model" },
+			acquireLocal: async () => ({ bytes: deck, truncated: false }),
+			mediaUnderstandingConfig: muCfg(["anthropic"]),
+			runMediaUnderstanding: run,
+			resultCache: false,
+			downscaleImage: ds,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/deck.pptx", question: "describe the wireframes" })) as Result;
+		assert.equal(imageBlocks(r).length, 0, "NO raw image blocks on a text-only model");
+		assert.equal(r.details.returned, "text");
+		// Each embedded image went to the understanding provider as an image kind.
+		assert.equal(calls.length, 2, "both embeds routed to the provider");
+		assert.equal(calls[0]?.kind, "image");
+		const t = textOf(r);
+		assert.match(t, /understood by a vision-capable provider/i);
+		assert.match(t, /A login wireframe\./);
+	});
+
+	it("text-only model + NO key → a clean note (images present, switch model), never a block, never a throw", async () => {
+		const deck = buildPptxWithImages([["image1.png"]]);
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { imageInput: false, modelId: "text-only-model" },
+			acquireLocal: async () => ({ bytes: deck, truncated: false }),
+			mediaUnderstandingConfig: muCfg([]),
+			resultCache: false,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/deck.pptx" })) as Result;
+		assert.equal(r.details.ok, true, "text result still stands");
+		assert.equal(imageBlocks(r).length, 0);
+		assert.equal(r.details.returned, "text");
+		assert.match(textOf(r), /current model is text-only/i);
+		assert.match(textOf(r), /[Ss]witch to a vision-capable model/);
+	});
+
+	it("a text doc with NO images is unchanged (no image cost, no notes)", async () => {
+		// A plain docx with text but no word/media/* — default-on must add nothing.
+		let downscaleCalled = false;
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async () => ({ bytes: buildDocx("Just text, no pictures."), truncated: false }),
+			resultCache: false,
+			downscaleImage: async (b) => {
+				downscaleCalled = true;
+				return { bytes: b, mimeType: "image/png", width: 1, height: 1, resized: false, rotated: false };
+			},
+		});
+		const r = (await tool.execute("c1", { source: "/ws/doc.docx" })) as Result;
+		assert.equal(r.details.returned, "text");
+		assert.equal(imageBlocks(r).length, 0);
+		assert.equal(downscaleCalled, false, "no image work for a doc with no images");
+		assert.ok(!/embedded image/i.test(textOf(r)), "no embedded-image note");
+		assert.match(textOf(r), /Just text, no pictures\./);
+	});
+
+	it("docx with embedded images → image blocks (all, capped; no page scoping)", async () => {
+		const docx = buildDocxWithImages("Report body.", {
+			"image1.png": Buffer.from([1, 2, 3]),
+			"image2.jpeg": Buffer.from([4, 5, 6]),
+		});
+		const { fn: ds } = echoDownscale();
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async () => ({ bytes: docx, truncated: false }),
+			resultCache: false,
+			downscaleImage: ds,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/doc.docx" })) as Result;
+		assert.equal(imageBlocks(r).length, 2, "both docx media images shown");
+		const t = textOf(r);
+		assert.match(t, /Report body\./);
+		assert.match(t, /image 1/);
+		assert.match(t, /image 2/);
+	});
+
+	it("total-byte budget drops the excess images with a note (deck under count cap but huge)", async () => {
+		// Two PNGs, each ~the per-image budget; the running total ceiling
+		// (EMBEDDED_IMAGES_TOTAL_BYTES) admits the first and drops the second.
+		// The fake downscaler echoes the (already large) bytes so the size sticks.
+		const big = Buffer.alloc(20 * 1024 * 1024, 7); // 20 MiB each → 2nd exceeds the 24 MiB total
+		const deck = buildPptxWithImages([["image1.png"], ["image2.png"]], {
+			"image1.png": big,
+			"image2.png": big,
+		});
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async () => ({ bytes: deck, truncated: false }),
+			resultCache: false,
+			// Echo bytes verbatim so the per-image "budget" doesn't shrink them.
+			downscaleImage: async (b, opts) => ({
+				bytes: b,
+				mimeType: (opts.sourceMime?.split(";")[0]?.trim().toLowerCase() || "image/png"),
+				width: 100,
+				height: 100,
+				resized: false,
+				rotated: false,
+			}),
+		});
+		const r = (await tool.execute("c1", { source: "/ws/deck.pptx" })) as Result;
+		assert.equal(imageBlocks(r).length, 1, "second image dropped by the total-byte ceiling");
+		assert.match(textOf(r), /omitted to stay within the size budget/i);
+	});
+});
+
+/* ─────────────────────── ooxml-images pure helpers ─────────────────────── */
+
+describe("ooxml-images — slide order + relationship resolution", () => {
+	it("resolveSlideOrder returns slides in PRESENTATION order (not filename order)", async () => {
+		// presentation lists slide2 before slide1 — the resolver must honour the
+		// r:id ordering, NOT the numeric filename.
+		const files: Record<string, Uint8Array> = {
+			"ppt/presentation.xml": strToU8(
+				`<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rIdA"/><p:sldId id="257" r:id="rIdB"/></p:sldIdLst></p:presentation>`,
+			),
+			"ppt/_rels/presentation.xml.rels": strToU8(
+				`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdA" Target="slides/slide2.xml"/><Relationship Id="rIdB" Target="slides/slide1.xml"/></Relationships>`,
+			),
+			"ppt/slides/slide1.xml": strToU8("<p:sld/>"),
+			"ppt/slides/slide2.xml": strToU8("<p:sld/>"),
+		};
+		const order = resolveSlideOrder(files);
+		assert.deepEqual(order, ["ppt/slides/slide2.xml", "ppt/slides/slide1.xml"]);
+	});
+
+	it("resolveRelTarget collapses ../ against the rels' owning part dir", () => {
+		assert.equal(resolveRelTarget("ppt/slides", "../media/image1.png"), "ppt/media/image1.png");
+		assert.equal(resolveRelTarget("ppt/slides", "../../ppt/media/x.png"), "ppt/media/x.png");
+		assert.equal(resolveRelTarget("ppt", "media/y.gif"), "ppt/media/y.gif");
+		assert.equal(resolveRelTarget("word", "/word/media/z.jpeg"), "word/media/z.jpeg");
+	});
+
+	it("parseRelationships tolerates attribute order + self-closing tags", () => {
+		const xml = `<Relationships><Relationship Id="r1" Target="../media/a.png"/><Relationship Target="../media/b.png" Id="r2"/></Relationships>`;
+		const rels = parseRelationships(xml);
+		assert.equal(rels.length, 2);
+		assert.deepEqual(rels.find((r) => r.id === "r1"), { id: "r1", target: "../media/a.png" });
+		assert.deepEqual(rels.find((r) => r.id === "r2"), { id: "r2", target: "../media/b.png" });
+	});
+
+	it("extractOoxmlImages maps pptx images to slides + counts skipped embeds", () => {
+		const files: Record<string, Uint8Array> = {
+			"ppt/presentation.xml": strToU8(
+				`<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>`,
+			),
+			"ppt/_rels/presentation.xml.rels": strToU8(
+				`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>`,
+			),
+			"ppt/slides/slide1.xml": strToU8("<p:sld/>"),
+			"ppt/slides/_rels/slide1.xml.rels": strToU8(
+				`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="i1" Target="../media/pic.png"/><Relationship Id="i2" Target="../media/vec.wmf"/></Relationships>`,
+			),
+			"ppt/media/pic.png": new Uint8Array([1, 2, 3]),
+			"ppt/media/vec.wmf": new Uint8Array([4, 5, 6]),
+		};
+		const out = extractOoxmlImages(files, "pptx", { cap: 20 });
+		assert.equal(out.images.length, 1, "only the decodable png");
+		assert.equal(out.images[0]?.slide, 1);
+		assert.equal(out.images[0]?.label, "slide 1 image 1");
+		assert.equal(out.matched, 1);
+		assert.equal(out.skipped, 1, "the .wmf vector is counted as skipped");
 	});
 });

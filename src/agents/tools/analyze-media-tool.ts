@@ -100,6 +100,11 @@ import {
 	type DownscaleResult,
 } from "./image-downscale.js";
 import {
+	extractOoxmlImages,
+	resolveSlideOrder,
+	type ExtractedOoxmlImage,
+} from "./ooxml-images.js";
+import {
 	mediaCacheKey,
 	readMediaCache,
 	writeMediaCache,
@@ -113,6 +118,7 @@ import {
 } from "../../config/paths.js";
 import {
 	runMediaUnderstanding as defaultRunMediaUnderstanding,
+	resolvePiModel,
 	MediaUnderstandingUnavailableError,
 	type MediaUnderstandingConfig,
 	type MediaUnderstandingKind,
@@ -145,6 +151,21 @@ const FETCH_TIMEOUT_MS = 45_000;
 const MAX_BATCH_IMAGES = 20;
 /** Max non-image (document/text) sources accepted in one batch. */
 const MAX_BATCH_DOCS = 10;
+/**
+ * Max EMBEDDED images surfaced from a single OOXML document when
+ * `includeImages` is set. A real deck can carry many pictures (the failure case
+ * had 35); cap the count (reusing the batch cap) so the turn stays bounded, and
+ * report "showing N of M" when truncated. Per-image + total byte budgets reuse
+ * the existing image downscale path.
+ */
+const MAX_EMBEDDED_IMAGES = MAX_BATCH_IMAGES;
+/**
+ * Total byte budget across ALL embedded image blocks from one document, so a
+ * deck with many large pictures can't blow the turn even under the count cap.
+ * Each image is downscaled to the per-image budget first; once the running total
+ * would exceed this ceiling, remaining images are dropped (and reported).
+ */
+const EMBEDDED_IMAGES_TOTAL_BYTES = 24 * 1024 * 1024; // 24 MiB
 
 /**
  * Image MIME types that the understanding providers reliably accept on an image
@@ -492,6 +513,12 @@ const AnalyzeMediaParams = Type.Object({
 		Type.String({
 			description:
 				'Page (PDF) or slide (PPTX) range to limit extraction, e.g. "1-5", "3", or "2-". 1-indexed. Ignored for other kinds.',
+		}),
+	),
+	includeImages: Type.Optional(
+		Type.Boolean({
+			description:
+				"For an Office document (PPTX/DOCX/XLSX): whether to ALSO extract the embedded images (wireframes / screenshots / diagrams / charts inside the file) and show them to the model alongside the text — so you SEE the visuals, not just read titles. DEFAULT TRUE: analyzing an Office doc on a vision model returns its embedded images automatically, no flag needed. For a PPTX, `pages` scopes which slides' images come back (e.g. pages:\"8-13\"). Images are labeled by slide where known and capped (≈20); use `pages` to scope a big deck. Set `false` to skip images (text only, cheaper). NEVER unzip the file with bash/python to get its images — this tool already does it.",
 		}),
 	),
 	language: Type.Optional(
@@ -1526,6 +1553,17 @@ export function makeAnalyzeMediaTool(
 						mime: acquired.mime,
 						question,
 						pages: args.pages,
+						// Embedded-image surfacing (OOXML only). DEFAULT-ON: when the
+						// caller didn't say otherwise, an Office doc on a vision model
+						// also returns its embedded pictures. `includeImages:false`
+						// opts out (text-only, cheap).
+						includeImages: args.includeImages !== false,
+						modelContext: opts.modelContext,
+						imageBudget,
+						...(args.provider ? { provider: args.provider } : {}),
+						...(args.model ? { model: args.model } : {}),
+						...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
+						...(signal ? { signal } : {}),
 					});
 			}
 		}
@@ -2197,6 +2235,20 @@ export function makeAnalyzeMediaTool(
 		mime?: string;
 		question: string;
 		pages?: string;
+		/**
+		 * Surface the doc's EMBEDDED images (OOXML only) alongside the text.
+		 * DEFAULT-ON from the dispatcher; ignored for non-OOXML kinds (pdf/html/
+		 * odf/epub/rtf/ipynb have no `<prefix>/media/*` raster store we map).
+		 */
+		includeImages?: boolean;
+		/** Turn-model context — drives whether embedded images go as blocks or via a provider. */
+		modelContext?: AnalyzeMediaModelContext;
+		/** Per-embedded-image byte budget (downscaled to fit). Reuses the image budget. */
+		imageBudget?: number;
+		provider?: "google" | "anthropic";
+		model?: string;
+		maxTokens?: number;
+		signal?: AbortSignal;
 	}): Promise<AgentToolResult<AnalyzeMediaDetails>> {
 		let rawText = "";
 		let totalPages: number | undefined;
@@ -2279,8 +2331,39 @@ export function makeAnalyzeMediaTool(
 		if (truncated) notes.push("Content was truncated to fit the turn — raise `maxBytes` / narrow `pages` for more.");
 		const noteBlock = notes.length > 0 ? `\n\n(${notes.join(" ")})` : "";
 
+		// ── Embedded images (OOXML only) ──────────────────────────────────────
+		// For a pptx/docx/xlsx, the substance is often in the PICTURES (wireframes,
+		// screenshots, charts). DEFAULT-ON: also surface the embedded images so the
+		// model SEES them — on a vision model as image blocks alongside the text; on
+		// a text-only model, routed through the understanding provider (or, with no
+		// key, a short note). The agent never needs bash. Honors `pages` (PPTX slide
+		// scope), the count cap + total-byte budget, and skips undecodable embeds.
+		const isOoxml = p.kind === "docx" || p.kind === "pptx" || p.kind === "xlsx";
+		const embedResult =
+			isOoxml && p.includeImages
+				? await attachEmbeddedImages({
+						kind: p.kind as "docx" | "pptx" | "xlsx",
+						bytes: p.bytes,
+						pages: p.pages,
+						imageBudget: p.imageBudget ?? DEFAULT_IMAGE_MAX_BYTES,
+						...(p.modelContext ? { modelContext: p.modelContext } : {}),
+						question: p.question,
+						source: p.source,
+						sourceType: p.sourceType,
+						...(p.provider ? { provider: p.provider } : {}),
+						...(p.model ? { model: p.model } : {}),
+						...(p.maxTokens !== undefined ? { maxTokens: p.maxTokens } : {}),
+						...(p.signal ? { signal: p.signal } : {}),
+					})
+				: undefined;
+
+		const content: AgentToolResult<AnalyzeMediaDetails>["content"] = [
+			{ type: "text", text: `${promptText}${noteBlock}\n\n${wrapped}` },
+		];
+		if (embedResult) content.push(...embedResult.content);
+
 		return {
-			content: [{ type: "text", text: `${promptText}${noteBlock}\n\n${wrapped}` }],
+			content,
 			details: {
 				ok: true,
 				source: p.source,
@@ -2288,11 +2371,213 @@ export function makeAnalyzeMediaTool(
 				kind: p.kind,
 				...(p.mime ? { mimeType: p.mime } : {}),
 				bytes: p.bytes.length,
-				returned: "text",
+				returned: embedResult && embedResult.imageCount > 0 ? "image" : "text",
 				...(p.pages ? { pages: p.pages } : {}),
 				...(truncated ? { truncated: true } : {}),
 			},
 		};
+	}
+
+	/**
+	 * Surface a doc's EMBEDDED images. Unzips the OOXML buffer, maps images to
+	 * slides (PPTX) / collects them (DOCX/XLSX) via `extractOoxmlImages`, honoring
+	 * `pages` over the PPTX slide order and the per-call count cap. Each selected
+	 * image is DOWNSCALED to the per-image budget (small is fine — these are
+	 * context), and a running TOTAL-byte budget drops any image that would blow the
+	 * turn (reported, not thrown). Then:
+	 *   • vision model  → emits the image blocks (each preceded by a label).
+	 *   • text-only     → routes EACH embed through the understanding provider and
+	 *     emits the resulting TEXT; with NO provider key, a single "images present,
+	 *     switch to a vision model" note (NEVER a raw block, NEVER a throw).
+	 * Undecodable embeds (`.wdp`/`.emf`/`.wmf`/…) and over-cap images are reported
+	 * as short notes. Returns the extra content blocks + how many image blocks were
+	 * emitted (so the caller can set `returned`). On ANY failure (corrupt zip,
+	 * decode error) it returns `undefined` — the text result already stands; the
+	 * embedded images are a best-effort add-on that must never break the text path.
+	 */
+	async function attachEmbeddedImages(e: {
+		kind: "docx" | "pptx" | "xlsx";
+		bytes: Buffer;
+		pages?: string;
+		imageBudget: number;
+		modelContext?: AnalyzeMediaModelContext;
+		question: string;
+		source: string;
+		sourceType: "url" | "path";
+		provider?: "google" | "anthropic";
+		model?: string;
+		maxTokens?: number;
+		signal?: AbortSignal;
+	}): Promise<{ content: AgentToolResult<AnalyzeMediaDetails>["content"]; imageCount: number } | undefined> {
+		let entries: Record<string, Uint8Array>;
+		try {
+			entries = await unzipEntries(e.bytes);
+		} catch {
+			// Corrupt/locked zip — the text path already reported the real failure
+			// (or succeeded); embedded images are best-effort, so just skip them.
+			return undefined;
+		}
+
+		// For PPTX, scope the embedded images by the same `pages` slide range the
+		// text honored. DOCX/XLSX have no page→image map, so `inRange` is omitted
+		// (all images, capped). The slide TOTAL drives the range clamp; resolve it
+		// from the presentation order when available, else the slide-file count.
+		let inRange: ((slideNum: number) => boolean) | undefined;
+		if (e.kind === "pptx" && e.pages) {
+			const slideTotal = countPptxSlides(entries);
+			inRange = parsePageRange(e.pages, slideTotal);
+		}
+
+		let extraction: ReturnType<typeof extractOoxmlImages>;
+		try {
+			extraction = extractOoxmlImages(entries, e.kind, {
+				cap: MAX_EMBEDDED_IMAGES,
+				...(inRange ? { inRange } : {}),
+			});
+		} catch {
+			return undefined;
+		}
+		if (extraction.images.length === 0 && extraction.skipped === 0) return undefined;
+
+		const content: AgentToolResult<AnalyzeMediaDetails>["content"] = [];
+		const sees = modelLikelySeesImages(e.modelContext);
+
+		// Downscale each selected image to the per-image budget AND enforce the
+		// running total-byte ceiling so a deck full of big pictures can't blow the
+		// turn even under the count cap. Images dropped by the total budget are
+		// reported (like the over-cap ones).
+		const prepared: ExtractedOoxmlImage[] = [];
+		let runningBytes = 0;
+		let droppedForBytes = 0;
+		for (const img of extraction.images) {
+			let bytes = img.bytes;
+			let mime = img.mime;
+			if (isDownscalableImageMime(mime)) {
+				try {
+					const ds = await downscaleImage(bytes, {
+						maxBytes: e.imageBudget,
+						sourceMime: mime,
+					});
+					bytes = ds.bytes;
+					mime = ds.mimeType;
+				} catch {
+					// Undecodable raster (rare for these types) — keep the original bytes;
+					// a vision block may still render and a provider may still sniff it.
+				}
+			}
+			if (runningBytes + bytes.length > EMBEDDED_IMAGES_TOTAL_BYTES && prepared.length > 0) {
+				droppedForBytes += 1;
+				continue;
+			}
+			runningBytes += bytes.length;
+			prepared.push({ ...img, bytes, mime });
+		}
+
+		// Header note: count, "N of M", skipped, and dropped-for-budget.
+		const emitted = prepared.length;
+		const headerBits: string[] = [];
+		if (emitted > 0) {
+			headerBits.push(
+				`${emitted} embedded image${emitted === 1 ? "" : "s"} from this ${e.kind}`,
+			);
+		}
+		if (extraction.matched > emitted + droppedForBytes) {
+			headerBits.push(
+				`showing ${emitted} of ${extraction.matched} embedded images — pass \`pages=\` to scope` +
+					(e.kind === "pptx" ? " to specific slides" : ""),
+			);
+		}
+		if (droppedForBytes > 0) {
+			headerBits.push(`${droppedForBytes} omitted to stay within the size budget`);
+		}
+		if (extraction.skipped > 0) {
+			headerBits.push(`${extraction.skipped} skipped (unsupported format)`);
+		}
+
+		if (emitted === 0) {
+			// Nothing decodable to show (e.g. every embed was a .wdp). Report the
+			// skip as a note; do NOT throw.
+			if (headerBits.length > 0) {
+				content.push({ type: "text", text: `(Embedded images: ${headerBits.join("; ")}.)` });
+			}
+			return { content, imageCount: 0 };
+		}
+
+		if (sees === false) {
+			// TEXT-ONLY current model. Don't ship raw blocks it will reject — route
+			// each embed through the understanding provider and emit the TEXT. With
+			// no key, a single honest note (the text extraction already stands).
+			const cfg = getMuConfig();
+			const providerAvailable = e.provider
+				? Boolean(safeResolveKey(cfg, e.provider))
+				: Boolean(safeResolveKey(cfg, "anthropic")) ||
+					Boolean(safeResolveKey(cfg, "google")) ||
+					Boolean(safeResolvePiImageModel(cfg));
+			if (!providerAvailable) {
+				content.push({
+					type: "text",
+					text:
+						`(This ${e.kind} has ${headerBits.join("; ")}, but the current model is text-only so they are not attached. ` +
+						"Switch to a vision-capable model to SEE them, or configure a Google/Anthropic key so Brigade can describe embedded images on any model.)",
+				});
+				return { content, imageCount: 0 };
+			}
+			content.push({
+				type: "text",
+				text:
+					`(The current model is text-only, so the ${headerBits.join("; ")} were understood by a vision-capable provider; descriptions follow.)`,
+			});
+			for (const img of prepared) {
+				// Re-encode a non-provider-safe raster (bmp/tiff) to JPEG so the
+				// provider accepts it (Anthropic 400s on image/bmp).
+				let bytes = img.bytes;
+				let mime = img.mime;
+				if (!PROVIDER_SAFE_IMAGE_MIME.has(mime) && isDownscalableImageMime(mime)) {
+					try {
+						const ds = await downscaleImage(bytes, { maxBytes: e.imageBudget, sourceMime: mime });
+						bytes = ds.bytes;
+						mime = ds.mimeType;
+					} catch {
+						/* leave as-is; a 400 surfaces as the note below */
+					}
+				}
+				const viaProvider = await understandViaProvider({
+					kind: "image",
+					source: `${e.source}#${img.label.replace(/\s+/g, "-")}`,
+					sourceType: e.sourceType,
+					bytes,
+					mimeType: mime,
+					question: e.question,
+					...(e.maxTokens !== undefined ? { maxTokens: e.maxTokens } : {}),
+					...(e.provider ? { provider: e.provider } : {}),
+					...(e.model ? { model: e.model } : {}),
+					...(e.signal ? { signal: e.signal } : {}),
+				});
+				if (viaProvider.ok) {
+					content.push({ type: "text", text: `--- ${img.label} ---\n${firstText(viaProvider.result)}` });
+				} else {
+					content.push({
+						type: "text",
+						text: `--- ${img.label} ---\n(Could not understand this embedded image: ${viaProvider.unavailable ? viaProvider.message : firstText(viaProvider.result)})`,
+					});
+				}
+			}
+			return { content, imageCount: 0 };
+		}
+
+		// VISION model (or unknown — assume yes, the common case). Emit each image
+		// as a labeled block. `sees === undefined` adds one short uncertainty note.
+		const lead =
+			`(Embedded images from this ${e.kind}: ${headerBits.join("; ")}.` +
+			(sees === undefined
+				? " Note: Brigade could not confirm this model is vision-capable; if you cannot see them, switch models.)"
+				: ")");
+		content.push({ type: "text", text: lead });
+		for (const img of prepared) {
+			content.push({ type: "text", text: `--- ${img.label} ---` });
+			content.push({ type: "image", data: img.bytes.toString("base64"), mimeType: img.mime });
+		}
+		return { content, imageCount: emitted };
 	}
 }
 
@@ -2308,6 +2593,36 @@ function safeResolveKey(
 	} catch {
 		return "";
 	}
+}
+
+/**
+ * True when the Pi image path can resolve an image-capable model for SOME keyed
+ * provider (OpenAI / Groq / Mistral / OpenRouter / xAI / Ollama / …) — so embedded
+ * images from an OOXML doc can be understood on a text-only current model even
+ * when neither google nor anthropic is keyed. Pure probe, never throws.
+ */
+function safeResolvePiImageModel(cfg: MediaUnderstandingConfig): boolean {
+	try {
+		return Boolean(resolvePiModel("image", cfg));
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Count slides in an already-unzipped PPTX for clamping a `pages` range over the
+ * embedded-image path. Prefers the PRESENTATION order (so the count matches what
+ * the text extractor + the image mapper see); falls back to the slide-file count
+ * when the presentation graph is unreadable. Never throws.
+ */
+function countPptxSlides(entries: Record<string, Uint8Array>): number {
+	try {
+		const ordered = resolveSlideOrder(entries);
+		if (ordered.length > 0) return ordered.length;
+	} catch {
+		/* fall through to the filename count */
+	}
+	return Object.keys(entries).filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n)).length;
 }
 
 function clampBytes(requested: number | undefined, looksImage = false): number {
