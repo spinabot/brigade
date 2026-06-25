@@ -25,6 +25,7 @@ import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 
 import { zipSync, strToU8 } from "fflate";
+import { Value } from "typebox/value";
 
 import {
 	makeAnalyzeMediaTool,
@@ -681,6 +682,152 @@ describe("analyze_media — convex-mode OS-cache channel root is allowed", () =>
 	});
 });
 
+/* ──────── macOS Messages Attachments root (the native-iMessage doc fix) ──────── */
+
+describe("analyze_media — macOS Messages Attachments root is allowed (native iMessage)", () => {
+	let fakeHome: string;
+	let prevHome: string | undefined;
+	let prevUserProfile: string | undefined;
+	before(() => {
+		fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-home-"));
+		// `os.homedir()` reads $HOME (POSIX) / %USERPROFILE% (Windows); override both
+		// so the computed Messages Attachments root points under our temp dir.
+		prevHome = process.env.HOME;
+		prevUserProfile = process.env.USERPROFILE;
+		process.env.HOME = fakeHome;
+		process.env.USERPROFILE = fakeHome;
+	});
+	after(() => {
+		if (prevHome === undefined) delete process.env.HOME;
+		else process.env.HOME = prevHome;
+		if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = prevUserProfile;
+		try {
+			fs.rmSync(fakeHome, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
+	});
+
+	it("resolves an iMessage attachment path instead of throwing 'outside allowed roots'", async () => {
+		// The native imessage adapter surfaces the bridge's raw
+		// ~/Library/Messages/Attachments/... path — previously NOT in the allowed
+		// roots, so an iMessage PDF/doc threw. A workspace dir that is NOT under
+		// that root proves the file is admitted by the NEW Messages root.
+		const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-imsg-ws-"));
+		const attachDir = path.join(fakeHome, "Library", "Messages", "Attachments", "ab", "01");
+		fs.mkdirSync(attachDir, { recursive: true });
+		const target = path.join(attachDir, "report.html");
+		fs.writeFileSync(
+			target,
+			"<html><body><h1>iMessage Document</h1><p>Body content long enough for the readability extractor to keep it.</p></body></html>",
+		);
+		const tool = makeAnalyzeMediaTool({ workspaceDir: workspace, cwd: workspace });
+		const r = (await tool.execute("c1", { source: target })) as Result;
+		assert.equal(r.details.ok, true, "native iMessage attachment must be readable");
+		assert.match(textOf(r), /iMessage Document/);
+		fs.rmSync(workspace, { recursive: true, force: true });
+	});
+
+	it("still refuses a secret file under the Messages Attachments root", async () => {
+		// Admitting the Apple data dir must NOT bypass the media-path guard.
+		const attachDir = path.join(fakeHome, "Library", "Messages", "Attachments");
+		fs.mkdirSync(attachDir, { recursive: true });
+		const target = path.join(attachDir, ".env");
+		fs.writeFileSync(target, "SECRET=1");
+		const tool = makeAnalyzeMediaTool();
+		await assert.rejects(
+			() => tool.execute("c1", { source: target, kind: "html" }),
+			(err: unknown) => /sensitive|refus/i.test((err as Error).message),
+		);
+	});
+});
+
+/* ───── owner local file access (the TUI/desktop user-typed-path fix, #5) ───── */
+
+describe("analyze_media — owner local access widens roots to the home dir", () => {
+	let fakeHome: string;
+	let fakeTmp: string;
+	const saved: Record<string, string | undefined> = {};
+	before(() => {
+		// IMPORTANT: `os.tmpdir()` is ALWAYS an allowed root. If the fake home lived
+		// under the real temp dir, a ~/Downloads path would be admitted via tmpdir
+		// regardless of ownerLocalAccess — defeating the non-owner test. So point the
+		// temp env at a DEDICATED fakeTmp and make fakeHome a SIBLING of it (not
+		// contained), so the home widening is the ONLY thing that can admit it.
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-owner-base-"));
+		fakeTmp = path.join(base, "tmp");
+		fakeHome = path.join(base, "home");
+		fs.mkdirSync(fakeTmp, { recursive: true });
+		fs.mkdirSync(fakeHome, { recursive: true });
+		for (const k of ["HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP"]) saved[k] = process.env[k];
+		process.env.HOME = fakeHome;
+		process.env.USERPROFILE = fakeHome;
+		process.env.TMPDIR = fakeTmp;
+		process.env.TEMP = fakeTmp;
+		process.env.TMP = fakeTmp;
+	});
+	after(() => {
+		for (const k of ["HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP"]) {
+			if (saved[k] === undefined) delete process.env[k];
+			else process.env[k] = saved[k];
+		}
+		try {
+			fs.rmSync(path.dirname(fakeHome), { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
+	});
+
+	/** Write a small HTML doc under the fake home's Downloads dir; return its path. */
+	function downloadsDoc(name = "report.html"): string {
+		const dir = path.join(fakeHome, "Downloads");
+		fs.mkdirSync(dir, { recursive: true });
+		const target = path.join(dir, name);
+		fs.writeFileSync(
+			target,
+			"<html><body><h1>Owner Download</h1><p>Body content long enough for the readability extractor to keep it.</p></body></html>",
+		);
+		return target;
+	}
+
+	it("OWNER turn reads a user-typed path in ~/Downloads (outside workspace/cwd)", async () => {
+		const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-owner-ws-"));
+		const target = downloadsDoc();
+		const tool = makeAnalyzeMediaTool({ workspaceDir: workspace, cwd: workspace, ownerLocalAccess: true });
+		const r = (await tool.execute("c1", { source: target })) as Result;
+		assert.equal(r.details.ok, true, "owner may read a personal-dir path they typed");
+		assert.match(textOf(r), /Owner Download/);
+		fs.rmSync(workspace, { recursive: true, force: true });
+	});
+
+	it("NON-owner turn is STILL refused a ~/Downloads path (remote sender can't read the home dir)", async () => {
+		const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-nonowner-ws-"));
+		const target = downloadsDoc("remote.html");
+		// ownerLocalAccess omitted (false) → the home widening must NOT apply.
+		const tool = makeAnalyzeMediaTool({ workspaceDir: workspace, cwd: workspace });
+		await assert.rejects(
+			() => tool.execute("c1", { source: target }),
+			(err: unknown) => /outside the allowed roots/i.test((err as Error).message),
+		);
+		fs.rmSync(workspace, { recursive: true, force: true });
+	});
+
+	it("OWNER access still refuses a secret in the home dir (denylist wins over the widening)", async () => {
+		// Widening to the home dir must NOT expose ~/.ssh — the media-path guard
+		// refuses credential dirs regardless of ownerLocalAccess.
+		const sshDir = path.join(fakeHome, ".ssh");
+		fs.mkdirSync(sshDir, { recursive: true });
+		const target = path.join(sshDir, "id_rsa");
+		fs.writeFileSync(target, "PRIVATE KEY");
+		const tool = makeAnalyzeMediaTool({ ownerLocalAccess: true });
+		await assert.rejects(
+			() => tool.execute("c1", { source: target, kind: "text" }),
+			(err: unknown) => /credentials directory|sensitive|refus/i.test((err as Error).message),
+		);
+	});
+});
+
 /* ─────────────────────────── audio (#6) ─────────────────────────── */
 
 describe("analyze_media — audio", () => {
@@ -892,6 +1039,59 @@ describe("analyze_media — oversize image is downscaled (not truncated)", () =>
 		assert.equal(imageBlocks(r).length, 1);
 		assert.equal(r.details.truncated, true);
 		assert.match(textOf(r), /could not be re-encoded|may be corrupt/i);
+	});
+});
+
+/* ───────── provider-bound image MIME normalization (bmp/tiff → JPEG) ───────── */
+
+describe("analyze_media — non-web-safe image MIME is re-encoded before a provider call", () => {
+	it("re-encodes a small image/bmp to JPEG before the (Anthropic) provider call — no 400", async () => {
+		// A SMALL bmp (under budget) on a text-only model routed to Anthropic. The
+		// OLD behaviour shipped media_type image/bmp, which Anthropic rejects (400);
+		// the NEW behaviour re-encodes it to JPEG first so the provider accepts it.
+		const bmp = Buffer.from([0x42, 0x4d, 1, 2, 3, 4]); // "BM" + a few bytes
+		const jpeg = Buffer.from("RE-ENCODED-JPEG");
+		let downscaleCalled = false;
+		const { run, calls } = stubRunner("A red square.", "anthropic", "claude-sonnet-4-5");
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { imageInput: false, modelId: "text-only-model" },
+			acquireLocal: async () => ({ bytes: bmp, mime: "image/bmp", truncated: false }),
+			mediaUnderstandingConfig: muCfg(["anthropic"]),
+			runMediaUnderstanding: run,
+			resultCache: false,
+			downscaleImage: async (_b, opts) => {
+				downscaleCalled = true;
+				void opts.maxBytes;
+				return { bytes: jpeg, mimeType: "image/jpeg", width: 10, height: 10, resized: true, rotated: false };
+			},
+		});
+		const r = (await tool.execute("c1", { source: "/ws/pic.bmp", question: "what is this?" })) as Result;
+		assert.equal(downscaleCalled, true, "the bmp must be re-encoded before the provider call");
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.mimeType, "image/jpeg", "provider receives JPEG, not image/bmp");
+		assert.deepEqual(calls[0]?.bytes, jpeg, "provider receives the re-encoded bytes");
+		assert.equal(r.details.ok, true);
+		assert.match(textOf(r), /A red square\./);
+	});
+
+	it("does NOT re-encode a small image/png heading to a provider (already provider-safe)", async () => {
+		const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+		let downscaleCalled = false;
+		const { run, calls } = stubRunner("A blue dot.", "anthropic", "claude-sonnet-4-5");
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { imageInput: false, modelId: "text-only-model" },
+			acquireLocal: async () => ({ bytes: png, mime: "image/png", truncated: false }),
+			mediaUnderstandingConfig: muCfg(["anthropic"]),
+			runMediaUnderstanding: run,
+			resultCache: false,
+			downscaleImage: async (b) => {
+				downscaleCalled = true;
+				return { bytes: b, mimeType: "image/png", width: 1, height: 1, resized: false, rotated: false };
+			},
+		});
+		await tool.execute("c1", { source: "/ws/pic.png", question: "what is this?" });
+		assert.equal(downscaleCalled, false, "a provider-safe PNG is not re-encoded");
+		assert.equal(calls[0]?.mimeType, "image/png");
 	});
 });
 
@@ -1152,6 +1352,46 @@ describe("analyze_media — extra document formats", () => {
 		assert.equal(detectKind({ source: "/a/x.epub" }), "epub");
 		assert.equal(detectKind({ source: "/a/x.rtf" }), "rtf");
 		assert.equal(detectKind({ source: "/a/x.ipynb" }), "ipynb");
+	});
+
+	it("accepts an explicit kind:'epub' override and routes it (rescues a mis-named file)", async () => {
+		// The source extension is a generic .bin (would NOT auto-detect as epub) —
+		// forcing kind:"epub" must be accepted by the schema AND drive EPUB parsing.
+		const tool = toolWithBytes(buildEpub());
+		const r = (await tool.execute("c1", { source: "/ws/mystery.bin", kind: "epub" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.kind, "epub");
+		assert.match(textOf(r), /Chapter One/);
+	});
+
+	it("accepts an explicit kind:'odt' override over a wrong extension", async () => {
+		const tool = toolWithBytes(buildOdt("Forced ODT content."));
+		// Extension says .pdf; the override must win and parse it as ODT.
+		const r = (await tool.execute("c1", { source: "/ws/wrong.pdf", kind: "odt" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.kind, "odt");
+		assert.match(textOf(r), /Forced ODT content\./);
+	});
+
+	it("detectKind honors odt/ods/odp/epub/rtf/ipynb overrides", () => {
+		// The override branch must recognise every new literal the schema now accepts.
+		assert.equal(detectKind({ source: "x.bin", override: "odt" }), "odt");
+		assert.equal(detectKind({ source: "x.bin", override: "ods" }), "ods");
+		assert.equal(detectKind({ source: "x.bin", override: "odp" }), "odp");
+		assert.equal(detectKind({ source: "x.bin", override: "epub" }), "epub");
+		assert.equal(detectKind({ source: "x.bin", override: "rtf" }), "rtf");
+		assert.equal(detectKind({ source: "x.bin", override: "ipynb" }), "ipynb");
+	});
+
+	it("the tool's `kind` param schema accepts the new literals (so the agent can pass them)", () => {
+		// The runtime validates tool args against this schema BEFORE execute — assert
+		// every new kind passes and a bogus one is rejected.
+		const tool = makeAnalyzeMediaTool();
+		const schema = tool.parameters;
+		for (const k of ["odt", "ods", "odp", "epub", "rtf", "ipynb", "image", "text"]) {
+			assert.equal(Value.Check(schema, { source: "/ws/x", kind: k }), true, `kind:"${k}" must validate`);
+		}
+		assert.equal(Value.Check(schema, { source: "/ws/x", kind: "not-a-kind" }), false, "garbage kind rejected");
 	});
 });
 

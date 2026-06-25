@@ -89,6 +89,34 @@ function extFromMime(mime: string | undefined): string {
 	return known[right] ?? (right.replace(/[^\w]+/g, "") || "bin");
 }
 
+/**
+ * Pull a clean lowercase extension (no dot, alphanumeric) from a real filename,
+ * or "" when the name has none / it isn't a sane extension. WhatsApp documents
+ * carry their original `fileName`, which is the AUTHORITATIVE source of the file
+ * type — `mimetype` defaults to `application/octet-stream`, so deriving the
+ * on-disk extension from the MIME alone saves a `report.csv` as `.octetstream`
+ * (and any unmapped type — .csv/.txt/.json/.odt/.epub/.rtf/.ipynb — as garbage),
+ * which then makes `analyze_media` fail to detect a perfectly readable file.
+ */
+function extFromFileName(fileName: string | undefined): string {
+	const name = (fileName ?? "").trim();
+	if (!name) return "";
+	const dot = name.lastIndexOf(".");
+	if (dot < 0 || dot === name.length - 1) return "";
+	const ext = name.slice(dot + 1).toLowerCase().replace(/[^a-z0-9]/g, "");
+	return /^[a-z0-9]{1,12}$/.test(ext) ? ext : "";
+}
+
+/**
+ * Decide the on-disk file extension for a saved inbound attachment: prefer the
+ * real `fileName`'s extension (documents), fall back to the MIME map. Keeps the
+ * MIME-derived behaviour for media that carries no filename (image/video/audio
+ * — they never set `fileName`).
+ */
+function savedExt(mime: string | undefined, fileName: string | undefined): string {
+	return extFromFileName(fileName) || extFromMime(mime);
+}
+
 interface MediaDescriptor {
 	kind: InboundMediaAttachment["kind"];
 	field: keyof NonNullable<WAMessage["message"]>;
@@ -185,6 +213,7 @@ export async function downloadInboundMedia(args: DownloadInboundMediaArgs): Prom
 		if (!env) continue;
 		const mime = spec.mimeFromMessage?.(env);
 		if (!mime) continue; // e.g. an audio envelope that's not actually a voice note
+		const fileName = spec.fileNameFromMessage?.(env);
 		try {
 			const bytes = await args.downloadMediaMessage(args.rawMessage, "buffer", {});
 			if (!bytes || bytes.length === 0) continue;
@@ -206,7 +235,10 @@ export async function downloadInboundMedia(args: DownloadInboundMediaArgs): Prom
 			const dir = path.join(baseDir, "media", dayBucket());
 			mkdirSync(dir, { recursive: true });
 			const suffix = MEDIA_FIELDS.length > 1 ? `-${index}` : "";
-			const filePath = path.join(dir, `${args.msgId}${suffix}.${extFromMime(mime)}`);
+			// Prefer the document's real filename extension (its `mimetype` is often
+			// the generic application/octet-stream) so the saved file is detectable by
+			// analyze_media; fall back to the MIME map for filename-less media.
+			const filePath = path.join(dir, `${args.msgId}${suffix}.${savedExt(mime, fileName)}`);
 			writeFileSync(filePath, bytes, { mode: 0o600 });
 			enqueueMediaMirror({
 				messageId: args.msgId,
@@ -219,7 +251,7 @@ export async function downloadInboundMedia(args: DownloadInboundMediaArgs): Prom
 				kind: spec.kind,
 				path: filePath,
 				mimeType: mime,
-				fileName: spec.fileNameFromMessage?.(env),
+				fileName,
 				caption: spec.captionFromMessage?.(env),
 			});
 		} catch (err) {
@@ -231,3 +263,7 @@ export async function downloadInboundMedia(args: DownloadInboundMediaArgs): Prom
 	}
 	return out;
 }
+
+// Exported for tests — the filename/MIME → extension resolution that keeps an
+// inbound document detectable by analyze_media.
+export { extFromMime, extFromFileName, savedExt };

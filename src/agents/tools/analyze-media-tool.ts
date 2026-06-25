@@ -146,6 +146,23 @@ const MAX_BATCH_IMAGES = 20;
 /** Max non-image (document/text) sources accepted in one batch. */
 const MAX_BATCH_DOCS = 10;
 
+/**
+ * Image MIME types that the understanding providers reliably accept on an image
+ * block. Anthropic's Messages API accepts ONLY jpeg / png / gif / webp and
+ * returns a 400 for anything else (e.g. image/bmp, image/tiff); Gemini + the
+ * Pi-driven providers are similarly conservative. So before routing an image to
+ * a provider we re-encode any other (decodable) raster format to JPEG via the
+ * downscale path. `image/heic`/`image/heif` are intentionally NOT here — they
+ * are not decodable without a native dep (they pass through with their declared
+ * mime + a warning).
+ */
+const PROVIDER_SAFE_IMAGE_MIME = new Set([
+	"image/jpeg",
+	"image/png",
+	"image/gif",
+	"image/webp",
+]);
+
 /* ─────────────────────────── kind detection ─────────────────────────── */
 
 export type MediaKind =
@@ -526,10 +543,19 @@ const AnalyzeMediaParams = Type.Object({
 				Type.Literal("video"),
 				Type.Literal("audio"),
 				Type.Literal("text"),
+				// OpenDocument + e-book + rich-text + notebook — `detectKind` already
+				// routes these, so the override must accept them too (lets the model
+				// force e.g. kind:"epub" to rescue a mis-detected / extension-less file).
+				Type.Literal("odt"),
+				Type.Literal("ods"),
+				Type.Literal("odp"),
+				Type.Literal("epub"),
+				Type.Literal("rtf"),
+				Type.Literal("ipynb"),
 			],
 			{
 				description:
-					"Optional override of the auto-detected kind (use when the extension/MIME is wrong or missing). Use \"audio\" for a voice note whose extension is ambiguous (e.g. .ogg/.webm); \"text\" to force plain/structured-text reading.",
+					"Optional override of the auto-detected kind (use when the extension/MIME is wrong or missing). Use \"audio\" for a voice note whose extension is ambiguous (e.g. .ogg/.webm); \"text\" to force plain/structured-text reading; odt/ods/odp/epub/rtf/ipynb to force an OpenDocument / e-book / rich-text / notebook read.",
 			},
 		),
 	),
@@ -605,7 +631,7 @@ interface AcquiredBytes {
 }
 
 /** Roots a local source path is allowed to live under (workspace, cwd, OS cache/temp, state dir). */
-function allowedLocalRoots(opts: { workspaceDir?: string; cwd?: string }): string[] {
+function allowedLocalRoots(opts: { workspaceDir?: string; cwd?: string; ownerLocalAccess?: boolean }): string[] {
 	const roots = new Set<string>();
 	const add = (p?: string) => {
 		if (!p) return;
@@ -655,6 +681,42 @@ function allowedLocalRoots(opts: { workspaceDir?: string; cwd?: string }): strin
 	} catch {
 		/* ignore */
 	}
+	// macOS Messages Attachments root. The NATIVE iMessage adapter surfaces the
+	// bridge's on-disk attachment path AS-IS (it does NOT copy bytes into a cache
+	// dir the way BlueBubbles does — see channels/imessage/media.ts
+	// resolveInboundAttachments), so an inbound iMessage PDF/doc lives under
+	// `~/Library/Messages/Attachments/...`. Without this root, "analyze the PDF I
+	// just iMessaged" throws "outside the allowed roots" (images still auto-see via
+	// inline base64). The iMessage adapter already constrains inbound paths to its
+	// own attachmentRoots allow-list, and `validateOutboundMediaPath` still refuses
+	// secrets/system files independently, so admitting this read-only Apple data
+	// dir is safe. (A REMOTE iMessage bridge SCP-copies bytes into an OS temp dir,
+	// already covered above.) Only meaningful on macOS; harmless elsewhere (the
+	// path simply never exists).
+	try {
+		add(path.join(os.homedir(), "Library", "Messages", "Attachments"));
+	} catch {
+		/* ignore */
+	}
+	// OWNER local turns only (TUI / desktop / the operator's own channel messages):
+	// the operator routinely references a file by an absolute path that lives in a
+	// personal directory — Downloads / Desktop / Documents — NOT under the workspace
+	// or cwd. Without this an "analyze C:\Users\me\Downloads\report.pdf" from the
+	// owner is refused as "outside the allowed roots", which is the wrong default
+	// for the trusted operator on their own machine. We widen to the operator's home
+	// dir (covers Downloads/Desktop/Documents and anything they point at). This is
+	// gated on `ownerLocalAccess` so an UNTRUSTED remote channel sender can NEVER
+	// make Brigade read the operator's home — a remote turn threads senderIsOwner:
+	// false → this stays off. `validateOutboundMediaPath` still independently refuses
+	// secrets / credential dirs / system files even for the owner, so the home dir's
+	// ~/.ssh, ~/.aws, .env, brigade.json, etc. remain denied.
+	if (opts.ownerLocalAccess) {
+		try {
+			add(os.homedir());
+		} catch {
+			/* ignore */
+		}
+	}
 	return [...roots].filter((r) => r.length > 0);
 }
 
@@ -677,7 +739,7 @@ function isInsideAnyRoot(resolved: string, roots: string[]): boolean {
  */
 async function acquireLocalBytes(
 	source: string,
-	opts: { workspaceDir?: string; cwd?: string; maxBytes: number },
+	opts: { workspaceDir?: string; cwd?: string; maxBytes: number; ownerLocalAccess?: boolean },
 ): Promise<AcquiredBytes> {
 	const verdict = validateOutboundMediaPath(source);
 	if (!verdict.ok) {
@@ -1189,6 +1251,16 @@ export interface MakeAnalyzeMediaToolOptions {
 	workspaceDir?: string;
 	/** Process cwd — an allowed root for local-path reads. */
 	cwd?: string;
+	/**
+	 * OWNER local turn (TUI / desktop / the operator's own channel messages):
+	 * widen the allowed local-read roots to the operator's HOME dir so a
+	 * user-typed absolute path into Downloads / Desktop / Documents resolves
+	 * (the common "analyze C:\Users\me\Downloads\report.pdf" case). MUST stay
+	 * false/undefined for an untrusted remote channel sender so they can't make
+	 * Brigade read the operator's home. The media-path guard still refuses
+	 * secrets / system files even when this is on.
+	 */
+	ownerLocalAccess?: boolean;
 	/** Caller's agent id — selects which auth profiles back the provider keys. */
 	agentId?: string;
 	/** Resolved turn model context — drives whether an IMAGE block is meaningful. */
@@ -1327,6 +1399,7 @@ export function makeAnalyzeMediaTool(
 					: await acquireLocal(source, {
 							...(opts.workspaceDir ? { workspaceDir: opts.workspaceDir } : {}),
 							...(opts.cwd ? { cwd: opts.cwd } : {}),
+							...(opts.ownerLocalAccess ? { ownerLocalAccess: true } : {}),
 							maxBytes: readCap,
 						});
 			} catch (err) {
@@ -1751,6 +1824,27 @@ export function makeAnalyzeMediaTool(
 			// key is configured) and return the resulting text — so vision works
 			// on any model. With no key, fall back to the honest "switch model"
 			// message.
+			//
+			// FIX: a provider-bound image whose MIME the providers DON'T accept
+			// (image/bmp, image/tiff — even when small + under budget, so the
+			// downscale step above didn't fire) would make Anthropic return a 400.
+			// Re-encode it to JPEG first (the downscale grid always emits JPEG and
+			// jimp decodes bmp/tiff). HEIC/SVG aren't decodable → left as-is (the
+			// HEIC warning already covers them).
+			if (!isHeic && !PROVIDER_SAFE_IMAGE_MIME.has(mimeType) && isDownscalableImageMime(mimeType)) {
+				try {
+					const ds: DownscaleResult = await downscaleImage(bytes, {
+						maxBytes: p.imageBudget,
+						sourceMime: mimeType,
+					});
+					bytes = ds.bytes;
+					mimeType = ds.mimeType; // image/jpeg
+					imageTruncated = false;
+				} catch {
+					// Undecodable — fall through with the original bytes/mime; the
+					// provider may still sniff it, and a 400 surfaces as a clean failure.
+				}
+			}
 			const viaProvider = await understandViaProvider({
 				kind: "image",
 				source: p.source,

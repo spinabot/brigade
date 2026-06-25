@@ -56,13 +56,28 @@ function dayBucket(): string {
 	return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }
 
-/** Derive a file extension from a Telegram `file_path` (it usually has one). */
-function extFromFilePath(filePath: string | undefined, kind: InboundMediaAttachment["kind"]): string {
+/**
+ * Derive a file extension for the saved file. Telegram's `file_path` usually
+ * carries the real extension, but for a DOCUMENT it can be a generic name (or
+ * extensionless) while the original `fileName` is authoritative — so consult the
+ * real filename before falling back to a kind default, otherwise a
+ * `report.csv`/`.txt`/`.odt` saves as `.bin` and analyze_media can't detect it.
+ */
+function extFromFilePath(
+	filePath: string | undefined,
+	kind: InboundMediaAttachment["kind"],
+	fileName?: string,
+): string {
 	if (filePath) {
 		const ext = path.extname(filePath).replace(/^\./, "").toLowerCase();
 		if (ext && /^[a-z0-9]+$/.test(ext)) return ext;
 	}
-	// Sensible default by kind when the path carried none.
+	// The original document filename is the next-best source of the real type.
+	if (fileName) {
+		const ext = path.extname(fileName).replace(/^\./, "").toLowerCase();
+		if (ext && /^[a-z0-9]+$/.test(ext)) return ext;
+	}
+	// Sensible default by kind when nothing carried an extension.
 	switch (kind) {
 		case "image":
 			return "jpg";
@@ -167,7 +182,7 @@ export async function downloadTelegramMedia(args: DownloadTelegramMediaArgs): Pr
 		// file_unique_id is stable across re-deliveries; use it as the filename so
 		// the same media resolves idempotently. Fall back to file_id.
 		const baseName = (file.file_unique_id || fileId).replace(/[^A-Za-z0-9_-]/g, "_");
-		const dest = path.join(dir, `${baseName}.${extFromFilePath(filePath, kind)}`);
+		const dest = path.join(dir, `${baseName}.${extFromFilePath(filePath, kind, args.fileName)}`);
 		writeFileSync(dest, buf, { mode: 0o600 });
 		return {
 			kind,
