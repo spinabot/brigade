@@ -46,7 +46,7 @@ async function run(
 	overrides: {
 		privateApi?: boolean | null;
 		rec?: ReturnType<typeof recordFetch>;
-		actions?: { reactions: boolean; edit: boolean; unsend: boolean; effects: boolean; groupAdmin: boolean };
+		actions?: import("../channels/bluebubbles/account-config.js").BlueBubblesActionFlags;
 	} = {},
 ): Promise<{ details: { action: string; ok: boolean; message: string }; calls: Array<{ url: string; method: string }> }> {
 	const rec = overrides.rec ?? recordFetch();
@@ -143,14 +143,14 @@ describe("bluebubbles_action — send-effect + reply (Fix 5)", () => {
 		assert.equal(rec.calls.length, 0);
 	});
 
-	it("send-effect is refused when actions.effects = false", async () => {
+	it("send-effect is refused when actions.effects = false (umbrella)", async () => {
 		const rec = recordFetch();
 		const { details } = await run(
 			{ action: "send-effect", chatGuid: "G", text: "hi", effect: "confetti" },
 			{ rec, actions: { ...ALL_ACTIONS, effects: false } },
 		);
 		assert.equal(details.ok, false);
-		assert.match(details.message, /effects.*disabled/i);
+		assert.match(details.message, /send-effect is disabled/i);
 		assert.equal(rec.calls.length, 0);
 	});
 
@@ -172,14 +172,14 @@ describe("bluebubbles_action — send-effect + reply (Fix 5)", () => {
 });
 
 describe("bluebubbles_action — groupAdmin gating (Fix 6)", () => {
-	it("refuses a group action when actions.groupAdmin = false (no request)", async () => {
+	it("refuses a group action when actions.groupAdmin = false (umbrella, no request)", async () => {
 		const rec = recordFetch();
 		const { details } = await run(
 			{ action: "rename-group", chatGuid: "G", displayName: "Team" },
 			{ rec, actions: { ...ALL_ACTIONS, groupAdmin: false } },
 		);
 		assert.equal(details.ok, false);
-		assert.match(details.message, /group administration is disabled/i);
+		assert.match(details.message, /rename-group is disabled/i);
 		assert.equal(rec.calls.length, 0);
 	});
 
@@ -187,6 +187,40 @@ describe("bluebubbles_action — groupAdmin gating (Fix 6)", () => {
 		const { details, calls } = await run({ action: "leave-group", chatGuid: "G" });
 		assert.equal(details.ok, true);
 		assert.equal(calls.length, 1);
+	});
+});
+
+describe("bluebubbles_action — per-op gating (Fix: finer than coarse umbrella)", () => {
+	it("disabling removeParticipant but leaving renameGroup: remove refused, rename proceeds", async () => {
+		// groupAdmin umbrella ON; only removeParticipant explicitly OFF.
+		const actions = { ...ALL_ACTIONS, removeParticipant: false } as never;
+		const recRemove = recordFetch();
+		const remove = await run({ action: "remove-participant", chatGuid: "G", address: "+1" }, { rec: recRemove, actions });
+		assert.equal(remove.details.ok, false, "remove-participant is refused");
+		assert.match(remove.details.message, /remove-participant is disabled/i);
+		assert.equal(recRemove.calls.length, 0, "no REST call for the refused op");
+
+		const recRename = recordFetch();
+		const rename = await run({ action: "rename-group", chatGuid: "G", displayName: "Team" }, { rec: recRename, actions });
+		assert.equal(rename.details.ok, true, "rename-group still works");
+		assert.equal(recRename.calls.length, 1);
+		assert.match(recRename.calls[0]!.url, /\/api\/v1\/chat\/G\?/);
+	});
+
+	it("an explicit renameGroup:true overrides a groupAdmin:false umbrella", async () => {
+		const actions = { ...ALL_ACTIONS, groupAdmin: false, renameGroup: true } as never;
+		const { details, calls } = await run({ action: "rename-group", chatGuid: "G", displayName: "Team" }, { actions });
+		assert.equal(details.ok, true, "explicit per-op true wins over the umbrella");
+		assert.equal(calls.length, 1);
+	});
+
+	it("send-effect honours an explicit sendWithEffect:false even when effects:true", async () => {
+		const rec = recordFetch();
+		const actions = { ...ALL_ACTIONS, effects: true, sendWithEffect: false } as never;
+		const { details } = await run({ action: "send-effect", chatGuid: "G", text: "hi", effect: "confetti" }, { rec, actions });
+		assert.equal(details.ok, false);
+		assert.match(details.message, /send-effect is disabled/i);
+		assert.equal(rec.calls.length, 0);
 	});
 });
 

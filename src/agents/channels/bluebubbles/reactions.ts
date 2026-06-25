@@ -39,48 +39,98 @@ const REACTION_EMOJI: Record<BlueBubblesReactionType, string> = {
 	question: "❓",
 };
 
-/** Text/name aliases → canonical type. */
+/**
+ * Text/name aliases → canonical type. Covers the canonical names, the
+ * Apple/Messages past-tense forms, and a broad colloquial set (`fire`, `wow`,
+ * `lmao`, `xd`, `ok`, `boo`, `heart_eyes`, `important`, `bang`, `ask`, …) so the
+ * agent can name a tapback however it likes.
+ */
 const REACTION_ALIASES: Record<string, BlueBubblesReactionType> = {
+	// love
 	love: "love",
 	heart: "love",
 	loved: "love",
+	red_heart: "love",
+	heart_eyes: "love",
+	fire: "love",
+	// like
 	like: "like",
+	liked: "like",
 	thumbsup: "like",
+	thumb: "like",
 	"thumbs-up": "like",
 	"thumbs up": "like",
-	liked: "like",
+	thumbs_up: "like",
+	ok: "like",
+	// dislike
 	dislike: "dislike",
+	disliked: "dislike",
 	thumbsdown: "dislike",
 	"thumbs-down": "dislike",
 	"thumbs down": "dislike",
-	disliked: "dislike",
+	thumbs_down: "dislike",
+	boo: "dislike",
+	no: "dislike",
+	// laugh
 	laugh: "laugh",
+	laughed: "laugh",
 	haha: "laugh",
 	lol: "laugh",
-	laughed: "laugh",
+	lmao: "laugh",
+	rofl: "laugh",
+	xd: "laugh",
+	smile: "laugh",
+	smiley: "laugh",
+	happy: "laugh",
+	joy: "laugh",
+	// emphasize / exclaim
 	emphasize: "emphasize",
 	emphasized: "emphasize",
+	emphasis: "emphasize",
 	exclaim: "emphasize",
+	important: "emphasize",
+	bang: "emphasize",
+	wow: "emphasize",
 	"!!": "emphasize",
+	"!": "emphasize",
+	// question
 	question: "question",
 	questioned: "question",
+	ask: "question",
 	"?": "question",
 };
 
-/** Emoji glyph → canonical type (resolves the common variants). */
+/** Emoji glyph → canonical type (resolves the common variants + the broadened set). */
 const REACTION_EMOJIS: Record<string, BlueBubblesReactionType> = {
+	// love
 	"❤️": "love",
 	"❤": "love",
+	"♥️": "love",
+	"♥": "love",
 	"🩷": "love",
+	"😍": "love",
+	"💕": "love",
+	"🔥": "love",
+	// like
 	"👍": "like",
 	"👍🏻": "like",
+	"👌": "like",
+	// dislike
 	"👎": "dislike",
 	"👎🏻": "dislike",
+	"🙅": "dislike",
+	// laugh
 	"😂": "laugh",
 	"🤣": "laugh",
+	"😆": "laugh",
+	"😁": "laugh",
+	"😹": "laugh",
+	// emphasize
 	"‼️": "emphasize",
 	"‼": "emphasize",
 	"❗": "emphasize",
+	"❕": "emphasize",
+	// question
 	"❓": "question",
 	"❔": "question",
 };

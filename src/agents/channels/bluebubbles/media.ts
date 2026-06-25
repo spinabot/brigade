@@ -48,6 +48,78 @@ export function mapInboundExtension(fileName: string): string {
 	return `${stem || "attachment"}.${mapped}`;
 }
 
+/* ───────────────────────── outbound voice pre-flight ───────────────────────── */
+
+/** MIME types BlueBubbles accepts as an mp3 voice memo. */
+const VOICE_MIME_MP3 = new Set(["audio/mpeg", "audio/mp3"]);
+/** MIME types BlueBubbles accepts as a caf voice memo. */
+const VOICE_MIME_CAF = new Set(["audio/x-caf", "audio/caf"]);
+
+/** The result of classifying a candidate voice attachment. */
+export interface BlueBubblesVoiceInfo {
+	/** True when the file looks like audio at all. */
+	isAudio: boolean;
+	/** True when it is mp3 (by extension or mime). */
+	isMp3: boolean;
+	/** True when it is caf (by extension or mime). */
+	isCaf: boolean;
+}
+
+/**
+ * Classify a candidate voice attachment by extension + (optional) MIME type. A
+ * BlueBubbles voice memo must be mp3 or caf — the server converts mp3 → caf when
+ * `isAudioMessage` is set.
+ */
+export function resolveVoiceInfo(filename: string, contentType?: string): BlueBubblesVoiceInfo {
+	const type = (contentType ?? "").trim().toLowerCase() || undefined;
+	const ext = path.extname(filename).toLowerCase();
+	const isMp3 = ext === ".mp3" || (type ? VOICE_MIME_MP3.has(type) : false);
+	const isCaf = ext === ".caf" || (type ? VOICE_MIME_CAF.has(type) : false);
+	const isAudio = isMp3 || isCaf || Boolean(type?.startsWith("audio/"));
+	return { isAudio, isMp3, isCaf };
+}
+
+/**
+ * Ensure a filename ends with `extension` (e.g. `.mp3`), swapping any existing
+ * extension. `fallbackBase` is used when the input has no stem.
+ */
+export function ensureExtension(filename: string, extension: string, fallbackBase: string): string {
+	const current = path.extname(filename);
+	if (current.toLowerCase() === extension) return filename;
+	const base = current ? filename.slice(0, -current.length) : filename;
+	return `${base || fallbackBase}${extension}`;
+}
+
+/** The outcome of the outbound voice pre-flight. */
+export interface ResolvedVoiceAttachment {
+	/** The (possibly extension-coerced) filename to send. */
+	filename: string;
+	/** The (possibly defaulted) content type to send. */
+	contentType: string | undefined;
+}
+
+/**
+ * Pre-flight an outbound VOICE attachment: validate it is mp3/caf, coerce the
+ * filename's extension to match, and default the MIME type when absent. Throws a
+ * clear operator-facing error when the file is not mp3/caf audio so the send
+ * fails fast (rather than the server silently rejecting / mis-handling it).
+ */
+export function resolveOutboundVoiceAttachment(filename: string, contentType?: string): ResolvedVoiceAttachment {
+	const fallbackBase = "Audio Message";
+	const info = resolveVoiceInfo(filename, contentType);
+	if (!info.isAudio) {
+		throw new Error("BlueBubbles voice messages require audio media (mp3 or caf).");
+	}
+	if (info.isMp3) {
+		return { filename: ensureExtension(filename, ".mp3", fallbackBase), contentType: contentType ?? "audio/mpeg" };
+	}
+	if (info.isCaf) {
+		return { filename: ensureExtension(filename, ".caf", fallbackBase), contentType: contentType ?? "audio/x-caf" };
+	}
+	// Audio, but not mp3/caf (e.g. wav/m4a) — BlueBubbles can't send it as a voice memo.
+	throw new Error("BlueBubbles voice messages require mp3 or caf audio (convert before sending).");
+}
+
 /** One raw inbound attachment as the BlueBubbles webhook reports it. */
 export interface RawBlueBubblesAttachment {
 	guid?: string;

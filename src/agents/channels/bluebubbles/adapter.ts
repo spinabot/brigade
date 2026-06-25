@@ -33,6 +33,7 @@ import {
 } from "../sdk.js";
 import {
 	bluebubblesChannelEnabled,
+	isBlueBubblesOpAllowed,
 	listBlueBubblesAccountIds,
 	resolveBlueBubblesAccount,
 	resolveBlueBubblesPassword,
@@ -47,7 +48,7 @@ import {
 	type BlueBubblesInboundMessage,
 	type ConnectBlueBubblesArgs,
 } from "./connection.js";
-import { probeBlueBubbles } from "./probe.js";
+import { isMacOSEditUnsupported, probeBlueBubbles } from "./probe.js";
 
 /** Practical per-message text limit for chunked sends (before bubble-splitting). */
 const BLUEBUBBLES_TEXT_LIMIT = 10_000;
@@ -107,6 +108,7 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 	let lastEnv: NodeJS.ProcessEnv = process.env;
 	let started = false;
 	let privateApi: boolean | null = null;
+	let macOSMajor: number | null = null;
 	let selfHandle = "";
 	let actions: BlueBubblesActionFlags = {
 		reactions: true,
@@ -148,15 +150,18 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 					timeoutMs: account.probeTimeoutMs,
 				});
 				privateApi = probe.privateApi;
+				macOSMajor = probe.macOSMajor ?? null;
 				if (!probe.ok) ctx.log(`BlueBubbles probe failed: ${probe.error ?? "unknown"}`);
 			} catch {
 				privateApi = null;
+				macOSMajor = null;
 			}
 			try {
 				connection = connectImpl({
 					account,
 					log: ctx.log,
 					privateApi,
+					macOSMajor,
 					onMessage: (msg: BlueBubblesInboundMessage) => {
 						void ctx.onInbound({
 							channel: BLUEBUBBLES_CHANNEL_ID,
@@ -253,6 +258,10 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 
 		async sendMedia(conversationId: string, media: OutboundMedia): Promise<{ messageId?: string } | void> {
 			if (!connection) throw new Error("BlueBubbles channel is not started");
+			// Per-op gate: the operator can disable attachment sends independently.
+			if (!isBlueBubblesOpAllowed(actions, "sendAttachment")) {
+				throw new Error("BlueBubbles attachment sends are disabled (channels.bluebubbles.actions.sendAttachment = false)");
+			}
 			const sent = await connection.sendMedia(conversationId, media);
 			return sent.messageId ? { messageId: sent.messageId } : undefined;
 		},
@@ -293,20 +302,45 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 			credentialKeys: [
 				{
 					key: "serverUrl",
-					prompt: "BlueBubbles server URL (e.g. http://192.168.1.5:1234).",
+					prompt: "BlueBubbles server URL (e.g. http://192.168.1.5:1234). Find it in the BlueBubbles Server app under Connection.",
 					secret: false,
 					envVar: "BLUEBUBBLES_SERVER_URL",
 				},
 				{
 					key: "password",
-					prompt: "BlueBubbles server password (configured in the BlueBubbles macOS app).",
+					prompt: "BlueBubbles server password (BlueBubbles Server app → Settings).",
 					secret: true,
 					envVar: "BLUEBUBBLES_PASSWORD",
 				},
+				{
+					key: "webhookPath",
+					prompt:
+						"Inbound webhook path (optional; default /bluebubbles/webhook). After setup, add your gateway URL + this path in BlueBubbles Server → Settings → Webhooks and enable it (e.g. https://your-gateway-host:3000/bluebubbles/webhook).",
+					secret: false,
+				},
+				{
+					key: "dmPolicy",
+					prompt:
+						"Who may DM this account? pairing (owner + approved; strangers challenged — default) / allowlist (only allowFrom) / open (anyone) / disabled (drop all DMs). Leave blank for pairing.",
+					secret: false,
+				},
+				{
+					key: "allowFrom",
+					prompt:
+						"Allowlist of senders for allowlist mode — handles or chat targets, comma-separated (e.g. +15555550123, user@example.com, chat_id:123). Leave blank for none.",
+					secret: false,
+				},
 			],
 			validateInput(key: string, value: string): string | null {
-				if (key === "serverUrl" && value.trim() && !/^https?:\/\//i.test(value.trim()) && !/^[\w.-]+(:\d+)?$/.test(value.trim())) {
+				const v = value.trim();
+				if (key === "serverUrl" && v && !/^https?:\/\//i.test(v) && !/^[\w.-]+(:\d+)?$/.test(v)) {
 					return "Server URL must be a host or http(s):// URL.";
+				}
+				if (key === "webhookPath" && v && !v.startsWith("/")) {
+					return "Webhook path must start with /.";
+				}
+				if (key === "dmPolicy" && v && !["pairing", "allowlist", "open", "disabled"].includes(v.toLowerCase())) {
+					return "dmPolicy must be one of: pairing, allowlist, open, disabled.";
 				}
 				return null;
 			},
@@ -314,6 +348,15 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 				const out: Record<string, unknown> = { enabled: true };
 				const serverUrl = (values.serverUrl ?? "").trim();
 				if (serverUrl) out.serverUrl = serverUrl;
+				const webhookPath = (values.webhookPath ?? "").trim();
+				if (webhookPath) out.webhookPath = webhookPath;
+				const dmPolicy = (values.dmPolicy ?? "").trim().toLowerCase();
+				if (dmPolicy && dmPolicy !== "pairing") out.dmPolicy = dmPolicy;
+				const allowFrom = (values.allowFrom ?? "")
+					.split(/[\n,]+/g)
+					.map((s) => s.trim())
+					.filter(Boolean);
+				if (allowFrom.length > 0) out.allowFrom = allowFrom;
 				return out;
 			},
 		},
@@ -341,6 +384,10 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 					case "edit": {
 						if (!actions.edit || privateApi !== true) {
 							return { ok: false, error: "BlueBubbles message edit requires the Private API" };
+						}
+						// macOS 26+ removed iMessage message EDIT — refuse cleanly.
+						if (isMacOSEditUnsupported(macOSMajor)) {
+							return { ok: false, error: "message edit isn't supported on macOS 26+" };
 						}
 						await connection.edit({ messageId: action.messageId, text: action.text });
 						return { ok: true };

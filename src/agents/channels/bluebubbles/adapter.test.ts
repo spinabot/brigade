@@ -52,9 +52,20 @@ function makeFake(): {
 		},
 		async runCatchup() {
 			catchupRuns.count++;
-			return { querySucceeded: true, fetched: 0, replayed: 0, windowStartMs: 0 };
+			return {
+				querySucceeded: true,
+				fetched: 0,
+				replayed: 0,
+				givenUp: 0,
+				skippedGivenUp: 0,
+				failed: 0,
+				cursorBefore: null,
+				cursorAfter: 0,
+				windowStartMs: 0,
+			};
 		},
 		setPrivateApi() {},
+		setMacOSMajor() {},
 		connectedAt: () => Date.now(),
 		close() {},
 	};
@@ -65,8 +76,8 @@ function startCtx(onInbound: (m: InboundMessage) => void): ChannelStartContext {
 	return { log: () => {}, onInbound: async (m: InboundMessage) => onInbound(m) } as unknown as ChannelStartContext;
 }
 
-const probeOk = (privateApi: boolean | null): typeof import("./probe.js").probeBlueBubbles =>
-	(async (): Promise<BlueBubblesProbeResult> => ({ ok: true, privateApi, elapsedMs: 1 })) as never;
+const probeOk = (privateApi: boolean | null, macOSMajor: number | null = null): typeof import("./probe.js").probeBlueBubbles =>
+	(async (): Promise<BlueBubblesProbeResult> => ({ ok: true, privateApi, macOSMajor, elapsedMs: 1 })) as never;
 
 describe("BlueBubbles adapter", () => {
 	it("isConfigured requires enable + serverUrl + password", () => {
@@ -250,6 +261,33 @@ describe("BlueBubbles adapter", () => {
 		assert.match(r.error ?? "", /Private API/);
 	});
 
+	it("performs an edit on macOS 15 (edit supported)", async () => {
+		const fake = makeFake();
+		const adapter = createBlueBubblesAdapter({ probeImpl: probeOk(true, 15), connectImpl: () => fake.conn });
+		adapter.isConfigured(baseCfg());
+		await adapter.start(startCtx(() => {}));
+		const r = await adapter.handleAction!({
+			conversationId: "chat_guid:G",
+			action: { kind: "edit", messageId: "M", text: "fixed" },
+		});
+		assert.equal(r.ok, true);
+		assert.deepEqual(fake.actions, ["edit"]);
+	});
+
+	it("refuses edit cleanly on macOS 26+ (Apple removed iMessage edit)", async () => {
+		const fake = makeFake();
+		const adapter = createBlueBubblesAdapter({ probeImpl: probeOk(true, 26), connectImpl: () => fake.conn });
+		adapter.isConfigured(baseCfg());
+		await adapter.start(startCtx(() => {}));
+		const r = await adapter.handleAction!({
+			conversationId: "chat_guid:G",
+			action: { kind: "edit", messageId: "M", text: "fixed" },
+		});
+		assert.equal(r.ok, false);
+		assert.match(r.error ?? "", /macOS 26/);
+		assert.deepEqual(fake.actions, [], "no edit reached the connection");
+	});
+
 	it("setComposing maps composing/paused onto the connection's setTyping", async () => {
 		const fake = makeFake();
 		const adapter = createBlueBubblesAdapter({ probeImpl: probeOk(true), connectImpl: () => fake.conn });
@@ -268,6 +306,46 @@ describe("BlueBubbles adapter", () => {
 		await adapter.start(startCtx(() => {}));
 		await adapter.markRead!("chat_guid:G", "M-1");
 		assert.ok(fake.actions.includes("mark-read"));
+	});
+
+	it("setup wizard exposes serverUrl/password + webhookPath/dmPolicy/allowFrom prompts", () => {
+		const adapter = createBlueBubblesAdapter();
+		const keys = (adapter.setup?.credentialKeys ?? []).map((k) => k.key);
+		assert.deepEqual(keys, ["serverUrl", "password", "webhookPath", "dmPolicy", "allowFrom"]);
+		// The webhook-path prompt carries the BlueBubbles-Server completion guidance.
+		const webhookKey = adapter.setup?.credentialKeys.find((k) => k.key === "webhookPath");
+		assert.match(webhookKey?.prompt ?? "", /BlueBubbles Server.*Webhooks/i);
+	});
+
+	it("setup validateInput rejects a bad dmPolicy + a non-slash webhook path", () => {
+		const adapter = createBlueBubblesAdapter();
+		assert.match(adapter.setup?.validateInput?.("dmPolicy", "whatever") ?? "", /pairing, allowlist, open, disabled/);
+		assert.match(adapter.setup?.validateInput?.("webhookPath", "no-slash") ?? "", /must start with \//);
+		assert.equal(adapter.setup?.validateInput?.("dmPolicy", "allowlist"), null);
+		assert.equal(adapter.setup?.validateInput?.("webhookPath", "/bb/hook"), null);
+	});
+
+	it("setup buildAccountConfig assembles webhookPath + dmPolicy + allowFrom", () => {
+		const adapter = createBlueBubblesAdapter();
+		const built = adapter.setup?.buildAccountConfig?.({
+			serverUrl: "http://10.0.0.5:1234",
+			password: "ignored-here",
+			webhookPath: "/bb/hook",
+			dmPolicy: "allowlist",
+			allowFrom: "+15555550123, user@example.com",
+		});
+		assert.equal(built?.enabled, true);
+		assert.equal(built?.serverUrl, "http://10.0.0.5:1234");
+		assert.equal(built?.webhookPath, "/bb/hook");
+		assert.equal(built?.dmPolicy, "allowlist");
+		assert.deepEqual(built?.allowFrom, ["+15555550123", "user@example.com"]);
+	});
+
+	it("setup buildAccountConfig omits dmPolicy when left at the pairing default + omits empty allowFrom", () => {
+		const adapter = createBlueBubblesAdapter();
+		const built = adapter.setup?.buildAccountConfig?.({ serverUrl: "http://10.0.0.5:1234", dmPolicy: "pairing", allowFrom: "" });
+		assert.equal(built?.dmPolicy, undefined, "pairing is the default → not written");
+		assert.equal(built?.allowFrom, undefined, "empty allowFrom → not written");
 	});
 
 	it("runs catch-up once on connect", async () => {

@@ -3,12 +3,16 @@ import { describe, it } from "node:test";
 
 import {
 	bluebubblesChannelEnabled,
+	isBlueBubblesOpAllowed,
 	listBlueBubblesAccountIds,
 	resolveBlueBubblesAccount,
+	resolveBlueBubblesActions,
+	resolveBlueBubblesHistoryLimit,
+	resolveBlueBubblesInboundDebounceMs,
+	resolveBlueBubblesMediaLocalRoots,
 	resolveBlueBubblesPassword,
 	resolveBlueBubblesServerUrl,
 	resolveBlueBubblesWebhookPath,
-	resolveBlueBubblesActions,
 	normalizeBlueBubblesServerUrl,
 } from "./account-config.js";
 import type { BrigadeConfig } from "../../../config/io.js";
@@ -108,5 +112,69 @@ describe("account-config — actions + resolved account", () => {
 		assert.equal(account.password, ENV_PW);
 		assert.equal(account.webhookPath, "/bluebubbles/webhook");
 		assert.ok(account.mediaMaxBytes > 0);
+		// New resolved fields carry their defaults.
+		assert.equal(account.inboundDebounceMs, 0);
+		assert.equal(account.historyLimit, 10);
+		assert.equal(account.dmHistoryLimit, 0);
+		assert.deepEqual(account.mediaLocalRoots, []);
+	});
+});
+
+describe("account-config — per-op action gates (Fix 5)", () => {
+	const ALL = { reactions: true, edit: true, unsend: true, effects: true, groupAdmin: true } as const;
+
+	it("a fine op inherits its umbrella when unset", () => {
+		assert.equal(isBlueBubblesOpAllowed({ ...ALL, groupAdmin: false }, "renameGroup"), false);
+		assert.equal(isBlueBubblesOpAllowed({ ...ALL, groupAdmin: true }, "removeParticipant"), true);
+		assert.equal(isBlueBubblesOpAllowed({ ...ALL, effects: false }, "sendWithEffect"), false);
+		// reply/sendAttachment have no coarse umbrella → default on.
+		assert.equal(isBlueBubblesOpAllowed({ ...ALL }, "reply"), true);
+		assert.equal(isBlueBubblesOpAllowed({ ...ALL }, "sendAttachment"), true);
+	});
+
+	it("an explicit fine flag overrides the umbrella both ways", () => {
+		assert.equal(isBlueBubblesOpAllowed({ ...ALL, groupAdmin: false, renameGroup: true }, "renameGroup"), true);
+		assert.equal(isBlueBubblesOpAllowed({ ...ALL, groupAdmin: true, removeParticipant: false }, "removeParticipant"), false);
+		assert.equal(isBlueBubblesOpAllowed({ ...ALL, sendAttachment: false }, "sendAttachment"), false);
+	});
+
+	it("resolveBlueBubblesActions carries an explicit per-op flag from config", () => {
+		const actions = resolveBlueBubblesActions(
+			cfg({ bluebubbles: { enabled: true, actions: { groupAdmin: true, removeParticipant: false } } }),
+			"default",
+		);
+		assert.equal(actions.removeParticipant, false);
+		assert.equal(isBlueBubblesOpAllowed(actions, "removeParticipant"), false);
+		assert.equal(isBlueBubblesOpAllowed(actions, "renameGroup"), true);
+	});
+});
+
+describe("account-config — debounce / history / media-roots resolvers", () => {
+	it("resolves inboundDebounceMs (0 default; per-account override)", () => {
+		assert.equal(resolveBlueBubblesInboundDebounceMs(cfg({ bluebubbles: { enabled: true } }), "default"), 0);
+		assert.equal(
+			resolveBlueBubblesInboundDebounceMs(cfg({ bluebubbles: { enabled: true, inboundDebounceMs: 500 } }), "default"),
+			500,
+		);
+	});
+
+	it("resolves historyLimit (default 10, clamps, 0 disables)", () => {
+		assert.equal(resolveBlueBubblesHistoryLimit(cfg({ bluebubbles: { enabled: true } }), "default"), 10);
+		assert.equal(resolveBlueBubblesHistoryLimit(cfg({ bluebubbles: { enabled: true, historyLimit: 0 } }), "default"), 0);
+		assert.equal(resolveBlueBubblesHistoryLimit(cfg({ bluebubbles: { enabled: true, historyLimit: 9999 } }), "default"), 100);
+	});
+
+	it("merges mediaLocalRoots from account + slot, de-duped", () => {
+		const roots = resolveBlueBubblesMediaLocalRoots(
+			cfg({
+				bluebubbles: {
+					enabled: true,
+					mediaLocalRoots: ["/srv/shared"],
+					accounts: [{ id: "home", mediaLocalRoots: ["/home/me/media", "/srv/shared"] }],
+				},
+			}),
+			"home",
+		);
+		assert.deepEqual(roots, ["/home/me/media", "/srv/shared"]);
 	});
 });

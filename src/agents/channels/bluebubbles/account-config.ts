@@ -55,6 +55,10 @@ const DEFAULT_REGION = "US";
 const DEFAULT_MEDIA_MAX_MB = 100;
 /** Default HTTP probe / request timeout (ms). */
 export const DEFAULT_BLUEBUBBLES_PROBE_TIMEOUT_MS = 10_000;
+/** Default rolling group-history context size (recent messages attached to an untagged group msg). */
+export const DEFAULT_BLUEBUBBLES_HISTORY_LIMIT = 10;
+/** Hard ceiling on the rolling-history fetch size. */
+export const BLUEBUBBLES_MAX_HISTORY_LIMIT = 100;
 
 /** Per-knob env var consulted as a last-resort fallback for the password. */
 const PASSWORD_ENV_VAR = "BLUEBUBBLES_PASSWORD";
@@ -64,13 +68,39 @@ const SERVER_URL_ENV_VAR = "BLUEBUBBLES_SERVER_URL";
 /** `${VAR}` secret-ref form — identical to `config/io.ts`'s SECRET_REF_PATTERN. */
 const SECRET_REF_PATTERN = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;
 
-/** Rich-action toggles. Each defaults to ON; the operator can disable per account. */
+/**
+ * Rich-action toggles. The five COARSE flags are the umbrella switches (each
+ * defaults ON; the operator disables per account). The optional FINE-GRAINED
+ * flags let the operator gate a single op independently — e.g. allow group
+ * renames but forbid removing participants. A fine flag left undefined inherits
+ * its umbrella (group-admin ops ← `groupAdmin`; `sendWithEffect` ← `effects`;
+ * `reply`/`sendAttachment` ← always on) — finer per-op gating layered on top of
+ * the coarse switches, which stay the simple default surface.
+ */
 export interface BlueBubblesActionFlags {
+	// ── coarse umbrellas (always present) ──
 	reactions: boolean;
 	edit: boolean;
 	unsend: boolean;
 	effects: boolean;
 	groupAdmin: boolean;
+	// ── fine-grained per-op overrides (optional; inherit the umbrella when unset) ──
+	/** Native inline reply (a threaded reply to a specific message). Default: on. */
+	reply?: boolean;
+	/** Send with a bubble/screen effect. Default: inherits `effects`. */
+	sendWithEffect?: boolean;
+	/** Rename a group chat. Default: inherits `groupAdmin`. */
+	renameGroup?: boolean;
+	/** Set a group chat icon. Default: inherits `groupAdmin`. */
+	setGroupIcon?: boolean;
+	/** Add a participant to a group. Default: inherits `groupAdmin`. */
+	addParticipant?: boolean;
+	/** Remove a participant from a group. Default: inherits `groupAdmin`. */
+	removeParticipant?: boolean;
+	/** Leave a group. Default: inherits `groupAdmin`. */
+	leaveGroup?: boolean;
+	/** Send a media attachment. Default: on. */
+	sendAttachment?: boolean;
 }
 
 /** Default rich-action toggles — everything on (Private API gates the rest at runtime). */
@@ -81,6 +111,44 @@ export const DEFAULT_BLUEBUBBLES_ACTIONS: BlueBubblesActionFlags = {
 	effects: true,
 	groupAdmin: true,
 };
+
+/** The fine-grained per-op action flag names. */
+export type BlueBubblesFineActionName =
+	| "reply"
+	| "sendWithEffect"
+	| "renameGroup"
+	| "setGroupIcon"
+	| "addParticipant"
+	| "removeParticipant"
+	| "leaveGroup"
+	| "sendAttachment";
+
+/**
+ * Resolve whether a FINE-GRAINED op is allowed, honouring an explicit per-op
+ * flag when set and otherwise inheriting the umbrella:
+ *   - group-admin ops (rename/icon/add/remove/leave) ← `groupAdmin`;
+ *   - `sendWithEffect` ← `effects`;
+ *   - `reply` / `sendAttachment` ← always on (no coarse umbrella gates them).
+ */
+export function isBlueBubblesOpAllowed(actions: BlueBubblesActionFlags, op: BlueBubblesFineActionName): boolean {
+	const explicit = actions[op];
+	if (typeof explicit === "boolean") return explicit;
+	switch (op) {
+		case "sendWithEffect":
+			return actions.effects;
+		case "renameGroup":
+		case "setGroupIcon":
+		case "addParticipant":
+		case "removeParticipant":
+		case "leaveGroup":
+			return actions.groupAdmin;
+		case "reply":
+		case "sendAttachment":
+			return true;
+		default:
+			return true;
+	}
+}
 
 /** Raw shape of one entry under `channels.bluebubbles.accounts`. */
 interface BlueBubblesAccountEntry {
@@ -96,6 +164,10 @@ interface BlueBubblesAccountEntry {
 	catchup?: BlueBubblesCatchupConfig;
 	network?: BlueBubblesNetworkConfig;
 	selfHandle?: string;
+	inboundDebounceMs?: number;
+	historyLimit?: number;
+	dmHistoryLimit?: number;
+	mediaLocalRoots?: string[];
 	[key: string]: unknown;
 }
 
@@ -122,6 +194,12 @@ interface BlueBubblesChannelConfigSlot {
 	catchup?: BlueBubblesCatchupConfig;
 	network?: BlueBubblesNetworkConfig;
 	selfHandle?: string;
+	inboundDebounceMs?: number;
+	historyLimit?: number;
+	dmHistoryLimit?: number;
+	mediaLocalRoots?: string[];
+	dmPolicy?: string;
+	allowFrom?: string[];
 	accounts?: BlueBubblesAccountEntry[];
 	/** Idle TTL (ms / duration string) after which idle thread sessions are reaped. */
 	threadIdleTtlMs?: number | string;
@@ -148,6 +226,26 @@ export interface ResolvedBlueBubblesAccount {
 	actions: BlueBubblesActionFlags;
 	/** On-(re)connect catch-up backfill config (undefined → defaults; `enabled:false` disables). */
 	catchup?: BlueBubblesCatchupConfig;
+	/**
+	 * Inbound coalescing window (ms). When > 0, a text + its link-preview balloon
+	 * (or a text + a split-out attachment) arriving as two `new-message` webhooks
+	 * are merged into ONE agent turn. 0 (default) disables coalescing.
+	 */
+	inboundDebounceMs: number;
+	/**
+	 * Rolling group-history context: how many recent messages to fetch + attach
+	 * as context on an untagged GROUP message (so the agent sees what it's
+	 * replying into). 0 disables. Default 10.
+	 */
+	historyLimit: number;
+	/** Same as `historyLimit` but for DMs. 0 disables. Default 0 (DMs already carry their own thread). */
+	dmHistoryLimit: number;
+	/**
+	 * Allow-list of local directory roots an OUTBOUND attachment may be read from.
+	 * Layered ON TOP OF the central media-path denylist. Empty (default) = no
+	 * extra root restriction (the central guard still applies).
+	 */
+	mediaLocalRoots: string[];
 	/** Allow private/LAN/loopback targets through the SSRF guard (default TRUE). */
 	allowPrivateNetwork: boolean;
 	/**
@@ -179,7 +277,19 @@ function resolveStringRef(raw: string | undefined, env: NodeJS.ProcessEnv): stri
 	return trimmed;
 }
 
-/** Coerce a loose `actions` object to the typed flags (each defaults ON). */
+/** The fine-grained op flag names — picked up only when the operator set them. */
+const FINE_ACTION_NAMES: readonly BlueBubblesFineActionName[] = [
+	"reply",
+	"sendWithEffect",
+	"renameGroup",
+	"setGroupIcon",
+	"addParticipant",
+	"removeParticipant",
+	"leaveGroup",
+	"sendAttachment",
+];
+
+/** Coerce a loose `actions` object to the typed flags (coarse default ON; fine flags only when set). */
 function coerceActionFlags(
 	entry: Partial<BlueBubblesActionFlags> | undefined,
 	slot: Partial<BlueBubblesActionFlags> | undefined,
@@ -187,15 +297,23 @@ function coerceActionFlags(
 	const pick = (key: keyof BlueBubblesActionFlags): boolean => {
 		if (entry && typeof entry[key] === "boolean") return entry[key] as boolean;
 		if (slot && typeof slot[key] === "boolean") return slot[key] as boolean;
-		return DEFAULT_BLUEBUBBLES_ACTIONS[key];
+		return DEFAULT_BLUEBUBBLES_ACTIONS[key] ?? true;
 	};
-	return {
+	const out: BlueBubblesActionFlags = {
 		reactions: pick("reactions"),
 		edit: pick("edit"),
 		unsend: pick("unsend"),
 		effects: pick("effects"),
 		groupAdmin: pick("groupAdmin"),
 	};
+	// Carry a fine-grained override ONLY when the operator explicitly set it
+	// (entry wins over slot); otherwise leave it undefined so `isBlueBubblesOpAllowed`
+	// inherits the umbrella.
+	for (const name of FINE_ACTION_NAMES) {
+		const v = entry && typeof entry[name] === "boolean" ? entry[name] : slot && typeof slot[name] === "boolean" ? slot[name] : undefined;
+		if (typeof v === "boolean") out[name] = v;
+	}
+	return out;
 }
 
 /** Is the BlueBubbles channel switched on at all (any shape)? */
@@ -409,6 +527,74 @@ export function resolveBlueBubblesCatchup(
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * Resolve the inbound coalescing window (ms) for an account (per-account wins
+ * over the top-level slot). 0 (default) disables coalescing.
+ */
+export function resolveBlueBubblesInboundDebounceMs(cfg: BrigadeConfig, accountId?: string | null): number {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = bluebubblesChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	const raw = typeof entry?.inboundDebounceMs === "number" ? entry.inboundDebounceMs : slot?.inboundDebounceMs;
+	return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+}
+
+/** Clamp a configured history limit into `[0, MAX]`. */
+function clampHistoryLimit(raw: unknown, fallback: number): number {
+	if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
+	const n = Math.floor(raw);
+	if (n <= 0) return 0;
+	return Math.min(n, BLUEBUBBLES_MAX_HISTORY_LIMIT);
+}
+
+/**
+ * Resolve the rolling group-history context size for an account (per-account
+ * wins over the top-level slot). Defaults to {@link DEFAULT_BLUEBUBBLES_HISTORY_LIMIT};
+ * 0 disables.
+ */
+export function resolveBlueBubblesHistoryLimit(cfg: BrigadeConfig, accountId?: string | null): number {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = bluebubblesChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	const raw = entry?.historyLimit ?? slot?.historyLimit;
+	return clampHistoryLimit(raw, DEFAULT_BLUEBUBBLES_HISTORY_LIMIT);
+}
+
+/**
+ * Resolve the rolling DM-history context size for an account. Defaults to 0
+ * (a DM already carries its own thread context); 0 disables.
+ */
+export function resolveBlueBubblesDmHistoryLimit(cfg: BrigadeConfig, accountId?: string | null): number {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = bluebubblesChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	const raw = entry?.dmHistoryLimit ?? slot?.dmHistoryLimit;
+	return clampHistoryLimit(raw, 0);
+}
+
+/**
+ * Resolve the OUTBOUND-attachment local-root allow-list for an account
+ * (per-account entries merged with the top-level slot, de-duped). Empty when
+ * neither level configured it — the central media-path denylist still applies.
+ */
+export function resolveBlueBubblesMediaLocalRoots(cfg: BrigadeConfig, accountId?: string | null): string[] {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = bluebubblesChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const list of [entry?.mediaLocalRoots, slot?.mediaLocalRoots]) {
+		if (!Array.isArray(list)) continue;
+		for (const raw of list) {
+			const v = typeof raw === "string" ? raw.trim() : "";
+			if (!v || seen.has(v)) continue;
+			seen.add(v);
+			out.push(v);
+		}
+	}
+	return out;
+}
+
 /** Resolve a per-account view of the config (defaults filled in). */
 export function resolveBlueBubblesAccount(
 	cfg: BrigadeConfig,
@@ -438,6 +624,10 @@ export function resolveBlueBubblesAccount(
 		actions: resolveBlueBubblesActions(cfg, id),
 		allowPrivateNetwork: resolveBlueBubblesAllowPrivateNetwork(cfg, id),
 		selfHandle: resolveBlueBubblesSelfHandle(cfg, id, env),
+		inboundDebounceMs: resolveBlueBubblesInboundDebounceMs(cfg, id),
+		historyLimit: resolveBlueBubblesHistoryLimit(cfg, id),
+		dmHistoryLimit: resolveBlueBubblesDmHistoryLimit(cfg, id),
+		mediaLocalRoots: resolveBlueBubblesMediaLocalRoots(cfg, id),
 		...(() => {
 			const catchup = resolveBlueBubblesCatchup(cfg, id);
 			return catchup ? { catchup } : {};

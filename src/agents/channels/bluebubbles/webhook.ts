@@ -23,6 +23,72 @@ import type { HttpRoute } from "../sdk.js";
 /** Cap on the webhook body (a BlueBubbles event is small; 4 MiB is generous). */
 const WEBHOOK_MAX_BODY_BYTES = 4 * 1024 * 1024;
 
+/** Default fixed-window rate-limit: max authenticated requests per window. */
+export const WEBHOOK_RATE_LIMIT_MAX = 240;
+/** Default fixed-window length (ms). 240 req / 10s ≈ 24 rps sustained per account. */
+export const WEBHOOK_RATE_LIMIT_WINDOW_MS = 10_000;
+/** Default bound on concurrently in-flight handler bodies (normalize/dedupe/dispatch). */
+export const WEBHOOK_MAX_IN_FLIGHT = 32;
+
+/**
+ * A fixed-window request rate-limiter. `hit()` records one request against the
+ * current window and returns whether it is WITHIN the limit. The window resets
+ * lazily on the first hit after it elapses (no timers held). Self-contained so
+ * the webhook route can bound a replay-storm / hostile sender on the `auth:none`
+ * path without a central dependency.
+ */
+export interface FixedWindowRateLimiter {
+	/** Record a request; returns true when it is allowed (within the window's cap). */
+	hit(nowMs?: number): boolean;
+}
+
+/** Build a fixed-window rate limiter (`max` requests per `windowMs`). */
+export function createFixedWindowRateLimiter(max: number, windowMs: number): FixedWindowRateLimiter {
+	const cap = Math.max(1, Math.floor(max));
+	const span = Math.max(1, Math.floor(windowMs));
+	let windowStart = 0;
+	let count = 0;
+	return {
+		hit(nowMs = Date.now()): boolean {
+			if (nowMs - windowStart >= span) {
+				windowStart = nowMs;
+				count = 0;
+			}
+			count++;
+			return count <= cap;
+		},
+	};
+}
+
+/**
+ * A bounded concurrency gate. `tryAcquire()` reserves a slot (returns a release
+ * fn) or returns null when the cap is already reached. The handler releases its
+ * slot in a `finally` so a thrown handler can't leak the count.
+ */
+export interface InFlightLimiter {
+	tryAcquire(): (() => void) | null;
+	inFlight(): number;
+}
+
+/** Build an in-flight concurrency limiter capped at `max` simultaneous holders. */
+export function createInFlightLimiter(max: number): InFlightLimiter {
+	const cap = Math.max(1, Math.floor(max));
+	let active = 0;
+	return {
+		tryAcquire(): (() => void) | null {
+			if (active >= cap) return null;
+			active++;
+			let released = false;
+			return () => {
+				if (released) return;
+				released = true;
+				active--;
+			};
+		},
+		inFlight: () => active,
+	};
+}
+
 /** Constant-time compare of two strings — avoids leaking via timing. */
 export function safeEqualToken(a: string, b: string): boolean {
 	if (a.length !== b.length) return false;
@@ -134,6 +200,14 @@ export interface BuildBlueBubblesWebhookRouteArgs {
 	resolveSink: () => BlueBubblesWebhookSink | null;
 	/** Logger. */
 	log?: (msg: string, meta?: Record<string, unknown>) => void;
+	/** Max authenticated requests per window before throttling (default {@link WEBHOOK_RATE_LIMIT_MAX}). */
+	rateLimitMax?: number;
+	/** Fixed-window length in ms (default {@link WEBHOOK_RATE_LIMIT_WINDOW_MS}). */
+	rateLimitWindowMs?: number;
+	/** Max concurrently in-flight handler bodies (default {@link WEBHOOK_MAX_IN_FLIGHT}). */
+	maxInFlight?: number;
+	/** TEST SEAM — inject the clock used by the rate limiter. */
+	now?: () => number;
 }
 
 /**
@@ -141,6 +215,14 @@ export interface BuildBlueBubblesWebhookRouteArgs {
  * `b.httpRoute(...)` from the module.
  */
 export function buildBlueBubblesWebhookRoute(args: BuildBlueBubblesWebhookRouteArgs): HttpRoute {
+	// Per-route limiters (one route = one account). Built once and closed over so
+	// the window/in-flight counters persist across requests.
+	const rateLimiter = createFixedWindowRateLimiter(
+		args.rateLimitMax ?? WEBHOOK_RATE_LIMIT_MAX,
+		args.rateLimitWindowMs ?? WEBHOOK_RATE_LIMIT_WINDOW_MS,
+	);
+	const inFlight = createInFlightLimiter(args.maxInFlight ?? WEBHOOK_MAX_IN_FLIGHT);
+
 	const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
 		const reply = (status: number, body: unknown): void => {
 			res.statusCode = status;
@@ -161,35 +243,57 @@ export function buildBlueBubblesWebhookRoute(args: BuildBlueBubblesWebhookRouteA
 			return;
 		}
 
-		// The gateway dispatcher has ALREADY drained + buffered the body onto
-		// `req.body`. Read that first; only stream when exercised outside the gateway.
-		const pre = (req as IncomingMessage & { body?: Buffer }).body;
-		const raw = pre ? pre.toString("utf8") : await readBody(req, WEBHOOK_MAX_BODY_BYTES);
-		if (raw === null) {
-			reply(413, { ok: false, error: "payload too large" });
+		// Rate-limit the authenticated stream — a replay-storm / hostile sender that
+		// has the password must not run the normalize/dedupe/dispatch path
+		// unbounded. Over-limit requests are dropped with 429 BEFORE the body is
+		// read, so the cost of an abusive burst is bounded.
+		if (!rateLimiter.hit(args.now?.())) {
+			args.log?.("bluebubbles webhook throttled — over rate limit");
+			reply(429, { ok: false, error: "rate limited" });
 			return;
 		}
 
-		const contentType = (() => {
-			const c = req.headers["content-type"];
-			return Array.isArray(c) ? (c[0] ?? "") : (c ?? "");
-		})();
-		const parsed = parseBlueBubblesBody(raw, contentType);
-		if (!parsed) {
-			reply(400, { ok: false, error: "invalid body" });
+		// Bound concurrent in-flight handler bodies. When the cap is reached, shed
+		// load with 429 rather than letting unbounded parses/dispatches pile up.
+		const release = inFlight.tryAcquire();
+		if (!release) {
+			args.log?.("bluebubbles webhook throttled — in-flight cap reached");
+			reply(429, { ok: false, error: "busy" });
 			return;
 		}
-
-		const sink = args.resolveSink();
-		if (sink) {
-			try {
-				sink.feedWebhookEvent(parsed.type, parsed.payload);
-			} catch (err) {
-				args.log?.("bluebubbles webhook dispatch threw", { error: err instanceof Error ? err.message : String(err) });
+		try {
+			// The gateway dispatcher has ALREADY drained + buffered the body onto
+			// `req.body`. Read that first; only stream when exercised outside the gateway.
+			const pre = (req as IncomingMessage & { body?: Buffer }).body;
+			const raw = pre ? pre.toString("utf8") : await readBody(req, WEBHOOK_MAX_BODY_BYTES);
+			if (raw === null) {
+				reply(413, { ok: false, error: "payload too large" });
+				return;
 			}
+
+			const contentType = (() => {
+				const c = req.headers["content-type"];
+				return Array.isArray(c) ? (c[0] ?? "") : (c ?? "");
+			})();
+			const parsed = parseBlueBubblesBody(raw, contentType);
+			if (!parsed) {
+				reply(400, { ok: false, error: "invalid body" });
+				return;
+			}
+
+			const sink = args.resolveSink();
+			if (sink) {
+				try {
+					sink.feedWebhookEvent(parsed.type, parsed.payload);
+				} catch (err) {
+					args.log?.("bluebubbles webhook dispatch threw", { error: err instanceof Error ? err.message : String(err) });
+				}
+			}
+			// Always 200 so BlueBubbles doesn't retry-storm.
+			reply(200, { ok: true });
+		} finally {
+			release();
 		}
-		// Always 200 so BlueBubbles doesn't retry-storm.
-		reply(200, { ok: true });
 	};
 
 	return {

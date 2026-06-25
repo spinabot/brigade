@@ -28,9 +28,11 @@ import { Type } from "typebox";
 import { loadConfig } from "../../core/config.js";
 import {
 	BLUEBUBBLES_DEFAULT_ACCOUNT_ID,
+	isBlueBubblesOpAllowed,
 	resolveBlueBubblesAccount,
 	resolveBlueBubblesActions,
 	type BlueBubblesActionFlags,
+	type BlueBubblesFineActionName,
 } from "../channels/bluebubbles/account-config.js";
 import {
 	addBlueBubblesParticipant,
@@ -40,7 +42,7 @@ import {
 	setBlueBubblesGroupIcon,
 } from "../channels/bluebubbles/chat.js";
 import { resolveEffectId } from "../channels/bluebubbles/effects.js";
-import { probeBlueBubbles } from "../channels/bluebubbles/probe.js";
+import { probeBlueBubblesCached } from "../channels/bluebubbles/probe.js";
 import { sendBlueBubblesText, type BlueBubblesRestBase } from "../channels/bluebubbles/send.js";
 import type { FetchLike } from "../channels/bluebubbles/types.js";
 import { validateOutboundMediaPath } from "../../security/media-path-guard.js";
@@ -131,7 +133,10 @@ export function makeBlueBubblesActionTool(
 	const resolvePrivateApi =
 		opts.resolvePrivateApi ??
 		(async (account: { serverUrl: string; password: string; timeoutMs?: number }): Promise<boolean | null> => {
-			const probe = await probeBlueBubbles({
+			// Served from the per-server TTL cache when fresh, so back-to-back actions
+			// don't each re-probe server/info.
+			const probe = await probeBlueBubblesCached({
+				accountId: `tool:${account.serverUrl}`,
 				serverUrl: account.serverUrl,
 				password: account.password,
 				...(account.timeoutMs !== undefined ? { timeoutMs: account.timeoutMs } : {}),
@@ -190,17 +195,24 @@ export function makeBlueBubblesActionTool(
 			const chatGuid = (args.chatGuid ?? "").trim().replace(/^chat_guid:/i, "");
 			if (!chatGuid) return fail(`${action} requires a \`chatGuid\`.`);
 
-			// Resolve the per-account action toggles + gate the action against them.
-			// Group-admin actions honour `actions.groupAdmin`; send-effect honours
-			// `actions.effects` — mirroring how the live adapter's handleAction gates
-			// reactions/edit/unsend.
+			// Resolve the per-account action toggles + gate the action against them,
+			// PER-OP. Each op maps to a fine-grained flag that inherits its coarse
+			// umbrella when unset (group-admin ops ← `groupAdmin`; send-effect ←
+			// `effects`; reply ← always on) — so the operator can, e.g., allow
+			// rename-group but forbid remove-participant.
 			const actions = resolveActions(accountId);
-			const GROUP_ADMIN_ACTIONS = new Set(["add-participant", "remove-participant", "rename-group", "set-group-icon", "leave-group"]);
-			if (GROUP_ADMIN_ACTIONS.has(action) && !actions.groupAdmin) {
-				return fail(`BlueBubbles group administration is disabled (channels.bluebubbles.actions.groupAdmin = false).`);
-			}
-			if (action === "send-effect" && !actions.effects) {
-				return fail(`BlueBubbles send effects are disabled (channels.bluebubbles.actions.effects = false).`);
+			const OP_FLAG: Record<string, BlueBubblesFineActionName> = {
+				"add-participant": "addParticipant",
+				"remove-participant": "removeParticipant",
+				"rename-group": "renameGroup",
+				"set-group-icon": "setGroupIcon",
+				"leave-group": "leaveGroup",
+				"send-effect": "sendWithEffect",
+				reply: "reply",
+			};
+			const opFlag = OP_FLAG[action];
+			if (opFlag && !isBlueBubblesOpAllowed(actions, opFlag)) {
+				return fail(`BlueBubbles ${action} is disabled (channels.bluebubbles.actions.${opFlag} = false).`);
 			}
 
 			// Probe once for the Private-API status — every action here needs it.

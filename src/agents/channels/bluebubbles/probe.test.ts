@@ -1,7 +1,13 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { probeBlueBubbles, parseMacOSMajorVersion } from "./probe.js";
+import {
+	clearBlueBubblesProbeCache,
+	isMacOSEditUnsupported,
+	parseMacOSMajorVersion,
+	probeBlueBubbles,
+	probeBlueBubblesCached,
+} from "./probe.js";
 
 const SERVER = "http://192.168.1.5:1234";
 const PASSWORD = ["bb", "probe", "pw"].join("-");
@@ -30,6 +36,16 @@ describe("probeBlueBubbles", () => {
 		assert.equal(res.ok, true);
 		assert.equal(res.privateApi, true);
 		assert.equal(res.serverInfo?.server_version, "1.9.0");
+		assert.equal(res.macOSMajor, 14, "macOS major parsed from os_version");
+	});
+
+	it("surfaces the macOS major version for a macOS 26 host", async () => {
+		const res = await probeBlueBubbles({
+			serverUrl: SERVER,
+			password: PASSWORD,
+			fetchImpl: fakeFetch({ data: { private_api: true, os_version: "26.0" } }),
+		});
+		assert.equal(res.macOSMajor, 26);
 	});
 
 	it("returns ok + privateApi:false when disabled", async () => {
@@ -84,5 +100,63 @@ describe("parseMacOSMajorVersion", () => {
 	it("returns null on garbage", () => {
 		assert.equal(parseMacOSMajorVersion("unknown"), null);
 		assert.equal(parseMacOSMajorVersion(undefined), null);
+	});
+});
+
+describe("probeBlueBubblesCached", () => {
+	/** A fetch that counts how many times it was called. */
+	function countingFetch(count: { n: number }, data: unknown = { private_api: true, os_version: "14.4" }): typeof fetch {
+		return (async () => {
+			count.n++;
+			return {
+				ok: true,
+				status: 200,
+				text: async () => JSON.stringify({ status: 200, data }),
+				headers: new Map<string, string>() as unknown as Headers,
+			} as unknown as Response;
+		}) as unknown as typeof fetch;
+	}
+
+	it("serves a second probe within the TTL from cache (no extra round-trip)", async () => {
+		clearBlueBubblesProbeCache();
+		const count = { n: 0 };
+		const f = countingFetch(count);
+		const args = { accountId: "cache-test", serverUrl: SERVER, password: PASSWORD, fetchImpl: f, now: () => 1_000 };
+		const a = await probeBlueBubblesCached(args);
+		const b = await probeBlueBubblesCached(args);
+		assert.equal(a.privateApi, true);
+		assert.equal(b.privateApi, true);
+		assert.equal(count.n, 1, "second call hit the cache, not the network");
+	});
+
+	it("re-probes after the TTL expires", async () => {
+		clearBlueBubblesProbeCache();
+		const count = { n: 0 };
+		const f = countingFetch(count);
+		await probeBlueBubblesCached({ accountId: "ttl-test", serverUrl: SERVER, password: PASSWORD, fetchImpl: f, cacheTtlMs: 100, now: () => 1_000 });
+		await probeBlueBubblesCached({ accountId: "ttl-test", serverUrl: SERVER, password: PASSWORD, fetchImpl: f, cacheTtlMs: 100, now: () => 2_000 });
+		assert.equal(count.n, 2, "expired cache → re-probe");
+	});
+
+	it("does NOT cache a failed probe", async () => {
+		clearBlueBubblesProbeCache();
+		const count = { n: 0 };
+		const f = (async () => {
+			count.n++;
+			throw new Error("ECONNREFUSED");
+		}) as unknown as typeof fetch;
+		await probeBlueBubblesCached({ accountId: "fail-test", serverUrl: SERVER, password: PASSWORD, fetchImpl: f, now: () => 1_000 });
+		await probeBlueBubblesCached({ accountId: "fail-test", serverUrl: SERVER, password: PASSWORD, fetchImpl: f, now: () => 1_001 });
+		assert.equal(count.n, 2, "a failed probe is not cached → retried");
+	});
+});
+
+describe("isMacOSEditUnsupported", () => {
+	it("is true on macOS 26+ and false below / unknown", () => {
+		assert.equal(isMacOSEditUnsupported(26), true);
+		assert.equal(isMacOSEditUnsupported(27), true);
+		assert.equal(isMacOSEditUnsupported(15), false);
+		assert.equal(isMacOSEditUnsupported(null), false);
+		assert.equal(isMacOSEditUnsupported(undefined), false);
 	});
 });

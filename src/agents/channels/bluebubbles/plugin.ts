@@ -23,6 +23,7 @@ import {
 	createInboundPipelineContext,
 	createSubsystemLogger,
 	runChannelInboundPipeline,
+	type ChannelAccountSnapshot,
 	type ChannelAdapter,
 	type ChannelCommand,
 	type ChannelGatewayContext,
@@ -51,6 +52,7 @@ import { registerBlueBubblesAccountSink, removeBlueBubblesAccountSink } from "./
 import { createBlueBubblesAdapter, type BlueBubblesAdapter } from "./adapter.js";
 import { bluebubblesMessagingAdapter } from "./messaging.js";
 import { probeBlueBubbles, type BlueBubblesProbeResult } from "./probe.js";
+import { collectBlueBubblesStatusIssues, statusAccountFromSnapshot, toChannelStatusIssues } from "./status-issues.js";
 
 const log = createSubsystemLogger("channels/bluebubbles/plugin");
 
@@ -219,6 +221,31 @@ export function createBlueBubblesPlugin(deps: BlueBubblesPluginDeps): BlueBubble
 			startAccount,
 			stopAccount,
 			logoutAccount,
+		},
+		status: {
+			// Stamp probe-derived diagnostics onto the open-shaped snapshot so
+			// `collectStatusIssues` can derive structured issues without re-probing.
+			buildAccountSnapshot: async ({ account, cfg, runtime }) => {
+				const base: Record<string, unknown> = { ...(runtime ?? {}), id: account.accountId };
+				const configured = Boolean(account.serverUrl) && Boolean(account.password);
+				base.configured = configured;
+				if (configured) {
+					try {
+						const probe = await probeBlueBubbles({
+							serverUrl: resolveBlueBubblesServerUrl(cfg, account.accountId),
+							password: resolveBlueBubblesPassword(cfg, account.accountId),
+							timeoutMs: resolveBlueBubblesProbeTimeoutMs(cfg, account.accountId),
+						});
+						base.reachable = probe.ok;
+						base.privateApi = probe.privateApi;
+					} catch {
+						base.reachable = false;
+					}
+				}
+				return base as ChannelAccountSnapshot;
+			},
+			collectStatusIssues: (accounts) =>
+				toChannelStatusIssues(collectBlueBubblesStatusIssues((accounts ?? []).map((s) => statusAccountFromSnapshot(s)))),
 		},
 		outbound: {
 			sendText: async (params) => {

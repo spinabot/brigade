@@ -4,7 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 
-import { downloadInboundAttachments, mapInboundExtension } from "./media.js";
+import {
+	downloadInboundAttachments,
+	ensureExtension,
+	mapInboundExtension,
+	resolveOutboundVoiceAttachment,
+	resolveVoiceInfo,
+} from "./media.js";
 
 const SERVER = "http://192.168.1.5:1234";
 const PASSWORD = ["bb", "media", "pw"].join("-");
@@ -33,6 +39,46 @@ describe("mapInboundExtension", () => {
 	it("leaves other extensions untouched", () => {
 		assert.equal(mapInboundExtension("clip.mp4"), "clip.mp4");
 		assert.equal(mapInboundExtension("doc.pdf"), "doc.pdf");
+	});
+});
+
+describe("voice pre-flight (Fix 6)", () => {
+	it("resolveVoiceInfo classifies mp3 by extension + by mime", () => {
+		assert.deepEqual(resolveVoiceInfo("memo.mp3"), { isAudio: true, isMp3: true, isCaf: false });
+		assert.deepEqual(resolveVoiceInfo("memo.bin", "audio/mpeg"), { isAudio: true, isMp3: true, isCaf: false });
+	});
+	it("resolveVoiceInfo classifies caf", () => {
+		assert.deepEqual(resolveVoiceInfo("note.caf"), { isAudio: true, isMp3: false, isCaf: true });
+	});
+	it("resolveVoiceInfo flags non-audio", () => {
+		assert.deepEqual(resolveVoiceInfo("pic.png"), { isAudio: false, isMp3: false, isCaf: false });
+	});
+
+	it("ensureExtension swaps / appends an extension", () => {
+		assert.equal(ensureExtension("memo.wav", ".mp3", "Audio Message"), "memo.mp3");
+		assert.equal(ensureExtension("memo", ".mp3", "Audio Message"), "memo.mp3");
+		assert.equal(ensureExtension("memo.mp3", ".mp3", "Audio Message"), "memo.mp3");
+		assert.equal(ensureExtension("", ".mp3", "Audio Message"), "Audio Message.mp3");
+	});
+
+	it("resolveOutboundVoiceAttachment accepts mp3 + defaults the mime", () => {
+		const r = resolveOutboundVoiceAttachment("voice.mp3");
+		assert.equal(r.filename, "voice.mp3");
+		assert.equal(r.contentType, "audio/mpeg");
+	});
+
+	it("resolveOutboundVoiceAttachment accepts caf + defaults the mime", () => {
+		const r = resolveOutboundVoiceAttachment("note.caf");
+		assert.equal(r.filename, "note.caf");
+		assert.equal(r.contentType, "audio/x-caf");
+	});
+
+	it("resolveOutboundVoiceAttachment fails fast for a non-audio file", () => {
+		assert.throws(() => resolveOutboundVoiceAttachment("photo.png"), /require audio media \(mp3 or caf\)/);
+	});
+
+	it("resolveOutboundVoiceAttachment rejects audio that isn't mp3/caf (e.g. wav)", () => {
+		assert.throws(() => resolveOutboundVoiceAttachment("clip.wav", "audio/wav"), /require mp3 or caf/);
 	});
 });
 

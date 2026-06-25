@@ -4,6 +4,8 @@ import { describe, it } from "node:test";
 
 import {
 	buildBlueBubblesWebhookRoute,
+	createFixedWindowRateLimiter,
+	createInFlightLimiter,
 	parseBlueBubblesBody,
 	verifyBlueBubblesWebhook,
 	type BlueBubblesWebhookSink,
@@ -134,5 +136,116 @@ describe("buildBlueBubblesWebhookRoute", () => {
 		const res = fakeRes();
 		await route.handler(fakeReq({ method: "GET" }), res);
 		assert.equal(res.statusCode, 405);
+	});
+
+	it("throttles (429) authenticated requests over the rate limit + stops feeding the sink", async () => {
+		const fed: unknown[] = [];
+		const sink: BlueBubblesWebhookSink = { feedWebhookEvent: (_e, p) => fed.push(p) };
+		let clock = 1_000;
+		const route = buildBlueBubblesWebhookRoute({
+			path: "/bluebubbles/webhook",
+			password: PASSWORD,
+			resolveSink: () => sink,
+			rateLimitMax: 2,
+			rateLimitWindowMs: 1_000,
+			now: () => clock,
+		});
+		const fire = async () => {
+			const res = fakeRes();
+			await route.handler(
+				fakeReq({
+					url: `/bluebubbles/webhook?password=${encodeURIComponent(PASSWORD)}`,
+					body: JSON.stringify({ type: "new-message", data: { guid: "M" } }),
+				}),
+				res,
+			);
+			return res.statusCode;
+		};
+		// Same window (clock fixed) — first 2 pass, 3rd is throttled.
+		assert.equal(await fire(), 200);
+		assert.equal(await fire(), 200);
+		assert.equal(await fire(), 429);
+		assert.equal(fed.length, 2, "the throttled request never reached the sink");
+		// New window — the counter resets and the next request passes again.
+		clock += 1_000;
+		assert.equal(await fire(), 200);
+	});
+
+	it("sheds load (429) when the in-flight cap is reached", async () => {
+		// A streaming (non-pre-buffered) body whose `end` we control, so the handler
+		// stays in-flight while holding its slot.
+		const releasers: Array<() => void> = [];
+		function streamingReq(): IncomingMessage {
+			const listeners: Record<string, (chunk?: Buffer) => void> = {};
+			const req = {
+				method: "POST",
+				url: `/bluebubbles/webhook?password=${encodeURIComponent(PASSWORD)}`,
+				headers: { "content-type": "application/json" },
+				on(event: string, cb: (chunk?: Buffer) => void) {
+					listeners[event] = cb;
+					return req;
+				},
+			} as unknown as IncomingMessage;
+			// Defer the body's completion until we release it.
+			releasers.push(() => {
+				listeners.data?.(Buffer.from(JSON.stringify({ type: "new-message", data: { guid: "M" } }), "utf8"));
+				listeners.end?.();
+			});
+			return req;
+		}
+		const sink: BlueBubblesWebhookSink = { feedWebhookEvent: () => {} };
+		const route = buildBlueBubblesWebhookRoute({
+			path: "/bluebubbles/webhook",
+			password: PASSWORD,
+			resolveSink: () => sink,
+			maxInFlight: 1,
+			rateLimitMax: 100,
+		});
+		const res1 = fakeRes();
+		const res2 = fakeRes();
+		// First request starts and parks on the unfinished body (holds the 1 slot).
+		const p1 = route.handler(streamingReq(), res1);
+		await new Promise((r) => setImmediate(r));
+		// Second request arrives while the first is still in-flight → 429.
+		await route.handler(streamingReq(), res2);
+		assert.equal(res2.statusCode, 429);
+		// Release the first request's body so it completes 200.
+		releasers[0]!();
+		await p1;
+		assert.equal(res1.statusCode, 200);
+	});
+});
+
+describe("createFixedWindowRateLimiter", () => {
+	it("allows up to `max` per window then throttles, resetting next window", () => {
+		let now = 0;
+		const rl = createFixedWindowRateLimiter(3, 1_000);
+		assert.equal(rl.hit(now), true);
+		assert.equal(rl.hit(now), true);
+		assert.equal(rl.hit(now), true);
+		assert.equal(rl.hit(now), false, "4th in the same window is throttled");
+		now += 1_000;
+		assert.equal(rl.hit(now), true, "new window resets the count");
+	});
+});
+
+describe("createInFlightLimiter", () => {
+	it("caps concurrent holders and frees a slot on release", () => {
+		const lim = createInFlightLimiter(2);
+		const a = lim.tryAcquire();
+		const b = lim.tryAcquire();
+		assert.ok(a && b);
+		assert.equal(lim.tryAcquire(), null, "third over the cap is refused");
+		a!();
+		assert.ok(lim.tryAcquire(), "a freed slot is reusable");
+	});
+
+	it("a double release does not over-decrement the count", () => {
+		const lim = createInFlightLimiter(1);
+		const rel = lim.tryAcquire();
+		assert.ok(rel);
+		rel!();
+		rel!(); // no-op
+		assert.equal(lim.inFlight(), 0);
 	});
 });

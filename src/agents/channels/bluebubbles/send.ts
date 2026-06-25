@@ -309,6 +309,8 @@ function sanitizeFilename(name: string): string {
 export interface SendAttachmentOptions extends BlueBubblesRestBase {
 	/** Local file path to upload. */
 	filePath: string;
+	/** Override the multipart filename (e.g. an extension coerced by the voice pre-flight). Defaults to the basename of `filePath`. */
+	fileName?: string;
 	/** MIME content type, when known. */
 	contentType?: string;
 	/** Send as a voice memo (BlueBubbles converts mp3→caf when set). */
@@ -330,7 +332,7 @@ export async function sendBlueBubblesAttachment(
 	opts: SendAttachmentOptions,
 ): Promise<BlueBubblesSendResult> {
 	const bytes = opts.bytes ?? new Uint8Array(await readFile(opts.filePath));
-	const filename = sanitizeFilename(opts.filePath);
+	const filename = sanitizeFilename(opts.fileName ?? opts.filePath);
 	const form = new FormData();
 	// Copy into a fresh ArrayBuffer so the Blob ctor accepts it across lib targets.
 	const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;

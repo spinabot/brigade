@@ -45,6 +45,20 @@ export interface NormalizedBlueBubblesMessage {
 	 * which is what lets the central pipeline's group requireMention gate fire.
 	 */
 	mentions?: string[];
+	/**
+	 * The GUID of the parent message this one is ASSOCIATED with (a link-preview
+	 * balloon, a sticker, …). Carried for inbound coalescing — a text + its
+	 * link-preview balloon arrive as two `new-message` webhooks; the debouncer
+	 * keys both on this so they collapse into ONE logical message. Distinct from a
+	 * tapback association (those are dropped earlier in `normalize`).
+	 */
+	associatedMessageGuid?: string;
+	/**
+	 * The balloon bundle id (`com.apple.messages.URLBalloonProvider`, sticker
+	 * providers, …) when this message is a balloon rather than plain text. Present
+	 * with `associatedMessageGuid` for a balloon; used as a coalescing signal.
+	 */
+	balloonBundleId?: string;
 	/** Raw attachment descriptors (downloaded later, post-access-gate). */
 	attachments: RawBlueBubblesAttachment[];
 	/** The raw webhook payload (for the pipeline's `raw` field). */
@@ -269,6 +283,12 @@ export function normalizeBlueBubblesWebhook(payload: unknown, eventType?: string
 	const replyToGuid = readString(message, "threadOriginatorGuid", "thread_originator_guid", "replyToGuid");
 	// Self-mention detection (group gating) — only meaningful in groups.
 	const mentions = isGroup ? detectBlueBubblesMentions(text, selfHandle) : undefined;
+	// Balloon-coalescing signals: a link-preview / sticker balloon carries an
+	// `associatedMessageGuid` pointing at its parent text + a `balloonBundleId`.
+	// These are NOT tapbacks (handled above) — they pass through as messages, and
+	// the debouncer keys them onto the parent so the two webhooks collapse.
+	const associatedMessageGuid = readString(message, "associatedMessageGuid", "associated_message_guid");
+	const balloonBundleId = readString(message, "balloonBundleId", "balloon_bundle_id");
 
 	return {
 		kind: "message",
@@ -283,6 +303,8 @@ export function normalizeBlueBubblesWebhook(payload: unknown, eventType?: string
 			...(timestampMs !== undefined ? { timestampMs } : {}),
 			...(replyToGuid ? { replyToGuid } : {}),
 			...(mentions ? { mentions } : {}),
+			...(associatedMessageGuid ? { associatedMessageGuid } : {}),
+			...(balloonBundleId ? { balloonBundleId } : {}),
 			attachments,
 			raw: payload,
 		},

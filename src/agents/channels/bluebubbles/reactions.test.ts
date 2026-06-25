@@ -25,6 +25,42 @@ describe("normalizeBlueBubblesReaction", () => {
 	it("returns null for an unknown reaction", () => {
 		assert.equal(normalizeBlueBubblesReaction("shrug"), null);
 	});
+
+	it("resolves the broadened emoji set (Fix 7)", () => {
+		assert.equal(normalizeBlueBubblesReaction("🔥"), "love");
+		assert.equal(normalizeBlueBubblesReaction("😍"), "love");
+		assert.equal(normalizeBlueBubblesReaction("💕"), "love");
+		assert.equal(normalizeBlueBubblesReaction("♥️"), "love");
+		assert.equal(normalizeBlueBubblesReaction("♥"), "love");
+		assert.equal(normalizeBlueBubblesReaction("👌"), "like");
+		assert.equal(normalizeBlueBubblesReaction("🙅"), "dislike");
+		assert.equal(normalizeBlueBubblesReaction("😆"), "laugh");
+		assert.equal(normalizeBlueBubblesReaction("😁"), "laugh");
+		assert.equal(normalizeBlueBubblesReaction("😹"), "laugh");
+		assert.equal(normalizeBlueBubblesReaction("❕"), "emphasize");
+	});
+
+	it("resolves the broadened colloquial aliases (Fix 7)", () => {
+		assert.equal(normalizeBlueBubblesReaction("fire"), "love");
+		assert.equal(normalizeBlueBubblesReaction("wow"), "emphasize");
+		assert.equal(normalizeBlueBubblesReaction("lmao"), "laugh");
+		assert.equal(normalizeBlueBubblesReaction("rofl"), "laugh");
+		assert.equal(normalizeBlueBubblesReaction("xd"), "laugh");
+		assert.equal(normalizeBlueBubblesReaction("ok"), "like");
+		assert.equal(normalizeBlueBubblesReaction("boo"), "dislike");
+		assert.equal(normalizeBlueBubblesReaction("no"), "dislike");
+		assert.equal(normalizeBlueBubblesReaction("smile"), "laugh");
+		assert.equal(normalizeBlueBubblesReaction("joy"), "laugh");
+		assert.equal(normalizeBlueBubblesReaction("heart_eyes"), "love");
+		assert.equal(normalizeBlueBubblesReaction("important"), "emphasize");
+		assert.equal(normalizeBlueBubblesReaction("bang"), "emphasize");
+		assert.equal(normalizeBlueBubblesReaction("ask"), "question");
+	});
+
+	it("still removes with the broadened aliases (e.g. -fire)", () => {
+		assert.equal(normalizeBlueBubblesReaction("-fire"), "-love");
+		assert.equal(normalizeBlueBubblesReaction("removed wow"), "-emphasize");
+	});
 });
 
 describe("decodeTapbackType", () => {
