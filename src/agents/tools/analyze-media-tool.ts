@@ -19,11 +19,16 @@
  *    blocks reach the provider); a PDF/DOCX/PPTX/XLSX/HTML/VIDEO can NOT be
  *    returned as a native non-text block. They must become TEXT.
  *
- * 2. NO AUX-MODEL RUNTIME. Brigade has no simple-completion helper — there is
- *    no path to run a one-off completion against a different model from inside
- *    a tool (confirmed: multiple in-tree comments say "Brigade has no
- *    simple-completion helper"). So the tool can only RETURN content for the
- *    CURRENT turn's model to analyze; it never calls a model itself.
+ * 2. DIRECT-PROVIDER UNDERSTANDING (the gap-closer). For modalities Pi can't
+ *    carry — VIDEO, native/scanned PDF, and images on a text-only current
+ *    model — the tool calls a provider REST API DIRECTLY via the
+ *    media-understanding subsystem (`agents/media-understanding/`): it ships
+ *    the media bytes + the question to Gemini (video → Files API; image/pdf →
+ *    inline) or Anthropic (pdf → native `document` block with OCR; image →
+ *    image block) and gets back TEXT, which it returns for the current model.
+ *    Keys are resolved through Brigade's existing credential store
+ *    (`readBrigadeCredentials`), never invented here. This bypasses Pi's
+ *    text+image content cap WITHOUT needing a Pi aux-model runtime.
  *
  * 3. REUSE. HTML → markdown reuses the existing readability/linkedom extractor
  *    (`web-fetch-utils.ts`); URL fetches route through the SSRF guard
@@ -37,27 +42,31 @@
  * ─────────────────────────────────────────────────────────────────────────
  * PER-FORMAT BEHAVIOUR
  * ─────────────────────────────────────────────────────────────────────────
- *   • image (png/jpg/jpeg/webp/gif/bmp/heic/heif): returned as an IMAGE block
- *     so a vision model sees it. HEIC/HEIF cannot be transcoded without a
- *     native dep, so they are passed through with their declared mime — most
- *     providers reject HEIC, so the tool warns. Capped by `maxBytes`. When the
- *     current model is known to be text-only, the tool says so instead of
- *     silently shipping a block the model can't consume.
- *   • pdf: text extracted per-page (`unpdf`, zero native deps) honoring a
- *     `pages` range, returned as TEXT. (Native-PDF document blocks are NOT
- *     reachable through Pi — see finding #1 — so every provider gets text.)
+ *   • image (png/jpg/jpeg/webp/gif/bmp/heic/heif): when the CURRENT model is
+ *     vision-capable, returned as an IMAGE block so the model sees it (cheap —
+ *     no extra call). When the current model is text-only AND an understanding
+ *     provider key is configured, the tool routes the image to that provider
+ *     and returns the resulting TEXT (so vision works on any model). HEIC/HEIF
+ *     cannot be transcoded without a native dep, so they are passed through
+ *     with their declared mime — most providers reject HEIC, so the tool warns.
+ *     Capped by `maxBytes`.
+ *   • pdf: when an understanding provider key is configured, the PDF is sent
+ *     NATIVELY (Anthropic `document` block — OCRs scanned pages + reads layout;
+ *     or Gemini inline) and the provider's TEXT answer is returned, so scanned
+ *     / no-text-layer PDFs now work. With no key (or `mode:"text"`) it falls
+ *     back to per-page text extraction (`unpdf`, zero native deps) honoring a
+ *     `pages` range. `mode:"provider"` forces the provider path.
  *   • docx: unzip (`fflate`) → concatenate `word/document.xml` text runs.
  *   • pptx: unzip → per-slide text (`ppt/slides/slideN.xml`), slide-numbered,
  *     honoring `pages` as a slide range.
  *   • xlsx: unzip → `xl/sharedStrings.xml` + each `xl/worksheets/sheetN.xml`
  *     → CSV-ish per-sheet text.
  *   • html (or a URL returning HTML): readability/linkedom → markdown.
- *   • video (mp4/webm/mov/…): Pi has no video modality, so the tool is honest:
- *     it returns a clear "video understanding needs a video-capable model that
- *     Brigade cannot drive through the current tool-result content channel"
- *     message. (No transcription is attempted here — the inbound media note
- *     path already transcribes audio when an STT provider is configured; this
- *     tool does not duplicate that plumbing.)
+ *   • video (mp4/webm/mov/…): always routed to the media-understanding
+ *     subsystem (Gemini via the Files API: upload → poll ACTIVE →
+ *     generateContent with a fileData part), and the model's TEXT description
+ *     is returned. Needs a Google/Gemini key; with none the tool returns a
+ *     clear "configure a Gemini key" message.
  *
  * The user's `question` is ALWAYS echoed back as a leading text block so the
  * model knows what to do with the resolved content.
@@ -77,7 +86,16 @@ import { Type, type Static } from "typebox";
 import { guardedFetch, SsrfBlockedError } from "../../infra/net/fetch-guard.js";
 import { validateOutboundMediaPath } from "../../security/media-path-guard.js";
 import { wrapWebContent } from "../../security/external-content.js";
-import { resolveCacheDir, resolveStateDir } from "../../config/paths.js";
+import { resolveCacheDir, resolveStateDir, DEFAULT_AGENT_ID } from "../../config/paths.js";
+import {
+	runMediaUnderstanding as defaultRunMediaUnderstanding,
+	MediaUnderstandingUnavailableError,
+	type MediaUnderstandingConfig,
+	type MediaUnderstandingKind,
+	type RunMediaUnderstandingRequest,
+	type RunMediaUnderstandingResult,
+} from "../media-understanding/index.js";
+import { buildMediaUnderstandingConfig } from "../media-understanding/config.js";
 import {
 	composeFetchBody,
 	extractBasicHtmlContent,
@@ -188,6 +206,27 @@ function imageMimeFromExt(ext: string): string {
 	}
 }
 
+/** Video mime from extension — used when a local video has no declared MIME. */
+function videoMimeFromExt(ext: string): string {
+	switch (ext) {
+		case "webm":
+			return "video/webm";
+		case "mov":
+			return "video/quicktime";
+		case "m4v":
+			return "video/x-m4v";
+		case "mkv":
+			return "video/x-matroska";
+		case "avi":
+			return "video/x-msvideo";
+		case "mpeg":
+		case "mpg":
+			return "video/mpeg";
+		default:
+			return "video/mp4";
+	}
+}
+
 /**
  * Resolve the kind. Explicit `kind` override wins; else extension; else MIME
  * (URL responses). Returns undefined when nothing matches (unsupported).
@@ -240,6 +279,24 @@ const AnalyzeMediaParams = Type.Object({
 				'Page (PDF) or slide (PPTX) range to limit extraction, e.g. "1-5", "3", or "2-". 1-indexed. Ignored for other kinds.',
 		}),
 	),
+	provider: Type.Optional(
+		Type.Union([Type.Literal("google"), Type.Literal("anthropic")], {
+			description:
+				"Optional provider override for understanding video / native-PDF / text-only-model images (else auto-selected from configured keys). google = Gemini.",
+		}),
+	),
+	model: Type.Optional(
+		Type.String({
+			description:
+				"Optional provider model id override for the understanding call (e.g. gemini-2.5-pro, claude-sonnet-4-5). Ignored for the local text-extraction path.",
+		}),
+	),
+	mode: Type.Optional(
+		Type.Union([Type.Literal("auto"), Type.Literal("provider"), Type.Literal("text")], {
+			description:
+				'PDF handling: "auto" (default — provider when a key is configured, else local text extraction), "provider" (force the native provider path), or "text" (force local unpdf text extraction).',
+		}),
+	),
 	maxBytes: Type.Optional(
 		Type.Integer({
 			description: `Optional cap on bytes read from the source (default ${DEFAULT_MAX_BYTES}, ceiling ${MAX_BYTES_CEILING}).`,
@@ -278,6 +335,9 @@ export interface AnalyzeMediaDetails {
 	truncated?: boolean;
 	warning?: string;
 	message?: string;
+	/** When the result came from a direct provider call: which provider + model produced it. */
+	provider?: string;
+	providerModel?: string;
 }
 
 /* ─────────────────────────── model capability seam ─────────────────────────── */
@@ -728,12 +788,22 @@ export interface MakeAnalyzeMediaToolOptions {
 	workspaceDir?: string;
 	/** Process cwd — an allowed root for local-path reads. */
 	cwd?: string;
+	/** Caller's agent id — selects which auth profiles back the provider keys. */
+	agentId?: string;
 	/** Resolved turn model context — drives whether an IMAGE block is meaningful. */
 	modelContext?: AnalyzeMediaModelContext;
 	/** Test seam: replace the URL fetch acquisition. */
 	acquireUrl?: typeof acquireUrlBytes;
 	/** Test seam: replace the local-file acquisition. */
 	acquireLocal?: typeof acquireLocalBytes;
+	/**
+	 * Media-understanding config (key resolution + per-kind defaults). Lazily
+	 * built from Brigade's credential store via `buildMediaUnderstandingConfig`
+	 * when omitted; tests inject one with a stub `resolveKey`.
+	 */
+	mediaUnderstandingConfig?: MediaUnderstandingConfig;
+	/** Test seam: replace the media-understanding entry point (mocks provider HTTP). */
+	runMediaUnderstanding?: (req: RunMediaUnderstandingRequest) => Promise<RunMediaUnderstandingResult>;
 }
 
 export function makeAnalyzeMediaTool(
@@ -741,6 +811,17 @@ export function makeAnalyzeMediaTool(
 ): BrigadeTool<typeof AnalyzeMediaParams, AnalyzeMediaDetails> {
 	const acquireUrl = opts.acquireUrl ?? acquireUrlBytes;
 	const acquireLocal = opts.acquireLocal ?? acquireLocalBytes;
+	const runUnderstanding = opts.runMediaUnderstanding ?? defaultRunMediaUnderstanding;
+	const agentId = opts.agentId ?? DEFAULT_AGENT_ID;
+	// Lazily resolve the media-understanding config (key resolution + per-kind
+	// defaults) from Brigade's credential store the first time it is needed, so
+	// constructing the tool never touches the auth store. A test-injected config
+	// short-circuits this.
+	let muConfig: MediaUnderstandingConfig | undefined = opts.mediaUnderstandingConfig;
+	const getMuConfig = (): MediaUnderstandingConfig => {
+		if (!muConfig) muConfig = buildMediaUnderstandingConfig(agentId);
+		return muConfig;
+	};
 	return {
 		name: "analyze_media",
 		label: "Analyze Media",
@@ -753,7 +834,7 @@ export function makeAnalyzeMediaTool(
 		description: [
 			"Understand a local file or URL: images, PDF, DOCX, PPTX, XLSX, HTML, and video (auto-detected by extension/MIME).",
 			"Pass `source` (a local path or http(s) URL) and a `question` describing what to analyze.",
-			"Images are handed to the model as a viewable image; PDF/DOCX/PPTX/XLSX/HTML are extracted to text/markdown; video is reported as unsupported (no video-capable channel exists).",
+			"Images are shown to a vision model (or understood via a provider on a text-only model); PDF is read natively when a provider key is configured (scanned PDFs work) else extracted to text; DOCX/PPTX/XLSX/HTML are extracted to text/markdown; VIDEO is understood via a Google/Gemini key.",
 			"Use `pages` to limit a PDF/PPTX range (e.g. \"1-5\"). Use this instead of bash/curl — it applies the SSRF guard for URLs and the path guard for local files.",
 		].join(" "),
 		parameters: AnalyzeMediaParams,
@@ -825,10 +906,35 @@ export function makeAnalyzeMediaTool(
 						mime: acquired.mime,
 						question,
 						modelContext: opts.modelContext,
+						...(args.provider ? { provider: args.provider } : {}),
+						...(args.model ? { model: args.model } : {}),
+						...(signal ? { signal } : {}),
 					});
 				case "video":
-					return handleVideo({ source, sourceType, question, modelContext: opts.modelContext });
+					return handleVideo({
+						source,
+						sourceType,
+						bytes: acquired.bytes,
+						mime: acquired.mime,
+						question,
+						...(args.provider ? { provider: args.provider } : {}),
+						...(args.model ? { model: args.model } : {}),
+						...(signal ? { signal } : {}),
+					});
 				case "pdf":
+					return handlePdf({
+						source,
+						sourceType,
+						bytes: acquired.bytes,
+						truncated: acquired.truncated,
+						mime: acquired.mime,
+						question,
+						pages: args.pages,
+						mode: args.mode ?? "auto",
+						...(args.provider ? { provider: args.provider } : {}),
+						...(args.model ? { model: args.model } : {}),
+						...(signal ? { signal } : {}),
+					});
 				case "docx":
 				case "pptx":
 				case "xlsx":
@@ -847,9 +953,90 @@ export function makeAnalyzeMediaTool(
 		},
 	};
 
+	/* ── media-understanding helpers (shared by image/video/pdf provider paths) ── */
+
+	/**
+	 * Run the media-understanding subsystem for `kind` and shape its TEXT into a
+	 * tool result. Returns `undefined` when no provider/key is available (so the
+	 * caller can fall back), and surfaces provider HTTP failures as a clean
+	 * failure result (never a raw throw to the model).
+	 */
+	async function understandViaProvider(p: {
+		kind: MediaUnderstandingKind;
+		source: string;
+		sourceType: "url" | "path";
+		bytes: Buffer;
+		mimeType: string;
+		question: string;
+		provider?: "google" | "anthropic";
+		model?: string;
+		signal?: AbortSignal;
+		/** Extra leading note prepended to the returned text (e.g. why provider was used). */
+		note?: string;
+	}): Promise<
+		| { ok: true; result: AgentToolResult<AnalyzeMediaDetails> }
+		| { ok: false; unavailable: true; message: string }
+		| { ok: false; unavailable: false; result: AgentToolResult<AnalyzeMediaDetails> }
+	> {
+		const cfg = getMuConfig();
+		try {
+			const res = await runUnderstanding({
+				kind: p.kind,
+				bytes: p.bytes,
+				mimeType: p.mimeType,
+				cfg,
+				...(p.question ? { prompt: p.question } : {}),
+				...(p.provider ? { provider: p.provider } : {}),
+				...(p.model ? { model: p.model } : {}),
+				...(p.signal ? { signal: p.signal } : {}),
+			});
+			const promptText = buildPromptText(p.question, p.kind === "audio" ? "video" : p.kind);
+			// The provider's answer is derived from operator-pointed media but can
+			// still echo injected instructions (a hostile document/video caption),
+			// so wrap it in the untrusted-content envelope like extracted text.
+			const wrapped = wrapWebContent(res.text, "web_fetch", { includeWarning: true });
+			const lead = p.note ? `${promptText}\n\n(${p.note})` : promptText;
+			return {
+				ok: true,
+				result: {
+					content: [{ type: "text", text: `${lead}\n\n${wrapped}` }],
+					details: {
+						ok: true,
+						source: p.source,
+						sourceType: p.sourceType,
+						kind: p.kind === "audio" ? "video" : (p.kind as MediaKind),
+						mimeType: p.mimeType,
+						bytes: p.bytes.length,
+						returned: "text",
+						provider: res.provider,
+						providerModel: res.model,
+					},
+				},
+			};
+		} catch (err) {
+			if (err instanceof MediaUnderstandingUnavailableError) {
+				return { ok: false, unavailable: true, message: err.message };
+			}
+			// Provider HTTP / processing failure — clean failure result.
+			const msg = err instanceof Error ? err.message : String(err);
+			return {
+				ok: false,
+				unavailable: false,
+				result: failure({
+					source: p.source,
+					sourceType: p.sourceType,
+					kind: p.kind === "audio" ? "video" : (p.kind as MediaKind),
+					mimeType: p.mimeType,
+					bytes: p.bytes.length,
+					message: `Provider media-understanding call failed: ${msg}`,
+				}),
+			};
+		}
+	}
+
 	/* ── handlers (closures so they share `opts`) ── */
 
-	function handleImage(p: {
+	async function handleImage(p: {
 		source: string;
 		sourceType: "url" | "path";
 		bytes: Buffer;
@@ -857,7 +1044,10 @@ export function makeAnalyzeMediaTool(
 		mime?: string;
 		question: string;
 		modelContext?: AnalyzeMediaModelContext;
-	}): AgentToolResult<AnalyzeMediaDetails> {
+		provider?: "google" | "anthropic";
+		model?: string;
+		signal?: AbortSignal;
+	}): Promise<AgentToolResult<AnalyzeMediaDetails>> {
 		const ext = extensionOf(p.source);
 		const mimeType = (p.mime?.split(";")[0]?.trim() || imageMimeFromExt(ext)).toLowerCase();
 		const isHeic = /heic|heif/.test(mimeType) || ext === "heic" || ext === "heif";
@@ -871,10 +1061,28 @@ export function makeAnalyzeMediaTool(
 			);
 		}
 		if (sees === false) {
-			// The current model is text-only — be honest rather than ship a
-			// block it will reject.
+			// The current model is text-only. Rather than ship a block it will
+			// reject, route the image through a provider that CAN see it (when a
+			// key is configured) and return the resulting text — so vision works
+			// on any model. With no key, fall back to the honest "switch model"
+			// message.
+			const viaProvider = await understandViaProvider({
+				kind: "image",
+				source: p.source,
+				sourceType: p.sourceType,
+				bytes: p.bytes,
+				mimeType,
+				question: p.question,
+				...(p.provider ? { provider: p.provider } : {}),
+				...(p.model ? { model: p.model } : {}),
+				...(p.signal ? { signal: p.signal } : {}),
+				note: "The current model is text-only, so the image was understood by a vision-capable provider and the description is below.",
+			});
+			if (viaProvider.ok) return viaProvider.result;
+			if (!viaProvider.unavailable) return viaProvider.result; // provider HTTP failure
+			// Unavailable (no key) — be honest.
 			warnings.push(
-				"The current model does not appear to accept images, so the image is NOT being attached. Switch to a vision-capable model (e.g. a Claude / GPT-4o / Gemini model) and try again.",
+				"The current model does not appear to accept images, so the image is NOT being attached. Switch to a vision-capable model (e.g. a Claude / GPT-4o / Gemini model), or configure a Google/Anthropic key so Brigade can understand images on any model.",
 			);
 			return {
 				content: [{ type: "text", text: `${promptText}\n\n${warnings.join("\n\n")}` }],
@@ -923,33 +1131,125 @@ export function makeAnalyzeMediaTool(
 		};
 	}
 
-	function handleVideo(p: {
+	async function handleVideo(p: {
 		source: string;
 		sourceType: "url" | "path";
+		bytes: Buffer;
+		mime?: string;
 		question: string;
-		modelContext?: AnalyzeMediaModelContext;
-	}): AgentToolResult<AnalyzeMediaDetails> {
-		// Pi's content model is text + image only — there is no video content
-		// block and no video modality, so even a video-capable model (e.g.
-		// Gemini) cannot be fed the video through a tool result. Be honest.
+		provider?: "google" | "anthropic";
+		model?: string;
+		signal?: AbortSignal;
+	}): Promise<AgentToolResult<AnalyzeMediaDetails>> {
+		// Pi's content channel can't carry video, so we call a video-capable
+		// provider DIRECTLY (Gemini via the Files API) and return its TEXT.
+		const mimeType = p.mime?.split(";")[0]?.trim().toLowerCase() || videoMimeFromExt(extensionOf(p.source));
+		const viaProvider = await understandViaProvider({
+			kind: "video",
+			source: p.source,
+			sourceType: p.sourceType,
+			bytes: p.bytes,
+			mimeType,
+			question: p.question,
+			...(p.provider ? { provider: p.provider } : {}),
+			...(p.model ? { model: p.model } : {}),
+			...(p.signal ? { signal: p.signal } : {}),
+		});
+		if (viaProvider.ok) return viaProvider.result;
+		if (!viaProvider.unavailable) return viaProvider.result; // provider HTTP failure
+		// No key configured — clear, actionable message.
 		const promptText = buildPromptText(p.question, "video");
-		const msg =
-			"Video understanding is not available: Brigade's tool-result channel can carry only text and images, " +
-			"so a video file cannot be handed to the model here — even a video-capable model (e.g. Gemini) would need " +
-			"a video content block that this runtime does not support. " +
-			"If the video has speech you need, extract the audio and send it through a channel with a configured " +
-			"transcription provider (inbound audio is auto-transcribed), or summarize key frames as images and analyze those.";
 		return {
-			content: [{ type: "text", text: `${promptText}\n\n${msg}` }],
+			content: [{ type: "text", text: `${promptText}\n\n${viaProvider.message}` }],
 			details: {
 				ok: false,
 				source: p.source,
 				sourceType: p.sourceType,
 				kind: "video",
+				mimeType,
+				bytes: p.bytes.length,
 				returned: "none",
-				message: msg,
+				message: viaProvider.message,
 			},
 		};
+	}
+
+	/**
+	 * PDF handler. With an understanding-provider key configured (and `mode` not
+	 * forced to "text"), the PDF is sent NATIVELY to the provider (Anthropic
+	 * document block — OCRs scanned pages + reads layout; or Gemini inline) and
+	 * the provider's TEXT answer is returned. Otherwise — or when `mode:"text"`,
+	 * or when the provider call comes back empty/unavailable — it falls back to
+	 * the local `unpdf` per-page text extraction (honoring `pages`).
+	 */
+	async function handlePdf(p: {
+		source: string;
+		sourceType: "url" | "path";
+		bytes: Buffer;
+		truncated: boolean;
+		mime?: string;
+		question: string;
+		pages?: string;
+		mode: "auto" | "provider" | "text";
+		provider?: "google" | "anthropic";
+		model?: string;
+		signal?: AbortSignal;
+	}): Promise<AgentToolResult<AnalyzeMediaDetails>> {
+		// Local text extraction is the fallback (and the forced path for mode:"text").
+		const extractLocally = () =>
+			handleTextExtract({
+				kind: "pdf",
+				source: p.source,
+				sourceType: p.sourceType,
+				bytes: p.bytes,
+				truncated: p.truncated,
+				...(p.mime ? { mime: p.mime } : {}),
+				question: p.question,
+				...(p.pages ? { pages: p.pages } : {}),
+			});
+
+		if (p.mode === "text") return extractLocally();
+
+		const cfg = getMuConfig();
+		// Does any capable provider have a key? (Pure read — no HTTP.)
+		const providerAvailable = p.provider
+			? Boolean(safeResolveKey(cfg, p.provider))
+			: Boolean(safeResolveKey(cfg, "anthropic")) || Boolean(safeResolveKey(cfg, "google"));
+
+		if (p.mode === "provider" || providerAvailable) {
+			const viaProvider = await understandViaProvider({
+				kind: "pdf",
+				source: p.source,
+				sourceType: p.sourceType,
+				bytes: p.bytes,
+				mimeType: "application/pdf",
+				question: p.question,
+				...(p.provider ? { provider: p.provider } : {}),
+				...(p.model ? { model: p.model } : {}),
+				...(p.signal ? { signal: p.signal } : {}),
+				note:
+					"This PDF was read natively by a provider (handles scanned pages + layout)." +
+					(p.pages ? " The `pages` range is not applied on the native path." : ""),
+			});
+			if (viaProvider.ok) return viaProvider.result;
+			// mode:"provider" forces provider — surface the failure/unavailable
+			// rather than silently extracting (the operator asked for native).
+			if (p.mode === "provider") {
+				if (viaProvider.unavailable) {
+					return failure({
+						source: p.source,
+						sourceType: p.sourceType,
+						kind: "pdf",
+						...(p.mime ? { mimeType: p.mime } : {}),
+						bytes: p.bytes.length,
+						message: viaProvider.message,
+					});
+				}
+				return viaProvider.result;
+			}
+			// auto + provider HTTP failure → fall back to local text extraction.
+		}
+		return extractLocally();
 	}
 
 	async function handleTextExtract(p: {
@@ -1047,6 +1347,18 @@ export function makeAnalyzeMediaTool(
 }
 
 /* ─────────────────────────── small helpers ─────────────────────────── */
+
+/** Resolve a provider key from the mu-config without throwing (pure probe). */
+function safeResolveKey(
+	cfg: MediaUnderstandingConfig,
+	provider: "google" | "anthropic",
+): string {
+	try {
+		return cfg.resolveKey(provider) || "";
+	} catch {
+		return "";
+	}
+}
 
 function clampBytes(requested: number | undefined, looksImage = false): number {
 	if (typeof requested !== "number" || !Number.isFinite(requested)) {

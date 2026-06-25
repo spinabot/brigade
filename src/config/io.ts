@@ -288,6 +288,24 @@ export type BrigadeBindings = { entries?: BindingEntry[] };
 
 export interface BrigadeToolsConfig {
   profile?: "minimal" | "coding" | "messaging" | "full";
+  /**
+   * Optional per-kind defaults for the direct-provider media-understanding
+   * subsystem that backs `analyze_media` (video / native-PDF / text-only-model
+   * images). Keys are the media kind ("video" | "pdf" | "image" | "audio").
+   *   - `models[kind]`    — provider model id override (e.g. "gemini-2.5-pro").
+   *   - `providers[kind]` — preferred provider ("google" | "anthropic"); used
+   *     only when that provider has a configured key, else auto-selection
+   *     falls through to whichever capable provider is keyed.
+   * When ABSENT, the subsystem auto-detects from available provider keys and
+   * uses sensible built-in model defaults — no config required.
+   */
+  mediaUnderstanding?: BrigadeMediaUnderstandingConfig;
+  [key: string]: unknown;
+}
+
+export interface BrigadeMediaUnderstandingConfig {
+  models?: Partial<Record<"video" | "pdf" | "image" | "audio", string>>;
+  providers?: Partial<Record<"video" | "pdf" | "image" | "audio", "google" | "anthropic">>;
   [key: string]: unknown;
 }
 

@@ -280,6 +280,7 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		makeAnalyzeMediaTool({
 			...(opts.workspaceDir !== undefined ? { workspaceDir: opts.workspaceDir } : {}),
 			...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
 			...(opts.modelContext !== undefined ? { modelContext: opts.modelContext } : {}),
 		}),
 		// manage_provider — owner-only credential + per-agent model surface.

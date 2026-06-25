@@ -33,20 +33,51 @@ import {
 	parsePageRange,
 	modelLikelySeesImages,
 	type AnalyzeMediaDetails,
+	type MakeAnalyzeMediaToolOptions,
 } from "./analyze-media-tool.js";
 import type { AgentToolResult } from "./types.js";
+import type {
+	MediaUnderstandingConfig,
+	RunMediaUnderstandingRequest,
+	RunMediaUnderstandingResult,
+} from "../media-understanding/index.js";
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
 type Result = AgentToolResult<AnalyzeMediaDetails>;
 
-/** Build a tool whose byte acquisition is stubbed to return `bytes` + `mime`. */
-function toolWithBytes(bytes: Buffer, mime?: string, modelContext?: { provider?: string; modelId?: string; imageInput?: boolean }) {
+/**
+ * Build a tool whose byte acquisition is stubbed to return `bytes` + `mime`.
+ * Extra options (model context, a stubbed understanding runner / config) are
+ * merged so routing tests can mock the provider layer without real HTTP.
+ */
+function toolWithBytes(
+	bytes: Buffer,
+	mime?: string,
+	modelContext?: { provider?: string; modelId?: string; imageInput?: boolean },
+	extra?: Partial<MakeAnalyzeMediaToolOptions>,
+) {
 	return makeAnalyzeMediaTool({
 		...(modelContext ? { modelContext } : {}),
 		acquireLocal: async () => ({ bytes, ...(mime ? { mime } : {}), truncated: false }),
 		acquireUrl: async () => ({ bytes, ...(mime ? { mime } : {}), truncated: false }),
+		...(extra ?? {}),
 	});
+}
+
+/** A media-understanding config whose key set is exactly `keyed`. */
+function muCfg(keyed: Array<"google" | "anthropic">): MediaUnderstandingConfig {
+	return { resolveKey: (p) => (keyed.includes(p) ? `key-${p}` : "") };
+}
+
+/** A stub `runMediaUnderstanding` that records the request and returns canned text. */
+function stubRunner(text: string, provider: "google" | "anthropic" = "google", model = "stub-model") {
+	const calls: RunMediaUnderstandingRequest[] = [];
+	const run = async (req: RunMediaUnderstandingRequest): Promise<RunMediaUnderstandingResult> => {
+		calls.push(req);
+		return { text, provider, model };
+	};
+	return { run, calls };
 }
 
 function textOf(r: Result): string {
@@ -220,14 +251,37 @@ describe("analyze_media — image", () => {
 		assert.match(textOf(r), /what is this\?/);
 	});
 
-	it("does NOT attach an image for a text-only model — returns a clear message", async () => {
+	it("text-only model + NO provider key → does NOT attach an image, returns a clear message", async () => {
 		const bytes = Buffer.from([1, 2, 3, 4]);
-		const tool = toolWithBytes(bytes, "image/png", { imageInput: false, modelId: "text-only-model" });
+		// No runner/config provided AND no real keys: the lazily-built config
+		// resolves no key, so the provider path is unavailable → honest message.
+		const tool = toolWithBytes(bytes, "image/png", { imageInput: false, modelId: "text-only-model" }, {
+			mediaUnderstandingConfig: muCfg([]),
+		});
 		const r = (await tool.execute("c1", { source: "/ws/pic.png" })) as Result;
 		assert.equal(imageBlocks(r).length, 0);
 		assert.equal(r.details.returned, "none");
 		assert.equal(r.details.ok, false);
 		assert.match(textOf(r), /does not appear to accept images|vision-capable/i);
+	});
+
+	it("text-only model + provider key → understands the image via the provider (returns TEXT, no block)", async () => {
+		const bytes = Buffer.from([1, 2, 3, 4]);
+		const { run, calls } = stubRunner("A blue circle on white.", "anthropic", "claude-sonnet-4-5");
+		const tool = toolWithBytes(bytes, "image/png", { imageInput: false, modelId: "text-only-model" }, {
+			mediaUnderstandingConfig: muCfg(["anthropic"]),
+			runMediaUnderstanding: run,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/pic.png", question: "what is this?" })) as Result;
+		assert.equal(imageBlocks(r).length, 0, "no image block for a text-only model");
+		assert.equal(r.details.returned, "text");
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.provider, "anthropic");
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.kind, "image");
+		assert.match(textOf(r), /A blue circle on white\./);
+		// provider output is wrapped in the untrusted-content envelope
+		assert.match(textOf(r), /EXTERNAL_UNTRUSTED_CONTENT/);
 	});
 
 	it("warns on HEIC pass-through", async () => {
@@ -248,12 +302,15 @@ describe("analyze_media — image", () => {
 /* ─────────────────────────── pdf ─────────────────────────── */
 
 describe("analyze_media — pdf", () => {
-	it("extracts text (real unpdf path) and reports page count", async () => {
-		const tool = toolWithBytes(MINIMAL_PDF, "application/pdf");
+	it("extracts text (real unpdf path) when NO provider key is configured", async () => {
+		const tool = toolWithBytes(MINIMAL_PDF, "application/pdf", undefined, {
+			mediaUnderstandingConfig: muCfg([]),
+		});
 		const r = (await tool.execute("c1", { source: "/ws/report.pdf", question: "summarize" })) as Result;
 		assert.equal(r.details.ok, true);
 		assert.equal(r.details.returned, "text");
 		assert.equal(r.details.kind, "pdf");
+		assert.equal(r.details.provider, undefined, "local path, no provider");
 		const t = textOf(r);
 		assert.match(t, /Hello PDF/);
 		assert.match(t, /Page 1/);
@@ -262,12 +319,70 @@ describe("analyze_media — pdf", () => {
 		assert.match(t, /EXTERNAL_UNTRUSTED_CONTENT/);
 	});
 
-	it("honors a `pages` range that selects nothing → clean empty error", async () => {
-		const tool = toolWithBytes(MINIMAL_PDF, "application/pdf");
+	it("honors a `pages` range that selects nothing → clean empty error (text mode)", async () => {
+		const tool = toolWithBytes(MINIMAL_PDF, "application/pdf", undefined, {
+			mediaUnderstandingConfig: muCfg([]),
+		});
 		// page 5 of a 1-page doc → no text selected
 		const r = (await tool.execute("c1", { source: "/ws/report.pdf", pages: "5" })) as Result;
 		assert.equal(r.details.ok, false);
 		assert.match(textOf(r), /No selectable text|scanned image/i);
+	});
+
+	it("sends the PDF NATIVELY to the provider when a key is configured (scanned PDFs work)", async () => {
+		// A buffer that unpdf could not read as a PDF — proves the provider path
+		// does NOT depend on a text layer (i.e. scanned-PDF support).
+		const scanned = Buffer.from("NOT-A-REAL-PDF-TEXT-LAYER");
+		const { run, calls } = stubRunner("Invoice total: $1,200.", "anthropic", "claude-sonnet-4-5");
+		const tool = toolWithBytes(scanned, "application/pdf", undefined, {
+			mediaUnderstandingConfig: muCfg(["anthropic"]),
+			runMediaUnderstanding: run,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/scan.pdf", question: "total?" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.returned, "text");
+		assert.equal(r.details.provider, "anthropic");
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.kind, "pdf");
+		assert.equal(calls[0]?.mimeType, "application/pdf");
+		assert.match(textOf(r), /Invoice total: \$1,200\./);
+		assert.match(textOf(r), /EXTERNAL_UNTRUSTED_CONTENT/);
+	});
+
+	it("mode:'text' forces local extraction even when a provider key exists", async () => {
+		const { run, calls } = stubRunner("should not be called");
+		const tool = toolWithBytes(MINIMAL_PDF, "application/pdf", undefined, {
+			mediaUnderstandingConfig: muCfg(["anthropic", "google"]),
+			runMediaUnderstanding: run,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/report.pdf", mode: "text" })) as Result;
+		assert.equal(calls.length, 0, "provider not called in text mode");
+		assert.equal(r.details.returned, "text");
+		assert.match(textOf(r), /Hello PDF/);
+	});
+
+	it("mode:'provider' with no key → clean error (does not silently extract)", async () => {
+		const tool = toolWithBytes(MINIMAL_PDF, "application/pdf", undefined, {
+			mediaUnderstandingConfig: muCfg([]),
+		});
+		const r = (await tool.execute("c1", { source: "/ws/report.pdf", mode: "provider" })) as Result;
+		assert.equal(r.details.ok, false);
+		assert.match(textOf(r), /Anthropic or Google\/Gemini API key|needs an/i);
+	});
+
+	it("auto mode falls back to local text extraction when the provider call fails", async () => {
+		const run = async (): Promise<RunMediaUnderstandingResult> => {
+			throw new Error("Anthropic error: HTTP 500");
+		};
+		const tool = toolWithBytes(MINIMAL_PDF, "application/pdf", undefined, {
+			mediaUnderstandingConfig: muCfg(["anthropic"]),
+			runMediaUnderstanding: run,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/report.pdf" })) as Result;
+		// fell back to unpdf text → ok with extracted text
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.returned, "text");
+		assert.match(textOf(r), /Hello PDF/);
 	});
 });
 
@@ -340,15 +455,61 @@ describe("analyze_media — html", () => {
 /* ─────────────────────────── video ─────────────────────────── */
 
 describe("analyze_media — video", () => {
-	it("returns a clear unsupported message (no block)", async () => {
-		const tool = toolWithBytes(Buffer.from([0, 0, 0, 0]), "video/mp4");
+	it("routes video to the understanding provider (Gemini) and returns its TEXT", async () => {
+		const { run, calls } = stubRunner("A cat plays piano for 12 seconds.", "google", "gemini-2.5-pro");
+		const tool = toolWithBytes(Buffer.from([0, 0, 0, 0]), "video/mp4", undefined, {
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/clip.mp4", question: "what happens?" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.returned, "text");
+		assert.equal(r.details.kind, "video");
+		assert.equal(r.details.provider, "google");
+		assert.equal(imageBlocks(r).length, 0);
+		// the subsystem got the video bytes + mime + question
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.kind, "video");
+		assert.equal(calls[0]?.mimeType, "video/mp4");
+		assert.equal(calls[0]?.prompt, "what happens?");
+		assert.match(textOf(r), /A cat plays piano/);
+		assert.match(textOf(r), /EXTERNAL_UNTRUSTED_CONTENT/);
+	});
+
+	it("with NO Gemini key → returns a clear 'configure a key' message (returned: none)", async () => {
+		const tool = toolWithBytes(Buffer.from([0, 0, 0, 0]), "video/mp4", undefined, {
+			mediaUnderstandingConfig: muCfg([]),
+		});
 		const r = (await tool.execute("c1", { source: "/ws/clip.mp4", question: "what happens?" })) as Result;
 		assert.equal(r.details.ok, false);
 		assert.equal(r.details.returned, "none");
 		assert.equal(r.details.kind, "video");
-		assert.equal(imageBlocks(r).length, 0);
 		assert.match(textOf(r), /video/i);
-		assert.match(textOf(r), /text and images|video-capable/i);
+		assert.match(textOf(r), /Gemini API key/i);
+	});
+
+	it("derives a video MIME from the extension when none is declared", async () => {
+		const { run, calls } = stubRunner("clip summary", "google");
+		const tool = toolWithBytes(Buffer.from([0]), undefined, undefined, {
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+		});
+		await tool.execute("c1", { source: "/ws/clip.webm" });
+		assert.equal(calls[0]?.mimeType, "video/webm");
+	});
+
+	it("surfaces a provider HTTP failure as a clean error result", async () => {
+		const run = async (): Promise<RunMediaUnderstandingResult> => {
+			throw new Error("Gemini error: HTTP 500");
+		};
+		const tool = toolWithBytes(Buffer.from([0]), "video/mp4", undefined, {
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/clip.mp4" })) as Result;
+		assert.equal(r.details.ok, false);
+		assert.equal(r.details.returned, "none");
+		assert.match(textOf(r), /failed/i);
 	});
 });
 

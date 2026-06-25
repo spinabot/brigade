@@ -29,6 +29,7 @@ import { readProfiles } from "../../auth/profiles.js";
 import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { FactStore } from "../../agents/memory/records.js";
 import { discoverEligibleSkills } from "../../agents/skills/index.js";
+import { probeMediaUnderstanding } from "../../agents/media-understanding/config.js";
 import {
 	collectChannelSecurityAudit,
 	listChannelSecurityAdapters,
@@ -72,6 +73,7 @@ export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise
 	checks.push(checkWorkspace());
 	checks.push(await checkMemory());
 	checks.push(checkSkills());
+	checks.push(checkMediaUnderstanding());
 	checks.push(checkLogDirWritable());
 	checks.push(checkExecApprovals());
 	checks.push(await checkChannelSecurity(await safeLoadConfig()));
@@ -440,6 +442,43 @@ function checkSkills(): CheckResult {
 		name: "skills",
 		status: "ok",
 		message: `${count} skill${count === 1 ? "" : "s"} available${suffix}`,
+	};
+}
+
+/**
+ * Media-understanding readiness — which provider keys back `analyze_media`'s
+ * direct-provider paths (video / native-PDF / text-only-model images). Pure
+ * read of the credential store; never makes a network call. "ok" in every
+ * case — this is informational (video just needs a key when first used).
+ */
+function checkMediaUnderstanding(): CheckResult {
+	let probe: ReturnType<typeof probeMediaUnderstanding>;
+	try {
+		probe = probeMediaUnderstanding(DEFAULT_AGENT_ID);
+	} catch (err) {
+		return {
+			name: "media understanding",
+			status: "warn",
+			message: `could not probe provider keys: ${(err as Error).message}`,
+		};
+	}
+	if (!probe.video && !probe.pdf && !probe.image) {
+		return {
+			name: "media understanding",
+			status: "ok",
+			message:
+				"no Google/Anthropic key — video + native-PDF understanding unavailable (PDF/Office still extract text)",
+			hint: "add a Google/Gemini key (video) or Anthropic key (scanned PDF) with `brigade onboard`",
+		};
+	}
+	const have: string[] = [];
+	if (probe.video) have.push("video (Gemini)");
+	if (probe.pdf) have.push("native PDF");
+	if (probe.image) have.push("provider images");
+	return {
+		name: "media understanding",
+		status: "ok",
+		message: `enabled: ${have.join(", ")}`,
 	};
 }
 
