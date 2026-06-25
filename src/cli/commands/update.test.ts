@@ -81,6 +81,14 @@ test("source checkout, build FAILS → does NOT restart the gateway", async () =
 	assert.ok(!ran(calls, "gateway restart"), "a broken build must not be restarted into");
 });
 
+test("source checkout, restart FAILS (foreground gateway / no service) → update still succeeds (0), restart attempted, no false claim", async () => {
+	const { run, calls } = makeRunner({ upstream: true, dirty: false, behind: 0, restartCode: 1 });
+	const code = await runUpdateCommand({ pkg: PKG(), run });
+	assert.equal(code, 0); // the build succeeded — a failed restart is non-fatal, not an error
+	assert.ok(ran(calls, "npm run build"));
+	assert.ok(ran(calls, "gateway restart"), "restart should still be attempted");
+});
+
 test("source checkout, --check → only inspects (fetch/status/rev-list), no pull/install/build/restart", async () => {
 	const { run, calls } = makeRunner({ upstream: true, dirty: false, behind: 1 });
 	const code = await runUpdateCommand({ pkg: PKG(), run, check: true });

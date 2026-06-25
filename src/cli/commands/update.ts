@@ -96,6 +96,20 @@ const out = (s: string): void => void process.stdout.write(s);
 const err = (s: string): void => void process.stderr.write(s);
 const step = (s: string): void => out(`${chalk.cyan("→")} ${s}\n`);
 
+/** Run a captured step with concise `→ label … ✓ / ✗` output; on failure, dump
+ *  the captured stdout/stderr so the error is still visible. Keeps the upgrade
+ *  quiet (no npm audit/funding noise) while staying honest about failures. */
+function runStep(run: CommandRunner, label: string, cmd: string, args: string[], cwd?: string): RunResult {
+	out(`${chalk.cyan("→")} ${label} … `);
+	const r = run(cmd, args, { cwd, capture: true });
+	out(r.code === 0 ? `${chalk.green("✓")}\n` : `${chalk.red("✗")}\n`);
+	if (r.code !== 0) {
+		if (r.stdout) err(`${r.stdout}\n`);
+		if (r.stderr) err(`${r.stderr}\n`);
+	}
+	return r;
+}
+
 export interface UpdateOptions {
 	check?: boolean;
 	/** Skip the final `gateway restart`. */
@@ -106,18 +120,37 @@ export interface UpdateOptions {
 	pkg?: PackageInfo;
 }
 
-/** Restart the running gateway so the freshly-built/installed code goes live. */
-function restartGateway(run: CommandRunner, source: boolean, root: string): void {
-	step("brigade gateway restart");
+/** Restart the running gateway so the freshly-built/installed code goes live.
+ *  This only succeeds when Brigade is installed as an OS service — it returns
+ *  false when there's nothing to restart (e.g. the gateway runs in the
+ *  foreground). Output is captured so the caller can report the outcome itself. */
+function restartGateway(run: CommandRunner, source: boolean, root: string): boolean {
 	const r = source
-		? run(process.execPath, [join(root, "brigade.mjs"), "gateway", "restart"], { cwd: root, shell: false })
-		: run("brigade", ["gateway", "restart"], { shell: true });
-	if (r.code !== 0) {
-		err(
-			`${chalk.yellow("⚠ Couldn't restart the gateway automatically.")} ` +
-				`Restart it yourself to load the new code: ${chalk.bold("brigade gateway restart")}\n`,
-		);
+		? run(process.execPath, [join(root, "brigade.mjs"), "gateway", "restart"], { cwd: root, shell: false, capture: true })
+		: run("brigade", ["gateway", "restart"], { shell: true, capture: true });
+	return r.code === 0;
+}
+
+/** Attempt the gateway restart and report HONESTLY — never claim a restart that
+ *  didn't happen. A failed restart is a warning, NOT an update failure: the new
+ *  code is already built/installed, it just needs the gateway bounced. */
+function restartAndReport(run: CommandRunner, source: boolean, root: string, opts: UpdateOptions): number {
+	if (opts.noRestart) {
+		out(`${chalk.green("✓ Brigade updated.")} Restart your gateway to load the new code ${chalk.dim("(--no-restart).")}\n`);
+		return 0;
 	}
+	out(`${chalk.cyan("→")} restarting gateway … `);
+	if (restartGateway(run, source, root)) {
+		out(`${chalk.green("✓")}\n${chalk.green("✓ Brigade updated + gateway restarted — running the latest code.")}\n`);
+		return 0;
+	}
+	out(`${chalk.yellow("⚠ nothing to restart")}\n`);
+	out(
+		`${chalk.green("✓ Brigade updated.")} To load the new code, ${chalk.bold("restart your gateway")} — ` +
+			`if you run it in the foreground, stop it and start it again. ` +
+			`${chalk.dim("(brigade gateway restart only applies when Brigade is installed as an OS service.)")}\n`,
+	);
+	return 0;
 }
 
 /** SOURCE-checkout update: git pull (when safe) → npm install → build → restart. */
@@ -165,33 +198,24 @@ function updateSourceCheckout(pkg: PackageInfo, opts: UpdateOptions, run: Comman
 		out(`${chalk.dim("• already up to date with upstream — rebuilding to apply any local commits.")}\n`);
 	}
 
-	// 2) npm install — deps may have changed.
-	step("npm install");
-	const install = run("npm", ["install"], { cwd: root });
-	if (install.code !== 0) {
+	// 2) npm install — deps may have changed. Captured so the upgrade stays quiet
+	//    (no npm audit/funding/postinstall noise); output is shown only on failure.
+	if (runStep(run, "installing dependencies", "npm", ["install"], root).code !== 0) {
 		err(`${chalk.red("✗ npm install failed.")} Fix the error above, then re-run ${chalk.bold("brigade update")}.\n`);
-		return install.code;
+		return 1;
 	}
 
 	// 3) npm run build — recompile src → dist (Brigade runs dist, not src).
-	step("npm run build");
-	const build = run("npm", ["run", "build"], { cwd: root });
-	if (build.code !== 0) {
+	if (runStep(run, "building", "npm", ["run", "build"], root).code !== 0) {
 		err(
 			`${chalk.red("✗ Build failed — NOT restarting the gateway")} (it keeps running the previous good build). ` +
 				`Fix the error above, then re-run ${chalk.bold("brigade update")}.\n`,
 		);
-		return build.code;
+		return 1;
 	}
 
-	// 4) restart so the new dist is live.
-	if (opts.noRestart) {
-		out(`${chalk.green("✓ Built.")} ${chalk.dim("(--no-restart)")} Run ${chalk.bold("brigade gateway restart")} to go live.\n`);
-		return 0;
-	}
-	restartGateway(run, true, root);
-	out(`${chalk.green("✓ Brigade updated + gateway restarted — running the latest code.")}\n`);
-	return 0;
+	// 4) restart so the new dist is live (honest about the foreground case).
+	return restartAndReport(run, true, root, opts);
 }
 
 /** NPM-GLOBAL update: npm i -g <pkg>@latest → restart. */
@@ -221,23 +245,15 @@ function updateNpmGlobal(pkg: PackageInfo, opts: UpdateOptions, run: CommandRunn
 		return 0;
 	}
 
-	step(`npm i -g ${pkg.name}@latest`);
-	const install = run("npm", ["i", "-g", `${pkg.name}@latest`], {});
-	if (install.code !== 0) {
+	if (runStep(run, `installing ${pkg.name}@latest`, "npm", ["i", "-g", `${pkg.name}@latest`]).code !== 0) {
 		err(
 			`${chalk.red("✗ Upgrade failed.")} If it's a permissions error, retry with elevated rights ` +
 				`(sudo / an Administrator shell), or run: ${chalk.bold(`npm i -g ${pkg.name}@latest`)}\n`,
 		);
-		return install.code;
+		return 1;
 	}
 
-	if (opts.noRestart) {
-		out(`${chalk.green("✓ Brigade updated.")} ${chalk.dim("(--no-restart)")} Run ${chalk.bold("brigade gateway restart")} to go live.\n`);
-		return 0;
-	}
-	restartGateway(run, false, pkg.root);
-	out(`${chalk.green("✓ Brigade updated + gateway restarted — running the latest code.")}\n`);
-	return 0;
+	return restartAndReport(run, false, pkg.root, opts);
 }
 
 export async function runUpdateCommand(opts: UpdateOptions = {}): Promise<number> {
