@@ -100,6 +100,12 @@ import {
 	imessageThreadIdleTtlMs,
 } from "../agents/channels/imessage/account-config.js";
 import { createIMessagePlugin, type IMessagePluginHandle } from "../agents/channels/imessage/plugin.js";
+import {
+	listBlueBubblesAccountIds,
+	bluebubblesChannelEnabled,
+	bluebubblesThreadIdleTtlMs,
+} from "../agents/channels/bluebubbles/account-config.js";
+import { createBlueBubblesPlugin, type BlueBubblesPluginHandle } from "../agents/channels/bluebubbles/plugin.js";
 import { createPluginChannelManagerFacade } from "../agents/channels/plugin-channel-manager-facade.js";
 import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
 import {
@@ -2027,7 +2033,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						telegramThreadIdleTtlMs(cfg) ??
 						slackThreadIdleTtlMs(cfg) ??
 						discordThreadIdleTtlMs(cfg) ??
-						imessageThreadIdleTtlMs(cfg)
+						imessageThreadIdleTtlMs(cfg) ??
+						bluebubblesThreadIdleTtlMs(cfg)
 					);
 				} catch {
 					return null;
@@ -5319,16 +5326,32 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		const imessageAccounts = imessageChannelEnabled(cfg as never)
 			? listIMessageAccountIds(cfg as never)
 			: [];
+		const bluebubblesAccounts = bluebubblesChannelEnabled(cfg as never)
+			? listBlueBubblesAccountIds(cfg as never)
+			: [];
 		const wantWhatsAppMulti = whatsappAccounts.length > 1;
 		const wantTelegramMulti = telegramAccounts.length > 1;
 		const wantSlackMulti = slackAccounts.length > 1;
 		const wantDiscordMulti = discordAccounts.length > 1;
 		const wantIMessageMulti = imessageAccounts.length > 1;
-		if (wantWhatsAppMulti || wantTelegramMulti || wantSlackMulti || wantDiscordMulti || wantIMessageMulti) {
+		const wantBlueBubblesMulti = bluebubblesAccounts.length > 1;
+		if (
+			wantWhatsAppMulti ||
+			wantTelegramMulti ||
+			wantSlackMulti ||
+			wantDiscordMulti ||
+			wantIMessageMulti ||
+			wantBlueBubblesMulti
+		) {
 			// Fresh list each (re)start so a reload doesn't accumulate stale plugins.
 			bundledChannelPlugins = [];
 			const facadeHandles: Array<
-				WhatsAppPluginHandle | TelegramPluginHandle | SlackPluginHandle | DiscordPluginHandle | IMessagePluginHandle
+				| WhatsAppPluginHandle
+				| TelegramPluginHandle
+				| SlackPluginHandle
+				| DiscordPluginHandle
+				| IMessagePluginHandle
+				| BlueBubblesPluginHandle
 			> = [];
 			const multiAccountSummary: string[] = [];
 			if (wantWhatsAppMulti) {
@@ -5388,6 +5411,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				bundledChannelPlugins.push(imessagePlugin);
 				facadeHandles.push(imessagePlugin);
 				multiAccountSummary.push(`imessage x${imessageAccounts.length}`);
+			}
+			if (wantBlueBubblesMulti) {
+				const bluebubblesPlugin = createBlueBubblesPlugin({
+					defaultAgentId: agentId,
+					loadConfig: () => cfg as never,
+					runTurn: (turn) => runGatewayTurn(turn),
+				});
+				bundledChannelPlugins.push(bluebubblesPlugin);
+				facadeHandles.push(bluebubblesPlugin);
+				multiAccountSummary.push(`bluebubbles x${bluebubblesAccounts.length}`);
 			}
 			const pluginById = new Map(bundledChannelPlugins.map((p) => [p.id, p] as const));
 			// Register each constructed plugin's `meta` + its `messaging`/`security`

@@ -7,6 +7,7 @@
  * + loaded by the loader alongside these (same gating) — see `discovery.ts`.
  */
 
+import { bluebubblesModule } from "../../channels/bluebubbles/module.js";
 import { discordModule } from "../../channels/discord/module.js";
 import { imessageModule } from "../../channels/imessage/module.js";
 import { slackModule } from "../../channels/slack/module.js";
@@ -45,6 +46,11 @@ export const BUNDLED_MODULES: BrigadeModule[] = [
 	// (`imsg rpc`); inbound is the subprocess notification stream only — no HTTP
 	// route. Requires Messages.app signed in on the host (macOS).
 	imessageModule,
+	// BlueBubbles channel adapter (richer iMessage transport) — inert until
+	// `channels.bluebubbles.enabled: true` and a serverUrl + password resolve.
+	// REST-out to the BlueBubbles macOS server; inbound via a gateway webhook
+	// route (the server password is embedded in the registered webhook URL).
+	bluebubblesModule,
 	// Web-fetch + web-search providers. Each module is inert unless its
 	// credential is configured (env var or `tools.web.{search,fetch}.providers.<id>`).
 	// The registry picks the active provider by `autoDetectOrder` ascending —

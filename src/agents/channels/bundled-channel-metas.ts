@@ -79,6 +79,23 @@ export const IMESSAGE_CHANNEL_META: ChannelMeta = {
 	markdownCapable: false,
 };
 
+/**
+ * BlueBubbles channel metadata. Like iMessage, BlueBubbles has NO rich markup
+ * (plain text only), so it is NOT markdown-capable — the assembler's markdown
+ * gate strips formatting for this channel. Driven by the BlueBubbles macOS server
+ * over REST (outbound) + a webhook (inbound).
+ */
+export const BLUEBUBBLES_CHANNEL_META: ChannelMeta = {
+	id: "bluebubbles",
+	label: "BlueBubbles",
+	selectionLabel: "BlueBubbles (iMessage)",
+	docsPath: "channels/bluebubbles",
+	blurb: "Drive native iMessage via a BlueBubbles macOS server; REST-out + webhook-in, reactions/edit/unsend.",
+	order: 55,
+	aliases: ["bb"],
+	markdownCapable: false,
+};
+
 /** Every bundled channel meta, in declaration order. The registry seeds from this. */
 export const BUNDLED_CHANNEL_METAS: readonly ChannelMeta[] = [
 	WHATSAPP_CHANNEL_META,
@@ -86,4 +103,5 @@ export const BUNDLED_CHANNEL_METAS: readonly ChannelMeta[] = [
 	SLACK_CHANNEL_META,
 	DISCORD_CHANNEL_META,
 	IMESSAGE_CHANNEL_META,
+	BLUEBUBBLES_CHANNEL_META,
 ];
