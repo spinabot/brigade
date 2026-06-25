@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.0](https://github.com/spinabot/brigade/compare/brigade-v1.10.0...brigade-v1.11.0) (2026-06-25)
+
+
+### Features
+
+* **update:** brigade update now actually self-updates (source + npm) + restarts ([2f2a734](https://github.com/spinabot/brigade/commit/2f2a734b0d526a63c182ccb699dba6a112299762))
+
 ## [1.10.0](https://github.com/spinabot/brigade/compare/brigade-v1.9.0...brigade-v1.10.0) (2026-06-25)
 
 
