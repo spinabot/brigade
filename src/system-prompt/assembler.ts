@@ -5,6 +5,7 @@ import { sanitizeForPromptLiteral } from "./sanitize.js";
 import { formatRuntimeLine, type RuntimeParams } from "./runtime-params.js";
 import {
   DELEGATION_CASCADE_GUIDANCE,
+  MEDIA_GUIDANCE,
   MEMORY_GUIDANCE,
   ORG_AWARENESS_GUIDANCE,
   pickModelFamilyGuidance,
@@ -796,6 +797,19 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // of browser" regression we saw on the Coimbatore / Srikakulam runs.
   if (args.capabilities?.web) {
     lines.push(WEB_TOOLS_GUIDANCE);
+    lines.push("");
+  }
+
+  // 7d'. ## Media & documents (conditional on the `analyze_media` tool).
+  // Keyed on the tool NAME (like the delegation cascade), not a capability
+  // flag — it only renders when the model actually has `analyze_media` to
+  // call. Closes the broken chain where an inbound `[attached … → <path>]`
+  // note arrived but the model ignored it / asked the user to paste the
+  // contents instead of calling the tool. NOT gated on minimal mode: a cron
+  // / sub-agent turn handed a file path needs this exactly as much, and the
+  // tool is in its surface only if it was wired.
+  if (args.toolDescriptions.some((t) => t.name === "analyze_media")) {
+    lines.push(MEDIA_GUIDANCE);
     lines.push("");
   }
 

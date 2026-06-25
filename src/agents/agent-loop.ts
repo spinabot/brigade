@@ -196,6 +196,23 @@ export interface RunSingleTurnArgs {
   provider: string;
   modelId: string;
   message: string;
+  /**
+   * OPTIONAL inbound IMAGE blocks to send INLINE with this turn's user message
+   * (A3 — "auto-see inbound images"). Each is a Pi `ImageContent` minus the
+   * literal tag: `{ data: <raw base64>, mimeType }`. The channel inbound
+   * pipeline decodes inbound image attachments into these (capped) and threads
+   * them here via `runGatewayTurn` → `runResilientTurn`.
+   *
+   * They are attached to `session.prompt(...)` as a multimodal user message
+   * ONLY when the RESOLVED turn model is vision-capable
+   * (`modelSupportsImageInput(model) === true`). When absent, empty, or the
+   * model is text-only, the turn builds the EXACT same string-prompt as before
+   * — so TUI / cron / sub-agent / RPC turns (which never set this) and
+   * text-only models are byte-identical to today. The `[attached image →
+   * <path>]` note stays in `message` regardless, so a text-only model still
+   * sees the path and can call `analyze_media`.
+   */
+  images?: ReadonlyArray<{ data: string; mimeType: string }>;
   sessionKey?: string;
   // Override the agent's workspace dir — where persona/SOUL/USER files live
   // AND the cwd Pi resolves relative tool paths against. Defaults to
@@ -1494,6 +1511,29 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // attempt closure on transient failures — so retries don't move it.
   const messageCountBeforeTurn = (session as AgentSession).messages.length;
 
+  // A3 — inbound IMAGE blocks as a multimodal user message.
+  //
+  // The channel inbound pipeline may have decoded inbound image attachments
+  // into `args.images` (`{ data: base64, mimeType }[]`). `resolveInboundImagePrompt`
+  // attaches them to `prompt(...)` as Pi `ImageContent` ONLY when the resolved
+  // turn model is vision-capable — it reads the authoritative `Model.input`
+  // (`("text"|"image")[]`) via `modelSupportsImageInput`. On a text-only model
+  // (or when no images were threaded) it returns `undefined`, so the call below
+  // is byte-identical to the historical string-only prompt and the `[attached
+  // image → <path>]` note in `scrubbedMessage` is the model's signal to call
+  // `analyze_media` instead. TUI / cron / sub-agent / RPC turns never set
+  // `args.images`, so they always take the string path too.
+  const promptImageOptions = resolveInboundImagePrompt(model, args.images);
+  if (promptImageOptions) {
+    log.debug("inbound images attached to turn", {
+      agentId,
+      sessionId: resolved.sessionId,
+      count: promptImageOptions.images.length,
+      provider: args.provider,
+      model: args.modelId,
+    });
+  }
+
   await runWithRetry({
     ctx: { provider: args.provider, model: args.modelId },
     signal: args.signal,
@@ -1567,7 +1607,15 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
           await runWithContentQualityRetry(
             session as AgentSession,
             async () => {
-              await (session as AgentSession).prompt(scrubbedMessage);
+              // Multimodal user message when inbound vision images are present
+              // + the model supports them (A3); otherwise the historical
+              // string-only prompt (byte-identical) — `promptImageOptions` is
+              // `undefined` in that case and Pi receives just the text.
+              if (promptImageOptions) {
+                await (session as AgentSession).prompt(scrubbedMessage, promptImageOptions);
+              } else {
+                await (session as AgentSession).prompt(scrubbedMessage);
+              }
               // Defensive settle wait. prompt() should already have settled
               // the run, but if Pi adds queued steers or background
               // compactions in a future minor, this catches the late activity.
@@ -2316,6 +2364,32 @@ export function modelSupportsImageInput(model: unknown): boolean | undefined {
   const input = (model as { input?: unknown } | null | undefined)?.input;
   if (!Array.isArray(input)) return undefined;
   return input.includes("image");
+}
+
+/**
+ * A3 gate — decide whether inbound IMAGE blocks ride this turn's `prompt(...)`
+ * as a multimodal user message. Returns the `{ images }` options object for
+ * `session.prompt(text, opts)` ONLY when BOTH:
+ *   1. the resolved model is vision-capable (`modelSupportsImageInput === true`
+ *      — an authoritative `Model.input` read; `undefined`/`false` → text-only),
+ *   2. at least one inbound image block was threaded in.
+ * Otherwise returns `undefined`, so the caller sends the plain string prompt —
+ * byte-identical to the historical path (no-image turns, text-only models, and
+ * every TUI / cron / sub-agent / RPC turn, which never set `images`).
+ *
+ * Maps the wire shape (`{ data, mimeType }`) to Pi's `ImageContent`
+ * (`{ type:"image", data, mimeType }`) — the SAME block `analyze_media` returns
+ * and `payload-mutators.ts` prunes from history. Pure + exported for unit tests.
+ */
+export function resolveInboundImagePrompt(
+  model: unknown,
+  images: ReadonlyArray<{ data: string; mimeType: string }> | undefined,
+): { images: Array<{ type: "image"; data: string; mimeType: string }> } | undefined {
+  if (!images || images.length === 0) return undefined;
+  if (modelSupportsImageInput(model) !== true) return undefined;
+  return {
+    images: images.map((b) => ({ type: "image" as const, data: b.data, mimeType: b.mimeType })),
+  };
 }
 
 // Both flags must clear for the turn to be considered done. prompt() is

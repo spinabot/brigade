@@ -550,6 +550,53 @@ describe("inbound-pipeline: deferred media downloads only AFTER the access gate 
 		assert.match(turnText ?? "", /attached image/, "media note reaches the agent turn");
 	});
 
+	it("ADMITTED sender + inbound IMAGE: decoded image blocks ALSO reach the turn (A3)", async () => {
+		// A3 end-to-end through the pipeline: an inbound image whose bytes are on
+		// disk is decoded into an inline `{ data, mimeType }` block and threaded to
+		// `runTurn` as `args.images`, so a vision turn SEES the photo with zero
+		// tool calls. The note still carries the path (for a text-only fallback /
+		// re-analysis), but the image data rides alongside it.
+		const dir = mkdtempSync(join(tmpdir(), "brigade-ibp-img-"));
+		try {
+			const imgPath = join(dir, "pic.png");
+			writeFileSync(imgPath, Buffer.from("REALPNGBYTES"));
+			let turnImages: ReadonlyArray<{ data: string; mimeType: string }> | undefined;
+			let turnText: string | undefined;
+			const fake = makeFakeChannel();
+			const pipeline = createInboundPipelineContext({
+				adapter: fake.adapter,
+				config: ACL_OPEN,
+				agentId: "main",
+				runTurn: async (args) => {
+					turnImages = args.images;
+					turnText = args.text;
+					return { reply: "ok" };
+				},
+				commandMap: new Map(),
+			});
+			await runChannelInboundPipeline(pipeline, {
+				channel: "fake",
+				conversationId: "+12025550100",
+				from: "+12025550100",
+				text: "what's in this photo?",
+				resolveMedia: async () => [{ kind: "image", path: imgPath, mimeType: "image/png" }],
+			});
+			assert.ok(turnImages && turnImages.length === 1, "one inline image block reaches the turn");
+			assert.equal(turnImages[0]?.mimeType, "image/png");
+			assert.equal(
+				Buffer.from(turnImages[0]!.data, "base64").toString(),
+				"REALPNGBYTES",
+				"the image block carries the raw bytes as base64 (no data: prefix)",
+			);
+			// The path note still rides in the text so a text-only model can fall
+			// back to analyze_media; the user's question is preserved too.
+			assert.match(turnText ?? "", /attached image/, "the path note is still present");
+			assert.match(turnText ?? "", /what's in this photo\?/, "the user's question is preserved");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("ADMITTED sender whose deferred download FAILS: message drops quietly (no turn)", async () => {
 		let turns = 0;
 		const fake = makeFakeChannel();

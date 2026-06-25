@@ -228,6 +228,32 @@ Skip patterns:
 
 When fetch returns truncated content (the payload's \`truncated: true\`), you have the first N characters — fetch again with a narrower scope or ask the user for the specific section they want.`;
 
+/* ───────────────── Media guidance (conditional on analyze_media tool) ───────────────── */
+
+/**
+ * Injected when the `analyze_media` tool is wired this turn (gated on the tool
+ * NAME, like the delegation cascade — not a capability flag — so it only renders
+ * when the model actually has the tool to call).
+ *
+ * Closes the broken chain: inbound documents/PDFs/spreadsheets/video/audio arrive
+ * as a `[attached … → <path>]` note (with an embedded `analyze_media` call-to-
+ * action, A1), but without this block the model frequently ignored the note and
+ * either asked the user to paste the contents or hallucinated. This is the
+ * behavioural pairing — tell it to CALL the tool with the path BEFORE answering.
+ *
+ * Images are NOT a tool job on a vision model — the inbound pipeline injects their
+ * bytes inline as a real multimodal block (A3), so they're already visible. The
+ * last line says so, so the model doesn't waste a tool call re-reading an image it
+ * can already see (and knows to fall back to the tool when it genuinely can't).
+ */
+export const MEDIA_GUIDANCE = `## Media & documents
+
+When the latest message includes an attached document, PDF, spreadsheet, slide deck, web page, video, or audio file — it arrives as an \`[attached … → <path>]\` note naming a local file path. You CANNOT read those bytes directly; the note's contents are a pointer, not the data.
+
+Call \`analyze_media({ source: "<path>", question: "<the user's request>" })\` BEFORE answering — it reads the file (PDF/Office/HTML → text, video/audio → transcription or description, scanned PDF → OCR via a vision provider) and returns what the current model can reason about. Never ask the user to paste, retype, or re-send the contents, and never answer from the filename alone.
+
+Images attached to the message are already visible to you inline when your model supports vision — describe or use them directly, no tool call needed. Only reach for \`analyze_media\` on an image if you genuinely cannot see it (e.g. the note says it was attached but no image is present in the message, which means the current model is text-only).`;
+
 /* ───────────────── Sub-agent guidance (conditional on spawn_agent tool) ───────────────── */
 
 /**

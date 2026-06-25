@@ -2519,6 +2519,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 */
 	const runGatewayTurn = (turn: {
 		text: string;
+		/**
+		 * OPTIONAL inbound IMAGE blocks to send INLINE with this turn's user
+		 * message (A3 — "auto-see inbound images"). Each is `{ data: <raw
+		 * base64>, mimeType }` (a Pi `ImageContent` minus the literal tag). Set
+		 * ONLY by the channel inbound pipeline when an inbound carried image
+		 * attachments; forwarded into `runResilientTurn` → `runSingleTurn`,
+		 * which attaches them to `session.prompt` ONLY when the resolved model
+		 * is vision-capable. Always undefined for TUI / cron / sub-agent / RPC
+		 * callers, so their turn is byte-identical (string-only prompt).
+		 */
+		images?: ReadonlyArray<{ data: string; mimeType: string }>;
 		sessionKey: string;
 		/**
 		 * Routed agent id for this turn (output of the 8-tier route resolver
@@ -2676,6 +2687,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					provider: turnProvider,
 					modelId: turnModelId,
 					message: turn.text,
+					// A3: forward inbound image blocks (set ONLY by the channel
+					// pipeline). runSingleTurn gates them on the resolved model's
+					// vision capability; undefined here for TUI / cron / RPC →
+					// string-only prompt, byte-identical.
+					...(turn.images && turn.images.length > 0 ? { images: turn.images } : {}),
 					sessionKey: turn.sessionKey,
 					thinkingLevel: turnThinkingLevel as "off" | "low" | "medium" | "high",
 					fallbacks,
