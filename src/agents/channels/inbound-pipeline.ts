@@ -54,7 +54,7 @@ import {
 } from "./approval-router.js";
 import { recordLastChannelForAgent } from "./last-channel.js";
 import { recordLastSentMessage } from "./last-sent-message.js";
-import { buildMediaNote } from "./media-capture.js";
+import { buildInboundImageBlocks, buildMediaNote, type InboundImageBlock } from "./media-capture.js";
 import { resolveAgentRoute } from "../routing/resolve-route.js";
 import { normalizeAccountId } from "../routing/account-id.js";
 import { resolveThreadSessionKeys } from "../routing/session-key.js";
@@ -69,6 +69,14 @@ const log = createSubsystemLogger("channels/inbound-pipeline");
 
 /** Same grace window the legacy manager applied (queued-during-downtime suppress). */
 const PAIRING_REPLY_HISTORY_GRACE_MS = 30_000;
+
+/**
+ * Hard cap on inline IMAGE blocks accumulated across a single debounce window
+ * (A3). A burst of photos coalesced into one turn can't push more than this many
+ * inline images at the model; the rest still carry their `[attached image →
+ * <path>]` note for `analyze_media`. Keeps the turn payload bounded.
+ */
+const INBOUND_IMAGE_DEBOUNCE_MAX = 8;
 
 /** Per-channel access-control config slice (DM/group policy + declarative allow-from). */
 interface ChannelAccessConfig {
@@ -272,6 +280,16 @@ export interface ChannelTurnResult {
 /** runTurn signature shared by the legacy manager and the plugin path. */
 export type RunChannelTurnFn = (args: {
 	text: string;
+	/**
+	 * OPTIONAL inbound IMAGE blocks decoded from this turn's attachments (A3 —
+	 * "auto-see inbound images"). Each is `{ data: <raw base64>, mimeType }`. The
+	 * gateway attaches them to the model's user message ONLY when the resolved
+	 * turn model is vision-capable; on a text-only model they're dropped and the
+	 * `[attached image → <path>]` note carries the path for `analyze_media`.
+	 * Undefined when the inbound had no image attachments (unchanged for every
+	 * text-only message + every existing channel).
+	 */
+	images?: ReadonlyArray<{ data: string; mimeType: string }>;
 	sessionKey: string;
 	agentId: string;
 	signal?: AbortSignal;
@@ -307,6 +325,14 @@ export interface PendingDispatch {
 	channelApprovalRoute: ChannelApprovalRoute;
 	/** Per-group/per-sender tool policy for this turn (group messages only). */
 	toolPolicy?: GroupToolPolicyConfig;
+	/**
+	 * Inbound image blocks accumulated across the debounce window (A3). Seeded
+	 * from the message that opened the slot; each coalesced message appends its
+	 * own (capped to `INBOUND_IMAGE_DEBOUNCE_MAX` total so a burst can't grow it
+	 * without bound). Optional + empty for text-only windows; the pipeline's only
+	 * constructor always sets it to an array, so the flush read is total.
+	 */
+	images?: InboundImageBlock[];
 }
 
 /** Bundled built-in channel commands an operator can DM to admin the bot. */
@@ -853,6 +879,15 @@ export async function runChannelInboundPipeline(
 			msg.media && msg.media.length > 0
 				? await buildMediaNote(msg.media, { registry: getActiveRegistry(), config: cfg })
 				: "";
+		// A3 — decode inbound IMAGE attachments into inline content blocks so a
+		// vision-capable turn SEES the photo with zero tool calls. The gateway
+		// gates these on the resolved model's vision capability and drops them on
+		// a text-only model (the `[attached image → <path>]` note in `mediaNote`
+		// then carries the path for `analyze_media`). Bytes are capped + best-
+		// effort; an unreadable / oversized image is simply not inlined. Empty
+		// for every text-only inbound, so non-image turns are unaffected.
+		const inboundImageBlocks: InboundImageBlock[] =
+			msg.media && msg.media.length > 0 ? await buildInboundImageBlocks(msg.media) : [];
 		const replyNote = msg.replyTo?.body
 			? `> ${msg.replyTo.body.replace(/\n/g, " ").slice(0, 200)}\n`
 			: "";
@@ -1013,6 +1048,16 @@ export async function runChannelInboundPipeline(
 			if (existing) {
 				clearTimeout(existing.timer);
 				existing.parts.push(text);
+				// Accumulate images across the coalesce window, capped so a burst of
+				// image messages can't grow the slot without bound. Excess images
+				// still have their `[attached image → <path>]` note in `parts`.
+				if (inboundImageBlocks.length > 0) {
+					const acc = (existing.images ??= []);
+					for (const b of inboundImageBlocks) {
+						if (acc.length >= INBOUND_IMAGE_DEBOUNCE_MAX) break;
+						acc.push(b);
+					}
+				}
 				existing.timer = setTimeout(
 					() => void flushDispatch(ctx, dispatchKey),
 					debounceMs,
@@ -1026,6 +1071,7 @@ export async function runChannelInboundPipeline(
 					senderIsOwner,
 					channelApprovalRoute,
 					...(groupToolPolicy ? { toolPolicy: groupToolPolicy } : {}),
+					images: inboundImageBlocks.slice(0, INBOUND_IMAGE_DEBOUNCE_MAX),
 					timer: setTimeout(() => void flushDispatch(ctx, dispatchKey), debounceMs),
 				});
 			}
@@ -1070,6 +1116,7 @@ export async function runChannelInboundPipeline(
 			senderIsOwner,
 			channelApprovalRoute,
 			...(groupToolPolicy ? { toolPolicy: groupToolPolicy } : {}),
+			...(inboundImageBlocks.length > 0 ? { images: inboundImageBlocks } : {}),
 		});
 	} catch (err) {
 		const errMsg = err instanceof Error ? err.message : String(err);
@@ -1107,6 +1154,8 @@ export async function runChannelInboundPipeline(
 			channelApprovalRoute?: ChannelApprovalRoute;
 			/** Per-group/per-sender tool policy for this turn (group messages only). */
 			toolPolicy?: GroupToolPolicyConfig;
+			/** Inbound image blocks to inline on a vision turn (A3). Undefined → none. */
+			images?: ReadonlyArray<InboundImageBlock>;
 		},
 	): Promise<void> {
 		const controller = new AbortController();
@@ -1173,6 +1222,7 @@ export async function runChannelInboundPipeline(
 					: {}),
 				...(a.toolPolicy ? { toolPolicy: a.toolPolicy } : {}),
 				...(onReplyDelta ? { onReplyDelta } : {}),
+				...(a.images && a.images.length > 0 ? { images: a.images } : {}),
 			});
 		} catch (err) {
 			replyStream?.stop();
@@ -1388,6 +1438,7 @@ export async function runChannelInboundPipeline(
 				senderIsOwner: slot.senderIsOwner,
 				channelApprovalRoute: slot.channelApprovalRoute,
 				...(slot.toolPolicy ? { toolPolicy: slot.toolPolicy } : {}),
+				...(slot.images && slot.images.length > 0 ? { images: slot.images } : {}),
 			});
 		} catch (err) {
 			log.warn("debounced dispatch failed", {

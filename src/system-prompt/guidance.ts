@@ -228,6 +228,60 @@ Skip patterns:
 
 When fetch returns truncated content (the payload's \`truncated: true\`), you have the first N characters — fetch again with a narrower scope or ask the user for the specific section they want.`;
 
+/* ───────────────── Media guidance (conditional on analyze_media tool) ───────────────── */
+
+/**
+ * Injected when the `analyze_media` tool is wired this turn (gated on the tool
+ * NAME, like the delegation cascade — not a capability flag — so it only renders
+ * when the model actually has the tool to call).
+ *
+ * Closes the broken chain: inbound documents/PDFs/spreadsheets/video/audio arrive
+ * as a `[attached … → <path>]` note (with an embedded `analyze_media` call-to-
+ * action, A1), but without this block the model frequently ignored the note and
+ * either asked the user to paste the contents or hallucinated. This is the
+ * behavioural pairing — tell it to CALL the tool with the path BEFORE answering.
+ *
+ * Images are NOT a tool job on a vision model — the inbound pipeline injects their
+ * bytes inline as a real multimodal block (A3), so they're already visible. The
+ * last line says so, so the model doesn't waste a tool call re-reading an image it
+ * can already see (and knows to fall back to the tool when it genuinely can't).
+ */
+export const MEDIA_GUIDANCE = `## Media & documents
+
+When the latest message includes an attached document, PDF, spreadsheet, slide deck, web page, video, or audio file — it arrives as an \`[attached … → <path>]\` note naming a local file path. You CANNOT read those bytes directly; the note's contents are a pointer, not the data.
+
+Call \`analyze_media({ source: "<path>", question: "<the user's request>" })\` BEFORE answering — it reads the file (PDF/Office/HTML → text, video/audio → transcription or description, scanned PDF → OCR via a vision provider) and returns what the current model can reason about. Never ask the user to paste, retype, or re-send the contents, and never answer from the filename alone.
+
+Office documents (pptx / docx / xlsx) return BOTH their text AND the images EMBEDDED inside them (the wireframes / screenshots / diagrams / charts) AUTOMATICALLY in the same call — you do NOT pass any flag to see the visuals, and you must NEVER unzip a document with bash/python (\`zipfile\`, \`unzip\`) to get at \`ppt/media/*\` or \`word/media/*\`; \`analyze_media\` already extracts them. To focus on specific visuals in a deck, scope with \`pages=\` (e.g. \`pages:"8-13"\` returns only those slides' images). To skip images for a cheaper text-only read, set \`includeImages:false\`.
+
+Images attached to the message are already visible to you inline when your model supports vision — describe or use them directly, no tool call needed. Only reach for \`analyze_media\` on an image if you genuinely cannot see it (e.g. the note says it was attached but no image is present in the message, which means the current model is text-only).`;
+
+/* ───────────────── Document authoring guidance (conditional on make_document tool) ───────────────── */
+
+/**
+ * Injected when the `make_document` tool is wired this turn (gated on the tool
+ * NAME, like MEDIA_GUIDANCE — not a capability flag — so it only renders when
+ * the model actually has the authoring tools to call).
+ *
+ * Closes the WRITE gap: Brigade has no python / pandoc / libreoffice and no code
+ * sandbox, so a model that tries to "write a Word doc" in bash silently fails.
+ * This block tells it the two correct surfaces (`make_document` to create,
+ * `edit_document` to change), that they pair with `analyze_media` (read) and
+ * `send_media` (deliver), and that it must NEVER claim a file was produced
+ * without actually calling the tool.
+ */
+export const DOCUMENT_GUIDANCE = `## Creating & editing documents
+
+You can produce real Office / PDF files natively — no shell, no Python, no LibreOffice (none of those exist here; trying to build a .docx/.xlsx/.pptx in \`bash\` will silently fail). Two tools own this:
+
+- \`make_document({ format, content, outputPath? })\` — CREATE a Word (docx), Excel (xlsx), PowerPoint (pptx), or PDF from scratch. \`content\` is structured per format: docx → \`{title?, sections:[{heading?, level?, paragraphs?, bullets?, table?, image?}]}\`; xlsx → \`{sheets:[{name?, header?, rows, numberFormats?}]}\`; pptx → \`{slides:[{title?, bullets?, image?, chart?, notes?}]}\` where \`chart\` is \`{type:"bar"|"line"|"pie", title?, categories:[…], series:[{name?, values:[…]}]}\`; pdf → \`{title?, pages:[{heading?, paragraphs?, image?}]}\`. Images embed from a local \`path\` or \`url\`. An xlsx cell may be a string, a number, or a formula object \`{formula:"SUM(B2:B10)", numFmt?}\` (no leading "="); set per-column number formats with \`numberFormats:["@","#,##0.00"]\`. PDFs are written with an embedded Unicode font, so Latin / accented / Greek / Cyrillic text renders correctly (CJK + emoji still fall back to "?"). The file is written into the workspace by default; the tool returns its \`path\`.
+
+- \`edit_document({ source, action, ... })\` — change an EXISTING file, preserving everything you don't touch. docx: \`append\` ({paragraphs, heading?}) / \`replace_text\` ({find, replace}) / \`fill_template\` ({values}). xlsx: \`set_cells\` ({sheet?, cells:[{ref|row,col, value, numFmt?}]}) / \`append_rows\` ({sheet?, rows}). pptx: \`replace_text\` ({find, replace}) / \`fill_template\` ({values}). pdf: \`fill_form\` ({fields}) / \`merge\` ({pdfs}) / \`split\` ({pages}) / \`stamp\` or \`watermark\` ({text}) / \`add_pages\` ({pdfs}) / \`remove_pages\` ({pages}). \`replace_text\` and \`fill_template\` match across run boundaries (Word/PowerPoint often split a word into several runs), so a literal \`find\` or a \`{{token}}\` placeholder is matched even when fragmented — \`fill_template({values:{"{{client}}":"Acme"}})\` is the mail-merge path and reports which tokens were filled vs not found. An xlsx cell value may be a formula object \`{formula:"SUM(A1:A3)"}\`. Writes over the source unless you pass \`outputPath\`.
+
+This is the WRITE half of document handling and pairs with \`analyze_media\` (the READ half): to turn a PDF into a Word memo, \`analyze_media\` the PDF to understand it, then \`make_document\` the memo. Reading back an Office file with \`analyze_media\` returns BOTH its text AND its embedded images (wireframes / screenshots / charts) automatically — so to review the visuals in a deck, just \`analyze_media\` it (scope with \`pages=\`); never unzip it with bash/python to reach \`ppt/media/*\`. After producing a file, hand it to the user with \`send_media({path})\` on a channel, or just report the workspace path on the TUI.
+
+Never claim you created or edited a document without actually calling one of these tools — there is no other way a file appears on disk. Don't reach for \`write\`/\`edit\` to hand-author binary Office formats (they are zipped XML; a raw write corrupts them); use these tools.`;
+
 /* ───────────────── Sub-agent guidance (conditional on spawn_agent tool) ───────────────── */
 
 /**

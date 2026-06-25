@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import path from "node:path";
 import { describe, it } from "node:test";
 
 import { downloadSlackFile, isAllowedSlackFileUrl, withSlackRetry } from "./media.js";
@@ -104,6 +105,25 @@ describe("downloadSlackFile", () => {
 			}) as unknown as typeof fetch,
 		});
 		assert.equal(seenRedirect, "manual");
+	});
+
+	it("saves a CSV document with a .csv extension (filetype, then filename)", async () => {
+		// Slack gives a friendly `filetype` ("csv"); even when it's absent the
+		// `name` extension drives the saved file so analyze_media can detect it.
+		const out = await downloadSlackFile({
+			file: {
+				id: "FCSV",
+				url_private: "https://files.slack.com/FCSV",
+				name: "data.csv",
+				mimetype: "application/octet-stream",
+				// no `filetype` set → must fall back to the name's extension
+			},
+			token: "xoxb-secret",
+			fetchImpl: (async () => new Response("a,b\n1,2\n", { status: 200 })) as unknown as typeof fetch,
+		});
+		assert.ok(out, "document download resolved");
+		assert.equal(path.extname(out!.path).toLowerCase(), ".csv");
+		assert.equal(out!.fileName, "data.csv");
 	});
 });
 

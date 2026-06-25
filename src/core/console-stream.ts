@@ -185,16 +185,18 @@ export function createConsoleStream(opts: ConsoleStreamOptions = {}): ConsoleStr
 					const usage = ev.message?.usage;
 					// `usage.cost` is the Pi SDK's structured cost record —
 					// `{ input, output, cacheRead, cacheWrite, total }` (not a number).
-					// We surface only `total`, gated on `Number.isFinite` so a missing
-					// price column (which leaves `total` as NaN or undefined) prints
-					// nothing instead of `$NaN`. Treating the field as a plain Number
-					// would always yield NaN because the object has no valueOf.
+					// We surface only `total`. A real cost is ALWAYS >= 0; an UNPRICED
+					// model (openrouter/auto, ollama, a custom endpoint) carries a -1
+					// price sentinel in the catalog, so Pi computes `total` as -(in+out)
+					// — a nonsense negative. So we show the dollar amount only when it's
+					// finite AND non-negative, and "n/a" otherwise (unpriced/unknown),
+					// never a garbage negative or `$NaN`.
 					const cost = usage?.cost as { total?: unknown } | undefined;
 					const total = typeof cost?.total === "number" ? cost.total : Number.NaN;
 					body = `${arrow("event")} turn_end ${fields({
 						in: usage?.input,
 						out: usage?.output,
-						cost: Number.isFinite(total) ? `$${total.toFixed(4)}` : undefined,
+						cost: Number.isFinite(total) && total >= 0 ? `$${total.toFixed(4)}` : "n/a",
 					})}`;
 					break;
 				}

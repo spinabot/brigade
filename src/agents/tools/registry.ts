@@ -36,6 +36,9 @@ import { makeCronTool } from "./cron-tool.js";
 import { makeManageAgentTool } from "./manage-agent-tool.js";
 import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
+import { makeAnalyzeMediaTool } from "./analyze-media-tool.js";
+import { makeMakeDocumentTool } from "./make-document-tool.js";
+import { makeEditDocumentTool } from "./edit-document-tool.js";
 import { makeManageAccessTool } from "./manage-access-tool.js";
 import { makeManageChannelAccessTool } from "./manage-channel-access-tool.js";
 import { makeConnectChannelTool } from "./connect-channel-tool.js";
@@ -143,6 +146,18 @@ export interface CreateBrigadeToolsOptions {
 	 * narrow per-call gate kicks in.
 	 */
 	senderIsOwner?: boolean;
+	/**
+	 * Resolved turn-model context (provider + modelId of the model driving this
+	 * turn). Threaded into `analyze_media` so it can decide whether returning an
+	 * IMAGE content block is meaningful (a text-only model can't consume one).
+	 * Optional — when omitted (tests / legacy call sites) the tool assumes the
+	 * model is vision-capable but annotates the uncertainty.
+	 */
+	modelContext?: {
+		provider?: string;
+		modelId?: string;
+		imageInput?: boolean;
+	};
 	/**
 	 * Per-turn session metadata (Step 11's `SessionContext`). When supplied,
 	 * `createBrigadeTools` includes the four sessions tools
@@ -255,6 +270,50 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// a billed generation got silently dropped that way in production).
 		// Owner-gated: each call is billed.
 		makeGenerateImageTool(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		// analyze_media — read-capability media + document understanding. The
+		// model hands it a local path or URL (+ a question) and it RESOLVES the
+		// input into content the CURRENT turn's model analyzes: images become an
+		// image content block (when the model is vision-capable), PDF/DOCX/PPTX/
+		// XLSX/HTML are extracted to text/markdown, video is reported unsupported
+		// (Pi's tool-result content channel is text+image only — no aux-model
+		// runtime, no video/document block). NOT owner-only (read), but the
+		// local-path guard + SSRF guard run for every sender. `modelContext` lets
+		// it skip attaching an image a text-only model can't see.
+		makeAnalyzeMediaTool({
+			...(opts.workspaceDir !== undefined ? { workspaceDir: opts.workspaceDir } : {}),
+			...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+			...(opts.modelContext !== undefined ? { modelContext: opts.modelContext } : {}),
+			// OWNER turns (TUI / desktop / the operator's own channel messages — i.e.
+			// senderIsOwner not explicitly false) may read a user-typed absolute path
+			// from the operator's personal dirs (Downloads / Desktop / Documents).
+			// An untrusted non-owner channel peer (senderIsOwner:false) does NOT get
+			// this widening — the secret/system denylist still applies regardless.
+			ownerLocalAccess: opts.senderIsOwner !== false,
+		}),
+		// make_document — CREATE a Word/Excel/PowerPoint/PDF file from structured
+		// content (the WRITE sibling of analyze_media's read side). Pure-JS libs
+		// (docx / exceljs / pptxgenjs / @cantoo/pdf-lib), no code sandbox needed.
+		// NOT owner-only: writing a file into the workspace is safe, and the
+		// output-path guard (workspace/cwd/cache/temp + the secret/system denylist,
+		// reused from analyze_media) is the real boundary. Produces a path the
+		// agent then hands off via send_media.
+		makeMakeDocumentTool({
+			...(opts.workspaceDir !== undefined ? { workspaceDir: opts.workspaceDir } : {}),
+			...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		}),
+		// edit_document — EDIT an existing Word/Excel/PowerPoint/PDF in place
+		// (docx append/replace_text, xlsx set_cells/append_rows, pptx replace_text,
+		// pdf fill_form/merge/split/stamp/watermark/add_pages/remove_pages),
+		// preserving the parts it doesn't touch (OOXML unzip→edit-XML→rezip for
+		// high-fidelity docx/pptx; exceljs / pdf-lib load→mutate→save). Same path
+		// guard on BOTH the input source AND the output. NOT owner-only.
+		makeEditDocumentTool({
+			...(opts.workspaceDir !== undefined ? { workspaceDir: opts.workspaceDir } : {}),
+			...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		}),
 		// manage_provider — owner-only credential + per-agent model surface.
 		// Exists so a pasted API key lands in the canonical 0600 credential
 		// store (never .env / workspace files / config / chat echoes) and so

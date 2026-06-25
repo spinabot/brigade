@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import path from "node:path";
 import { describe, it } from "node:test";
 
 import { stickerToAttachment } from "./inbound-extras.js";
@@ -108,6 +109,24 @@ describe("downloadDiscordAttachment", () => {
 		assert.equal(fetchedUrl, "https://media.discordapp.net/stickers/777.png");
 		assert.ok(out, "the sticker download should produce a saved media descriptor");
 		assert.equal(out?.kind, "image");
+	});
+
+	it("saves an octet-stream CSV document with a .csv extension (from the filename)", async () => {
+		// A document whose contentType is the generic application/octet-stream but
+		// whose name is data.csv — the saved file must be .csv so analyze_media
+		// detects it as text (Discord derives the ext from the filename first).
+		const out = await downloadDiscordAttachment({
+			attachment: {
+				id: "doc1",
+				url: "https://cdn.discordapp.com/attachments/1/2/data.csv",
+				name: "data.csv",
+				contentType: "application/octet-stream",
+			},
+			fetchImpl: (async () => new Response("a,b\n1,2\n", { status: 200 })) as unknown as typeof fetch,
+		});
+		assert.ok(out, "document download resolved");
+		assert.equal(path.extname(out!.path).toLowerCase(), ".csv");
+		assert.equal(out!.fileName, "data.csv");
 	});
 });
 

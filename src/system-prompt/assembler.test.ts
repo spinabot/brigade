@@ -407,6 +407,46 @@ describe("assembleSystemPrompt — Delegation Cascade (sessions_send + sessions_
 	});
 });
 
+describe("assembleSystemPrompt — Media guidance (analyze_media tool)", () => {
+	// A2. The ## Media & documents block fires when `analyze_media` is in the
+	// tool surface — keyed on the tool NAME, not a capability flag — so it only
+	// renders when the model actually has the tool to call. Teaches the model to
+	// call analyze_media on an `[attached … → <path>]` note BEFORE answering, and
+	// that inbound images are already visible inline (no tool call needed).
+
+	it("emits the ## Media block when analyze_media is in the tool surface", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [{ name: "analyze_media", summary: "read a media file" }],
+		});
+		assert.match(out.text, /## Media & documents/);
+		assert.match(out.text, /analyze_media\(\{ source:/);
+		assert.match(out.text, /BEFORE answering/);
+		// The image-already-visible affordance (A3 pairing).
+		assert.match(out.text, /already visible to you inline/);
+	});
+
+	it("does NOT emit the ## Media block when analyze_media is absent", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [{ name: "web_search", summary: "search" }],
+		});
+		assert.doesNotMatch(out.text, /## Media & documents/);
+	});
+
+	it("emits the ## Media block even in minimal mode (a cron/sub-agent may get a file path)", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" }],
+			toolDescriptions: [{ name: "analyze_media", summary: "read a media file" }],
+			capabilities: { subagentMode: true },
+		});
+		assert.match(out.text, /## Media & documents/);
+	});
+});
+
 describe("assembleSystemPrompt — no ## Agents block (OC mirror)", () => {
 	// The assembler deliberately does NOT enumerate peer agents in the
 	// system prompt. The model learns the agent catalog exclusively via
