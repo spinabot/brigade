@@ -32,15 +32,16 @@
 import * as http from "node:http";
 import * as net from "node:net";
 import type { Duplex } from "node:stream";
-import { timingSafeEqual } from "node:crypto";
+import { extractToken, matchesAnyToken } from "../gateway-auth.js";
 
 export interface AuthProxyOptions {
   /** Gateway host to forward to (loopback). */
   gatewayHost: string;
   /** Gateway port to forward to. */
   gatewayPort: number;
-  /** Required bearer token. `undefined`/empty → pass-through (insecure). */
-  token?: string;
+  /** Valid tokens — a client presenting ANY one is allowed through. Empty/omit
+   *  → pass-through (insecure). Supersedes the former single `token`. */
+  tokens?: readonly string[];
   /** Sink for proxy diagnostics. */
   onLog?: (line: string) => void;
 }
@@ -54,33 +55,9 @@ export interface AuthProxyHandle {
   stop(): Promise<void>;
 }
 
-/** Constant-time token comparison that never throws on length mismatch. */
-function tokenMatches(expected: string, provided: string | undefined): boolean {
-  if (!provided) return false;
-  const a = Buffer.from(expected, "utf8");
-  const b = Buffer.from(provided, "utf8");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
-}
-
-/** Pull a candidate token from headers or the request URL. */
-function extractToken(reqUrl: string | undefined, headers: http.IncomingHttpHeaders): string | undefined {
-  const auth = headers["authorization"];
-  if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
-    return auth.slice(7).trim();
-  }
-  const hdr = headers["x-brigade-token"];
-  if (typeof hdr === "string" && hdr.length > 0) return hdr;
-  if (reqUrl) {
-    const qIdx = reqUrl.indexOf("?");
-    if (qIdx >= 0) {
-      const params = new URLSearchParams(reqUrl.slice(qIdx + 1));
-      const t = params.get("token");
-      if (t) return t;
-    }
-  }
-  return undefined;
-}
+// Token extraction + constant-time matching live in `core/gateway-auth.ts` so
+// the expose proxy and the gateway's own connection gate share ONE
+// implementation and can never drift.
 
 /**
  * Start the auth-proxy. Resolves once it is listening; the returned handle
@@ -88,13 +65,14 @@ function extractToken(reqUrl: string | undefined, headers: http.IncomingHttpHead
  * exits).
  */
 export async function startAuthProxy(opts: AuthProxyOptions): Promise<AuthProxyHandle> {
-  const { gatewayHost, gatewayPort, token, onLog } = opts;
-  const secured = typeof token === "string" && token.length > 0;
+  const { gatewayHost, gatewayPort, tokens, onLog } = opts;
+  const tokenList = tokens ?? [];
+  const secured = tokenList.length > 0;
   const sockets = new Set<Duplex>();
 
   const authorize = (reqUrl: string | undefined, headers: http.IncomingHttpHeaders): boolean => {
     if (!secured) return true;
-    return tokenMatches(token as string, extractToken(reqUrl, headers));
+    return matchesAnyToken(tokenList, extractToken(reqUrl, headers));
   };
 
   const server = http.createServer((req, res) => {

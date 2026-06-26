@@ -27,6 +27,7 @@ import { WebSocket } from "ws";
 import { BRIGADE_DIR } from "./config.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import type { SessionStateSnapshot } from "../protocol.js";
+import { clientAuthHeaders } from "./gateway-auth.js";
 
 export const GATEWAY_PID_PATH = path.join(BRIGADE_DIR, "gateway.pid");
 
@@ -217,6 +218,11 @@ export interface GatewayProbeOptions {
   port?: number;
   /** Total wallclock budget. Default 1500ms — enough for a local boot, fast enough to keep `brigade status` snappy. */
   timeoutMs?: number;
+  /** Token for an authenticated gateway. Omit when unauthenticated (default).
+   *  A missing/wrong token against an authed gateway surfaces as
+   *  `errorKind: "auth"` (the handshake 401), which callers report as
+   *  "up, but the token was rejected" rather than "down". */
+  token?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 1500;
@@ -236,7 +242,7 @@ export async function probeGateway(opts: GatewayProbeOptions = {}): Promise<Gate
   const start = Date.now();
   return await new Promise<GatewayProbeResult>((resolve) => {
     let settled = false;
-    const ws = new WebSocket(url, { handshakeTimeout: timeoutMs });
+    const ws = new WebSocket(url, { handshakeTimeout: timeoutMs, headers: clientAuthHeaders(opts.token) });
     const finish = (result: GatewayProbeResult): void => {
       if (settled) return;
       settled = true;

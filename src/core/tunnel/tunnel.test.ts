@@ -47,7 +47,7 @@ describe("auth-proxy token gate", () => {
     await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
     const addr = upstream.address();
     upstreamPort = typeof addr === "object" && addr ? addr.port : 0;
-    proxy = await startAuthProxy({ gatewayHost: "127.0.0.1", gatewayPort: upstreamPort, token: TOKEN });
+    proxy = await startAuthProxy({ gatewayHost: "127.0.0.1", gatewayPort: upstreamPort, tokens: [TOKEN] });
   });
 
   after(async () => {
@@ -116,6 +116,37 @@ describe("auth-proxy insecure mode", () => {
       req.end();
     });
     assert.equal(status, 200);
+
+    await proxy.stop();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  });
+});
+
+describe("auth-proxy multi-token", () => {
+  it("accepts ANY token in the list and rejects the rest", async () => {
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200);
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const addr = upstream.address();
+    const upstreamPort = typeof addr === "object" && addr ? addr.port : 0;
+    const proxy = await startAuthProxy({ gatewayHost: "127.0.0.1", gatewayPort: upstreamPort, tokens: ["tok-A", "tok-B"] });
+    assert.equal(proxy.secured, true);
+
+    const statusFor = (token: string): Promise<number> =>
+      new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          { host: "127.0.0.1", port: proxy.port, path: `/?token=${token}`, method: "GET" },
+          (res) => resolve(res.statusCode ?? 0),
+        );
+        req.on("error", reject);
+        req.end();
+      });
+
+    assert.equal(await statusFor("tok-A"), 200); // first token works
+    assert.equal(await statusFor("tok-B"), 200); // second token works too
+    assert.equal(await statusFor("tok-C"), 401); // anything else is rejected
 
     await proxy.stop();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));

@@ -40,6 +40,7 @@ import { loadBrigadeAuthStorage } from "../../core/auth-bridge.js";
 import { getTodayLogPath } from "../../core/event-logger.js";
 import { readApprovalsSummary } from "../../core/exec-approvals.js";
 import { probeGateway, readPid, isProcessAlive } from "../../core/gateway-probe.js";
+import { resolveClientToken } from "../../core/gateway-auth.js";
 import { findProvider, PROVIDERS } from "../../providers/catalog.js";
 import { readSentinel, sentinelExists } from "../../storage/sentinel.js";
 
@@ -544,7 +545,7 @@ function checkLogDirWritable(): CheckResult {
 }
 
 async function checkGateway(opts: DoctorCommandOptions): Promise<CheckResult> {
-	const probe = await probeGateway({ host: opts.host, port: opts.port });
+	const probe = await probeGateway({ host: opts.host, port: opts.port, token: resolveClientToken(readConfigOrInit().gateway?.auth) });
 	const pid = await readPid();
 	if (probe.reachable) {
 		return {

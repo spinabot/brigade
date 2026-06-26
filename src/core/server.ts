@@ -35,7 +35,7 @@ import {
 	type AuthStorage,
 	ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocketServer, type ServerOptions as WsServerOptions, type WebSocket } from "ws";
 
 import {
 	type AgentSummary,
@@ -262,6 +262,7 @@ import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig, saveConfig, type Confi
 import { mutateConfigAtomic } from "../config/io.js";
 import { acquireGatewayLock, type GatewayLockHandle } from "./gateway-lock.js";
 import { clearHeartbeatFile, clearPidFile, writeHeartbeatFile, writePidFile } from "./gateway-probe.js";
+import { extractToken, matchesAnyToken, resolveGatewayAuth } from "./gateway-auth.js";
 
 // Persist a model selection to brigade.json's new wizard-shape (the lifted
 // code expected the older flat `defaultProvider`/`defaultModelId` fields).
@@ -1731,7 +1732,29 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// value the handshake's `HelloOk.policy.maxBufferedBytes` field advertises;
 	// at 2× the payload cap a client this far behind is a stuck/slow consumer.
 	const MAX_WS_BUFFERED_BYTES = 64 * 1024 * 1024; // 64 MiB
-	const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_WS_PAYLOAD_BYTES });
+	// Optional, opt-in gateway authentication (see core/gateway-auth.ts).
+	// DEFAULT — no tokens configured — resolves to `required:false`, so the
+	// gateway stays unauthenticated + localhost-only exactly as before; this
+	// feature NEVER changes behaviour until the operator sets
+	// `gateway.auth.tokens` (or the BRIGADE_GATEWAY_TOKENS env var). When tokens
+	// ARE present we install a `verifyClient` gate that rejects the WS upgrade
+	// with 401 unless a valid token rides in via `Authorization: Bearer`,
+	// `x-brigade-token`, or `?token=`. We gate ONLY the WS control surface (every
+	// connection is granted operator scope) — NOT the HTTP routes, which carry
+	// inbound channel webhooks that must stay reachable. Resolved once at boot;
+	// token changes take effect on the next gateway start.
+	const gatewayAuth = resolveGatewayAuth(loadConfig().gateway?.auth, process.env);
+	const wssOptions: WsServerOptions = { server: httpServer, maxPayload: MAX_WS_PAYLOAD_BYTES };
+	if (gatewayAuth.required) {
+		wssOptions.verifyClient = (info: { req: IncomingMessage }) =>
+			matchesAnyToken(gatewayAuth.tokens, extractToken(info.req.url, info.req.headers));
+	}
+	const wss = new WebSocketServer(wssOptions);
+	if (gatewayAuth.required) {
+		bootLog(
+			`authentication enabled — clients must present a valid token (${gatewayAuth.tokens.length} configured)`,
+		);
+	}
 
 	// `WebSocketServer` re-emits errors from the underlying httpServer (and
 	// can emit its own — bad upgrade frame, etc). With NO 'error' listener on

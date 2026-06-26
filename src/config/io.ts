@@ -182,7 +182,24 @@ export interface BrigadeGatewayConfig {
   mode?: "local" | "remote";
   port?: number;
   bind?: "loopback" | "lan" | "auto" | "custom" | "tailnet";
-  auth?: { mode?: "none" | "token" | "password"; token?: string; password?: string };
+  /**
+   * Optional gateway authentication. By DEFAULT the gateway is unauthenticated
+   * (localhost-only — every local connection is the operator). Set one or more
+   * `tokens` to REQUIRE a valid token on every WebSocket connection; clients
+   * then send `Authorization: Bearer <t>`, `x-brigade-token: <t>`, or
+   * `?token=<t>`. `mode: "none"` is an explicit off-switch even when tokens
+   * exist. The legacy single `token` is still honored (merged into the
+   * effective list, alongside the `BRIGADE_GATEWAY_TOKENS` env var). The same
+   * tokens are accepted by `brigade expose`. See `core/gateway-auth.ts`.
+   */
+  auth?: {
+    mode?: "none" | "token" | "password";
+    token?: string;
+    /** Multiple valid tokens — any one authenticates. Hand a distinct token to
+     *  each device/client and revoke one without disturbing the others. */
+    tokens?: string[];
+    password?: string;
+  };
   tailscale?: { mode?: "off" | "serve" | "funnel"; resetOnExit?: boolean };
   /**
    * `brigade expose` ( = `brigade bloody benchmark` ) settings. Tunnels the

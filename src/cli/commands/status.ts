@@ -28,6 +28,7 @@ import { discoverEligibleSkills } from "../../agents/skills/index.js";
 import { readConfigOrInit } from "../../config/io.js";
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveSessionsDir } from "../../config/paths.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig } from "../../core/config.js";
+import { resolveClientToken } from "../../core/gateway-auth.js";
 import { getLastLoggedError, getTodayLogPath } from "../../core/event-logger.js";
 import { readApprovalsSummary } from "../../core/exec-approvals.js";
 import { probeGateway } from "../../core/gateway-probe.js";
@@ -120,7 +121,7 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 
 	const execApprovals = readApprovalsSummary();
 
-	const probe = await probeGateway({ host: opts.host, port: opts.port });
+	const probe = await probeGateway({ host: opts.host, port: opts.port, token: resolveClientToken(readConfigOrInit().gateway?.auth) });
 
 	return {
 		provider,

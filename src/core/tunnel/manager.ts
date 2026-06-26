@@ -22,8 +22,10 @@ export interface StartTunnelOptions {
   /** Gateway host/port the auth-proxy forwards to. */
   gatewayHost: string;
   gatewayPort: number;
-  /** Bearer token gating the public URL. `undefined` → insecure pass-through. */
-  token?: string;
+  /** Tokens gating the public URL — a client presenting ANY one is allowed.
+   *  The first is appended to the shared URL (`?token=`). Empty/omit → insecure
+   *  pass-through. */
+  tokens?: readonly string[];
   /** Self-hosted relay (`bore` / `custom`). */
   relay?: string;
   /** `custom` provider command template. */
@@ -74,7 +76,7 @@ export async function startTunnel(opts: StartTunnelOptions): Promise<RunningTunn
     proxy = await startAuthProxy({
       gatewayHost: opts.gatewayHost,
       gatewayPort: opts.gatewayPort,
-      token: opts.token,
+      tokens: opts.tokens,
       onLog: opts.onLog,
     });
 
@@ -88,7 +90,8 @@ export async function startTunnel(opts: StartTunnelOptions): Promise<RunningTunn
 
     const secured = proxy.secured;
     const url = handle.url;
-    const urlWithToken = secured && opts.token ? withToken(url, opts.token) : url;
+    const shareToken = opts.tokens?.[0];
+    const urlWithToken = secured && shareToken ? withToken(url, shareToken) : url;
 
     await writeTunnelState({
       url,

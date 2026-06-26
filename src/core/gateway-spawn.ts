@@ -121,7 +121,10 @@ export async function ensureGatewayRunning(opts: EnsureGatewayOptions = {}): Pro
 	const timeoutMs = opts.spawnTimeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS;
 
 	const existing = await probeGateway({ host, port, timeoutMs: PROBE_TIMEOUT_MS });
-	if (existing.reachable) return { alreadyRunning: true, host, port };
+	// An authenticated gateway answers our token-less liveness probe with a 401
+	// (errorKind "auth") — that still proves a gateway is listening, so treat it
+	// as already-running instead of spawning a duplicate onto the held port.
+	if (existing.reachable || existing.errorKind === "auth") return { alreadyRunning: true, host, port };
 
 	opts.onStatus?.("starting Brigade service…");
 	const child = spawnDetachedGateway(host, port);
@@ -165,7 +168,7 @@ export async function ensureGatewayRunning(opts: EnsureGatewayOptions = {}): Pro
 			}
 			await sleep(SPAWN_POLL_INTERVAL_MS);
 			const probe = await probeGateway({ host, port, timeoutMs: PROBE_TIMEOUT_MS });
-			if (probe.reachable) return { alreadyRunning: false, host, port };
+			if (probe.reachable || probe.errorKind === "auth") return { alreadyRunning: false, host, port };
 			lastError = probe.error;
 		}
 		throw new Error(

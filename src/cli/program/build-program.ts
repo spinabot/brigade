@@ -498,13 +498,15 @@ export function buildProgram(): Command {
     .option("-p, --port <port>", "gateway port", (v) => parseInt(v, 10))
     .option("--timeout <ms>", "request timeout in ms", (v) => parseInt(v, 10))
     .option("--agent <id>", "bind the TUI to this agent at startup (skips the /agent step)")
-    .action(async (agentArg: string | undefined, opts: { host?: string; port?: number; timeout?: number; agent?: string }) => {
+    .option("--token <token>", "access token for an authenticated gateway (else read from config / BRIGADE_GATEWAY_TOKEN)")
+    .action(async (agentArg: string | undefined, opts: { host?: string; port?: number; timeout?: number; agent?: string; token?: string }) => {
       const { runConnectCommand } = await import("../commands/connect.js");
       const agentId = opts.agent ?? agentArg;
       await runConnectCommand({
         host: opts.host,
         port: opts.port,
         requestTimeoutMs: opts.timeout,
+        ...(opts.token ? { token: opts.token } : {}),
         ...(agentId ? { agentId } : {}),
       });
       await new Promise<void>(() => {});

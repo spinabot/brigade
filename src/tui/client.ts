@@ -32,12 +32,19 @@ import {
 	type ResponseFor,
 	TICK_INTERVAL_MS,
 } from "../protocol.js";
+import { clientAuthHeaders } from "../core/gateway-auth.js";
 
 export interface ClientOptions {
 	/** WebSocket URL. Defaults to `ws://127.0.0.1:7777`. */
 	url?: string;
 	/** Per-request timeout (ms). Defaults to 60_000. */
 	requestTimeoutMs?: number;
+	/**
+	 * Token presented to an authenticated gateway (sent as the `x-brigade-token`
+	 * header). Omit/undefined when the gateway is unauthenticated — the default —
+	 * and no auth header is sent.
+	 */
+	token?: string;
 }
 
 /** Per-request options; today only the timeout is overridable. */
@@ -66,6 +73,8 @@ export class BrigadeClient extends EventEmitter {
 	private ws: WebSocket | undefined;
 	private readonly url: string;
 	private readonly requestTimeoutMs: number;
+	/** Gateway token, or undefined when the gateway is unauthenticated. */
+	private readonly token: string | undefined;
 
 	/** True once a connection is OPEN. False after close until reconnect. */
 	private connected = false;
@@ -97,6 +106,7 @@ export class BrigadeClient extends EventEmitter {
 		super();
 		this.url = opts.url ?? `ws://127.0.0.1:${DEFAULT_PORT}`;
 		this.requestTimeoutMs = opts.requestTimeoutMs ?? 60_000;
+		this.token = opts.token;
 	}
 
 	/** Open the connection. Resolves once the socket is OPEN. */
@@ -188,7 +198,7 @@ export class BrigadeClient extends EventEmitter {
 
 	private openSocket(): Promise<void> {
 		return new Promise((resolve, reject) => {
-			const ws = new WebSocket(this.url);
+			const ws = new WebSocket(this.url, { headers: clientAuthHeaders(this.token) });
 			this.ws = ws;
 			let resolved = false;
 

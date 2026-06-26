@@ -45,6 +45,8 @@ import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { brand, editorTheme, markdownTheme } from "../../ui/theme.js";
 import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
+import { loadConfig } from "../../core/config.js";
+import { resolveClientToken } from "../../core/gateway-auth.js";
 import { ApprovalPrompt, type ApprovalResolution } from "../../tui/approval-prompt.js";
 import type { AgentSummary, ModelSummary, SessionStateSnapshot, SessionSummary } from "../../protocol.js";
 import {
@@ -88,6 +90,12 @@ export interface ConnectCommandOptions {
 	port?: number;
 	/** Per-request timeout (ms). Default: 60_000 */
 	requestTimeoutMs?: number;
+	/**
+	 * Token for an authenticated gateway. Falls back to `BRIGADE_GATEWAY_TOKEN`
+	 * then the local `gateway.auth` config when omitted; undefined for an
+	 * unauthenticated gateway (the default), in which case no auth is sent.
+	 */
+	token?: string;
 	/**
 	 * Bind the TUI to this agent id at startup — equivalent to opening the
 	 * TUI and immediately running `/agent <id>`, but without the manual step.
@@ -170,9 +178,14 @@ export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promi
 	};
 	process.once("SIGINT", onSigint);
 
+	// Resolve the gateway token (flag → BRIGADE_GATEWAY_TOKEN → local config).
+	// Undefined when the gateway is unauthenticated — the client then sends no
+	// auth header and connects exactly as before.
+	const token = resolveClientToken(loadConfig().gateway?.auth, { override: opts.token });
 	const client = new BrigadeClient({
 		url,
 		requestTimeoutMs: opts.requestTimeoutMs ?? 60_000,
+		...(token ? { token } : {}),
 	});
 
 	try {

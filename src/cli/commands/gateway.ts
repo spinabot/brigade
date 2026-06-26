@@ -33,6 +33,9 @@ import { createConsoleStream, type LogLevel } from "../../core/console-stream.js
 import { getLastLoggedError, getTodayLogPath } from "../../core/event-logger.js";
 import { isGatewayLockError } from "../../core/gateway-lock.js";
 import { isProcessAlive, probeGateway, readPid, GATEWAY_PID_PATH } from "../../core/gateway-probe.js";
+import { clientAuthHeaders, generateGatewayToken, maskToken, resolveClientToken, resolveGatewayTokens } from "../../core/gateway-auth.js";
+import { loadConfig } from "../../core/config.js";
+import { mutateConfigAtomic } from "../../config/io.js";
 import { formatPortListener, inspectPortListeners } from "../../core/port-inspect.js";
 import { EXIT_CONFIG_ERROR, EXIT_FAILURE } from "../../protocol.js";
 import { startServer } from "../../core/server.js";
@@ -111,13 +114,166 @@ export function registerGatewayCommand(program: import("commander").Command): vo
 			const code = await runGatewayStopCommand(opts);
 			process.exit(code);
 		});
+
+	// Optional gateway authentication — multiple tokens supported. Entirely
+	// opt-in: with no tokens the gateway stays unauthenticated (localhost-only).
+	const tokenCmd = gw
+		.command("token")
+		.description("Manage optional gateway access tokens — multiple are supported");
+	tokenCmd
+		.command("list")
+		.description("List configured tokens (masked) and whether auth is enforced")
+		.option("--json", "emit JSON instead of human-readable text", false)
+		.action(async (opts: { json?: boolean }) => {
+			process.exit(await runGatewayTokenListCommand(opts));
+		});
+	tokenCmd
+		.command("new")
+		.description("Generate a new token, store it, and print it once")
+		.option("--json", "emit JSON instead of human-readable text", false)
+		.action(async (opts: { json?: boolean }) => {
+			process.exit(await runGatewayTokenNewCommand(opts));
+		});
+	tokenCmd
+		.command("add <token>")
+		.description("Add an existing token to the accepted list")
+		.action(async (token: string) => {
+			process.exit(await runGatewayTokenAddCommand(token));
+		});
+	tokenCmd
+		.command("revoke <tokenOrIndex>")
+		.description("Remove a token by value, or by its number from `token list`")
+		.action(async (arg: string) => {
+			process.exit(await runGatewayTokenRevokeCommand(arg));
+		});
+}
+
+/* ───────────────────── token management ───────────────────── */
+
+/** Atomically mutate `gateway.auth` (mode-aware — filesystem or Convex). */
+async function mutateGatewayAuth(
+	fn: (auth: { mode?: "none" | "token" | "password"; token?: string; tokens?: string[]; password?: string }) => void,
+): Promise<void> {
+	await mutateConfigAtomic((current) => {
+		const next = { ...current };
+		const gateway = { ...(next.gateway ?? {}) };
+		const auth = { ...(gateway.auth ?? {}) };
+		fn(auth);
+		gateway.auth = auth;
+		next.gateway = gateway;
+		return next;
+	});
+}
+
+/** `brigade gateway token list` — show configured tokens (masked) + status. */
+export async function runGatewayTokenListCommand(opts: { json?: boolean } = {}): Promise<number> {
+	const auth = loadConfig().gateway?.auth;
+	const stored = [...(auth?.token ? [auth.token] : []), ...(auth?.tokens ?? [])];
+	const envCount = (process.env.BRIGADE_GATEWAY_TOKENS ?? "").split(/[\s,]+/).filter(Boolean).length;
+	const effective = resolveGatewayTokens(auth, process.env);
+	const enforced = effective.length > 0 && auth?.mode !== "none";
+
+	if (opts.json) {
+		console.log(JSON.stringify({ enforced, effectiveCount: effective.length, stored: stored.map(maskToken), envCount }, null, 2));
+		return 0;
+	}
+	if (effective.length === 0) {
+		console.log("Gateway authentication is OFF — no tokens configured. The gateway is open on localhost.");
+		console.log(chalk.dim("Create one with:  brigade gateway token new"));
+		return 0;
+	}
+	console.log(
+		enforced
+			? chalk.green(`Gateway authentication is ON — ${effective.length} token(s) accepted.`)
+			: chalk.yellow(`${effective.length} token(s) configured, but auth.mode is "none" — NOT enforced.`),
+	);
+	stored.forEach((t, i) => console.log(`  ${i + 1}. ${maskToken(t)}`));
+	if (envCount > 0) console.log(chalk.dim(`  + ${envCount} more from BRIGADE_GATEWAY_TOKENS (this shell only)`));
+	return 0;
+}
+
+/** `brigade gateway token new` — generate, store, print once. */
+export async function runGatewayTokenNewCommand(opts: { json?: boolean } = {}): Promise<number> {
+	const token = generateGatewayToken();
+	await mutateGatewayAuth((auth) => {
+		auth.tokens = [...(auth.tokens ?? []), token];
+	});
+	if (opts.json) {
+		console.log(JSON.stringify({ token }));
+		return 0;
+	}
+	console.log(chalk.green("New gateway token created:"));
+	console.log(`\n  ${chalk.bold(token)}\n`);
+	console.log(chalk.dim("This is the only time it's shown in full — copy it now."));
+	console.log(
+		chalk.dim("Clients on this machine read it from config automatically; elsewhere pass --token <t> or set BRIGADE_GATEWAY_TOKEN."),
+	);
+	if (loadConfig().gateway?.auth?.mode === "none") {
+		console.log(chalk.yellow('Heads up: auth.mode is "none", so tokens are stored but NOT enforced. Clear it to turn auth on.'));
+	} else {
+		console.log(
+			chalk.yellow("Authentication is now ON for the next gateway start. Restart to apply:  brigade gateway stop && brigade gateway"),
+		);
+	}
+	return 0;
+}
+
+/** `brigade gateway token add <token>` — accept an externally-supplied token. */
+export async function runGatewayTokenAddCommand(token: string): Promise<number> {
+	const value = token.trim();
+	if (!value) {
+		console.error(chalk.red("Provide a non-empty token."));
+		return 1;
+	}
+	if (resolveGatewayTokens(loadConfig().gateway?.auth, {}).includes(value)) {
+		console.log("That token is already configured — nothing to do.");
+		return 0;
+	}
+	await mutateGatewayAuth((auth) => {
+		auth.tokens = [...(auth.tokens ?? []), value];
+	});
+	console.log(chalk.green(`Added token ${maskToken(value)}.`));
+	console.log(chalk.yellow("Restart the gateway to apply:  brigade gateway stop && brigade gateway"));
+	return 0;
+}
+
+/** `brigade gateway token revoke <token|index>` — remove one token. */
+export async function runGatewayTokenRevokeCommand(arg: string): Promise<number> {
+	const auth = loadConfig().gateway?.auth;
+	const stored = [...(auth?.token ? [auth.token] : []), ...(auth?.tokens ?? [])];
+	if (stored.length === 0) {
+		console.log("No tokens are configured.");
+		return 0;
+	}
+	// Target a 1-based index from `token list`, or an exact token value.
+	let target: string | undefined;
+	const asIndex = Number(arg);
+	if (Number.isInteger(asIndex) && asIndex >= 1 && asIndex <= stored.length) {
+		target = stored[asIndex - 1];
+	} else if (stored.includes(arg.trim())) {
+		target = arg.trim();
+	}
+	if (!target) {
+		console.error(
+			chalk.red(`No token matches "${arg}". Use its number from \`brigade gateway token list\`, or its exact value.`),
+		);
+		return 1;
+	}
+	const victim = target;
+	await mutateGatewayAuth((a) => {
+		if (a.token === victim) delete a.token;
+		a.tokens = (a.tokens ?? []).filter((t) => t !== victim);
+	});
+	console.log(chalk.green(`Revoked token ${maskToken(victim)}.`));
+	console.log(chalk.yellow("Restart the gateway to apply:  brigade gateway stop && brigade gateway"));
+	return 0;
 }
 
 /* ───────────────────── status subcommand ───────────────────── */
 
 export async function runGatewayStatusCommand(opts: { host?: string; port?: number; json?: boolean }): Promise<number> {
 	const port = opts.port ?? 7777;
-	const probe = await probeGateway({ host: opts.host, port: opts.port });
+	const probe = await probeGateway({ host: opts.host, port: opts.port, token: resolveClientToken(loadConfig().gateway?.auth) });
 	const pid = await readPid();
 	const logPath = getTodayLogPath();
 	// Inspect the port even when the probe says reachable — surfaces a
@@ -220,7 +376,8 @@ async function sendShutdownRpc(args: { host?: string; port?: number; timeoutMs: 
 	const url = `ws://${host}:${port}`;
 	return await new Promise<boolean>((resolve) => {
 		let settled = false;
-		const ws = new WebSocket(url, { handshakeTimeout: args.timeoutMs });
+		const token = resolveClientToken(loadConfig().gateway?.auth);
+		const ws = new WebSocket(url, { handshakeTimeout: args.timeoutMs, headers: clientAuthHeaders(token) });
 		const finish = (ok: boolean): void => {
 			if (settled) return;
 			settled = true;

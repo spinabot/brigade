@@ -26,6 +26,7 @@ import chalk from "chalk";
 import { loadConfig } from "../../core/config.js";
 import { mutateConfigAtomic } from "../../config/io.js";
 import { isProcessAlive, probeGateway } from "../../core/gateway-probe.js";
+import { resolveClientToken, resolveGatewayTokens } from "../../core/gateway-auth.js";
 import { startTunnel, type RunningTunnel } from "../../core/tunnel/manager.js";
 import { DEFAULT_PROVIDER, listProviderNames } from "../../core/tunnel/registry.js";
 import { clearTunnelState, readTunnelState } from "../../core/tunnel/state.js";
@@ -93,7 +94,7 @@ export async function runExposeCommand(opts: ExposeCommandOptions): Promise<void
 
   // The gateway must be up — the tunnel forwards to it. Probe before we open
   // anything to the world.
-  const probe = await probeGateway({ host: LOOPBACK_HOST, port: gatewayPort });
+  const probe = await probeGateway({ host: LOOPBACK_HOST, port: gatewayPort, token: resolveClientToken(cfg.gateway?.auth) });
   if (!probe.reachable) {
     console.error(chalk.red(`No gateway reachable on ${LOOPBACK_HOST}:${gatewayPort}.`));
     console.error(chalk.dim("Start it first:  brigade gateway run"));
@@ -108,14 +109,31 @@ export async function runExposeCommand(opts: ExposeCommandOptions): Promise<void
     process.exit(EXIT_FAILURE);
   }
 
-  const token = await resolveToken(opts, cfg);
+  // Token model: when the GATEWAY itself enforces auth (gateway.auth.tokens),
+  // the proxy forwards the client's token straight through, so a public client
+  // must present a GATEWAY token. We therefore gate the tunnel with exactly that
+  // list — one token works through both proxy and gateway, and ALL of them are
+  // valid (multi-token over the tunnel too). --open can't loosen this: the
+  // gateway would reject an unauthed client regardless. Otherwise the gateway is
+  // open, so we use the tunnel's own auto-token (or none under --open/--insecure).
+  const gatewayTokens = resolveGatewayTokens(cfg.gateway?.auth);
+  let tokens: string[];
+  if (gatewayTokens.length > 0) {
+    tokens = gatewayTokens;
+    if (opts.open || opts.insecure) {
+      console.error(chalk.yellow("Note: the gateway requires a token, so the tunnel stays secured (--open ignored)."));
+    }
+  } else {
+    const exposeToken = await resolveToken(opts, cfg);
+    tokens = exposeToken ? [exposeToken] : [];
+  }
   const onLog = opts.verbose ? (line: string): void => console.error(chalk.dim(`  ${line}`)) : undefined;
 
   console.error(chalk.cyan(`Opening ${provider} tunnel to the gateway on :${gatewayPort}…`));
 
   let tunnel: RunningTunnel;
   try {
-    tunnel = await startTunnel({ provider, gatewayHost: LOOPBACK_HOST, gatewayPort, token, relay, command, onLog });
+    tunnel = await startTunnel({ provider, gatewayHost: LOOPBACK_HOST, gatewayPort, tokens, relay, command, onLog });
   } catch (err) {
     console.error(chalk.red(`Failed to open tunnel: ${err instanceof Error ? err.message : String(err)}`));
     process.exit(EXIT_FAILURE);

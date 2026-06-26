@@ -306,6 +306,14 @@ by a per-agent approval allowlist (`brigade exec`). Secrets in config use `${VAR
 references that resolve at read time and are never persisted resolved. Optional
 **AES-256-GCM at-rest encryption** in Convex mode (`brigade encrypt`).
 
+**Optional gateway tokens.** The gateway is unauthenticated and localhost-only by
+default — ideal for a single machine. Want more? Add one or more access tokens
+(`brigade gateway token new`) and every connection must then present a valid one
+(`Authorization: Bearer`, `x-brigade-token`, or `?token=`). **Multiple tokens** are
+supported, so you can hand a distinct token to each device and revoke one without
+disturbing the rest, and the same tokens secure `brigade expose`. Entirely opt-in:
+with no tokens configured, nothing changes.
+
 ### 🔀 Carrow — cross-model continuity
 Switch models mid-conversation **without losing context**. Carrow carries the full
 transcript onto the new model (it's the same session), **re-anchors your thinking
@@ -365,6 +373,7 @@ principle is the same: *independent verification, never the agent judging itself
 | `brigade gateway install` · `uninstall` | Install/remove as a system service (launchd / systemd / Task Scheduler) |
 | `brigade gateway supervise` | Out-of-process crash watchdog (respawns a wedged gateway) |
 | `brigade expose` · `expose stop` | Publish the gateway to the public internet via a secure, token-gated tunnel (alias: `bloody benchmark`) |
+| `brigade gateway token new` · `list` · `add` · `revoke` | Manage **optional** access tokens (multiple supported). No tokens → the gateway stays unauthenticated + localhost-only |
 
 ### Agents
 
@@ -442,6 +451,10 @@ brigade gateway stop
 brigade gateway restart
 brigade gateway install      # install as a system service (launchd / systemd / Task Scheduler)
 brigade gateway supervise    # out-of-process crash watchdog
+
+brigade gateway token new        # generate + store an access token (printed once)
+brigade gateway token list       # show configured tokens (masked) + whether auth is on
+brigade gateway token revoke 1   # remove a token by its number (or its exact value)
 ```
 
 | Flag | Default | Notes |
@@ -451,6 +464,13 @@ brigade gateway supervise    # out-of-process crash watchdog
 | `--verbose` | off | Stream a one-line summary of every event |
 | `--quiet` | off | Suppress the live console stream |
 | `--log-level X` | `info` | `debug` / `info` / `warn` / `error` |
+
+**Optional authentication.** By default the gateway is unauthenticated and refuses to
+bind anywhere but loopback. To require a token, run `brigade gateway token new` (repeat
+for multiple tokens) and restart the gateway. On the same machine, clients read the
+token from config automatically; elsewhere pass `--token <t>` or set
+`BRIGADE_GATEWAY_TOKEN`. `BRIGADE_GATEWAY_TOKENS` (comma-separated) adds tokens via the
+environment. Remove every token to return to open, localhost-only mode.
 
 ### `brigade connect`
 
