@@ -46,7 +46,9 @@ import {
 	DEFAULT_AGENT_ID,
 } from "../../config/paths.js";
 import { validateOutboundMediaPath } from "../../security/media-path-guard.js";
+import { loadConfig } from "../../core/config.js";
 import { resolveMediaProviderKey } from "../media-understanding/config.js";
+import { runCommandStt, type CommandRunner } from "./media-command.js";
 import { BrigadeToolInputError, jsonResult } from "./common.js";
 import type { AgentToolResult, BrigadeTool } from "./types.js";
 
@@ -57,7 +59,7 @@ const FETCH_TIMEOUT_MS = 45_000;
 /** Hard cap on audio bytes read for ANY source — providers reject huge uploads. */
 const MAX_AUDIO_BYTES = 48 * 1024 * 1024; // 48 MiB
 
-type TranscribeProviderId = "groq" | "openai" | "deepgram" | "elevenlabs" | "mistral" | "xai" | "google";
+type TranscribeProviderId = "groq" | "openai" | "deepgram" | "elevenlabs" | "mistral" | "xai" | "google" | "command";
 
 /** Preference order when no provider is pinned: first keyed one wins. */
 const PROVIDER_PREFERENCE: TranscribeProviderId[] = [
@@ -68,6 +70,7 @@ const PROVIDER_PREFERENCE: TranscribeProviderId[] = [
 	"mistral",
 	"xai",
 	"google",
+	"command",
 ];
 
 /** Default model id per provider (xai's /v1/stt takes none). */
@@ -79,6 +82,7 @@ const DEFAULT_MODEL: Record<TranscribeProviderId, string> = {
 	mistral: "voxtral-mini-latest",
 	xai: "",
 	google: "gemini-2.5-flash",
+	command: "",
 };
 
 const TranscribeAudioParams = Type.Object({
@@ -104,6 +108,7 @@ const TranscribeAudioParams = Type.Object({
 				Type.Literal("mistral"),
 				Type.Literal("xai"),
 				Type.Literal("google"),
+				Type.Literal("command"),
 			],
 			{
 				description:
@@ -166,6 +171,10 @@ export interface MakeTranscribeAudioToolOptions {
 	 * and local paths via the media-path guard + allowed-root scoping.
 	 */
 	readSource?: (source: string, signal?: AbortSignal) => Promise<TranscribeSource>;
+	/** Test seam: the local-STT command template (else resolved from env/config). */
+	sttCommand?: string;
+	/** Test seam: the local-command runner (else a real spawn). */
+	commandRunner?: CommandRunner;
 }
 
 export function makeTranscribeAudioTool(
@@ -174,6 +183,10 @@ export function makeTranscribeAudioTool(
 	const agentId = opts.agentId ?? DEFAULT_AGENT_ID;
 	const fetchFn = opts.fetchFn ?? fetch;
 	const resolveKey = opts.resolveKey ?? ((p: TranscribeProviderId) => resolveMediaProviderKey(p, agentId));
+	const sttCommand = opts.sttCommand ?? resolveSttCommand();
+	// `command` (offline local CLI) is available iff configured; cloud providers need a key.
+	const isAvailable = (p: TranscribeProviderId): boolean =>
+		p === "command" ? sttCommand.length > 0 : resolveKey(p).length > 0;
 	const readSource =
 		opts.readSource ??
 		((source: string, signal?: AbortSignal) =>
@@ -206,7 +219,7 @@ export function makeTranscribeAudioTool(
 			const action = args.action ?? "transcribe";
 
 			if (action === "list") {
-				const providers = PROVIDER_PREFERENCE.filter((p) => resolveKey(p).length > 0);
+				const providers = PROVIDER_PREFERENCE.filter(isAvailable);
 				return jsonResult({
 					action,
 					providers,
@@ -226,15 +239,15 @@ export function makeTranscribeAudioTool(
 			// Resolve the provider: explicit override (must be keyed) else first keyed.
 			let provider: TranscribeProviderId | undefined;
 			if (args.provider) {
-				if (resolveKey(args.provider).length === 0) {
+				if (!isAvailable(args.provider)) {
 					return fail(
 						action,
-						`Provider "${args.provider}" has no configured key. Add one with \`brigade onboard\`, or omit \`provider\` to auto-select.`,
+						`Provider "${args.provider}" is not available (no key, or no local command configured). Add one with \`brigade onboard\`, or omit \`provider\` to auto-select.`,
 					);
 				}
 				provider = args.provider;
 			} else {
-				provider = PROVIDER_PREFERENCE.find((p) => resolveKey(p).length > 0);
+				provider = PROVIDER_PREFERENCE.find(isAvailable);
 			}
 			if (!provider) {
 				return fail(
@@ -261,15 +274,26 @@ export function makeTranscribeAudioTool(
 			// Transcribe via the chosen provider.
 			let transcript: string;
 			try {
-				transcript = await transcribe({
-					provider,
-					fetchFn,
-					apiKey,
-					model,
-					audio,
-					...(args.language ? { language: args.language.trim() } : {}),
-					...(signal ? { signal } : {}),
-				});
+				transcript =
+					provider === "command"
+						? runCommandStt(
+								sttCommand,
+								{
+									audioBytes: audio.bytes,
+									audioExt: audio.extension,
+									...(args.language ? { language: args.language.trim() } : {}),
+								},
+								opts.commandRunner ? { runFn: opts.commandRunner } : {},
+							)
+						: await transcribe({
+								provider,
+								fetchFn,
+								apiKey,
+								model,
+								audio,
+								...(args.language ? { language: args.language.trim() } : {}),
+								...(signal ? { signal } : {}),
+							});
 			} catch (err) {
 				return fail(action, `Transcription via ${provider} failed: ${err instanceof Error ? err.message : String(err)}`, {
 					provider,
@@ -300,7 +324,9 @@ export function makeTranscribeAudioTool(
 /* ───────────────────────── provider plumbing ───────────────────────── */
 
 async function transcribe(params: {
-	provider: TranscribeProviderId;
+	// `command` (local CLI) is handled in execute before this dispatch, so the
+	// cloud switch below is exhaustive for the remaining provider ids.
+	provider: Exclude<TranscribeProviderId, "command">;
 	fetchFn: typeof fetch;
 	apiKey: string;
 	model: string;
@@ -614,6 +640,20 @@ function isInsideAnyRoot(resolved: string, roots: string[]): boolean {
 }
 
 /* ───────────────────────── helpers ───────────────────────── */
+
+/** The local-STT command template (env override, then config), or "" if unset. */
+function resolveSttCommand(): string {
+	const env = process.env.BRIGADE_STT_COMMAND?.trim();
+	if (env) return env;
+	try {
+		const cfg = loadConfig() as { tools?: { transcription?: { command?: unknown } } };
+		const c = cfg.tools?.transcription?.command;
+		if (typeof c === "string" && c.trim()) return c.trim();
+	} catch {
+		/* default below */
+	}
+	return "";
+}
 
 /** Pull a lowercase extension (no dot) from a path or URL pathname. */
 export function extensionOf(source: string): string {

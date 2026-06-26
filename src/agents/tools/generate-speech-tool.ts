@@ -34,6 +34,7 @@ import { resolveCacheDir, DEFAULT_AGENT_ID } from "../../config/paths.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveMediaProviderKey } from "../media-understanding/config.js";
 import { synthesizeEdge } from "./edge-tts.js";
+import { runCommandTts, type CommandRunner } from "./media-command.js";
 import { jsonResult } from "./common.js";
 import type { AgentToolResult, BrigadeTool } from "./types.js";
 
@@ -42,13 +43,13 @@ const REQUEST_TIMEOUT_MS = 120_000;
 /** Hard cap on input length — providers reject very long text; fail clearly. */
 const MAX_INPUT_CHARS = 8_000;
 
-type SpeechProviderId = "openai" | "elevenlabs" | "google" | "minimax" | "xai" | "edge";
+type SpeechProviderId = "openai" | "elevenlabs" | "google" | "minimax" | "xai" | "command" | "edge";
 
-/** Preference order when no provider is pinned: first AVAILABLE one wins. Edge is
- *  FREE (no key, Microsoft "Read Aloud" over WebSocket) so it sits LAST — a
- *  configured cloud provider is preferred, and Edge is the always-available free
- *  fallback when no cloud TTS key exists. */
-const PROVIDER_PREFERENCE: SpeechProviderId[] = ["openai", "elevenlabs", "google", "minimax", "xai", "edge"];
+/** Preference order when no provider is pinned: first AVAILABLE one wins. Keyed
+ *  cloud providers come first; a configured local `command` (offline piper /
+ *  kitten-tts) is next; the free `edge` (Microsoft "Read Aloud" WS, no key) is the
+ *  always-available last fallback. */
+const PROVIDER_PREFERENCE: SpeechProviderId[] = ["openai", "elevenlabs", "google", "minimax", "xai", "command", "edge"];
 
 const DEFAULTS: Record<SpeechProviderId, { model: string; voice: string }> = {
 	openai: { model: "gpt-4o-mini-tts", voice: "alloy" },
@@ -56,6 +57,7 @@ const DEFAULTS: Record<SpeechProviderId, { model: string; voice: string }> = {
 	google: { model: "gemini-2.5-flash-preview-tts", voice: "Kore" },
 	minimax: { model: "speech-2.8-hd", voice: "English_expressive_narrator" },
 	xai: { model: "", voice: "eve" },
+	command: { model: "", voice: "" },
 	edge: { model: "", voice: "en-US-AvaNeural" },
 };
 
@@ -68,7 +70,7 @@ const GenerateSpeechParams = Type.Object({
 	text: Type.Optional(Type.String({ description: "The text to speak aloud." })),
 	provider: Type.Optional(
 		Type.Union(
-			[Type.Literal("openai"), Type.Literal("elevenlabs"), Type.Literal("google"), Type.Literal("minimax"), Type.Literal("xai"), Type.Literal("edge")],
+			[Type.Literal("openai"), Type.Literal("elevenlabs"), Type.Literal("google"), Type.Literal("minimax"), Type.Literal("xai"), Type.Literal("command"), Type.Literal("edge")],
 			{ description: "Optional TTS provider override. `edge` is FREE (no key). Default: first available (cloud preferred, edge fallback)." },
 		),
 	),
@@ -106,6 +108,10 @@ export interface MakeGenerateSpeechToolOptions {
 	resolveKey?: (provider: SpeechProviderId) => string;
 	/** Test seam: replace the free Edge WebSocket synth (the `edge` provider has no key). */
 	edgeSynth?: (text: string, voice: string, signal?: AbortSignal) => Promise<Buffer>;
+	/** Test seam: the local-TTS command template (else resolved from env/config). */
+	ttsCommand?: string;
+	/** Test seam: the local-command runner (else a real spawn). */
+	commandRunner?: CommandRunner;
 }
 
 export function makeGenerateSpeechTool(
@@ -118,8 +124,11 @@ export function makeGenerateSpeechTool(
 		opts.edgeSynth ??
 		((text: string, voice: string, signal?: AbortSignal) =>
 			synthesizeEdge({ text, voice, ...(signal ? { signal } : {}) }));
-	// Edge is FREE (no key) → always available; every other provider needs a key.
-	const isAvailable = (p: SpeechProviderId): boolean => p === "edge" || resolveKey(p).length > 0;
+	const ttsCommand = opts.ttsCommand ?? resolveTtsCommand();
+	// Edge is FREE (no key) → always available; `command` needs a configured local
+	// CLI; every cloud provider needs a key.
+	const isAvailable = (p: SpeechProviderId): boolean =>
+		p === "edge" ? true : p === "command" ? ttsCommand.length > 0 : resolveKey(p).length > 0;
 
 	return {
 		name: "generate_speech",
@@ -185,7 +194,9 @@ export function makeGenerateSpeechTool(
 				audio =
 					provider === "edge"
 						? { bytes: await edgeSynth(text, voice, signal), extension: "mp3" }
-						: await synthesize({ provider, fetchFn, apiKey, model, voice, text, signal });
+						: provider === "command"
+							? runCommandTts(ttsCommand, { text, voice }, opts.commandRunner ? { runFn: opts.commandRunner } : {})
+							: await synthesize({ provider, fetchFn, apiKey, model, voice, text, signal });
 			} catch (err) {
 				return fail(action, `TTS via ${provider} failed: ${err instanceof Error ? err.message : String(err)}`, { provider, model, voice });
 			}
@@ -217,7 +228,7 @@ export function makeGenerateSpeechTool(
 async function synthesize(params: {
 	// `edge` is handled in execute (no key, WS synth) before this dispatch, so the
 	// cloud switch below is exhaustive for the remaining provider ids.
-	provider: Exclude<SpeechProviderId, "edge">;
+	provider: Exclude<SpeechProviderId, "edge" | "command">;
 	fetchFn: typeof fetch;
 	apiKey: string;
 	model: string;
@@ -381,6 +392,20 @@ export function wrapPcmAsWav(pcm: Buffer, sampleRate: number, channels = 1, bits
 }
 
 /* ───────────────────────── helpers ───────────────────────── */
+
+/** The local-TTS command template (env override, then config), or "" if unset. */
+function resolveTtsCommand(): string {
+	const env = process.env.BRIGADE_TTS_COMMAND?.trim();
+	if (env) return env;
+	try {
+		const cfg = loadConfig() as { tools?: { speech?: { command?: unknown } } };
+		const c = cfg.tools?.speech?.command;
+		if (typeof c === "string" && c.trim()) return c.trim();
+	} catch {
+		/* default below */
+	}
+	return "";
+}
 
 function resolveConfiguredModel(provider: SpeechProviderId): string | undefined {
 	try {

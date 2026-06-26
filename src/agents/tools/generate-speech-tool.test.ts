@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -164,6 +164,26 @@ test("xai → raw audio bytes saved as mp3", async () => {
 	assert.equal(res.details.ok, true);
 	assert.equal(res.details.provider, "xai");
 	assert.ok(res.details.path!.endsWith(".mp3"));
+});
+
+test("command provider (offline) runs the local TTS CLI via the runner seam", async () => {
+	let ranCmd = "";
+	const tool = makeGenerateSpeechTool({
+		outDirOverride: outDir,
+		resolveKey: () => "",
+		ttsCommand: "mytts {text_path} -o {output} -v {voice}",
+		commandRunner: (cmd) => {
+			ranCmd = cmd;
+			const out = /-o (\S+\.wav)/.exec(cmd)?.[1] ?? "";
+			writeFileSync(out, Buffer.from([1, 2, 3]));
+			return { code: 0, stdout: "", stderr: "" };
+		},
+	});
+	const res = await tool.execute("c1", { text: "hi", provider: "command" }, undefined as never);
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.provider, "command");
+	assert.ok(res.details.path!.endsWith(".wav"));
+	assert.ok(ranCmd.includes("mytts"));
 });
 
 test("wrapPcmAsWav writes a valid 44-byte RIFF/WAVE header", () => {

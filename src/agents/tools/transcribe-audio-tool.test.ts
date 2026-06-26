@@ -19,6 +19,37 @@ function jsonResponse(payload: unknown, ok = true, status = 200): Response {
 	} as unknown as Response;
 }
 
+test("transcribe (google) → Gemini generateContent joins the transcript parts", async () => {
+	let calledUrl = "";
+	const fetchFn = (async (url: string) => {
+		calledUrl = String(url);
+		return jsonResponse({ candidates: [{ content: { parts: [{ text: "hello " }, { text: "world" }] } }] });
+	}) as unknown as typeof fetch;
+	const tool = makeTranscribeAudioTool({ fetchFn, readSource, resolveKey: (p) => (p === "google" ? "gk" : "") });
+	const res = await tool.execute("c1", { source: "voice.mp3", provider: "google" }, undefined as never);
+	assert.equal(res.details.ok, true);
+	assert.ok(calledUrl.includes("generativelanguage.googleapis.com"));
+	assert.equal(res.details.transcript, "hello world");
+});
+
+test("command provider (offline) runs the local STT CLI via the runner seam (stdout transcript)", async () => {
+	let ranCmd = "";
+	const tool = makeTranscribeAudioTool({
+		readSource,
+		resolveKey: () => "",
+		sttCommand: "mystt {input} -o {output} -l {language}",
+		commandRunner: (cmd) => {
+			ranCmd = cmd;
+			return { code: 0, stdout: "local transcript", stderr: "" };
+		},
+	});
+	const res = await tool.execute("c1", { source: "voice.mp3", provider: "command" }, undefined as never);
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.provider, "command");
+	assert.equal(res.details.transcript, "local transcript");
+	assert.ok(ranCmd.includes("mystt"));
+});
+
 test("transcribe (groq) → posts to groq, returns transcript + provider", async () => {
 	let calledUrl = "";
 	const fetchFn = (async (url: string) => {
@@ -67,7 +98,7 @@ test("explicit provider with no key → ok:false", async () => {
 	const tool = makeTranscribeAudioTool({ fetchFn, readSource, resolveKey: (p) => (p === "groq" ? "gk" : "") });
 	const res = await tool.execute("c1", { source: "voice.mp3", provider: "openai" }, undefined as never);
 	assert.equal(res.details.ok, false);
-	assert.match(res.details.message ?? "", /no configured key/i);
+	assert.match(res.details.message ?? "", /not available|no key/i);
 });
 
 test("no key configured → ok:false with a clear message", async () => {
