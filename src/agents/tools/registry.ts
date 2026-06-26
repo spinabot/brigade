@@ -36,6 +36,7 @@ import { makeCronTool } from "./cron-tool.js";
 import { makeManageAgentTool } from "./manage-agent-tool.js";
 import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
+import { makeGenerateSpeechTool } from "./generate-speech-tool.js";
 import { makeAnalyzeMediaTool } from "./analyze-media-tool.js";
 import { makeMakeDocumentTool } from "./make-document-tool.js";
 import { makeEditDocumentTool } from "./edit-document-tool.js";
@@ -270,6 +271,11 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// a billed generation got silently dropped that way in production).
 		// Owner-gated: each call is billed.
 		makeGenerateImageTool(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		// generate_speech — text-to-speech (TTS). Same owner-gated billed posture
+		// as generate_image; multi-provider (OpenAI / ElevenLabs / Google Gemini)
+		// with auto-select by configured key. Saves an audio file the agent then
+		// hands off to send_media.
+		makeGenerateSpeechTool(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
 		// analyze_media — read-capability media + document understanding. The
 		// model hands it a local path or URL (+ a question) and it RESOLVES the
 		// input into content the CURRENT turn's model analyzes: images become an

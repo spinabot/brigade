@@ -52,7 +52,7 @@ describe("createBrigadeTools — Primitive #4 (memory) + agents_list + manage_ag
 			else process.env.BRIGADE_STATE_DIR = prev;
 			fs.rmSync(stateDir, { recursive: true, force: true });
 		}
-		assert.equal(tools.length, 19);
+		assert.equal(tools.length, 20);
 		const names = tools.map((t) => t.name).sort();
 		assert.deepEqual(names, [
 			"agents_list",
@@ -62,6 +62,7 @@ describe("createBrigadeTools — Primitive #4 (memory) + agents_list + manage_ag
 			"edit_document",
 			"find",
 			"generate_image",
+			"generate_speech",
 			"make_document",
 			"manage_access",
 			"manage_agent",
