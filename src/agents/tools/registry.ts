@@ -37,6 +37,7 @@ import { makeManageAgentTool } from "./manage-agent-tool.js";
 import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
 import { makeGenerateSpeechTool } from "./generate-speech-tool.js";
+import { makeTranscribeAudioTool } from "./transcribe-audio-tool.js";
 import { makeAnalyzeMediaTool } from "./analyze-media-tool.js";
 import { makeMakeDocumentTool } from "./make-document-tool.js";
 import { makeEditDocumentTool } from "./edit-document-tool.js";
@@ -295,6 +296,16 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 			// from the operator's personal dirs (Downloads / Desktop / Documents).
 			// An untrusted non-owner channel peer (senderIsOwner:false) does NOT get
 			// this widening — the secret/system denylist still applies regardless.
+			ownerLocalAccess: opts.senderIsOwner !== false,
+		}),
+		// transcribe_audio — speech-to-text (STT). Read/understand op like
+		// analyze_media (NOT owner-only); multi-provider (groq / openai / deepgram /
+		// elevenlabs / mistral / xai) auto-selected by configured key, with the same
+		// local-path guard. Returns the transcript text.
+		makeTranscribeAudioTool({
+			...(opts.workspaceDir !== undefined ? { workspaceDir: opts.workspaceDir } : {}),
+			...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
 			ownerLocalAccess: opts.senderIsOwner !== false,
 		}),
 		// make_document — CREATE a Word/Excel/PowerPoint/PDF file from structured
