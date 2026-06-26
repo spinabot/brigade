@@ -201,7 +201,7 @@ describe("assembleBrigadeToolset — senderIsOwner gating", () => {
 			// would be (the wrapper short-circuits in owner mode).
 			assert.equal(typeof tool.execute, "function");
 		}
-		assert.equal(ts.customTools.length, 21); // + transcribe_audio: analyze_media + make_document + edit_document + composio + connect_channel + message_action + find + generate_image + generate_speech + transcribe_audio + manage_provider + manage_access + manage_channel_access + manage_memory + oauth_authorize + recall + read_memory + write_memory + agents_list + manage_agent + manage_skill
+		assert.equal(ts.customTools.length, 23); // + generate_music/generate_video: analyze_media + make_document + edit_document + composio + connect_channel + message_action + find + generate_image + generate_music + generate_speech + generate_video + transcribe_audio + manage_provider + manage_access + manage_channel_access + manage_memory + oauth_authorize + recall + read_memory + write_memory + agents_list + manage_agent + manage_skill
 	});
 
 	it("senderIsOwner: false wraps any ownerOnly tool so it refuses execute", async () => {
@@ -218,7 +218,7 @@ describe("assembleBrigadeToolset — senderIsOwner gating", () => {
 			cwd: workspace,
 			senderIsOwner: false,
 		});
-		assert.equal(ts.customTools.length, 21);
+		assert.equal(ts.customTools.length, 23);
 		// brigadeToolNames mirror customTools.name — wrapping must NOT change
 		// the visible name surface.
 		assert.deepEqual(ts.brigadeToolNames.sort(), [
@@ -229,7 +229,9 @@ describe("assembleBrigadeToolset — senderIsOwner gating", () => {
 			"edit_document",
 			"find",
 			"generate_image",
+			"generate_music",
 			"generate_speech",
+			"generate_video",
 			"make_document",
 			"manage_access",
 			"manage_agent",

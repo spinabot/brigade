@@ -58,7 +58,7 @@ after(() => {
 });
 
 describe("assembleBrigadeToolset", () => {
-	it("returns 6 builtins + 21 brigade tools (composio/connect_channel/message_action/find/generate_image/generate_speech/transcribe_audio/make_document/edit_document/manage_provider/manage_access/manage_channel_access/manage_memory/oauth_authorize + 3 memory + agents_list + manage_agent + manage_skill) = 27 enabled names", () => {
+	it("returns 6 builtins + 23 brigade tools (composio/connect_channel/message_action/find/generate_image/generate_music/generate_speech/generate_video/transcribe_audio/make_document/edit_document/manage_provider/manage_access/manage_channel_access/manage_memory/oauth_authorize + 3 memory + agents_list + manage_agent + manage_skill) = 29 enabled names", () => {
 		// `find` moved from the Pi builtin list to a Brigade-native custom tool
 		// (fd's --glob --full-path matches nothing on Windows — see find-tool.ts).
 		const ts = assembleBrigadeToolset({ workspaceDir: workspace, agentId: "main", cwd: workspace });
@@ -71,7 +71,9 @@ describe("assembleBrigadeToolset", () => {
 			"edit_document",
 			"find",
 			"generate_image",
+			"generate_music",
 			"generate_speech",
+			"generate_video",
 			"make_document",
 			"manage_access",
 			"manage_agent",
@@ -86,8 +88,8 @@ describe("assembleBrigadeToolset", () => {
 			"transcribe_audio",
 			"write_memory",
 		]);
-		assert.equal(ts.enabledToolNames.length, 27);
-		assert.equal(ts.customTools.length, 21);
+		assert.equal(ts.enabledToolNames.length, 29);
+		assert.equal(ts.customTools.length, 23);
 	});
 
 	it("derives capabilities.memory=true when recall_memory present", () => {

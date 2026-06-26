@@ -38,6 +38,8 @@ import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
 import { makeGenerateSpeechTool } from "./generate-speech-tool.js";
 import { makeTranscribeAudioTool } from "./transcribe-audio-tool.js";
+import { makeGenerateVideoTool } from "./generate-video-tool.js";
+import { makeGenerateMusicTool } from "./generate-music-tool.js";
 import { makeAnalyzeMediaTool } from "./analyze-media-tool.js";
 import { makeMakeDocumentTool } from "./make-document-tool.js";
 import { makeEditDocumentTool } from "./edit-document-tool.js";
@@ -277,6 +279,14 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// with auto-select by configured key. Saves an audio file the agent then
 		// hands off to send_media.
 		makeGenerateSpeechTool(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		// generate_video — text/image-to-video. Billed (owner-gated like
+		// generate_image); multi-provider (openrouter / fal / openai-sora / xai /
+		// minimax / runway) with async submit→poll→download. Saves an mp4 the agent
+		// hands off to send_media.
+		makeGenerateVideoTool(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		// generate_music — text-to-music. Billed (owner-gated); multi-provider
+		// (google-lyria / minimax-music / elevenlabs-music). Saves audio for send_media.
+		makeGenerateMusicTool(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
 		// analyze_media — read-capability media + document understanding. The
 		// model hands it a local path or URL (+ a question) and it RESOLVES the
 		// input into content the CURRENT turn's model analyzes: images become an
