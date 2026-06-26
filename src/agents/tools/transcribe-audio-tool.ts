@@ -57,7 +57,7 @@ const FETCH_TIMEOUT_MS = 45_000;
 /** Hard cap on audio bytes read for ANY source — providers reject huge uploads. */
 const MAX_AUDIO_BYTES = 48 * 1024 * 1024; // 48 MiB
 
-type TranscribeProviderId = "groq" | "openai" | "deepgram" | "elevenlabs" | "mistral" | "xai";
+type TranscribeProviderId = "groq" | "openai" | "deepgram" | "elevenlabs" | "mistral" | "xai" | "google";
 
 /** Preference order when no provider is pinned: first keyed one wins. */
 const PROVIDER_PREFERENCE: TranscribeProviderId[] = [
@@ -67,6 +67,7 @@ const PROVIDER_PREFERENCE: TranscribeProviderId[] = [
 	"elevenlabs",
 	"mistral",
 	"xai",
+	"google",
 ];
 
 /** Default model id per provider (xai's /v1/stt takes none). */
@@ -77,6 +78,7 @@ const DEFAULT_MODEL: Record<TranscribeProviderId, string> = {
 	elevenlabs: "scribe_v2",
 	mistral: "voxtral-mini-latest",
 	xai: "",
+	google: "gemini-2.5-flash",
 };
 
 const TranscribeAudioParams = Type.Object({
@@ -101,6 +103,7 @@ const TranscribeAudioParams = Type.Object({
 				Type.Literal("elevenlabs"),
 				Type.Literal("mistral"),
 				Type.Literal("xai"),
+				Type.Literal("google"),
 			],
 			{
 				description:
@@ -318,7 +321,51 @@ async function transcribe(params: {
 			return transcribeElevenLabs(params);
 		case "deepgram":
 			return transcribeDeepgram(params);
+		case "google":
+			return transcribeGoogle(params);
 	}
+}
+
+/**
+ * Google Gemini — audio understanding via `generateContent`: the audio rides as
+ * inline base64 plus a "transcribe verbatim" instruction; the transcript is the
+ * joined text parts of the first candidate.
+ */
+async function transcribeGoogle(p: {
+	fetchFn: typeof fetch;
+	apiKey: string;
+	model: string;
+	audio: TranscribeSource;
+	language?: string;
+	signal?: AbortSignal;
+}): Promise<string> {
+	const instruction = p.language
+		? `Transcribe this audio verbatim (language: ${p.language}). Return ONLY the transcript text.`
+		: "Transcribe this audio verbatim. Return ONLY the transcript text.";
+	const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(p.model)}:generateContent?key=${encodeURIComponent(p.apiKey)}`;
+	const res = await p.fetchFn(url, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			contents: [
+				{
+					parts: [
+						{ inline_data: { mime_type: p.audio.mime, data: p.audio.bytes.toString("base64") } },
+						{ text: instruction },
+					],
+				},
+			],
+		}),
+		signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${(await safeText(res)).slice(0, 200)}`);
+	const body = (await res.json()) as {
+		candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+	};
+	return (body.candidates?.[0]?.content?.parts ?? [])
+		.map((x) => x.text ?? "")
+		.join("")
+		.trim();
 }
 
 /**

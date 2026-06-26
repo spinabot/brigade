@@ -33,6 +33,7 @@ import { Type } from "typebox";
 import { resolveCacheDir, DEFAULT_AGENT_ID } from "../../config/paths.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveMediaProviderKey } from "../media-understanding/config.js";
+import { synthesizeEdge } from "./edge-tts.js";
 import { jsonResult } from "./common.js";
 import type { AgentToolResult, BrigadeTool } from "./types.js";
 
@@ -41,10 +42,13 @@ const REQUEST_TIMEOUT_MS = 120_000;
 /** Hard cap on input length — providers reject very long text; fail clearly. */
 const MAX_INPUT_CHARS = 8_000;
 
-type SpeechProviderId = "openai" | "elevenlabs" | "google" | "minimax" | "xai";
+type SpeechProviderId = "openai" | "elevenlabs" | "google" | "minimax" | "xai" | "edge";
 
-/** Preference order when no provider is pinned: first keyed one wins. */
-const PROVIDER_PREFERENCE: SpeechProviderId[] = ["openai", "elevenlabs", "google", "minimax", "xai"];
+/** Preference order when no provider is pinned: first AVAILABLE one wins. Edge is
+ *  FREE (no key, Microsoft "Read Aloud" over WebSocket) so it sits LAST — a
+ *  configured cloud provider is preferred, and Edge is the always-available free
+ *  fallback when no cloud TTS key exists. */
+const PROVIDER_PREFERENCE: SpeechProviderId[] = ["openai", "elevenlabs", "google", "minimax", "xai", "edge"];
 
 const DEFAULTS: Record<SpeechProviderId, { model: string; voice: string }> = {
 	openai: { model: "gpt-4o-mini-tts", voice: "alloy" },
@@ -52,6 +56,7 @@ const DEFAULTS: Record<SpeechProviderId, { model: string; voice: string }> = {
 	google: { model: "gemini-2.5-flash-preview-tts", voice: "Kore" },
 	minimax: { model: "speech-2.8-hd", voice: "English_expressive_narrator" },
 	xai: { model: "", voice: "eve" },
+	edge: { model: "", voice: "en-US-AvaNeural" },
 };
 
 const GenerateSpeechParams = Type.Object({
@@ -63,8 +68,8 @@ const GenerateSpeechParams = Type.Object({
 	text: Type.Optional(Type.String({ description: "The text to speak aloud." })),
 	provider: Type.Optional(
 		Type.Union(
-			[Type.Literal("openai"), Type.Literal("elevenlabs"), Type.Literal("google"), Type.Literal("minimax"), Type.Literal("xai")],
-			{ description: "Optional TTS provider override. Default: the first one with a configured key." },
+			[Type.Literal("openai"), Type.Literal("elevenlabs"), Type.Literal("google"), Type.Literal("minimax"), Type.Literal("xai"), Type.Literal("edge")],
+			{ description: "Optional TTS provider override. `edge` is FREE (no key). Default: first available (cloud preferred, edge fallback)." },
 		),
 	),
 	voice: Type.Optional(
@@ -99,6 +104,8 @@ export interface MakeGenerateSpeechToolOptions {
 	outDirOverride?: string;
 	/** Test seam: per-provider API-key resolver override. */
 	resolveKey?: (provider: SpeechProviderId) => string;
+	/** Test seam: replace the free Edge WebSocket synth (the `edge` provider has no key). */
+	edgeSynth?: (text: string, voice: string, signal?: AbortSignal) => Promise<Buffer>;
 }
 
 export function makeGenerateSpeechTool(
@@ -107,6 +114,12 @@ export function makeGenerateSpeechTool(
 	const agentId = opts.agentId ?? DEFAULT_AGENT_ID;
 	const fetchFn = opts.fetchFn ?? fetch;
 	const resolveKey = opts.resolveKey ?? ((p: SpeechProviderId) => resolveMediaProviderKey(p, agentId));
+	const edgeSynth =
+		opts.edgeSynth ??
+		((text: string, voice: string, signal?: AbortSignal) =>
+			synthesizeEdge({ text, voice, ...(signal ? { signal } : {}) }));
+	// Edge is FREE (no key) → always available; every other provider needs a key.
+	const isAvailable = (p: SpeechProviderId): boolean => p === "edge" || resolveKey(p).length > 0;
 
 	return {
 		name: "generate_speech",
@@ -126,15 +139,15 @@ export function makeGenerateSpeechTool(
 			const action = args.action ?? "generate";
 
 			if (action === "list") {
-				const providers = PROVIDER_PREFERENCE.filter((p) => resolveKey(p).length > 0);
+				const providers = PROVIDER_PREFERENCE.filter(isAvailable);
 				return jsonResult({
 					action,
 					providers,
 					ok: true,
 					message:
 						providers.length > 0
-							? `${providers.length} TTS provider(s) configured: ${providers.join(", ")}.`
-							: "No TTS provider configured. Add an OpenAI, ElevenLabs, or Google key with `brigade onboard`.",
+							? `${providers.length} TTS provider(s) available: ${providers.join(", ")} (edge is free, no key).`
+							: "No TTS provider available. Add an OpenAI/ElevenLabs/Google key with `brigade onboard` (or edge works free).",
 				} satisfies GenerateSpeechDetails) as AgentToolResult<GenerateSpeechDetails>;
 			}
 
@@ -149,17 +162,17 @@ export function makeGenerateSpeechTool(
 			// Resolve the provider: explicit override (must be keyed) else first keyed.
 			let provider: SpeechProviderId | undefined;
 			if (args.provider) {
-				if (resolveKey(args.provider).length === 0) {
-					return fail(action, `Provider "${args.provider}" has no configured key. Add one with \`brigade onboard\`, or omit \`provider\` to auto-select.`);
+				if (!isAvailable(args.provider)) {
+					return fail(action, `Provider "${args.provider}" has no configured key. Add one with \`brigade onboard\`, or omit \`provider\` to auto-select (or use the free \`edge\`).`);
 				}
 				provider = args.provider;
 			} else {
-				provider = PROVIDER_PREFERENCE.find((p) => resolveKey(p).length > 0);
+				provider = PROVIDER_PREFERENCE.find(isAvailable);
 			}
 			if (!provider) {
 				return fail(
 					action,
-					"No TTS provider is configured. Add an OpenAI, ElevenLabs, or Google API key with `brigade onboard` (then this tool auto-selects it).",
+					"No TTS provider is available. Add an OpenAI/ElevenLabs/Google API key with `brigade onboard` — or use the free `edge` provider (no key needed).",
 				);
 			}
 
@@ -169,7 +182,10 @@ export function makeGenerateSpeechTool(
 
 			let audio: { bytes: Buffer; extension: string };
 			try {
-				audio = await synthesize({ provider, fetchFn, apiKey, model, voice, text, signal });
+				audio =
+					provider === "edge"
+						? { bytes: await edgeSynth(text, voice, signal), extension: "mp3" }
+						: await synthesize({ provider, fetchFn, apiKey, model, voice, text, signal });
 			} catch (err) {
 				return fail(action, `TTS via ${provider} failed: ${err instanceof Error ? err.message : String(err)}`, { provider, model, voice });
 			}
@@ -199,7 +215,9 @@ export function makeGenerateSpeechTool(
 /* ───────────────────────── provider plumbing ───────────────────────── */
 
 async function synthesize(params: {
-	provider: SpeechProviderId;
+	// `edge` is handled in execute (no key, WS synth) before this dispatch, so the
+	// cloud switch below is exhaustive for the remaining provider ids.
+	provider: Exclude<SpeechProviderId, "edge">;
 	fetchFn: typeof fetch;
 	apiKey: string;
 	model: string;

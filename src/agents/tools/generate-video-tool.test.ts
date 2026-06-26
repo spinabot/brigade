@@ -282,6 +282,232 @@ test("openrouter: submit returns {id}, poll yields a video url → downloaded", 
 	assert.equal(readFileSync(res.details.path!).length, 3);
 });
 
+test("byteplus: submit → poll(succeeded) → content.video_url → download mp4", async () => {
+	let submitUrl = "";
+	let submitBody: Record<string, unknown> = {};
+	let pollCount = 0;
+	let downloaded = false;
+	const fetchFn = (async (url: string, init?: RequestInit) => {
+		const u = String(url);
+		if (u === "https://ark.ap-southeast.bytepluses.com/api/v3/contents/generations/tasks") {
+			submitUrl = u;
+			submitBody = JSON.parse(String(init?.body));
+			const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+			assert.ok(auth.startsWith("Bearer "), `expected Bearer auth, got "${auth}"`);
+			return jsonResponse({ id: "task_bp" });
+		}
+		if (u === "https://ark.ap-southeast.bytepluses.com/api/v3/contents/generations/tasks/task_bp") {
+			pollCount += 1;
+			return pollCount >= 2
+				? jsonResponse({ status: "succeeded", content: { video_url: "https://cdn.byteplus/out.mp4" } })
+				: jsonResponse({ status: "running" });
+		}
+		if (u === "https://cdn.byteplus/out.mp4") {
+			downloaded = true;
+			return bytesResponse([1, 2, 3, 4]);
+		}
+		throw new Error(`unexpected url ${u}`);
+	}) as unknown as typeof fetch;
+
+	const tool = makeGenerateVideoTool({
+		fetchFn,
+		outDirOverride: outDir,
+		pollIntervalMs: 1,
+		resolveKey: (p) => (p === "byteplus" ? "bp-key" : ""),
+	});
+	const res = await tool.execute("c1", { prompt: "a dragon", provider: "byteplus" }, undefined as never);
+
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.provider, "byteplus");
+	assert.equal(submitUrl, "https://ark.ap-southeast.bytepluses.com/api/v3/contents/generations/tasks");
+	assert.equal((submitBody.content as Array<{ text?: string }>)[0]?.text, "a dragon");
+	assert.ok(pollCount >= 2 && downloaded, "polled until succeeded + downloaded");
+	const saved = res.details.path!;
+	assert.ok(saved.endsWith(".mp4"));
+	assert.equal(readFileSync(saved).length, 4);
+});
+
+test("alibaba: async submit (X-DashScope-Async) → poll(SUCCEEDED) → results[0].video_url → download", async () => {
+	let submitUrl = "";
+	let asyncHeader = "";
+	let pollCount = 0;
+	const fetchFn = (async (url: string, init?: RequestInit) => {
+		const u = String(url);
+		if (u === "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis") {
+			submitUrl = u;
+			asyncHeader = (init?.headers as Record<string, string> | undefined)?.["X-DashScope-Async"] ?? "";
+			return jsonResponse({ output: { task_id: "ali_1" } });
+		}
+		if (u === "https://dashscope-intl.aliyuncs.com/api/v1/tasks/ali_1") {
+			pollCount += 1;
+			return pollCount >= 2
+				? jsonResponse({ output: { task_status: "SUCCEEDED", results: [{ video_url: "https://cdn.ali/v.mp4" }] } })
+				: jsonResponse({ output: { task_status: "RUNNING" } });
+		}
+		if (u === "https://cdn.ali/v.mp4") return bytesResponse([5, 6, 7]);
+		throw new Error(`unexpected url ${u}`);
+	}) as unknown as typeof fetch;
+
+	const tool = makeGenerateVideoTool({
+		fetchFn,
+		outDirOverride: outDir,
+		pollIntervalMs: 1,
+		resolveKey: (p) => (p === "alibaba" ? "ali-key" : ""),
+	});
+	const res = await tool.execute("c1", { prompt: "a river", provider: "alibaba" }, undefined as never);
+
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.provider, "alibaba");
+	assert.equal(submitUrl, "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis");
+	assert.equal(asyncHeader, "enable", "must send X-DashScope-Async: enable on submit");
+	assert.ok(pollCount >= 2, "polled until SUCCEEDED");
+	const saved = res.details.path!;
+	assert.ok(saved.endsWith(".mp4"));
+	assert.equal(readFileSync(saved).length, 3);
+});
+
+test("together: submit → poll(completed) → outputs[0].video_url → download mp4", async () => {
+	let submitUrl = "";
+	let pollCount = 0;
+	const fetchFn = (async (url: string) => {
+		const u = String(url);
+		if (u === "https://api.together.xyz/v1/videos") {
+			submitUrl = u;
+			return jsonResponse({ id: "tg_1" });
+		}
+		if (u === "https://api.together.xyz/v1/videos/tg_1") {
+			pollCount += 1;
+			return pollCount >= 2
+				? jsonResponse({ status: "completed", outputs: [{ video_url: "https://cdn.together/clip.mp4" }] })
+				: jsonResponse({ status: "in_progress" });
+		}
+		if (u === "https://cdn.together/clip.mp4") return bytesResponse([8, 8]);
+		throw new Error(`unexpected url ${u}`);
+	}) as unknown as typeof fetch;
+
+	const tool = makeGenerateVideoTool({
+		fetchFn,
+		outDirOverride: outDir,
+		pollIntervalMs: 1,
+		resolveKey: (p) => (p === "together" ? "tg-key" : ""),
+	});
+	const res = await tool.execute("c1", { prompt: "a forest", provider: "together" }, undefined as never);
+
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.provider, "together");
+	assert.equal(submitUrl, "https://api.together.xyz/v1/videos");
+	assert.ok(pollCount >= 2, "polled until completed");
+	const saved = res.details.path!;
+	assert.ok(saved.endsWith(".mp4"));
+	assert.equal(readFileSync(saved).length, 2);
+});
+
+test("together: outputs as a single object (not array) still resolves the url", async () => {
+	const fetchFn = (async (url: string) => {
+		const u = String(url);
+		if (u === "https://api.together.xyz/v1/videos") return jsonResponse({ id: "tg_2" });
+		if (u === "https://api.together.xyz/v1/videos/tg_2") {
+			return jsonResponse({ status: "completed", outputs: { url: "https://cdn.together/single.mp4" } });
+		}
+		if (u === "https://cdn.together/single.mp4") return bytesResponse([3, 3, 3]);
+		throw new Error(`unexpected url ${u}`);
+	}) as unknown as typeof fetch;
+
+	const tool = makeGenerateVideoTool({
+		fetchFn,
+		outDirOverride: outDir,
+		pollIntervalMs: 1,
+		resolveKey: (p) => (p === "together" ? "tg-key" : ""),
+	});
+	const res = await tool.execute("c1", { prompt: "x", provider: "together" }, undefined as never);
+	assert.equal(res.details.ok, true);
+	assert.equal(readFileSync(res.details.path!).length, 3);
+});
+
+test("google veo: predictLongRunning submit → operation poll(done) → uri (+key) download", async () => {
+	let submitUrl = "";
+	let pollUrl = "";
+	let downloadUrl = "";
+	let pollCount = 0;
+	const fetchFn = (async (url: string) => {
+		const u = String(url);
+		if (u.includes(":predictLongRunning")) {
+			submitUrl = u;
+			return jsonResponse({ name: "operations/abc123" });
+		}
+		if (u.includes("/v1beta/operations/abc123")) {
+			pollUrl = u;
+			pollCount += 1;
+			return pollCount >= 2
+				? jsonResponse({
+						done: true,
+						response: {
+							generateVideoResponse: {
+								generatedSamples: [{ video: { uri: "https://generativelanguage.googleapis.com/v1beta/files/xyz:download" } }],
+							},
+						},
+					})
+				: jsonResponse({ done: false });
+		}
+		if (u.startsWith("https://generativelanguage.googleapis.com/v1beta/files/xyz:download")) {
+			downloadUrl = u;
+			return bytesResponse([4, 4, 4, 4]);
+		}
+		throw new Error(`unexpected url ${u}`);
+	}) as unknown as typeof fetch;
+
+	const tool = makeGenerateVideoTool({
+		fetchFn,
+		outDirOverride: outDir,
+		pollIntervalMs: 1,
+		resolveKey: (p) => (p === "google" ? "g-key" : ""),
+	});
+	const res = await tool.execute("c1", { prompt: "a comet", provider: "google" }, undefined as never);
+
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.provider, "google");
+	assert.ok(
+		submitUrl.startsWith(
+			"https://generativelanguage.googleapis.com/v1beta/models/veo-3.0-fast-generate-001:predictLongRunning?key=",
+		),
+		`submit URL was ${submitUrl}`,
+	);
+	assert.ok(pollUrl.includes("?key="), "operation poll must carry the api key");
+	assert.ok(pollCount >= 2, "polled the operation until done");
+	assert.ok(downloadUrl.includes("key="), "the file uri download must have the key appended");
+	const saved = res.details.path!;
+	assert.ok(saved.endsWith(".mp4"));
+	assert.equal(readFileSync(saved).length, 4);
+});
+
+test("google veo: inline base64 sample (no uri) is decoded directly", async () => {
+	const fetchFn = (async (url: string) => {
+		const u = String(url);
+		if (u.includes(":predictLongRunning")) return jsonResponse({ name: "operations/inline1" });
+		if (u.includes("/v1beta/operations/inline1")) {
+			return jsonResponse({
+				done: true,
+				response: {
+					generateVideoResponse: {
+						generatedSamples: [{ video: { bytesBase64Encoded: Buffer.from([0xaa, 0xbb, 0xcc]).toString("base64") } }],
+					},
+				},
+			});
+		}
+		throw new Error(`unexpected url ${u} (inline base64 must NOT be fetched)`);
+	}) as unknown as typeof fetch;
+
+	const tool = makeGenerateVideoTool({
+		fetchFn,
+		outDirOverride: outDir,
+		pollIntervalMs: 1,
+		resolveKey: (p) => (p === "google" ? "g-key" : ""),
+	});
+	const res = await tool.execute("c1", { prompt: "inline", provider: "google" }, undefined as never);
+	assert.equal(res.details.ok, true);
+	assert.equal(readFileSync(res.details.path!).length, 3);
+});
+
 test("findVideoUrl deep-searches for data:video and …mp4 urls", () => {
 	assert.equal(findVideoUrl({ a: { b: MP4_DATA_URL } }), MP4_DATA_URL);
 	assert.equal(findVideoUrl({ data: [{ url: "https://x.test/out.mp4" }] }), "https://x.test/out.mp4");

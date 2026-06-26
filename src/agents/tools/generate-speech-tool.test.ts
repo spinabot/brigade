@@ -70,12 +70,33 @@ test("explicit provider override is honored (when keyed)", async () => {
 	assert.ok(calledUrl.includes("api.elevenlabs.io/v1/text-to-speech/Rachel"));
 });
 
-test("no key configured → ok:false with a clear message, no file written", async () => {
-	const fetchFn = (async () => audioResponse([1])) as unknown as typeof fetch;
-	const tool = makeGenerateSpeechTool({ fetchFn, outDirOverride: outDir, resolveKey: () => "" });
+test("no cloud key → auto-falls back to the FREE edge provider", async () => {
+	const tool = makeGenerateSpeechTool({
+		outDirOverride: outDir,
+		resolveKey: () => "",
+		edgeSynth: async () => Buffer.from([0xff, 0xfb, 0x90]),
+	});
 	const res = await tool.execute("c1", { text: "hi" }, undefined as never);
-	assert.equal(res.details.ok, false);
-	assert.match(res.details.message ?? "", /no TTS provider|configured/i);
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.provider, "edge");
+	assert.ok(res.details.path!.endsWith(".mp3"));
+});
+
+test("edge (free) explicit provider synthesizes via the WS synth seam at the default voice", async () => {
+	let calledVoice = "";
+	const tool = makeGenerateSpeechTool({
+		outDirOverride: outDir,
+		resolveKey: () => "",
+		edgeSynth: async (_t, voice) => {
+			calledVoice = voice;
+			return Buffer.from([0xff, 0xfb]);
+		},
+	});
+	const res = await tool.execute("c1", { text: "hi", provider: "edge" }, undefined as never);
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.provider, "edge");
+	assert.equal(calledVoice, "en-US-AvaNeural");
+	assert.ok(res.details.path!.endsWith(".mp3"));
 });
 
 test("empty text → ok:false", async () => {
@@ -84,11 +105,11 @@ test("empty text → ok:false", async () => {
 	assert.equal(res.details.ok, false);
 });
 
-test("action=list reports configured providers", async () => {
+test("action=list reports available providers (edge is always free)", async () => {
 	const tool = makeGenerateSpeechTool({ outDirOverride: outDir, resolveKey: (p) => (p === "openai" ? "k" : "") });
 	const res = await tool.execute("c1", { action: "list" }, undefined as never);
 	assert.equal(res.details.ok, true);
-	assert.deepEqual(res.details.providers, ["openai"]);
+	assert.deepEqual(res.details.providers, ["openai", "edge"]);
 });
 
 test("google PCM response is wrapped into a .wav file", async () => {

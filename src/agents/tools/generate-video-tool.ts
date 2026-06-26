@@ -59,7 +59,17 @@ const MAX_PROMPT = 4_000;
  */
 const POLL_TIMEOUT_MS = 12 * 60_000;
 
-type VideoProviderId = "openrouter" | "fal" | "openai" | "xai" | "minimax" | "runway";
+type VideoProviderId =
+	| "openrouter"
+	| "fal"
+	| "openai"
+	| "xai"
+	| "minimax"
+	| "runway"
+	| "google"
+	| "byteplus"
+	| "alibaba"
+	| "together";
 
 /** Preference order when no provider is pinned: first keyed one wins. */
 const PROVIDER_PREFERENCE: VideoProviderId[] = [
@@ -69,6 +79,10 @@ const PROVIDER_PREFERENCE: VideoProviderId[] = [
 	"xai",
 	"minimax",
 	"runway",
+	"google",
+	"byteplus",
+	"alibaba",
+	"together",
 ];
 
 /** Default model per provider (overridable via the `model` param / config). */
@@ -79,6 +93,10 @@ const DEFAULT_MODELS: Record<VideoProviderId, string> = {
 	xai: "grok-imagine-video",
 	minimax: "MiniMax-Hailuo-2.3",
 	runway: "gen4_turbo",
+	google: "veo-3.0-fast-generate-001",
+	byteplus: "seedance-1-0-pro-250528",
+	alibaba: "wan2.6-t2v",
+	together: "Wan-AI/Wan2.2-T2V-A14B",
 };
 
 const GenerateVideoParams = Type.Object({
@@ -103,6 +121,10 @@ const GenerateVideoParams = Type.Object({
 				Type.Literal("xai"),
 				Type.Literal("minimax"),
 				Type.Literal("runway"),
+				Type.Literal("google"),
+				Type.Literal("byteplus"),
+				Type.Literal("alibaba"),
+				Type.Literal("together"),
 			],
 			{ description: "Optional provider override. Default: the first one with a configured key." },
 		),
@@ -304,6 +326,14 @@ async function generate(p: GenerateParams): Promise<Buffer> {
 			return generateMiniMax(p);
 		case "runway":
 			return generateRunway(p);
+		case "google":
+			return generateGoogle(p);
+		case "byteplus":
+			return generateBytePlus(p);
+		case "alibaba":
+			return generateAlibaba(p);
+		case "together":
+			return generateTogether(p);
 	}
 }
 
@@ -613,6 +643,244 @@ async function generateRunway(p: GenerateParams): Promise<Buffer> {
 	return downloadVideo(url, p.fetchFn, p.apiKey, p.signal);
 }
 
+/**
+ * Google Veo (Gemini API, REST — not the SDK). Submit
+ * `POST /v1beta/models/{model}:predictLongRunning?key=` with
+ * `{ instances:[{ prompt, image? }], parameters:{ aspectRatio?, durationSeconds? } }`
+ * → returns `{ name:"<operation>" }`. Poll the long-running operation at
+ * `GET /v1beta/{operation}?key=` until `done:true`; the finished sample is at
+ * `response.generateVideoResponse.generatedSamples[0].video` — either a `.uri`
+ * (a download URL that itself needs `?key=` appended) or inline
+ * `.bytesBase64Encoded`. Image-to-video passes the seed frame as raw base64
+ * (the `data:` prefix stripped) plus its mime type.
+ */
+async function generateGoogle(p: GenerateParams): Promise<Buffer> {
+	const base = "https://generativelanguage.googleapis.com/v1beta";
+	const keyQuery = `key=${encodeURIComponent(p.apiKey)}`;
+
+	const instance: Record<string, unknown> = { prompt: p.prompt };
+	if (p.imageDataUrl) {
+		const { base64, mimeType } = splitDataUrl(p.imageDataUrl);
+		instance.image = { bytesBase64Encoded: base64, mimeType };
+	}
+	const parameters: Record<string, unknown> = {};
+	if (p.aspectRatio) parameters.aspectRatio = p.aspectRatio;
+	if (p.durationSeconds !== undefined) parameters.durationSeconds = p.durationSeconds;
+	const body = { instances: [instance], parameters };
+
+	const res = await p.fetchFn(`${base}/models/${encodeURIComponent(p.model)}:predictLongRunning?${keyQuery}`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+		signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${(await safeText(res)).slice(0, 200)}`);
+	const submit = (await safeJson(res)) as { name?: string };
+	const operation = submit.name;
+	if (!operation) throw new Error("Google Veo submit returned no operation name.");
+
+	// Poll the long-running operation; on done, return either the sample's URI
+	// (sentinel + download below) or its inline base64 as a data-url.
+	const finalUrl = await pollUntil(
+		async () => {
+			const r = await p.fetchFn(`${base}/${operation}?${keyQuery}`, {
+				signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+			});
+			if (!r.ok) throw new Error(`HTTP ${r.status} ${(await safeText(r)).slice(0, 200)}`);
+			const pollBody = (await safeJson(r)) as {
+				done?: boolean;
+				error?: { message?: string };
+				response?: unknown;
+			};
+			if (pollBody.error) {
+				throw new Error(`Google reported error: ${pollBody.error.message ?? "unknown"}`);
+			}
+			if (pollBody.done !== true) return POLL_AGAIN;
+			const sample = findVeoSample(pollBody.response);
+			if (sample?.uri) return sample.uri;
+			if (sample?.bytesBase64Encoded) {
+				return `data:video/mp4;base64,${sample.bytesBase64Encoded}`;
+			}
+			throw new Error("Google Veo done but carried no video uri/bytes.");
+		},
+		{ intervalMs: scaleInterval(10_000, p.intervalOverride), maxAttempts: 90 },
+	);
+
+	// Inline base64 → decode directly. A `uri` is a signed Google URL that still
+	// needs the API key appended as a query param to download.
+	if (finalUrl.startsWith("data:")) return downloadVideo(finalUrl, p.fetchFn, p.apiKey, p.signal);
+	const withKey = finalUrl.includes("?") ? `${finalUrl}&${keyQuery}` : `${finalUrl}?${keyQuery}`;
+	return downloadVideo(withKey, p.fetchFn, p.apiKey, p.signal);
+}
+
+/**
+ * BytePlus Seedance (Ark). Submit
+ * `POST /api/v3/contents/generations/tasks` (Bearer) with a multimodal
+ * `content` array (text + optional first-frame image_url) → `{id}`. Poll
+ * `GET /api/v3/contents/generations/tasks/{id}` until `succeeded`; the finished
+ * url is `content.video_url`. `failed`/`cancelled` throw; queued/running keep
+ * polling.
+ */
+async function generateBytePlus(p: GenerateParams): Promise<Buffer> {
+	const base = "https://ark.ap-southeast.bytepluses.com/api/v3/contents/generations/tasks";
+	const content: Array<Record<string, unknown>> = [{ type: "text", text: p.prompt }];
+	if (p.imageDataUrl) {
+		content.push({ type: "image_url", image_url: { url: p.imageDataUrl }, role: "first_frame" });
+	}
+	const body = { model: p.model, content };
+
+	const res = await p.fetchFn(base, {
+		method: "POST",
+		headers: { Authorization: `Bearer ${p.apiKey}`, "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+		signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${(await safeText(res)).slice(0, 200)}`);
+	const submit = (await safeJson(res)) as { id?: string };
+	const id = submit.id;
+	if (!id) throw new Error("BytePlus video submit returned no id.");
+
+	const url = await pollUntil(
+		async () => {
+			const r = await p.fetchFn(`${base}/${encodeURIComponent(id)}`, {
+				headers: { Authorization: `Bearer ${p.apiKey}` },
+				signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+			});
+			if (!r.ok) throw new Error(`HTTP ${r.status} ${(await safeText(r)).slice(0, 200)}`);
+			const pollBody = (await safeJson(r)) as { status?: string; content?: { video_url?: string } };
+			const status = (pollBody.status ?? "").toLowerCase();
+			if (status === "failed" || status === "cancelled" || status === "canceled" || status === "error") {
+				throw new Error(`BytePlus reported status "${pollBody.status}".`);
+			}
+			if (status === "succeeded") {
+				const videoUrl = pollBody.content?.video_url ?? findVideoUrl(pollBody);
+				if (!videoUrl) throw new Error("BytePlus succeeded but carried no video_url.");
+				return videoUrl;
+			}
+			return POLL_AGAIN;
+		},
+		{ intervalMs: scaleInterval(5_000, p.intervalOverride), maxAttempts: 120 },
+	);
+	return downloadVideo(url, p.fetchFn, p.apiKey, p.signal);
+}
+
+/**
+ * Alibaba Wan (DashScope, international endpoint). Submit
+ * `POST /api/v1/services/aigc/video-generation/video-synthesis` with the async
+ * header `X-DashScope-Async: enable` → `{ output:{ task_id } }`. Poll
+ * `GET /api/v1/tasks/{task_id}` until `output.task_status` is `SUCCEEDED`; the
+ * final url is `output.results[0].video_url ?? output.video_url`.
+ * `FAILED`/`CANCELED` throw; PENDING/RUNNING keep polling.
+ */
+async function generateAlibaba(p: GenerateParams): Promise<Buffer> {
+	const input: Record<string, unknown> = { prompt: p.prompt };
+	if (p.imageDataUrl) input.img_url = p.imageDataUrl;
+	const parameters: Record<string, unknown> = {};
+	if (p.resolution) parameters.size = p.resolution;
+	if (p.durationSeconds !== undefined) parameters.duration = p.durationSeconds;
+	const body = { model: p.model, input, parameters };
+
+	const res = await p.fetchFn(
+		"https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis",
+		{
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${p.apiKey}`,
+				"Content-Type": "application/json",
+				"X-DashScope-Async": "enable",
+			},
+			body: JSON.stringify(body),
+			signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+		},
+	);
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${(await safeText(res)).slice(0, 200)}`);
+	const submit = (await safeJson(res)) as { output?: { task_id?: string } };
+	const taskId = submit.output?.task_id;
+	if (!taskId) throw new Error("Alibaba video submit returned no task_id.");
+
+	const url = await pollUntil(
+		async () => {
+			const r = await p.fetchFn(`https://dashscope-intl.aliyuncs.com/api/v1/tasks/${encodeURIComponent(taskId)}`, {
+				headers: { Authorization: `Bearer ${p.apiKey}` },
+				signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+			});
+			if (!r.ok) throw new Error(`HTTP ${r.status} ${(await safeText(r)).slice(0, 200)}`);
+			const pollBody = (await safeJson(r)) as {
+				output?: {
+					task_status?: string;
+					video_url?: string;
+					results?: Array<{ video_url?: string }>;
+				};
+			};
+			const status = (pollBody.output?.task_status ?? "").toUpperCase();
+			if (status === "FAILED" || status === "CANCELED" || status === "CANCELLED" || status === "ERROR") {
+				throw new Error(`Alibaba reported status "${pollBody.output?.task_status}".`);
+			}
+			if (status === "SUCCEEDED") {
+				const videoUrl = pollBody.output?.results?.[0]?.video_url ?? pollBody.output?.video_url;
+				if (!videoUrl) throw new Error("Alibaba succeeded but carried no video_url.");
+				return videoUrl;
+			}
+			return POLL_AGAIN;
+		},
+		{ intervalMs: scaleInterval(2_500, p.intervalOverride), maxAttempts: 120 },
+	);
+	return downloadVideo(url, p.fetchFn, p.apiKey, p.signal);
+}
+
+/**
+ * Together AI. Submit `POST /v1/videos` (Bearer) with
+ * `{ model, prompt, seconds?, width?, height? }` → `{id}`. Poll
+ * `GET /v1/videos/{id}` until `completed`; the final url is
+ * `outputs[0].video_url ?? outputs[0].url` (outputs may be an array or a single
+ * object). `failed` throws; in_progress/queued keep polling.
+ */
+async function generateTogether(p: GenerateParams): Promise<Buffer> {
+	const body: Record<string, unknown> = { model: p.model, prompt: p.prompt };
+	if (p.durationSeconds !== undefined) body.seconds = String(p.durationSeconds); // Together wants a STRING
+	const dims = parseResolution(p.resolution);
+	if (dims) {
+		body.width = dims.width;
+		body.height = dims.height;
+	}
+
+	const res = await p.fetchFn("https://api.together.xyz/v1/videos", {
+		method: "POST",
+		headers: { Authorization: `Bearer ${p.apiKey}`, "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+		signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${(await safeText(res)).slice(0, 200)}`);
+	const submit = (await safeJson(res)) as { id?: string };
+	const id = submit.id;
+	if (!id) throw new Error("Together video submit returned no id.");
+
+	const url = await pollUntil(
+		async () => {
+			const r = await p.fetchFn(`https://api.together.xyz/v1/videos/${encodeURIComponent(id)}`, {
+				headers: { Authorization: `Bearer ${p.apiKey}` },
+				signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+			});
+			if (!r.ok) throw new Error(`HTTP ${r.status} ${(await safeText(r)).slice(0, 200)}`);
+			const pollBody = (await safeJson(r)) as { status?: string; outputs?: unknown };
+			const status = (pollBody.status ?? "").toLowerCase();
+			if (status === "failed" || status === "error" || status === "canceled" || status === "cancelled") {
+				throw new Error(`Together reported status "${pollBody.status}".`);
+			}
+			if (status === "completed") {
+				const first = Array.isArray(pollBody.outputs) ? pollBody.outputs[0] : pollBody.outputs;
+				const out = (first ?? {}) as { video_url?: string; url?: string };
+				const videoUrl = out.video_url ?? out.url ?? findVideoUrl(pollBody);
+				if (!videoUrl) throw new Error("Together completed but carried no video url.");
+				return videoUrl;
+			}
+			return POLL_AGAIN;
+		},
+		{ intervalMs: scaleInterval(5_000, p.intervalOverride), maxAttempts: 120 },
+	);
+	return downloadVideo(url, p.fetchFn, p.apiKey, p.signal);
+}
+
 /* ───────────────────────── shared helpers ───────────────────────── */
 
 /**
@@ -706,6 +974,72 @@ function guessImageMime(p: string): string {
 		default:
 			return "image/jpeg";
 	}
+}
+
+/**
+ * Split a `data:<mime>;base64,<payload>` URL into its raw base64 payload and
+ * mime type — Google Veo's `image` field wants the bytes WITHOUT the `data:`
+ * prefix plus the mime type as a sibling. Non-data inputs are returned verbatim
+ * as the payload with a sensible default mime.
+ */
+function splitDataUrl(dataUrl: string): { base64: string; mimeType: string } {
+	const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(dataUrl);
+	if (!match) return { base64: dataUrl, mimeType: "image/jpeg" };
+	return { base64: match[3] ?? "", mimeType: match[1] || "image/jpeg" };
+}
+
+/**
+ * Pull the first Veo sample (`{ uri?, bytesBase64Encoded? }`) out of a finished
+ * long-running operation's `response`. The documented path is
+ * `response.generateVideoResponse.generatedSamples[0].video`; we fall back to a
+ * deep walk for any sibling shape so a slightly different field name still
+ * yields the bytes.
+ */
+function findVeoSample(response: unknown): { uri?: string; bytesBase64Encoded?: string } | undefined {
+	const direct = (
+		response as
+			| {
+					generateVideoResponse?: {
+						generatedSamples?: Array<{ video?: { uri?: string; bytesBase64Encoded?: string } }>;
+					};
+			  }
+			| undefined
+	)?.generateVideoResponse?.generatedSamples?.[0]?.video;
+	if (direct && (direct.uri || direct.bytesBase64Encoded)) return direct;
+
+	// Fallback: deep-walk for the first object carrying a uri or base64 video.
+	const seen = new Set<unknown>();
+	const stack: unknown[] = [response];
+	while (stack.length > 0) {
+		const node = stack.pop();
+		if (node === null || typeof node !== "object") continue;
+		if (seen.has(node)) continue;
+		seen.add(node);
+		const obj = node as Record<string, unknown>;
+		if (typeof obj.bytesBase64Encoded === "string" && obj.bytesBase64Encoded.length > 0) {
+			return { bytesBase64Encoded: obj.bytesBase64Encoded };
+		}
+		if (typeof obj.uri === "string" && /^https?:\/\//i.test(obj.uri)) {
+			return { uri: obj.uri };
+		}
+		for (const value of Object.values(obj)) stack.push(value);
+	}
+	return undefined;
+}
+
+/**
+ * Parse a `"WIDTHxHEIGHT"` (or `"WIDTH*HEIGHT"`) resolution string into numeric
+ * width/height. `"720p"`-style shorthands (no explicit pair) yield undefined so
+ * the caller simply omits the dimensions.
+ */
+function parseResolution(resolution: string | undefined): { width: number; height: number } | undefined {
+	if (!resolution) return undefined;
+	const match = /^(\d+)\s*[x*×]\s*(\d+)$/i.exec(resolution.trim());
+	if (!match) return undefined;
+	const width = Number(match[1]);
+	const height = Number(match[2]);
+	if (!Number.isFinite(width) || !Number.isFinite(height)) return undefined;
+	return { width, height };
 }
 
 /**
