@@ -263,6 +263,36 @@ import { mutateConfigAtomic } from "../config/io.js";
 import { acquireGatewayLock, type GatewayLockHandle } from "./gateway-lock.js";
 import { clearHeartbeatFile, clearPidFile, writeHeartbeatFile, writePidFile } from "./gateway-probe.js";
 import { extractToken, matchesAnyToken, resolveGatewayAuth } from "./gateway-auth.js";
+import {
+	handleConfigGet,
+	handleConfigList,
+	handleConfigSchema,
+	handleConfigSet,
+	handleConfigUnset,
+	handleConfigValidate,
+} from "./config-ops.js";
+import {
+	handleExecAllow,
+	handleExecAllowPattern,
+	handleExecDenyTest,
+	handleExecList,
+	handleExecRemove,
+} from "./exec-ops.js";
+import { handleAgentsBind, handleAgentsBindings, handleAgentsUnbind } from "./agents-ops.js";
+import { handlePairingApprove, handlePairingList, handlePairingRevoke } from "./pairing-ops.js";
+import { handleSessionsCleanup } from "./sessions-ops.js";
+import { handleMemoryManage, handleMemoryWrite } from "./memory-ops.js";
+import { handleAgentsAdd, handleAgentsDelete, handleAgentsSetIdentity } from "./agents-crud-ops.js";
+import { handleSkillsCreate, handleSkillsDelete, handleSkillsWriteFile } from "./skills-ops.js";
+import {
+	handleChannelsAllowAdd,
+	handleChannelsAllowList,
+	handleChannelsAllowRemove,
+	handleChannelsConnect,
+	handleChannelsDisconnect,
+} from "./channels-ops.js";
+import { handleProviderRemove } from "./provider-ops.js";
+import { handleComposio, handleOauth } from "./integrations-ops.js";
 
 // Persist a model selection to brigade.json's new wizard-shape (the lifted
 // code expected the older flat `defaultProvider`/`defaultModelId` fields).
@@ -4690,6 +4720,97 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}),
 		),
 	);
+
+	// `config.*` — operator-level config CRUD over the wire (the `brigade
+	// config` CLI, reachable from a remote client). Path/value/redact shape:
+	// never session-targeted, so the guard-sweep correctly needs no per-session
+	// access check. Reads/writes go through the mode-aware loadConfig/saveConfig,
+	// so this works in filesystem AND Convex mode.
+	disposeHandlers.push(registerGatewayHandler("config.get", handleConfigGet));
+	disposeHandlers.push(registerGatewayHandler("config.set", handleConfigSet));
+	disposeHandlers.push(registerGatewayHandler("config.unset", handleConfigUnset));
+	disposeHandlers.push(registerGatewayHandler("config.list", handleConfigList));
+	disposeHandlers.push(registerGatewayHandler("config.schema", handleConfigSchema));
+	disposeHandlers.push(registerGatewayHandler("config.validate", handleConfigValidate));
+
+	// `exec.*` — operator-level exec-approval allowlist CRUD (the `brigade exec`
+	// CLI over the wire). Per-agent + operator-scoped (the operator manages
+	// their OWN agents' bash-approval allowlist), the same posture as the
+	// allowlisted exec-allow-all / exec-grant-skill RPCs — no per-session guard
+	// (see ALLOWLIST_NO_GUARD_NEEDED in server.guard-sweep.test.ts). The
+	// hard-deny safety net in exec-approvals.ts still applies on every allow.
+	disposeHandlers.push(registerGatewayHandler("exec.list", handleExecList));
+	disposeHandlers.push(registerGatewayHandler("exec.allow", handleExecAllow));
+	disposeHandlers.push(registerGatewayHandler("exec.allow-pattern", handleExecAllowPattern));
+	disposeHandlers.push(registerGatewayHandler("exec.remove", handleExecRemove));
+	disposeHandlers.push(registerGatewayHandler("exec.deny-test", handleExecDenyTest));
+
+	// `agents.*` — operator-level routing-binding management (which agent owns
+	// which channel/account). The genuine no-other-path gap: agent add/delete/
+	// set-identity are already reachable via the `manage_agent` tool, but
+	// bindings had no remote path. Operator-scoped config mutation, no per-
+	// session guard (allowlisted in server.guard-sweep.test.ts).
+	disposeHandlers.push(registerGatewayHandler("agents.bindings", handleAgentsBindings));
+	disposeHandlers.push(registerGatewayHandler("agents.bind", handleAgentsBind));
+	disposeHandlers.push(registerGatewayHandler("agents.unbind", handleAgentsUnbind));
+
+	// `pairing.*` — operator-level channel pairing (approve/revoke strangers who
+	// DM the bot). Per-channel + operator-scoped, no per-session guard. The RPCs
+	// require an explicit channel (a client gets the channel list from
+	// system.capabilities), unlike the CLI's single-channel auto-pick.
+	disposeHandlers.push(registerGatewayHandler("pairing.list", handlePairingList));
+	disposeHandlers.push(registerGatewayHandler("pairing.approve", handlePairingApprove));
+	disposeHandlers.push(registerGatewayHandler("pairing.revoke", handlePairingRevoke));
+
+	// `sessions.cleanup` — operator maintenance: delete an agent's stale idle
+	// transcript files (the gateway regenerates the store entry on next access).
+	// NOT session-content access (unlike sessions.list/history), so no per-
+	// session guard (allowlisted in server.guard-sweep.test.ts).
+	disposeHandlers.push(registerGatewayHandler("sessions.cleanup", handleSessionsCleanup));
+
+	// `memory.*` — Tideline write + governance (write_memory / manage_memory).
+	// Memory lives in facts.jsonl (NOT config), so config.set can't reach it;
+	// these are the only typed remote path to MUTATE memory (read is covered by
+	// memory-query / memory-graph). Operator-scoped owner origin, no per-session
+	// guard (allowlisted in server.guard-sweep.test.ts).
+	disposeHandlers.push(registerGatewayHandler("memory.write", handleMemoryWrite));
+	disposeHandlers.push(registerGatewayHandler("memory.manage", handleMemoryManage));
+
+	// agents.add/delete/set-identity — agent CRUD (reuses the manage_agent tool,
+	// which wraps `brigade agents add/delete/set-identity`). Seeds/soft-deletes a
+	// workspace, so config.set alone can't do it. Operator-scoped (allowlisted).
+	disposeHandlers.push(registerGatewayHandler("agents.add", handleAgentsAdd));
+	disposeHandlers.push(registerGatewayHandler("agents.delete", handleAgentsDelete));
+	disposeHandlers.push(registerGatewayHandler("agents.set-identity", handleAgentsSetIdentity));
+
+	// skills.create/delete/write-file — skill authoring (reuses the manage_skill
+	// tool). SKILL.md files on disk, not config. (status/install/update already
+	// cover read/install/enable.) Operator-scoped (allowlisted).
+	disposeHandlers.push(registerGatewayHandler("skills.create", handleSkillsCreate));
+	disposeHandlers.push(registerGatewayHandler("skills.delete", handleSkillsDelete));
+	disposeHandlers.push(registerGatewayHandler("skills.write-file", handleSkillsWriteFile));
+
+	// channels.* — LIVE connect/disconnect (runtime adapter via the global
+	// channel manager) + DM allow-from (a per-channel file store, not config).
+	// Channel enable/disable/policy are already config.set-reachable. Operator-
+	// scoped (allowlisted). connect reuses the owner-scoped connect_channel tool.
+	disposeHandlers.push(registerGatewayHandler("channels.connect", handleChannelsConnect));
+	disposeHandlers.push(registerGatewayHandler("channels.disconnect", handleChannelsDisconnect));
+	disposeHandlers.push(registerGatewayHandler("channels.allow-add", handleChannelsAllowAdd));
+	disposeHandlers.push(registerGatewayHandler("channels.allow-remove", handleChannelsAllowRemove));
+	disposeHandlers.push(registerGatewayHandler("channels.allow-list", handleChannelsAllowList));
+
+	// provider.remove — delete a provider key (auth-profiles.json, not config;
+	// add-provider exists, removal had no gateway path). Operator-scoped.
+	disposeHandlers.push(registerGatewayHandler("provider.remove", handleProviderRemove));
+
+	// composio + oauth — integrations. `composio` is remote-clean (Composio
+	// hosts the OAuth callback; the gateway hands over a click-link + polls).
+	// `oauth` is the DIY loopback flow (callback on the gateway host — completes
+	// only for a local/tunneled operator; status/token work remotely). Both
+	// reuse the owner-scoped tools. Operator-scoped (allowlisted).
+	disposeHandlers.push(registerGatewayHandler("composio", handleComposio));
+	disposeHandlers.push(registerGatewayHandler("oauth", handleOauth));
 
 	// Wave O0.8 GAP 11 — opt the session inbox into JSONL persistence at
 	// gateway boot. The disk write surface defaults off so the existing

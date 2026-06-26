@@ -277,9 +277,431 @@ export type OrgSnapshotResult =
 		redirect: string;
 	};
 
+/* ─── Config methods ────────────────────────────────────────────── */
+//
+// Operator-level config CRUD over the wire — the `brigade config` CLI surface,
+// reachable by a remote client. Secrets are redacted in get/list output.
+
+export interface ConfigGetParams {
+	path: string;
+}
+export interface ConfigGetResult {
+	found: boolean;
+	value?: unknown;
+}
+export interface ConfigSetParams {
+	path: string;
+	value: unknown;
+}
+export interface ConfigSetResult {
+	ok: boolean;
+	path: string;
+	value: unknown;
+}
+export interface ConfigUnsetParams {
+	path: string;
+}
+export interface ConfigUnsetResult {
+	ok: boolean;
+	path: string;
+	removed: boolean;
+}
+export interface ConfigListParams {
+	/** Pass `false` to include raw secret values. Default redacts. */
+	redact?: boolean;
+}
+export interface ConfigListResult {
+	config: unknown;
+}
+export type ConfigSchemaParams = Record<string, never> | undefined;
+export interface ConfigSchemaResult {
+	schema: unknown;
+}
+export type ConfigValidateParams = Record<string, never> | undefined;
+export interface ConfigValidateResult {
+	valid: boolean;
+	issues: Array<{ path: string; message: string }>;
+}
+
+/* ─── Exec-approval methods ─────────────────────────────────────── */
+//
+// Operator-level per-agent bash-approval allowlist CRUD — the `brigade exec`
+// CLI surface, reachable by a remote client.
+
+export interface ExecListParams {
+	agentId?: string;
+}
+export interface ExecListResult {
+	agentId: string;
+	filePath: string;
+	commands: string[];
+	patterns: string[];
+}
+export interface ExecAllowParams {
+	command: string;
+	agentId?: string;
+}
+export interface ExecAllowPatternParams {
+	pattern: string;
+	agentId?: string;
+}
+export interface ExecMutateResult {
+	ok: boolean;
+	agentId: string;
+	kind?: "exact" | "pattern";
+	value?: string;
+	reason?: string;
+}
+export interface ExecRemoveParams {
+	value: string;
+	agentId?: string;
+}
+export interface ExecRemoveResult {
+	ok: boolean;
+	agentId: string;
+	removedCommands: number;
+	removedPatterns: number;
+	reason?: string;
+}
+export interface ExecDenyTestParams {
+	command: string;
+	agentId?: string;
+}
+export interface ExecDenyTestResult {
+	agentId: string;
+	command: string;
+	decision: "allow" | "deny" | "prompt";
+}
+
+/* ─── Agent routing-binding methods ─────────────────────────────── */
+//
+// Operator-level routing-binding management — the `brigade agents
+// <bindings|bind|unbind>` surface. (Agent add/delete/set-identity are reached
+// over the gateway via the `manage_agent` tool, not these RPCs.)
+
+export interface AgentsBindingsParams {
+	agentId?: string;
+}
+export interface AgentsBindingsResult {
+	bindings: Array<{ agentId: string; description: string }>;
+}
+export interface AgentsBindParams {
+	agentId?: string;
+	/** Binding specs, e.g. `["whatsapp", "slack:T123"]`. */
+	specs: string[];
+}
+export interface AgentsBindResult {
+	ok: boolean;
+	agentId: string;
+	added: string[];
+	updated: string[];
+	skipped: string[];
+	conflicts: string[];
+	errors?: string[];
+}
+export interface AgentsUnbindParams {
+	agentId?: string;
+	specs?: string[];
+	/** Remove every binding owned by the agent. */
+	all?: boolean;
+}
+export interface AgentsUnbindResult {
+	ok: boolean;
+	agentId: string;
+	removed: string[];
+	missing: string[];
+	conflicts: string[];
+	errors?: string[];
+}
+
+/* ─── Channel pairing methods ───────────────────────────────────── */
+//
+// Operator-level channel access control — the `brigade pairing
+// <list|approve|revoke>` surface. Requires an explicit channel id.
+
+export interface PairingPendingEntry {
+	code: string;
+	senderId: string;
+	senderName?: string;
+	createdAt: string;
+}
+export interface PairingListParams {
+	channel: string;
+}
+export interface PairingListResult {
+	channel: string;
+	pending: PairingPendingEntry[];
+}
+export interface PairingApproveParams {
+	channel: string;
+	code: string;
+}
+export interface PairingApproveResult {
+	ok: boolean;
+	channel: string;
+	sender?: string;
+	owner?: boolean;
+	reason?: string;
+}
+export interface PairingRevokeParams {
+	channel: string;
+	code: string;
+}
+export interface PairingRevokeResult {
+	ok: boolean;
+	channel: string;
+	reason?: string;
+}
+
+/* ─── Session maintenance methods ───────────────────────────────── */
+
+export interface SessionsCleanupParams {
+	agentId?: string;
+	/** Duration like "30d" / "12h" / "2w". */
+	olderThan: string;
+	dryRun?: boolean;
+}
+export interface SessionsCleanupResult {
+	ok: boolean;
+	agentId: string;
+	candidates: number;
+	deleted: number;
+	dryRun: boolean;
+	wouldDelete?: string[];
+	reason?: string;
+}
+
+/* ─── Agent CRUD + skill authoring methods ──────────────────────── */
+//
+// agents add/delete/set-identity (workspace + config) and skill create/delete/
+// write-file (SKILL.md files) — neither is purely config-backed. Reuse the
+// manage_agent / manage_skill tool logic; results are the tool's `details`.
+
+export interface AgentsAddParams {
+	id: string;
+	provider?: string;
+	model?: string;
+	department?: string;
+	reportsTo?: string;
+	role?: string;
+	bio?: string;
+	displayName?: string;
+	[key: string]: unknown;
+}
+export interface AgentsDeleteParams {
+	id: string;
+}
+export interface AgentsSetIdentityParams {
+	id: string;
+	displayName?: string;
+	emoji?: string;
+	theme?: string;
+	avatar?: string;
+	[key: string]: unknown;
+}
+export interface AgentsManageResult {
+	action: string;
+	id: string;
+	ok: boolean;
+	exitCode?: number;
+	stdout?: string;
+	stderr?: string;
+	[key: string]: unknown;
+}
+export interface SkillsCreateParams {
+	name: string;
+	scope?: "agent" | "managed";
+	agentId?: string;
+	body?: string;
+	description?: string;
+	[key: string]: unknown;
+}
+export interface SkillsDeleteParams {
+	name: string;
+	scope?: "agent" | "managed";
+	agentId?: string;
+}
+export interface SkillsWriteFileParams {
+	name: string;
+	filePath: string;
+	content?: string;
+	scope?: "agent" | "managed";
+	agentId?: string;
+	[key: string]: unknown;
+}
+export interface SkillsManageResult {
+	action: string;
+	name: string;
+	ok: boolean;
+	message?: string;
+	[key: string]: unknown;
+}
+
+/* ─── Memory (Tideline) write/manage methods ────────────────────── */
+//
+// The ONLY typed remote path to MUTATE memory (it lives in facts.jsonl, not
+// config). Read is covered by the memory-query / memory-graph methods.
+
+export interface MemoryWriteParams {
+	content: string;
+	/** identity | preference | fact | correction | context | project … */
+	segment: string;
+	importance?: number;
+	supersedes?: string[];
+	subjectKey?: string;
+	agentId?: string;
+}
+export interface MemoryWriteResult {
+	memoryId?: string;
+	segment?: string;
+	importance?: number;
+	backend?: string;
+	[key: string]: unknown;
+}
+export interface MemoryManageParams {
+	action: "dream" | "purge" | "inspect" | "export" | "retention" | "vault" | "propose" | "retract" | "restore" | "relink";
+	memory_id?: string;
+	ttl_days?: number;
+	agentId?: string;
+}
+export interface MemoryManageResult {
+	action: string;
+	ok: boolean;
+	message: string;
+	[key: string]: unknown;
+}
+
+/* ─── Channel runtime + DM-allow, and provider-key removal ──────── */
+
+export interface ChannelsConnectParams {
+	channel: string;
+	/** Token for token channels (e.g. Telegram); omit for QR channels. */
+	token?: string;
+	accountId?: string;
+}
+export interface ChannelsDisconnectParams {
+	channel: string;
+	accountId?: string;
+}
+export interface ChannelsActionResult {
+	action?: string;
+	ok: boolean;
+	message?: string;
+	[key: string]: unknown;
+}
+export interface ChannelsAllowParams {
+	channel: string;
+	senderId: string;
+	accountId?: string;
+}
+export interface ChannelsAllowResult {
+	ok: boolean;
+	channel: string;
+	senderId: string;
+	changed: boolean;
+	reason?: string;
+}
+export interface ChannelsAllowListParams {
+	channel: string;
+	accountId?: string;
+}
+export interface ChannelsAllowListResult {
+	channel: string;
+	senders: string[];
+}
+export interface ProviderRemoveParams {
+	providerId: string;
+	agentId?: string;
+}
+export interface ProviderRemoveResult {
+	ok: boolean;
+	providerId: string;
+	agentId: string;
+	removed: number;
+	reason?: string;
+}
+
+/* ─── Integrations: Composio + OAuth ─────────────────────────────── */
+//
+// `composio` is remote-clean (Composio hosts the OAuth callback). `oauth` is
+// the DIY loopback flow — `start` opens a 127.0.0.1 listener ON THE GATEWAY
+// HOST, so the round-trip completes only for a local/tunneled operator;
+// status/token work remotely. Action-based, mirroring the tools.
+
+export interface ComposioParams {
+	action: "set-key" | "apps" | "connect" | "status" | "search" | "execute" | "disconnect" | "refresh";
+	key?: string;
+	app?: string;
+	query?: string;
+	tool?: string;
+	arguments?: Record<string, unknown>;
+	connectionId?: string;
+	all?: boolean;
+	agentId?: string;
+	[key: string]: unknown;
+}
+export interface ComposioResult {
+	action: string;
+	ok: boolean;
+	message: string;
+	[key: string]: unknown;
+}
+export interface OauthParams {
+	action: "start" | "await" | "cancel" | "status" | "token";
+	clientId?: string;
+	clientSecret?: string;
+	authorizeUrl?: string;
+	tokenUrl?: string;
+	scopes?: string[];
+	port?: number;
+	waitSeconds?: number;
+	connectionId?: string;
+	agentId?: string;
+	[key: string]: unknown;
+}
+export interface OauthResult {
+	action?: string;
+	ok?: boolean;
+	[key: string]: unknown;
+}
+
 /* ─── Authoritative catalogue ───────────────────────────────────── */
 
 export interface GatewayMethodSignatures {
+	"memory.write": { params: MemoryWriteParams; result: MemoryWriteResult };
+	"memory.manage": { params: MemoryManageParams; result: MemoryManageResult };
+	"agents.add": { params: AgentsAddParams; result: AgentsManageResult };
+	"agents.delete": { params: AgentsDeleteParams; result: AgentsManageResult };
+	"agents.set-identity": { params: AgentsSetIdentityParams; result: AgentsManageResult };
+	"skills.create": { params: SkillsCreateParams; result: SkillsManageResult };
+	"skills.delete": { params: SkillsDeleteParams; result: SkillsManageResult };
+	"skills.write-file": { params: SkillsWriteFileParams; result: SkillsManageResult };
+	"channels.connect": { params: ChannelsConnectParams; result: ChannelsActionResult };
+	"channels.disconnect": { params: ChannelsDisconnectParams; result: ChannelsActionResult };
+	"channels.allow-add": { params: ChannelsAllowParams; result: ChannelsAllowResult };
+	"channels.allow-remove": { params: ChannelsAllowParams; result: ChannelsAllowResult };
+	"channels.allow-list": { params: ChannelsAllowListParams; result: ChannelsAllowListResult };
+	"provider.remove": { params: ProviderRemoveParams; result: ProviderRemoveResult };
+	composio: { params: ComposioParams; result: ComposioResult };
+	oauth: { params: OauthParams; result: OauthResult };
+	"config.get": { params: ConfigGetParams; result: ConfigGetResult };
+	"config.set": { params: ConfigSetParams; result: ConfigSetResult };
+	"config.unset": { params: ConfigUnsetParams; result: ConfigUnsetResult };
+	"config.list": { params: ConfigListParams; result: ConfigListResult };
+	"config.schema": { params: ConfigSchemaParams; result: ConfigSchemaResult };
+	"config.validate": { params: ConfigValidateParams; result: ConfigValidateResult };
+	"exec.list": { params: ExecListParams; result: ExecListResult };
+	"exec.allow": { params: ExecAllowParams; result: ExecMutateResult };
+	"exec.allow-pattern": { params: ExecAllowPatternParams; result: ExecMutateResult };
+	"exec.remove": { params: ExecRemoveParams; result: ExecRemoveResult };
+	"exec.deny-test": { params: ExecDenyTestParams; result: ExecDenyTestResult };
+	"agents.bindings": { params: AgentsBindingsParams; result: AgentsBindingsResult };
+	"agents.bind": { params: AgentsBindParams; result: AgentsBindResult };
+	"agents.unbind": { params: AgentsUnbindParams; result: AgentsUnbindResult };
+	"pairing.list": { params: PairingListParams; result: PairingListResult };
+	"pairing.approve": { params: PairingApproveParams; result: PairingApproveResult };
+	"pairing.revoke": { params: PairingRevokeParams; result: PairingRevokeResult };
+	"sessions.cleanup": { params: SessionsCleanupParams; result: SessionsCleanupResult };
 	"sessions.send": { params: SessionsSendParams; result: SessionsSendResult };
 	"sessions.spawn": { params: SessionsSpawnParams; result: SessionsSpawnResult };
 	"sessions.list": { params: SessionsListParams; result: SessionsListResult };

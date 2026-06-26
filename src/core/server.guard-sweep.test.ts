@@ -65,11 +65,54 @@ const ALLOWLIST_NO_GUARD_NEEDED = new Set<string>([
 	// config/path-write guards are the real boundary.
 	"exec-allow-all",
 	"exec-grant-skill",
+	// `exec.*` — operator-level exec-approval allowlist CRUD (the `brigade exec`
+	// CLI over the wire). Per-agent + operator-scoped: the operator manages
+	// their OWN agents' bash-approval allowlist, NOT another agent's session.
+	// Same posture as exec-allow-all/exec-grant-skill above. (Handlers live in
+	// `core/exec-ops.ts`; registered by reference, so the same-file walker
+	// already treats them as session-free — these entries make the intent
+	// explicit + survive any future inlining.)
+	"exec.list",
+	"exec.allow",
+	"exec.allow-pattern",
+	"exec.remove",
+	"exec.deny-test",
 	// Read-only registry / snapshot methods.
 	"list-models",
 	"refresh-models",
 	"get-state",
 	"agents.list",
+	// `agents.bindings/bind/unbind` — operator-level routing-binding management
+	// (which agent owns which channel/account slot). Operator-scoped config
+	// mutation, NOT a per-session target. Handlers in core/agents-ops.ts.
+	"agents.bindings",
+	"agents.bind",
+	"agents.unbind",
+	// `sessions.cleanup` — operator maintenance that DELETES an agent's own
+	// stale transcript files. It discloses no session CONTENT (unlike
+	// sessions.list/history/send, which stay guarded above) — it only removes
+	// idle files the gateway regenerates. Handler in core/sessions-ops.ts.
+	"sessions.cleanup",
+	// Agent CRUD + skill authoring (reuse the owner-gated manage_agent /
+	// manage_skill tools). Operator-scoped; not another agent's session content.
+	"agents.add",
+	"agents.delete",
+	"agents.set-identity",
+	"skills.create",
+	"skills.delete",
+	"skills.write-file",
+	// channels.* live connect/disconnect + DM allow-from, and provider.remove.
+	// Operator-scoped channel/credential management; not another agent's session.
+	"channels.connect",
+	"channels.disconnect",
+	"channels.allow-add",
+	"channels.allow-remove",
+	"channels.allow-list",
+	"provider.remove",
+	// composio + oauth integration control (reuse the owner-scoped composio /
+	// oauth_authorize tools). Operator-scoped; not another agent's session.
+	"composio",
+	"oauth",
 	// `org.snapshot` — read-only org topology + every Pride chart format.
 	// Takes no per-session params; the handler derives from cfg + renders.
 	"org.snapshot",
@@ -86,6 +129,12 @@ const ALLOWLIST_NO_GUARD_NEEDED = new Set<string>([
 	// Memory sweep — gateway-internal, no agent targeting.
 	"memory.sweep",
 	"memory.consolidate",
+	// `memory.write` / `memory.manage` — Tideline write + governance over the
+	// operator's OWN owner-origin memory (facts.jsonl). Not another agent's
+	// session content. Handlers in core/memory-ops.ts (reuse the owner-scoped
+	// write_memory / manage_memory tools).
+	"memory.write",
+	"memory.manage",
 ]);
 
 /** Sessions registry methods that ARE guarded (registered with accessCheck). */

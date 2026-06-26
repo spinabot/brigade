@@ -1,18 +1,17 @@
 /**
- * `brigade config <list|get|set|unset|file>` — config CRUD over brigade.json.
+ * `brigade config <list|get|set|unset|file|schema|validate>` — config CRUD
+ * over brigade.json.
  *
- *   - 4 subcommands (no `schema` / `validate` — Brigade's TypeBox schema is
- *     private and validation happens automatically on every write through
- *     `writeBrigadeConfig`).
- *   - Dot-notation only (no `path[0]` array indexing) — Brigade's super-
- *     config has no positional arrays the user would target by index.
- *   - JSON5 parsing for `set` values when --strict-json is off (numbers,
- *     booleans, arrays, objects) with raw-string fallback.
- *   - Atomic write + 4-deep .bak rotation already inherited from
- *     `writeBrigadeConfig` — no extra wiring needed.
+ * The path parsing, nested get/set/delete, value parsing, and secret redaction
+ * all live in `core/config-ops.ts` — SHARED with the `config.*` gateway RPCs so
+ * the CLI and a remote client mutate config (and redact secrets) identically.
+ * This file is the thin CLI shell: arg handling + stdout/exit-code formatting.
+ *
+ *   - Dot-notation paths (+ escaped dots + bracket indices/keys).
+ *   - JSON5 parsing for `set` values when --strict-json is off, raw-string fallback.
+ *   - Atomic write + .bak rotation inherited from `saveConfig`.
  *   - Secrets redaction in `list`/`get`: any segment matching
- *     /^(key|apiKey|token|password|secret)$/i (case-insensitive) renders
- *     as `__BRIGADE_REDACTED__`.
+ *     /^(key|apiKey|token|password|secret|...)$/i renders as `__BRIGADE_REDACTED__`.
  *
  * On-disk path: `~/.brigade/brigade.json` (resolved via BRIGADE_DIR).
  */
@@ -21,7 +20,6 @@ import * as path from "node:path";
 
 import chalk from "chalk";
 import type { Command } from "commander";
-import JSON5 from "json5";
 
 import {
 	BrigadeConfigSchema,
@@ -29,11 +27,14 @@ import {
 	collectBrigadeConfigErrors,
 } from "../../core/brigade-config.js";
 import { BRIGADE_DIR, loadConfig, saveConfig } from "../../core/config.js";
-
-const REDACTED_SENTINEL = "__BRIGADE_REDACTED__";
-// Case-insensitive match — segments that smell secret get their VALUE redacted
-// in `list` and `get` output. The actual on-disk file is unchanged.
-const SENSITIVE_SEGMENT = /^(key|apikey|token|secret|password|refreshtoken|accesstoken)$/i;
+import {
+	deleteNested,
+	getNested,
+	parseConfigValue,
+	parsePath,
+	redactDeep,
+	setNested,
+} from "../../core/config-ops.js";
 
 export interface ConfigGetOptions {
 	json?: boolean;
@@ -46,179 +47,6 @@ export interface ConfigSetOptions {
 export interface ConfigListOptions {
 	json?: boolean;
 	noRedact?: boolean;
-}
-
-/* ───────────────────────── path helpers ───────────────────────── */
-
-/**
- * Parse a config path into segments. Supports:
- *
- *   - dot-notation:        `agents.defaults.provider`
- *   - escaped dot:         `keys.foo\.bar`         → ["keys", "foo.bar"]
- *   - bracket array index: `agents.fallbacks[0]`   → ["agents", "fallbacks", "0"]
- *   - bracket literal key: `secrets.providers["my.vault"]` → ["secrets", "providers", "my.vault"]
- *
- * Bracket support is the genuine ergonomic win (operators editing array
- * slots in `agents.defaults.model.fallbacks[]` shouldn't have to fall
- * through to `--strict-json` whole-array overwrites).
- */
-function parsePath(raw: string): string[] {
-	const trimmed = raw.trim();
-	if (trimmed.length === 0) {
-		throw new Error("config path is empty");
-	}
-	const segments: string[] = [];
-	let buf = "";
-	for (let i = 0; i < trimmed.length; i++) {
-		const ch = trimmed[i];
-		// Escape a literal dot inside a key.
-		if (ch === "\\" && trimmed[i + 1] === ".") {
-			buf += ".";
-			i++;
-			continue;
-		}
-		// Dot separator.
-		if (ch === ".") {
-			if (buf.length === 0) {
-				throw new Error(`empty segment in config path "${raw}"`);
-			}
-			segments.push(buf);
-			buf = "";
-			continue;
-		}
-		// Bracket: either array index `[0]` or literal key `["foo.bar"]`.
-		if (ch === "[") {
-			if (buf.length > 0) {
-				segments.push(buf);
-				buf = "";
-			}
-			const close = trimmed.indexOf("]", i);
-			if (close === -1) {
-				throw new Error(`unclosed "[" in config path "${raw}"`);
-			}
-			let inside = trimmed.slice(i + 1, close).trim();
-			// Strip optional surrounding quotes — accept both `[0]` and `["key"]`.
-			if (
-				(inside.startsWith('"') && inside.endsWith('"')) ||
-				(inside.startsWith("'") && inside.endsWith("'"))
-			) {
-				inside = inside.slice(1, -1);
-			}
-			if (inside.length === 0) {
-				throw new Error(`empty bracket segment in config path "${raw}"`);
-			}
-			segments.push(inside);
-			i = close;
-			continue;
-		}
-		buf += ch;
-	}
-	if (buf.length > 0) segments.push(buf);
-	if (segments.length === 0) {
-		throw new Error(`unable to parse config path "${raw}"`);
-	}
-	return segments;
-}
-
-/** True iff the segment looks like a non-negative integer (array index). */
-function isIndexSegment(seg: string): boolean {
-	return /^[0-9]+$/.test(seg);
-}
-
-function getNested(root: unknown, segments: string[]): unknown {
-	let cur: unknown = root;
-	for (const seg of segments) {
-		if (cur === null || cur === undefined) return undefined;
-		if (Array.isArray(cur) && isIndexSegment(seg)) {
-			cur = cur[Number(seg)];
-			continue;
-		}
-		if (typeof cur !== "object") return undefined;
-		cur = (cur as Record<string, unknown>)[seg];
-	}
-	return cur;
-}
-
-function setNested(root: Record<string, unknown>, segments: string[], value: unknown): void {
-	let cur: any = root;
-	for (let i = 0; i < segments.length - 1; i++) {
-		const seg = segments[i] ?? "";
-		const nextSeg = segments[i + 1] ?? "";
-		const wantArray = isIndexSegment(nextSeg);
-		const existing = Array.isArray(cur) && isIndexSegment(seg) ? cur[Number(seg)] : cur[seg];
-		if (existing === undefined || existing === null || typeof existing !== "object") {
-			// Create container in the right shape for the NEXT segment.
-			const fresh = wantArray ? [] : {};
-			if (Array.isArray(cur) && isIndexSegment(seg)) {
-				cur[Number(seg)] = fresh;
-			} else {
-				cur[seg] = fresh;
-			}
-			cur = fresh;
-		} else {
-			cur = Array.isArray(cur) && isIndexSegment(seg) ? cur[Number(seg)] : cur[seg];
-		}
-	}
-	const tail = segments[segments.length - 1] ?? "";
-	if (Array.isArray(cur) && isIndexSegment(tail)) {
-		cur[Number(tail)] = value;
-	} else {
-		cur[tail] = value;
-	}
-}
-
-function deleteNested(root: Record<string, unknown>, segments: string[]): boolean {
-	let cur: any = root;
-	for (let i = 0; i < segments.length - 1; i++) {
-		const seg = segments[i] ?? "";
-		const next = Array.isArray(cur) && isIndexSegment(seg) ? cur[Number(seg)] : cur?.[seg];
-		if (next === undefined || next === null || typeof next !== "object") return false;
-		cur = next;
-	}
-	const tail = segments[segments.length - 1] ?? "";
-	if (Array.isArray(cur) && isIndexSegment(tail)) {
-		const idx = Number(tail);
-		if (idx < cur.length) {
-			cur.splice(idx, 1); // shift down — matches array-mutation semantics
-			return true;
-		}
-		return false;
-	}
-	if (cur && typeof cur === "object" && tail in cur) {
-		delete cur[tail];
-		return true;
-	}
-	return false;
-}
-
-/* ───────────────────────── value parsing ─────────────────────── */
-
-function parseValue(raw: string, opts: { strictJson?: boolean } = {}): unknown {
-	if (opts.strictJson) {
-		return JSON.parse(raw);
-	}
-	try {
-		return JSON5.parse(raw);
-	} catch {
-		// Fall through to raw string when JSON5 can't parse it.
-		return raw;
-	}
-}
-
-/* ───────────────────────── redaction ─────────────────────────── */
-
-function redactDeep(value: unknown, segmentsParent: string[] = []): unknown {
-	if (value === null || typeof value !== "object") return value;
-	if (Array.isArray(value)) return value.map((v) => redactDeep(v, segmentsParent));
-	const out: Record<string, unknown> = {};
-	for (const [k, v] of Object.entries(value)) {
-		if (SENSITIVE_SEGMENT.test(k) && typeof v === "string" && v.length > 0) {
-			out[k] = REDACTED_SENTINEL;
-		} else {
-			out[k] = redactDeep(v, [...segmentsParent, k]);
-		}
-	}
-	return out;
 }
 
 /* ───────────────────────── runtime ───────────────────────────── */
@@ -250,7 +78,7 @@ export async function runConfigSet(rawPath: string, rawValue: string, opts: Conf
 	const segments = parsePath(rawPath);
 	let parsed: unknown;
 	try {
-		parsed = parseValue(rawValue, { strictJson: opts.strictJson });
+		parsed = parseConfigValue(rawValue, { strictJson: opts.strictJson });
 	} catch (err) {
 		process.stderr.write(`brigade config: failed to parse value: ${(err as Error).message}\n`);
 		process.stderr.write(
@@ -326,10 +154,6 @@ export async function runConfigFile(opts: { json?: boolean } = {}): Promise<numb
 /**
  * Print the brigade.json TypeBox schema as JSON — useful for IDE /
  * external-tool autocompletion against the live shape.
- *
- * The output is the in-memory TypeBox schema descriptor (with `type`,
- * `properties`, `required`, etc.) — JSON-Schema-compatible enough to feed
- * into a JSON-Schema-aware editor.
  */
 export async function runConfigSchema(_opts: {} = {}): Promise<number> {
 	process.stdout.write(`${JSON.stringify(BrigadeConfigSchema, null, 2)}\n`);
@@ -340,9 +164,7 @@ export async function runConfigSchema(_opts: {} = {}): Promise<number> {
  * Validate the on-disk brigade.json against the TypeBox schema. Reports a
  * pass/fail line plus per-issue path + message when invalid.
  *
- * Exit codes:
- *   0 — config is valid (or doesn't exist yet — empty file is benign)
- *   1 — config is invalid; issues listed
+ * Exit codes: 0 — valid (or absent); 1 — invalid (issues listed).
  */
 export async function runConfigValidate(opts: { json?: boolean } = {}): Promise<number> {
 	const filePath = path.join(BRIGADE_DIR, BRIGADE_CONFIG_FILENAME);
