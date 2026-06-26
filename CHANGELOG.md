@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.13.0](https://github.com/spinabot/brigade/compare/brigade-v1.12.0...brigade-v1.13.0) (2026-06-26)
+
+
+### Features
+
+* **gateway:** optional multi-token gateway authentication ([4aee34b](https://github.com/spinabot/brigade/commit/4aee34bf6401e8702e2049f50a3228969167bd1c))
+
+
+### Bug Fixes
+
+* **gateway:** register `gateway token` subcommands in the live CLI ([01e2bc1](https://github.com/spinabot/brigade/commit/01e2bc101e41e83cc2aed06edd706c511aedb302))
+
 ## [1.12.0](https://github.com/spinabot/brigade/compare/brigade-v1.11.2...brigade-v1.12.0) (2026-06-26)
 
 
