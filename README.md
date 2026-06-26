@@ -119,6 +119,7 @@ backend — all under one `~/.brigade/` directory you fully own.
 | 📅 **Always-on** | Run as a headless WebSocket gateway with a crash supervisor, cron jobs, and OS service install. |
 | 💬 **Channels** | Talk to your crew from WhatsApp and Telegram today; the adapter contract is built for more. |
 | 🔗 **1,000+ connectors** | Gmail, Slack, GitHub, Notion, Calendar, Linear… via the built-in Composio tool. |
+| 📄 **Reads & writes documents** | Send a PDF, Office doc, image, audio, or video and your crew *understands* it — then have it **create or edit** Word, Excel, PowerPoint, and PDF files and hand them back. |
 | 🧩 **MCP** | Expose your long-term memory to any MCP client (`brigade mcp`), or connect MCP servers in. |
 | 🗄️ **Your storage** | Default filesystem mode, or an optional **fully self-hosted Convex** backend with at-rest encryption. |
 | 🔐 **Yours** | Everything lives under `~/.brigade/`. Keys are stored locally at mode `0600`. `rm -rf ~/.brigade` wipes it clean. |
@@ -283,6 +284,17 @@ to **PLATFORM**, open **Settings → API Keys**, and copy the `ak_…` key. Hand
 Brigade once (*"set my Composio key to `ak_…`"*) and it's verified and stored encrypted.
 Full guide: **[docs/composio.md](docs/composio.md)**.
 
+### 📄 Documents & media
+Send your crew a file and it actually **reads** it: the `analyze_media` tool
+understands PDFs (text or scanned), Word / Excel / PowerPoint (including the images
+embedded inside them), plain images, audio, and video — auto-selecting the right
+provider and caching the result. The write side, `make_document` and
+`edit_document`, **creates and edits** Word / Excel / PowerPoint / PDF in place:
+fill templates and form fields, set cells and formulas, add charts, and
+merge / split / stamp / watermark PDFs — all with pure-JS libraries, no sandbox.
+Drop a document into a channel and Brigade sees it; ask for a report and it hands
+one back with `send_media`.
+
 ### 🧩 MCP
 Run `brigade mcp` to expose your long-term memory to any MCP client (Claude Desktop,
 editors, etc.) as add/search/context tools over stdio, owner-bound.
@@ -342,6 +354,7 @@ principle is the same: *independent verification, never the agent judging itself
 | `brigade status` | Snapshot config, sessions, and gateway state (`--json`) |
 | `brigade doctor` | Health-check Node, config, providers, prompts, logs, gateway (`--json`, `--strict`, `--gateway <url>`) |
 | `brigade logs` | Tail today's gateway log (`--follow`) |
+| `brigade update` · `upgrade` | Update Brigade to the latest code and restart the gateway (`--check`, `--no-restart`) |
 
 ### Gateway
 
@@ -351,6 +364,7 @@ principle is the same: *independent verification, never the agent judging itself
 | `brigade gateway status` · `stop` · `restart` | Inspect / stop / restart the running gateway |
 | `brigade gateway install` · `uninstall` | Install/remove as a system service (launchd / systemd / Task Scheduler) |
 | `brigade gateway supervise` | Out-of-process crash watchdog (respawns a wedged gateway) |
+| `brigade expose` · `expose stop` | Publish the gateway to the public internet via a secure, token-gated tunnel (alias: `bloody benchmark`) |
 
 ### Agents
 
@@ -485,6 +499,27 @@ brigade doctor --json            # machine-readable
 brigade doctor --strict          # exit 1 on warnings (CI mode)
 ```
 
+### `brigade update`
+
+Bring Brigade up to date and reload the gateway. It auto-detects how Brigade is
+installed and does the right thing:
+
+- **npm global** — `npm i -g @spinabot/brigade@latest`, then restart.
+- **source checkout** — `git pull` (fast-forward, only when your tree is clean and
+  behind upstream — a dirty tree is left untouched and rebuilt as-is), then
+  `npm install`, `npm run build`, then restart.
+
+```bash
+brigade update            # update + restart the gateway
+brigade upgrade           # alias of update
+brigade update --check    # report whether newer code is available; change nothing
+brigade update --no-restart
+```
+
+If Brigade is installed as a background service (`brigade gateway install`) the
+restart is automatic; if you run the gateway in the foreground, restart it yourself
+to load the new code. Same behavior on macOS, Linux, and Windows.
+
 ### `brigade config`
 
 Read and write the local config without opening the TUI.
@@ -605,6 +640,7 @@ Every agent gets a curated toolset. Mutating/privileged tools are owner-gated
 - **Web:** `web_search`, `fetch_url`, `browser` (when a provider is configured)
 - **Connectors:** `composio` (1,000+ apps), `oauth_authorize`
 - **Generation:** `generate_image`
+- **Documents & media:** `analyze_media` (read/understand PDF · Office · image · audio · video), `make_document` · `edit_document` (create & edit Word/Excel/PowerPoint/PDF)
 - **Channels:** `send_message`, `send_media` (when a channel is linked)
 
 ---
