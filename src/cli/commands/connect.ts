@@ -1313,6 +1313,24 @@ export async function wireConnectUi(
 				insertBeforeEditor(indicator);
 				break;
 			}
+			case "tool_execution_update": {
+				// LIVE tool output. Pi streams a tool's accumulating result via
+				// `onUpdate` (e.g. `bash` fires stdout/stderr as it runs); the
+				// gateway forwards each as a `tool_execution_update`. Repaint the
+				// ⚡ chip with the running preview so the operator watches the tool
+				// work in real time instead of a static spinner. The repaint is
+				// coalesced through the streaming debouncer so a chatty command
+				// can't thrash the terminal.
+				const liveIndicator = pendingTools.get(event.toolCallId);
+				if (liveIndicator) {
+					const summary = summarizeToolResult(event.partialResult, { preserveNewlines: false });
+					const previewText = scrubRenderable(summary.preview);
+					const tail = summary.hasContent ? ` ${brand.dim(`· ${previewText}`)}` : "";
+					liveIndicator.setText(`${subIndent}  ${brand.tool("⚡")} ${brand.tool(event.toolName)}${tail}`);
+					scheduleStreamingRender();
+				}
+				break;
+			}
 			case "tool_execution_end": {
 				const indicator = pendingTools.get(event.toolCallId);
 				if (indicator) {
