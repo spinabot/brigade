@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.16.0](https://github.com/spinabot/brigade/compare/brigade-v1.15.0...brigade-v1.16.0) (2026-06-27)
+
+
+### Features
+
+* **connect:** stream live tool output via tool_execution_update ([96a7a98](https://github.com/spinabot/brigade/commit/96a7a986466fca48de6316f60eab62a31d668ca1))
+
 ## [1.15.0](https://github.com/spinabot/brigade/compare/brigade-v1.14.0...brigade-v1.15.0) (2026-06-27)
 
 
