@@ -20,6 +20,7 @@
  */
 
 import process from "node:process";
+import { randomUUID } from "node:crypto";
 
 import {
 	CancellableLoader,
@@ -277,6 +278,16 @@ export async function wireConnectUi(
 	tui.addChild(header);
 	const divider = new Text(brand.dim("─".repeat(80)), 0, 0);
 	tui.addChild(divider);
+	// Persistent status FOOTER. Pi-TUI renders a viewport anchored to the
+	// focused editor at the bottom, so the top header (brand wordmark + this
+	// model/token line) scrolls ABOVE the viewport as soon as a streamed reply
+	// fills the screen — the operator loses sight of the model + token/cost
+	// readout exactly when a turn is running. The footer lives in the
+	// always-visible bottom region (added after the editor, alongside the hint
+	// lines), and `updateHeader` paints the same live status into it. Declared
+	// here so the first `updateHeader()` (before the editor is built) can target
+	// it; added to the tree below, right under the editor.
+	const footer = new Text("", 0, 0);
 
 	// Cumulative usage — accumulated from state snapshots so a reconnect picks
 	// up where we left off instead of zeroing the totals on the user's screen.
@@ -359,12 +370,28 @@ export async function wireConnectUi(
 	// server-side subscribe (so we only drop frames that explicitly stamp a
 	// DIFFERENT lane — frames with no stamp at all fall through, preserving
 	// back-compat with older gateway builds that don't tag broadcasts yet).
-	const isOffLane = (frameAgentId?: string, frameSessionId?: string): boolean => {
+	const isOffLane = (frameAgentId?: string, frameSessionId?: string, subagentDepth?: number): boolean => {
 		if (boundAgentId !== undefined && typeof frameAgentId === "string" && frameAgentId.length > 0) {
 			if (frameAgentId !== boundAgentId) return true;
 		}
+		// A SUB-AGENT of the bound agent is in-lane regardless of its session id.
+		// Sub-agent STREAMING pi frames carry a child Pi-session UUID (NOT the
+		// `…:subagent:…` descendant key), so the session-prefix check below can't
+		// catch them — the depth tag is the reliable signal. Without this, the
+		// operator watching the parent turn never sees the sub-agent working
+		// (only its approval prompts, which DO carry the descendant key, slipped
+		// through). The agent already matched above, so this can't leak another
+		// agent's sub-agents.
+		if (typeof subagentDepth === "number" && subagentDepth > 0) return false;
 		if (boundSessionKey !== undefined && typeof frameSessionId === "string" && frameSessionId.length > 0) {
-			if (frameSessionId !== boundSessionKey) return true;
+			// In-lane = the bound session OR a sub-agent DESCENDANT of it. A
+			// spawned sub-agent runs under a child key (`<bound>:subagent:<id>`),
+			// so its live frames + approval prompts belong to the operator
+			// watching this lane — without this they'd be dropped, the sub-agent's
+			// work would be invisible, and its `bash` approval prompt would never
+			// render (the turn hangs until the approval times out). Trailing ":"
+			// prevents a sibling (`…:main2`) from matching (`…:main`).
+			if (frameSessionId !== boundSessionKey && !frameSessionId.startsWith(`${boundSessionKey}:`)) return true;
 		}
 		return false;
 	};
@@ -536,6 +563,12 @@ export async function wireConnectUi(
 		header.setText(
 			`  ${dot} 🦁 ${brand.white(personaLabel)}${crewSegment}${sessionSegment}  ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
 		);
+		// Mirror the live model + token/cost/context readout into the bottom
+		// status footer so it survives the viewport scroll while a turn streams
+		// (the top header scrolls out of view; this stays pinned by the editor).
+		footer.setText(
+			`  ${dot} ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
+		);
 	};
 
 	/**
@@ -569,6 +602,10 @@ export async function wireConnectUi(
 	const editor = new BrigadeEditor(tui, editorTheme);
 	tui.addChild(editor);
 	tui.setFocus(editor);
+	// Pin the live status line directly under the editor — the bottom region
+	// Pi-TUI keeps in view (the hint lines below also live here). This is what
+	// keeps `provider · model · tokens · cost` visible while a reply streams.
+	tui.addChild(footer);
 
 	// Slash-command autocomplete (Pi-TUI built-in). Connect-mode list omits
 	// `/provider` (it can't run the wizard against the remote gateway's
@@ -656,6 +693,10 @@ export async function wireConnectUi(
 			argumentHint: "[<agent-id>]",
 		},
 		{
+			name: "new",
+			description: "start a fresh thread (new session, clean screen, no prior context)",
+		},
+		{
 			name: "session",
 			description: "show/bind the connection's active session key",
 			argumentHint: "[<session-key>]",
@@ -688,7 +729,7 @@ export async function wireConnectUi(
 	// providers still need `brigade onboard` on the gateway machine.
 	tui.addChild(
 		new Text(
-			brand.dim("  connect-mode: /agent /agents /sessions · /model /provider /thinking /reasoning · /abort /steer /compact · /usage /help"),
+			brand.dim("  connect-mode: /new /agent /agents /session /sessions · /model /provider /thinking /reasoning · /abort /steer /compact · /usage /help"),
 			0,
 			0,
 		),
@@ -1014,6 +1055,15 @@ export async function wireConnectUi(
 	// overlapping clears/rebuilds against the shared render maps.
 	let resumeInFlight = false;
 	let resumePending = false;
+	// Resume = ONE idempotent operation: "attach to the bound thread and render
+	// its current truth." It fires identically on initial connect AND on
+	// reconnect/resync — both land the operator in the SAME thread with its
+	// history, so the screen never disagrees with what the agent actually
+	// remembers (best-in-class default: ChatGPT/Claude.ai/Cursor/Hermes all land
+	// you in your thread WITH history). A genuinely clean slate is `/new` (a real
+	// empty thread), never a blanked view of a thread that's secretly full.
+	// The replay is BOUNDED server-side — the `resume` RPC caps how many
+	// transcript messages it ships — so a 10k-message thread stays snappy.
 	const doResume = async (): Promise<void> => {
 		if (resumeInFlight) {
 			resumePending = true;
@@ -1033,8 +1083,8 @@ export async function wireConnectUi(
 			for (const m of messages) renderTranscriptMessage(m);
 			// Recover the non-transcript events too ("nothing lost"): recent
 			// system-event notices, then any tool-approval prompts STILL pending
-			// on this session — re-rendered answerable, so a prompt that arrived
-			// or was missed during the disconnect doesn't strand the turn.
+			// on this session — re-rendered answerable so a prompt that arrived or
+			// was missed doesn't strand the turn.
 			for (const ev of snap.recentSystemEvents ?? []) renderSystemEventLine(ev);
 			for (const appr of snap.pendingApprovals ?? []) renderApprovalPrompt(appr);
 			if (snap.snapshot) {
@@ -1125,9 +1175,10 @@ export async function wireConnectUi(
 		// their own applySubscription() from their handlers below.
 		if (!seededSubscription && (boundAgentId !== undefined || boundSessionKey !== undefined)) {
 			seededSubscription = true;
-			// Subscribe to the bound lane, THEN resume to load this session's
-			// transcript (history) from the gateway's source of truth. Runs once
-			// per connection (the gate); reconnects drive their own resume below.
+			// Subscribe to the bound lane, THEN resume to load this thread's
+			// (bounded) history from the gateway's source of truth, so the operator
+			// lands back where they left off — the same operation reconnect/resync
+			// use. Runs once per connection. `/new` is the path to a fresh thread.
 			void applySubscription().finally(() => {
 				void doResume();
 			});
@@ -1148,7 +1199,13 @@ export async function wireConnectUi(
 		// don't belong to the lane this TUI is bound to. Server-side subscribe
 		// should already filter this, but a race between /agent rebind + the
 		// next gated-tool frame can still leak a stale one here.
-		if (isOffLane((req as { agentId?: string }).agentId, (req as { sessionId?: string }).sessionId)) {
+		if (
+			isOffLane(
+				(req as { agentId?: string }).agentId,
+				(req as { sessionId?: string }).sessionId,
+				(req as { subagentDepth?: number }).subagentDepth,
+			)
+		) {
 			return;
 		}
 		renderApprovalPrompt(req);
@@ -1161,7 +1218,7 @@ export async function wireConnectUi(
 		// Wave N3 (bug #3) — defensive lane drop. Stamped log entries from
 		// off-lane agents get silently dropped here, matching the same
 		// filter the server's subscribe applies.
-		if (isOffLane(entry.agentId, entry.sessionId)) return;
+		if (isOffLane(entry.agentId, entry.sessionId, (entry as { subagentDepth?: number }).subagentDepth)) return;
 		// Scrub the server-pushed log message before rendering (see
 		// `scrubRenderable`) — these can carry forwarded model/tool text.
 		const message = scrubRenderable(entry.message);
@@ -1185,7 +1242,7 @@ export async function wireConnectUi(
 	client.on("system-event", (event) => {
 		// Wave N3 (bug #3) — defensive lane drop. Cron-fired events stamped
 		// for another agent shouldn't surface on this operator's connect TUI.
-		if (isOffLane(event.agentId, event.sessionId)) return;
+		if (isOffLane(event.agentId, event.sessionId, (event as { subagentDepth?: number }).subagentDepth)) return;
 		renderSystemEventLine(event);
 	});
 
@@ -1200,7 +1257,7 @@ export async function wireConnectUi(
 		// filters via subscribe; this catches the gap between an /agent or
 		// /session rebind and the gateway's next-frame view of the new
 		// binding (or a legacy gateway that doesn't filter at all).
-		if (isOffLane(payload.agentId, payload.sessionId)) return;
+		if (isOffLane(payload.agentId, payload.sessionId, subagentDepth)) return;
 		const depth = typeof subagentDepth === "number" ? subagentDepth : 0;
 		const subIndent = depth > 0 ? "  ".repeat(depth) : "";
 		switch (event?.type) {
@@ -1630,6 +1687,7 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/abort")} — stop the in-flight turn\n` +
 						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
 						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's thinking blocks before replies (default: off)\n` +
+						`- ${chalk.bold("/new")} — start a fresh thread (new session, clean screen, no prior context)\n` +
 						`- ${chalk.bold("/agent [<id>]")} — show/bind the connection's active agent\n` +
 						`- ${chalk.bold("/session [<key>]")} — show/bind the connection's active session\n` +
 						`- ${chalk.bold("/agents")} — list every agent the gateway knows about\n` +
@@ -1659,6 +1717,33 @@ export async function wireConnectUi(
 		// agent's `main` lane. With `/session agent:main:whatsapp:<jid>` an
 		// operator can intervene in a runaway channel turn from the TUI.
 		// No-arg form prints the current binding.
+		// /new — start a genuinely fresh thread. Binds the connection to a NEW
+		// session key under the current agent (the gateway opens a fresh
+		// transcript on the first prompt, so the agent starts with NO prior
+		// context), clears the screen, and re-subscribes. This is the ONE true
+		// clean-slate affordance: a normal launch lands you back in your existing
+		// thread WITH its (bounded) history — the best-in-class default — and
+		// `/new` is how you deliberately start over. Mirrors OpenClaw's `/new` and
+		// Claude.ai/ChatGPT "new chat"; `/sessions` lists threads, `/session <key>`
+		// jumps back to one.
+		if (trimmed === "/new") {
+			editor.setText("");
+			const agentForNew = boundAgentId ?? lastSnapshot?.agentId ?? "main";
+			const freshKey = `agent:${agentForNew}:t-${randomUUID().slice(0, 8)}`;
+			boundSessionKey = freshKey;
+			clearTranscriptRegion();
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.amber("✓")} ${brand.dim("new thread")} ${brand.amber(freshKey)}`,
+					0,
+					0,
+				),
+			);
+			updateHeader();
+			void applySubscription();
+			return;
+		}
+
 		if (trimmed === "/session" || trimmed.startsWith("/session ")) {
 			editor.setText("");
 			const arg = trimmed === "/session" ? "" : trimmed.slice("/session ".length).trim();
