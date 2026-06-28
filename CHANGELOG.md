@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.17.1](https://github.com/spinabot/brigade/compare/brigade-v1.17.0...brigade-v1.17.1) (2026-06-28)
+
+
+### Bug Fixes
+
+* **cli:** resolve Brigade's bundled libraries from agent scripts via exec-node ([a71653e](https://github.com/spinabot/brigade/commit/a71653e6f75ff119353a460fe894b55f7b82f91d))
+
 ## [1.17.0](https://github.com/spinabot/brigade/compare/brigade-v1.16.0...brigade-v1.17.0) (2026-06-28)
 
 
