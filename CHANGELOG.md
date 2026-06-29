@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.19.1](https://github.com/spinabot/brigade/compare/brigade-v1.19.0...brigade-v1.19.1) (2026-06-29)
+
+
+### Bug Fixes
+
+* **security:** resolve open CodeQL code-scanning alerts ([0bd8f9a](https://github.com/spinabot/brigade/commit/0bd8f9ac76c39f4cc9350ac2d98322049f91328c))
+
 ## [1.19.0](https://github.com/spinabot/brigade/compare/brigade-v1.18.0...brigade-v1.19.0) (2026-06-29)
 
 
