@@ -71,11 +71,18 @@ interface LockResult<T> {
  * gateway "disconnecting" a day or two after onboarding. This backend closes
  * that gap.
  */
-function persistentAuthBackend(agentId: string): {
+export function persistentAuthBackend(
+  agentId: string,
+  seedCredentials?: Record<string, unknown>,
+): {
   withLock<T>(fn: (current: string | undefined) => LockResult<T>): T;
   withLockAsync<T>(fn: (current: string | undefined) => Promise<LockResult<T>>): Promise<T>;
 } {
   const readCurrent = (): string => {
+    // When seeded (the per-turn path), return the already-resolved
+    // (cooldown-filtered) credential map so Pi's profile SELECTION is
+    // preserved; otherwise read the raw on-disk profiles (boot path).
+    if (seedCredentials) return JSON.stringify(seedCredentials);
     try {
       return JSON.stringify(readBrigadeCredentials(agentId));
     } catch {

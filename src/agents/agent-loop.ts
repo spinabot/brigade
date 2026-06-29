@@ -75,6 +75,7 @@ import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { runWithRetry } from "./retry-policy.js";
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { cleanProviderError } from "../core/model-caps.js";
+import { persistentAuthBackend } from "../core/auth-bridge.js";
 import { resolveModelNeverMiss } from "./model-resolution.js";
 import { buildAutoRecallBlock, resolveAutoRecallOrigin } from "./memory/auto-recall.js";
 import { runPreCompactionExtraction } from "./memory/extract.js";
@@ -2019,8 +2020,21 @@ function buildAuthStorage(
     inMemory?: (data?: unknown) => unknown;
     fromStorage?: (storage: unknown) => unknown;
   };
+  // If a selected credential is an OAuth/subscription cred, route through the
+  // PERSISTENT write-back backend. Anthropic/Codex/Google ROTATE the refresh
+  // token on every refresh; `inMemory` keeps the rotated token only for THIS
+  // turn, so the next turn re-reads the now-dead on-disk token and 401s (the
+  // recurring "login keeps dropping" bug). The persistent backend writes the
+  // rotation back to auth-profiles.json mid-turn. Seeded with the cooldown-
+  // filtered `credentials` so profile selection is preserved. api_key-only
+  // agents keep `inMemory` (unchanged) for cooldown round-robin.
+  const hasOAuth = Object.values(credentials).some(
+    (c) => !!c && typeof c === "object" && (c as { type?: unknown }).type === "oauth",
+  );
   let storage: unknown;
-  if (typeof Storage.inMemory === "function") {
+  if (hasOAuth && agentId && typeof Storage.fromStorage === "function") {
+    storage = Storage.fromStorage(persistentAuthBackend(agentId, credentials));
+  } else if (typeof Storage.inMemory === "function") {
     storage = Storage.inMemory(credentials);
   } else if (typeof Storage.fromStorage === "function") {
     // Fallback path for Pi minors that removed inMemory.
