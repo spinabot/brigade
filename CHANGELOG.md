@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.19.0](https://github.com/spinabot/brigade/compare/brigade-v1.18.0...brigade-v1.19.0) (2026-06-29)
+
+
+### Features
+
+* **gateway:** add brigade expose status --show-qr ([ab8349f](https://github.com/spinabot/brigade/commit/ab8349faecef167b6ee2df3089ef727a7ee4eb67))
+
+
+### Bug Fixes
+
+* **auth:** persist OAuth token rotation on the per-turn path ([d419297](https://github.com/spinabot/brigade/commit/d41929743e59162a3f63d7e73d3ea0312d1e3a41))
+
 ## [1.18.0](https://github.com/spinabot/brigade/compare/brigade-v1.17.1...brigade-v1.18.0) (2026-06-29)
 
 
