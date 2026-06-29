@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.18.0](https://github.com/spinabot/brigade/compare/brigade-v1.17.1...brigade-v1.18.0) (2026-06-29)
+
+
+### Features
+
+* **auth:** add brigade auth/login group + refresh-less subscription detection ([acfb5c2](https://github.com/spinabot/brigade/commit/acfb5c29ac8913144443d45e4b7714b8d4bb8ece))
+* **media:** add Sarvam TTS/STT provider ([f9a3c5a](https://github.com/spinabot/brigade/commit/f9a3c5a5beed5a07b08218a68a9dd673afc624b5))
+
+
+### Bug Fixes
+
+* **connect:** /sessions crashed on the RPC object result ([bf3de7d](https://github.com/spinabot/brigade/commit/bf3de7d6dbf3b2fb6f21f2682cbeaec2063cb01d))
+
 ## [1.17.1](https://github.com/spinabot/brigade/compare/brigade-v1.17.0...brigade-v1.17.1) (2026-06-28)
 
 
