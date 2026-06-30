@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.19.2](https://github.com/spinabot/brigade/compare/brigade-v1.19.1...brigade-v1.19.2) (2026-06-30)
+
+
+### Bug Fixes
+
+* **whatsapp:** serialize creds saves; retry rename on Windows lock errors ([46bca82](https://github.com/spinabot/brigade/commit/46bca829012ae9941e4341ab2880281e916bb243))
+
 ## [1.19.1](https://github.com/spinabot/brigade/compare/brigade-v1.19.0...brigade-v1.19.1) (2026-06-29)
 
 
