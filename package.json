@@ -201,7 +201,7 @@
     "cfonts": "^3.3.1",
     "chalk": "^5.3.0",
     "cli-highlight": "^2.1.11",
-    "commander": "^12.1.0",
+    "commander": "^15.0.0",
     "convex": "^1.40.0",
     "croner": "^10.0.1",
     "discord.js": "^14.26.4",
