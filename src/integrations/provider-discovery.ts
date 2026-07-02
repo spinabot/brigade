@@ -205,6 +205,32 @@ export async function listOpenRouterModels(): Promise<LiveCloudModel[]> {
 	}
 }
 
+/**
+ * List an OpenAI-compatible endpoint's served models via `GET {baseUrl}/models`
+ * (Bearer auth). Used for LIVE model discovery on catalog providers flagged
+ * `liveModels` — e.g. NVIDIA NIM (https://integrate.api.nvidia.com/v1), whose
+ * served set changes over time and isn't in Pi's bundled catalog. Doubles as an
+ * online key check (a bad key → the request fails → null). Filters out obvious
+ * non-chat models (embedding / reranking). Returns model ids, or `null` on any
+ * failure so the caller can surface an actionable error rather than persisting a
+ * dead provider. Never throws.
+ */
+export async function fetchOpenAICompatibleModelIds(
+	baseUrl: string,
+	apiKey: string,
+): Promise<string[] | null> {
+	const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+	const body = (await fetchJson(url, apiKey)) as { data?: Array<{ id?: unknown }> } | null;
+	if (!body || !Array.isArray(body.data)) return null;
+	const ids = body.data
+		.map((m) => (typeof m?.id === "string" ? m.id.trim() : ""))
+		// Substring (not word-bounded) — NVIDIA fuses the type into the id, e.g.
+		// `nv-embedqa-e5-v5`, `llama-3.2-nv-rerankqa-1b-v2`, where a `\b` after
+		// "embed"/"rerank" wouldn't match.
+		.filter((id) => id.length > 0 && !/(embed|rerank)/i.test(id));
+	return ids.length > 0 ? ids : null;
+}
+
 /* ──────────────────────── subscription live catalogs ──────────────────────── */
 
 /**

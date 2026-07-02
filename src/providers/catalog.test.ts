@@ -139,6 +139,7 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 			"kimi",
 			"minimax-sub",
 			"mistral",
+			"nvidia-nim",
 			"ollama",
 			"openai",
 			"openai-codex",

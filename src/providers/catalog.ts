@@ -82,6 +82,13 @@ export interface ProviderInfo {
 	api?: "openai-completions" | "anthropic-messages";
 	/** Catalog model ids registered into models.json for a custom provider. */
 	models?: string[];
+	/**
+	 * Discover this custom provider's models LIVE from its OpenAI-compatible
+	 * `/models` endpoint during onboarding (instead of a hardcoded `models` list),
+	 * for providers whose served set changes over time and isn't in Pi's bundled
+	 * catalog — e.g. NVIDIA NIM. The fetch also online-validates the key.
+	 */
+	liveModels?: boolean;
 }
 
 export const PROVIDERS: ProviderInfo[] = [
@@ -237,6 +244,18 @@ export const PROVIDERS: ProviderInfo[] = [
 		api: "anthropic-messages",
 		baseUrl: "https://api.deepseek.com/anthropic",
 		models: ["deepseek-v4-flash", "deepseek-v4-pro"],
+	},
+	{
+		id: "nvidia-nim",
+		name: "NVIDIA NIM",
+		description: "NVIDIA-hosted open models (Llama, DeepSeek, Nemotron, Qwen…) — live catalog",
+		keyUrl: "https://build.nvidia.com",
+		envVar: "NVIDIA_API_KEY",
+		envVarFallbacks: ["NVIDIA_NIM_API_KEY", "NGC_API_KEY"],
+		custom: true,
+		liveModels: true, // models fetched live from /v1/models at onboarding
+		api: "openai-completions",
+		baseUrl: "https://integrate.api.nvidia.com/v1",
 	},
 	{
 		id: "ollama",

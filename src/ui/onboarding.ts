@@ -50,6 +50,7 @@ import { brand, selectListTheme } from "./theme.js";
 import { pickStorageMode, type StorageModeResult } from "./onboard-storage-mode.js";
 import { SearchableSelectList } from "./searchable-select.js";
 import {
+	fetchOpenAICompatibleModelIds,
 	getCachedSubscriptionModels,
 	listOpenRouterModels,
 	prefetchSubscriptionModels,
@@ -1287,6 +1288,22 @@ async function ensureCustomProvider(
 			continue;
 		}
 
+		// LIVE model discovery (e.g. NVIDIA NIM): fetch the served set from the
+		// provider's OpenAI-compatible /models endpoint BEFORE persisting anything.
+		// The fetch also online-validates the key — a bad key returns nothing, so we
+		// re-prompt instead of saving a dead provider with a stale hardcoded list.
+		let models = provider.models ?? [];
+		if (provider.liveModels && provider.baseUrl) {
+			tui.addChild(new Text(brand.dim(`  Fetching ${provider.name} models…`), 0, 0));
+			tui.requestRender();
+			const ids = await fetchOpenAICompatibleModelIds(provider.baseUrl, key);
+			if (!ids || ids.length === 0) {
+				lastError = `Couldn't fetch models from ${provider.name} with that key. Check the key and try again.`;
+				continue;
+			}
+			models = ids;
+		}
+
 		upsertApiKeyProfile(DEFAULT_AGENT_ID, { provider: provider.id, key });
 		authStorage.set(provider.id, { type: "api_key", key });
 		authStorage.reload();
@@ -1295,11 +1312,12 @@ async function ensureCustomProvider(
 			baseUrl: provider.baseUrl!,
 			api: provider.api!,
 			apiKey: key,
-			models: provider.models ?? [],
+			models,
 		});
 		modelRegistry.refresh();
 
-		tui.addChild(new Text(`  ${brand.amber("✓")} ${provider.name} connected.`, 0, 0));
+		const countNote = provider.liveModels ? ` · ${brand.white(String(models.length))} models` : "";
+		tui.addChild(new Text(`  ${brand.amber("✓")} ${provider.name} connected.${countNote}`, 0, 0));
 		tui.requestRender();
 		await delay(500);
 		return "ok";

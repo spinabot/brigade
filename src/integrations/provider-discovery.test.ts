@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { afterEach, describe, it } from "node:test";
 
-import { discoverCloudModelMeta } from "./provider-discovery.js";
+import { discoverCloudModelMeta, fetchOpenAICompatibleModelIds } from "./provider-discovery.js";
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -67,5 +67,35 @@ describe("discoverCloudModelMeta — generic OpenAI-compatible", () => {
 		mockFetch({ data: [{ id: "should-not-be-read" }] });
 		const res = await discoverCloudModelMeta("groq", "anything");
 		assert.deepEqual(res, { exists: false, meta: {} });
+	});
+});
+
+describe("fetchOpenAICompatibleModelIds — live model discovery (NVIDIA NIM etc.)", () => {
+	it("returns chat model ids from /models, filtering out embedding/reranking", async () => {
+		mockFetch({
+			data: [
+				{ id: "meta/llama-3.3-70b-instruct" },
+				{ id: "deepseek-ai/deepseek-r1" },
+				{ id: "nvidia/nv-embedqa-e5-v5" }, // embedding — excluded
+				{ id: "nvidia/llama-3.2-nv-rerankqa-1b-v2" }, // reranking — excluded
+				{ id: "qwen/qwen2.5-coder-32b-instruct" },
+			],
+		});
+		const ids = await fetchOpenAICompatibleModelIds("https://integrate.api.nvidia.com/v1", "nvapi-xxx");
+		assert.deepEqual(ids, [
+			"meta/llama-3.3-70b-instruct",
+			"deepseek-ai/deepseek-r1",
+			"qwen/qwen2.5-coder-32b-instruct",
+		]);
+	});
+
+	it("returns null on a failed request (bad key / unreachable) — never throws", async () => {
+		mockFetch({ error: "unauthorized" }, false);
+		assert.equal(await fetchOpenAICompatibleModelIds("https://integrate.api.nvidia.com/v1", "bad"), null);
+	});
+
+	it("returns null when the endpoint yields no usable ids", async () => {
+		mockFetch({ data: [] });
+		assert.equal(await fetchOpenAICompatibleModelIds("https://integrate.api.nvidia.com/v1", "nvapi-xxx"), null);
 	});
 });
