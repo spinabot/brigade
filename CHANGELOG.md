@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.19.3](https://github.com/spinabot/brigade/compare/brigade-v1.19.2...brigade-v1.19.3) (2026-07-02)
+
+
+### Bug Fixes
+
+* **agent:** treat inline &lt;thinking&gt; as reasoning, not planning-only ([7c5278b](https://github.com/spinabot/brigade/commit/7c5278b5dfd571a59b339d76d1f2ea21e4689118))
+* **gateway:** scope list-models to genuinely-connected providers ([42c03fe](https://github.com/spinabot/brigade/commit/42c03fe5ca61405823caf2a0aef99f533d626d6c))
+* **ollama:** detect reasoning/tools/vision from /api/show capabilities ([25f84bb](https://github.com/spinabot/brigade/commit/25f84bb7cd56e0d899be61731a15c7a4587c19b6))
+* **tui:** restore header divider + status line, scope /model to connected providers, strip &lt;thinking&gt; tags ([5ccbedf](https://github.com/spinabot/brigade/commit/5ccbedf8d3dc0f23829ba84e3bbdc0995af97b53))
+* **update:** skip redundant rebuilds, clearer dirty/behind messaging, add --force and --npm ([7c33ade](https://github.com/spinabot/brigade/commit/7c33ade564e5f18ab32270e7480383fd045d3fea))
+
 ## [1.19.2](https://github.com/spinabot/brigade/compare/brigade-v1.19.1...brigade-v1.19.2) (2026-06-30)
 
 
