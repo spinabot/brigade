@@ -67,6 +67,21 @@ describe("parseExtractedFacts", () => {
 		assert.equal(facts.length, 1);
 		assert.equal(facts[0]?.content, "ok");
 	});
+	it("strips inline <think> reasoning that surrounds the JSON (local reasoning models)", () => {
+		const facts = parseExtractedFacts(
+			'<think>I should record that the user is on Windows and prefers spaces.</think>\n' +
+				'{"facts":[{"content":"User is on Windows.","segment":"identity"}]}',
+		);
+		assert.equal(facts.length, 1);
+		assert.equal(facts[0]?.content, "User is on Windows.");
+	});
+	it("tolerates near-JSON (trailing commas / single quotes) via the JSON5 fallback", () => {
+		const facts = parseExtractedFacts(
+			"{'facts':[{'content':'Likes tabs','segment':'preference',},],}",
+		);
+		assert.equal(facts.length, 1);
+		assert.equal(facts[0]?.content, "Likes tabs");
+	});
 });
 
 describe("storeExtractedFacts", () => {
@@ -265,6 +280,28 @@ describe("runExtractionSweep — batched, cursor-tracked, LLM injected", () => {
 			assert.equal(res.stored, 0);
 			assert.equal(getCursor(dir, sid), messages.length, `cursor advances past a genuine empty (${empty})`);
 		}
+	});
+
+	it("RETRY CAP: after repeated unparseable replies, advances the cursor so it can't re-burn LLM calls forever", async () => {
+		const sid = "cap-sess";
+		let calls = 0;
+		const llm = async () => {
+			calls++;
+			return "totally not json — a weak local model that never returns JSON";
+		};
+		// Attempts 1 & 2 HOLD the cursor (retry next sweep).
+		await runExtractionSweep({ workspaceDir: dir, sessionId: sid, messages, llm });
+		assert.equal(getCursor(dir, sid), 0, "attempt 1 holds the cursor");
+		await runExtractionSweep({ workspaceDir: dir, sessionId: sid, messages, llm });
+		assert.equal(getCursor(dir, sid), 0, "attempt 2 holds the cursor");
+		// Attempt 3 hits the cap → advance past the un-distillable slice.
+		const capped = await runExtractionSweep({ workspaceDir: dir, sessionId: sid, messages, llm });
+		assert.equal(capped.ran, false);
+		assert.equal(getCursor(dir, sid), messages.length, "attempt 3 advances the cursor (cap reached)");
+		assert.equal(calls, 3);
+		// A later sweep is now a no-op (cursor at end) — the loop is bounded.
+		await runExtractionSweep({ workspaceDir: dir, sessionId: sid, messages, llm });
+		assert.equal(calls, 3, "no further LLM calls once the cursor has advanced past the slice");
 	});
 
 	it("respects minNewMessages (skips tiny slices without a call)", async () => {

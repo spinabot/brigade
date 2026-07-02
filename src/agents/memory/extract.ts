@@ -20,6 +20,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import JSON5 from "json5";
+
 import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
@@ -32,6 +34,7 @@ import { wrapStreamFnWithPayloadMutations } from "../payload-mutators.js";
 import { FactStore, MEMORY_SEGMENTS, type MemoryRecordOrigin, type MemorySegment, type MemorySourceType } from "./records.js";
 import { confineUntrustedSegment } from "./write-gate.js";
 import { balancedObjects } from "./json-scan.js";
+import { stripReasoningTags } from "../../shared/reasoning-tags.js";
 import {
 	buildCandidateBlock,
 	DEFAULT_CANDIDATE_K,
@@ -137,13 +140,26 @@ export { balancedObjects };
  */
 export function parseExtractionReply(text: string): { facts: ExtractedFact[]; parsedJson: boolean } {
 	if (!text) return { facts: [], parsedJson: false };
+	// Local reasoning models (Ollama qwen3/deepseek-r1/ornith/…) emit their
+	// chain-of-thought INLINE as <think>…</think> text around the JSON. Strip it
+	// first so the balanced-brace scan finds the real envelope instead of braces
+	// buried in the reasoning. No-op for frontier models (their reasoning is a
+	// typed block, already excluded upstream — the text is clean JSON).
+	const cleaned = stripReasoningTags(text);
 	let sawEnvelope = false; // a structured "nothing to extract" — an empty object {}
-	for (const block of balancedObjects(text)) {
+	for (const block of balancedObjects(cleaned)) {
 		let parsed: Record<string, unknown>;
 		try {
 			parsed = JSON.parse(block) as Record<string, unknown>;
 		} catch {
-			continue;
+			// Tolerant fallback: weak models slip on trailing commas, single quotes,
+			// unquoted keys, // comments — all of which JSON5 accepts. Only reached
+			// when strict JSON.parse already failed, so it never changes valid JSON.
+			try {
+				parsed = JSON5.parse(block) as Record<string, unknown>;
+			} catch {
+				continue;
+			}
 		}
 		if (Array.isArray((parsed as { facts?: unknown }).facts)) {
 			const out: ExtractedFact[] = [];
@@ -382,6 +398,16 @@ export interface SweepResult {
 	processedTo: number;
 }
 
+// Bounded retry for UN-parseable extraction replies. When a model reliably
+// returns non-JSON (some weak local models), the cursor is held and the SAME
+// turns get re-distilled — a wasted LLM call — every sweep, FOREVER. After this
+// many consecutive parse failures for a session we advance the cursor past the
+// slice (accepting the lost distillation for those turns) so the loop can never
+// run unbounded. Resets on any successful parse. In-memory by design: a gateway
+// restart is a natural reset point and this only needs to bound a live run.
+const MAX_EXTRACTION_PARSE_FAILURES = 3;
+const extractionParseFailures = new Map<string, number>();
+
 /**
  * Distill the NEW transcript messages since this session's cursor into facts.
  * Batches everything new into one LLM call, stores the result, advances the
@@ -447,12 +473,29 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 	// write-time dedup absorbs any repeat). A structured empty reply (parsedJson=true,
 	// facts=[]) falls through and advances as before — re-distilling it wastes calls.
 	if (!parsedJson) {
+		const fails = (extractionParseFailures.get(args.sessionId) ?? 0) + 1;
+		if (fails >= MAX_EXTRACTION_PARSE_FAILURES) {
+			// Repeatedly un-parseable → stop re-burning calls. Advance past this
+			// slice (write-time dedup absorbs anything a later sweep does parse).
+			extractionParseFailures.delete(args.sessionId);
+			writeCursor(args.workspaceDir, args.sessionId, total);
+			log.warn("extraction reply unparseable after repeated attempts; advancing cursor to stop retrying", {
+				sessionId: args.sessionId,
+				attempts: fails,
+				replyChars: reply.length,
+			});
+			return { ran: false, stored: 0, processedTo: total };
+		}
+		extractionParseFailures.set(args.sessionId, fails);
 		log.warn("extraction reply was not parseable JSON; cursor NOT advanced (next sweep retries)", {
 			sessionId: args.sessionId,
 			replyChars: reply.length,
+			attempt: fails,
 		});
 		return { ran: false, stored: 0, processedTo: from };
 	}
+	// Parsed OK — reset this session's consecutive-failure counter.
+	extractionParseFailures.delete(args.sessionId);
 	const wsId = workspaceIdFromDir(args.workspaceDir);
 	const errorsBefore = factsFlushErrorCount(wsId);
 	const stored = storeExtractedFacts(args.workspaceDir, facts, args.sessionId, {
