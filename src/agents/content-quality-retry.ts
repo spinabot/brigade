@@ -37,6 +37,15 @@ export type ContentQualityIssue = "empty" | "reasoning-only" | "planning-only" |
  */
 const SENTENCE_START = "(?:^|[.!?\\n]\\s+)";
 
+/**
+ * Matches a full inline reasoning block — <think>/<thinking>/<thought> …
+ * </…> (any attributes, case-insensitive). Used to strip chain-of-thought
+ * that some models emit as plain text before quality detection runs, so the
+ * reasoning content is never mistaken for a visible answer or an action plan.
+ */
+const THINK_BLOCK_RE =
+	/<\s*(?:think(?:ing)?|thought)\b[^>]*>[\s\S]*?<\/\s*(?:think(?:ing)?|thought)\s*>/gi;
+
 const PLANNING_PHRASES = [
 	new RegExp(
 		`${SENTENCE_START}i'?ll (?:create|write|build|make|generate|set up|implement|fix|update|add|do|run|execute|launch|deploy|install|configure)`,
@@ -91,13 +100,28 @@ export function detectContentIssue(
 		(b) => b && typeof b === "object" && (b as { type?: unknown }).type === "toolCall",
 	);
 
-	const totalText = textBlocks
+	const rawText = textBlocks
 		.map((b) => (b as { text: string }).text)
 		.join("")
 		.trim();
 
-	// Reasoning-only: had thinking blocks, no text, no tool call.
-	if (thinkingBlocks.length > 0 && totalText.length === 0 && toolCallBlocks.length === 0) {
+	// Some models (notably local Ollama reasoning models marked reasoning:false)
+	// emit their chain-of-thought INLINE as <think>/<thinking>/<thought> text
+	// rather than as Pi-tagged `thinking` blocks. That reasoning is NOT a visible
+	// answer and NOT a plan-to-act, so strip it before the planning / slop checks —
+	// otherwise "let me do X" *inside* the reasoning falsely trips planning-only.
+	THINK_BLOCK_RE.lastIndex = 0;
+	const hadInlineThinking = THINK_BLOCK_RE.test(rawText);
+	THINK_BLOCK_RE.lastIndex = 0;
+	const totalText = rawText.replace(THINK_BLOCK_RE, "").trim();
+
+	// Reasoning-only: had reasoning (Pi-tagged blocks OR inline <think> text), no
+	// visible answer text, and no tool call.
+	if (
+		(thinkingBlocks.length > 0 || hadInlineThinking) &&
+		totalText.length === 0 &&
+		toolCallBlocks.length === 0
+	) {
 		return "reasoning-only";
 	}
 

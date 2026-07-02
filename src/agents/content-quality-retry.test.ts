@@ -110,6 +110,29 @@ describe("detectContentIssue — planning-only", () => {
 		assert.equal(detectContentIssue(planningContent("I'll write the script for you."), false), null);
 	});
 
+	it("does NOT flag a planning phrase that lives INSIDE inline <thinking> reasoning", () => {
+		// Local Ollama reasoning models (reasoning:false) emit chain-of-thought as
+		// inline text. "Let me do X" inside <thinking> is reasoning, not a plan-to-act
+		// — with a real answer after the block it must NOT trip planning-only.
+		assert.equal(
+			detectContentIssue(
+				planningContent("<thinking>Let me do this step by step.</thinking>The answer is 42."),
+				true,
+			),
+			null,
+		);
+	});
+
+	it("treats an inline <thinking>-only reply (no visible answer) as reasoning-only, not planning-only", () => {
+		assert.equal(
+			detectContentIssue(
+				planningContent("<thinking>Let me do this step by step so I can answer fully.</thinking>"),
+				true,
+			),
+			"reasoning-only",
+		);
+	});
+
 	it("does NOT flag when the planning phrase is mid-sentence (quoted user message)", () => {
 		assert.equal(
 			detectContentIssue(
