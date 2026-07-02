@@ -9,9 +9,12 @@
  * via the `~/.brigade/models.json` mechanism Pi exposes for custom providers.
  * Each model the user has pulled becomes a Pi `Model<"openai-completions">`.
  *
- * Capability inference is best-effort — Ollama doesn't tell us a model's
- * context window or whether it reasons. We pattern-match the model name
- * against well-known families and fall back to safe defaults.
+ * Capability detection is AUTHORITATIVE where possible: Ollama's POST /api/show
+ * returns a `capabilities` array (e.g. ["completion","tools","thinking","vision"])
+ * that tells us directly whether a model REASONS, supports TOOLS, and accepts
+ * IMAGES. We read that first and only fall back to name-pattern guessing when the
+ * probe is unavailable (older daemon / offline). Context window still isn't
+ * reported, so that stays a safe default.
  */
 
 import * as fs from "node:fs/promises";
@@ -151,6 +154,45 @@ export function inferOllamaModelCapabilities(modelId: string): InferredCapabilit
 	return { reasoning, contextWindow, maxTokens, input };
 }
 
+/** Subset of Ollama's POST /api/show response we read. `capabilities` is the
+ *  authoritative signal — e.g. ["completion","tools","thinking","vision"]. */
+interface OllamaShowResponse {
+	capabilities?: unknown;
+}
+
+/**
+ * AUTHORITATIVE capability probe — POST /api/show for one model and return its
+ * lower-cased `capabilities` array. This is the source of truth for whether a
+ * model REASONS (`"thinking"`), supports TOOLS (`"tools"`), and accepts IMAGES
+ * (`"vision"`) — far better than guessing from the model name. Best-effort:
+ * returns null on any failure (older Ollama, daemon down, timeout) so callers
+ * fall back to `inferOllamaModelCapabilities`.
+ */
+export async function fetchOllamaCapabilities(
+	modelId: string,
+	baseUrl: string = DEFAULT_BASE_URL,
+): Promise<string[] | null> {
+	const url = `${baseUrl.replace(/\/$/, "")}/api/show`;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+	try {
+		const res = await fetch(url, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ model: modelId }),
+			signal: controller.signal,
+		});
+		if (!res.ok) return null;
+		const body = (await res.json()) as OllamaShowResponse;
+		if (!Array.isArray(body.capabilities)) return null;
+		return body.capabilities.map((c) => String(c).toLowerCase());
+	} catch {
+		return null;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 /**
  * Write Brigade's Ollama provider entry into Pi's `~/.brigade/models.json`.
  * Pi's `ModelRegistry.refresh()` picks this up and exposes the models as
@@ -173,18 +215,27 @@ export async function writeOllamaToModelsJson(
 		// File missing or unparseable — start fresh. Pi treats an absent file as no config.
 	}
 
-	const modelDefs = models.map((m) => {
-		const caps = inferOllamaModelCapabilities(m.id);
-		return {
-			id: m.id,
-			name: m.name + (m.parameterSize ? ` (${m.parameterSize})` : ""),
-			reasoning: caps.reasoning,
-			input: caps.input,
-			contextWindow: caps.contextWindow,
-			maxTokens: caps.maxTokens,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, // local = free
-		};
-	});
+	// Prefer Ollama's own /api/show `capabilities` (authoritative for reasoning /
+	// tools / vision); fall back to the name heuristic only when the probe fails.
+	// Probes run in parallel, so total added latency is ~one request, not N.
+	const modelDefs = await Promise.all(
+		models.map(async (m) => {
+			const guess = inferOllamaModelCapabilities(m.id);
+			const caps = await fetchOllamaCapabilities(m.id, baseUrl);
+			const reasoning = caps ? caps.includes("thinking") : guess.reasoning;
+			const vision = caps ? caps.includes("vision") : guess.input.includes("image");
+			const input: ("text" | "image")[] = vision ? ["text", "image"] : ["text"];
+			return {
+				id: m.id,
+				name: m.name + (m.parameterSize ? ` (${m.parameterSize})` : ""),
+				reasoning,
+				input,
+				contextWindow: guess.contextWindow,
+				maxTokens: guess.maxTokens,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, // local = free
+			};
+		}),
+	);
 
 	existing.providers!["ollama"] = {
 		baseUrl: `${baseUrl.replace(/\/$/, "")}/v1`,
