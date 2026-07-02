@@ -34,6 +34,7 @@ import {
 import { BrigadeEditor } from "../../ui/editor.js";
 import { PROVIDERS, findProvider } from "../../providers/catalog.js";
 import { sanitizeTerminalInput } from "../../security/terminal-input-sanitizer.js";
+import { splitReasoning } from "../../shared/reasoning-tags.js";
 import chalk from "chalk";
 
 // Brigade's `Markdown` is a thin Pi-TUI subclass that normalizes `_text_`
@@ -648,8 +649,8 @@ export async function wireConnectUi(
 		},
 		{
 			name: "model",
-			description: "switch to another configured model (no arg = picker)",
-			argumentHint: "[<model-id>]",
+			description: "switch model (no arg = current provider's models · --all = every provider)",
+			argumentHint: "[<model-id>|--all]",
 		},
 		{
 			name: "provider",
@@ -848,22 +849,14 @@ export async function wireConnectUi(
 				continue;
 			}
 			if (b.type === "text" && typeof b.text === "string") {
-				const inlineThinking: string[] = [];
-				// Match <think>, <thinking>, and <thought> (with any attributes) —
-				// local models (e.g. Ollama's reasoning models) emit <thinking>…
-				// </thinking> inline as TEXT when models.json marks them
-				// reasoning:false, so a <think>-only regex left the raw tags in the
-				// transcript. Case-insensitive; tolerant of attributes/whitespace.
-				const stripped = b.text.replace(
-					/<\s*(?:think(?:ing)?|thought)\b[^>]*>([\s\S]*?)<\/\s*(?:think(?:ing)?|thought)\s*>\s*/gi,
-					(_m: string, inner: string) => {
-						const t = inner.trim();
-						if (t) inlineThinking.push(t);
-						return "";
-					},
-				);
-				thinkingParts.push(...inlineThinking);
-				if (stripped.trim()) contentParts.push(stripped);
+				// Local models (e.g. Ollama reasoning forks) emit <think>/<thinking>/
+				// <thought>/<final> INLINE as text rather than as typed thinking
+				// blocks. Split reasoning out via the shared util so the raw tags
+				// never leak into the transcript and /show-thinking can still surface
+				// the trace.
+				const { visible, reasoning } = splitReasoning(b.text);
+				if (reasoning) thinkingParts.push(reasoning);
+				if (visible.trim()) contentParts.push(visible);
 			}
 		}
 
@@ -2600,13 +2593,8 @@ export async function wireConnectUi(
 			}
 
 			const arg = trimmed === "/model" ? "" : trimmed.slice("/model ".length).trim();
-			if (!arg) {
-				// `/model` lists EVERY configured provider's models (it's a global
-				// switcher — picking a model on another provider switches provider
-				// too). Group by provider with the CURRENT one first so the operator
-				// sees the provider they're on up top instead of hunting through a
-				// flat list dominated by providers with huge catalogs (OpenRouter's
-				// live catalog is merged in gateway-side and runs to hundreds).
+			const wantAllModels = arg === "--all" || arg === "-a";
+			if (!arg || wantAllModels) {
 				const current = lastSnapshot?.provider;
 				const byProvider = new Map<string, ModelSummary[]>();
 				for (const m of models) {
@@ -2614,26 +2602,45 @@ export async function wireConnectUi(
 					arr.push(m);
 					byProvider.set(m.provider, arr);
 				}
-				const PER_PROVIDER_CAP = 20;
+
+				// DEFAULT: show ONLY the current provider and its FULL model list —
+				// that's what you switch within day to day. No cap, no other
+				// providers. `/model --all` lists every provider.
+				if (!wantAllModels && current && byProvider.has(current)) {
+					const rows = byProvider.get(current) ?? [];
+					const body = rows.map((m) => `  ${brand.white(m.id)}`).join("\n");
+					const others = [...byProvider.keys()].filter((p) => p !== current);
+					const otherCount = others.reduce((n, p) => n + (byProvider.get(p)?.length ?? 0), 0);
+					const footer =
+						otherCount > 0
+							? `\n\n${brand.dim(`${otherCount} model${otherCount === 1 ? "" : "s"} on ${others.length} other provider${others.length === 1 ? "" : "s"} — /model --all to list · /provider to switch`)}`
+							: "";
+					insertBeforeEditor(
+						new Markdown(
+							`${brand.amber(current)} ${brand.dim(`(current) · ${rows.length} model${rows.length === 1 ? "" : "s"}`)}\n${body}${footer}\n\n${brand.dim("usage: /model <id>")}`,
+							1,
+							0,
+							markdownTheme,
+						),
+					);
+					return;
+				}
+
+				// `--all` (or no current provider resolved yet): every provider, the
+				// current one first, full lists.
 				const order = [...byProvider.keys()].sort((a, b) =>
 					a === current ? -1 : b === current ? 1 : a.localeCompare(b),
 				);
 				const sections = order.map((prov) => {
 					const rows = byProvider.get(prov) ?? [];
 					const head =
-						prov === current
-							? `${brand.amber(prov)} ${brand.dim("(current)")}`
-							: brand.dim(prov);
-					const shown = rows.slice(0, PER_PROVIDER_CAP);
-					const body = shown.map((m) => `    ${brand.white(m.id)}`).join("\n");
-					const more = rows.length - shown.length;
-					const moreLine =
-						more > 0 ? `\n    ${brand.dim(`… +${more} more — type /model <id>`)}` : "";
-					return `  ${head}\n${body}${moreLine}`;
+						prov === current ? `${brand.amber(prov)} ${brand.dim("(current)")}` : brand.dim(prov);
+					const body = rows.map((m) => `  ${brand.white(m.id)}`).join("\n");
+					return `${head}\n${body}`;
 				});
 				insertBeforeEditor(
 					new Markdown(
-						`${brand.dim("configured models on the gateway (current provider first):")}\n\n${sections.join("\n\n")}\n\n${brand.dim("usage: /model <id>")}`,
+						`${brand.dim("all configured models:")}\n\n${sections.join("\n\n")}\n\n${brand.dim("usage: /model <id>")}`,
 						1,
 						0,
 						markdownTheme,
