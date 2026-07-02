@@ -3406,17 +3406,35 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			case "list-models": {
 				const registryModels = modelRegistry.getAvailable() as Array<Model<any>>;
+				// Only surface providers the operator ACTUALLY connected. Pi merges
+				// its full bundled catalog (Anthropic/OpenAI/OpenRouter/Google/…) into
+				// the registry even when none of those have credentials, so an
+				// unfiltered list shows models for providers that were never set up
+				// during onboard. Connected = a custom/local provider declared in
+				// models.json (e.g. Ollama, which is noAuth) OR a provider with
+				// credentials in the gateway's auth store.
+				const connected = new Set<string>();
+				for (const p of authStorage.list()) connected.add(p);
+				try {
+					const rawModels = JSON.parse(readFileSync(modelsFile, "utf8")) as {
+						providers?: Record<string, unknown>;
+					};
+					for (const p of Object.keys(rawModels?.providers ?? {})) connected.add(p);
+				} catch {
+					/* no/invalid models.json → rely on the auth store alone */
+				}
+				const scopedModels = registryModels.filter((m) => connected.has(m.provider));
 				// Live-merge OpenRouter's CURRENT catalog (only when OpenRouter is
-				// configured) so `/model` lists models newer than Pi's bundled
+				// actually connected) so `/model` lists models newer than Pi's bundled
 				// snapshot. Best-effort + cached + short timeout; on any failure the
 				// registry list stands alone. Registry entries win (richer metadata).
-				let merged: Array<Model<any>> = registryModels;
-				if (registryModels.some((m) => m.provider === "openrouter")) {
+				let merged: Array<Model<any>> = scopedModels;
+				if (scopedModels.some((m) => m.provider === "openrouter")) {
 					try {
 						const live = await listOpenRouterModels();
 						if (live.length > 0) {
-							const seen = new Set(registryModels.map((m) => m.id));
-							merged = [...registryModels];
+							const seen = new Set(scopedModels.map((m) => m.id));
+							merged = [...scopedModels];
 							for (const lm of live) {
 								if (!seen.has(lm.id)) merged.push(lm as unknown as Model<any>);
 							}
