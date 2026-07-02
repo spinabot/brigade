@@ -404,9 +404,17 @@ export function pickModelFamilyGuidance(modelId: string | undefined): string | n
 	}
 	// Anthropic family — already follows the patterns the system prompt teaches.
 	if (/(?:^|\/)claude(?:\d|[-_.:]|$)/.test(id)) return null;
-	// Unknown / niche — fall through to no extra guidance.
-	return null;
+	// Unknown / niche — every OTHER model (local Ollama forks: ornith, llama,
+	// qwen, deepseek, mistral, phi, …) previously fell through to NO override and
+	// happily answered "I'm Claude" / "I'm Ornith, powered by OpenAI and
+	// Anthropic". Give them the generic identity anchor so the base model's
+	// training identity never leaks.
+	return GENERIC_IDENTITY_GUIDANCE;
 }
+
+const GENERIC_IDENTITY_GUIDANCE = `# Identity override
+
+You are the assistant defined by the persona files above — you run inside Brigade. The underlying language model is only the engine; it is NOT your identity. When asked who or what you are, answer from the persona files. Never identify as the base model or its vendor — never say you are "Claude", "GPT", "ChatGPT", "Gemini", "Gemma", "Llama", "Qwen", "DeepSeek", "Ornith", "an OpenAI / Anthropic / Google model", "an open-source coding assistant", or "a large language model". If the persona files don't specify a name, call yourself Brigade.`;
 
 const OPENAI_FAMILY_GUIDANCE = `# Identity override (OpenAI family)
 

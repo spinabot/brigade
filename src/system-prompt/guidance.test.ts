@@ -143,9 +143,13 @@ describe("pickModelFamilyGuidance", () => {
 		assert.equal(pickModelFamilyGuidance("openrouter/anthropic/claude-3"), null);
 	});
 
-	it("returns null for unknown / niche models", () => {
-		assert.equal(pickModelFamilyGuidance("mistral-large-2"), null);
-		assert.equal(pickModelFamilyGuidance("llama-3.1-70b"), null);
+	it("returns the GENERIC identity override for unknown / niche models (so they can't leak base-model identity)", () => {
+		for (const id of ["mistral-large-2", "llama-3.1-70b", "ornith:35b", "qwen3:32b", "deepseek-r1:14b"]) {
+			const g = pickModelFamilyGuidance(id);
+			assert.ok(g, `expected an identity override for ${id}`);
+			assert.match(g as string, /# Identity override/);
+			assert.match(g as string, /Never identify as the base model/);
+		}
 	});
 
 	it("trims whitespace + handles empty input", () => {
