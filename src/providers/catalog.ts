@@ -72,7 +72,7 @@ export interface ProviderInfo {
 	 * "reuse this login" path (no browser, no key) before the subscription / key
 	 * flow.
 	 */
-	cliLogin?: { read: "claude" | "codex"; label: string };
+	cliLogin?: { read: "claude" | "codex" | "gemini"; label: string };
 	/**
 	 * Pi API shape for a custom (catalog-defined) provider. Determines how Pi
 	 * frames requests against `baseUrl` — `anthropic-messages` for an
@@ -189,6 +189,22 @@ export const PROVIDERS: ProviderInfo[] = [
 		keyUrl: "https://github.com/settings/copilot",
 		envVar: "",
 		subscription: { oauthProviderId: "github-copilot", label: "Log in with GitHub Copilot" },
+	},
+	{
+		// Its OWN Pi provider id (NOT "google") — Antigravity serves models through
+		// Google's Cloud Code Assist (api:"antigravity" → cloudcode-pa /v1internal),
+		// not the public Gemini API. It runs its OWN Google OAuth (PKCE); Brigade
+		// ships no OAuth client, so browser sign-in needs BRIGADE_ANTIGRAVITY_CLIENT_ID
+		// + _SECRET. ⚠ Google's Antigravity Terms prohibit third-party use and accounts
+		// have been banned — this provider is opt-in and at the operator's own risk.
+		id: "antigravity",
+		providerId: "antigravity",
+		name: "Google Antigravity",
+		description: "Gemini 3 + Claude via your Google login (⚠ 3rd-party use breaks Google's ToS — opt-in only)",
+		keyUrl: "https://antigravity.google",
+		envVar: "",
+		subscription: { oauthProviderId: "antigravity", label: "Log in with Google (Antigravity)" },
+		models: ["gemini-3-pro-high", "gemini-3-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"],
 	},
 	{
 		id: "glm",

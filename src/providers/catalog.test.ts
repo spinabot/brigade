@@ -127,6 +127,7 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 		const ids = PROVIDERS.map((p) => p.id).sort();
 		assert.deepEqual(ids, [
 			"anthropic",
+			"antigravity",
 			"cerebras",
 			"claude-code",
 			"custom",

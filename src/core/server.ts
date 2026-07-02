@@ -125,7 +125,11 @@ import { clearChannelMetaRegistry, registerChannelMeta } from "../agents/channel
 import type { GroupToolPolicyConfig } from "../agents/channels/access-control/index.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
-import { listOpenRouterModels } from "../integrations/provider-discovery.js";
+import {
+	getCachedSubscriptionModels,
+	listOpenRouterModels,
+	prefetchSubscriptionModels,
+} from "../integrations/provider-discovery.js";
 import { onAgentEvent } from "../agents/agent-event-bus.js";
 import {
 	InMemoryApprovalBridge,
@@ -3424,6 +3428,39 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					} catch {
 						/* keep the registry list */
 					}
+				}
+				// Subscription live-merge: a login can grant models NEWER than Pi's
+				// bundled catalog (GitHub Copilot). Pi already FILTERS `/model` to the
+				// account's live ids via `availableModelIds` but can't ADD ids it doesn't
+				// ship — so merge the live-only ids from the per-account cache.
+				//
+				// (L1) The merge reads the cache SYNCHRONOUSLY, so `/model` never blocks
+				// on a network round-trip; the cache is warmed at login and kept fresh by
+				// the background refresh below. Live-only ids may appear one call late on
+				// a cold cache (e.g. right after a gateway restart) — an acceptable trade
+				// for a never-blocking picker; the static plan-filtered list always stands.
+				// (L2) The refresh runs in the BACKGROUND with a token from
+				// `authStorage.getApiKey`, which auto-refreshes an idle-expired Copilot
+				// token — the raw on-disk token would 401 and silently no-op the merge.
+				for (const subProvider of ["github-copilot"]) {
+					if (!merged.some((m) => m.provider === subProvider)) continue;
+					const live = getCachedSubscriptionModels(subProvider);
+					if (live && live.length > 0) {
+						const seen = new Set(merged.map((m) => m.id));
+						for (const lm of live) {
+							if (!seen.has(lm.id)) merged.push(lm as unknown as Model<any>);
+						}
+					}
+					// Fire-and-forget: freshen the cache for the NEXT call. Never awaited,
+					// so a slow or failing fetch can't delay this response.
+					void (async () => {
+						try {
+							const token = await authStorage.getApiKey(subProvider);
+							if (token) await prefetchSubscriptionModels(subProvider, token);
+						} catch {
+							/* best-effort — the merged list above already stands */
+						}
+					})();
 				}
 				const models = merged.map((m: Model<any>) => modelToSummary(m));
 				return models as ResponseFor[M];

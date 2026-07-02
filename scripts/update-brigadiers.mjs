@@ -17,8 +17,12 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const REPO = process.env.BRIGADIERS_REPO || "spinabot/brigade";
-// Format matches OpenClaw's committed wall byte-for-byte: markdown linked images
-// at s=48, 10 per line (space-separated), rows separated by a blank line.
+// Linked HTML avatars with EXPLICIT width/height so every avatar renders at a
+// uniform 48px. Markdown `![](…&s=48)` can't enforce a display size — GitHub only
+// honors the `s=` param for users with a real photo; for identicon (no-photo)
+// users it serves the full ~460px image, which then renders giant. The width/
+// height HTML attributes ARE honored, so all avatars line up at 48px. 10 per row,
+// rows separated by a blank line.
 const AVATAR_SIZE = 48;
 const PER_LINE = 10;
 const START = "<!-- brigadiers:start -->";
@@ -56,11 +60,11 @@ function renderWall(contributors) {
 	if (contributors.length === 0) {
 		return "_Be the first — see [CONTRIBUTING.md](CONTRIBUTING.md)._";
 	}
-	// EXACT OpenClaw format: markdown linked images `[![login](avatar?s=48)](profile)`,
-	// PER_LINE per row (space-separated), rows separated by a blank line. Plain
-	// markdown — no HTML — so it's byte-for-byte how OpenClaw commits its wall.
+	// Linked HTML avatar with explicit width/height — forces a uniform 48px for
+	// EVERY contributor (real photo OR generated identicon). PER_LINE per row,
+	// rows separated by a blank line.
 	const cell = (c) =>
-		`[![${c.login}](https://avatars.githubusercontent.com/u/${c.id}?v=4&s=${AVATAR_SIZE})](https://github.com/${c.login})`;
+		`<a href="https://github.com/${c.login}" title="${c.login}"><img src="https://avatars.githubusercontent.com/u/${c.id}?v=4&s=${AVATAR_SIZE}" width="${AVATAR_SIZE}" height="${AVATAR_SIZE}" alt="${c.login}" /></a>`;
 	const lines = [];
 	for (let i = 0; i < contributors.length; i += PER_LINE) {
 		lines.push(contributors.slice(i, i + PER_LINE).map(cell).join(" "));

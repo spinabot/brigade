@@ -1,7 +1,12 @@
 import { strict as assert } from "node:assert";
 import { afterEach, describe, it } from "node:test";
 
-import { discoverCloudModelMeta, fetchOpenAICompatibleModelIds } from "./provider-discovery.js";
+import {
+	describeModelProbe,
+	discoverCloudModelMeta,
+	fetchOpenAICompatibleModelIds,
+	probeModelReachable,
+} from "./provider-discovery.js";
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -97,5 +102,68 @@ describe("fetchOpenAICompatibleModelIds — live model discovery (NVIDIA NIM etc
 	it("returns null when the endpoint yields no usable ids", async () => {
 		mockFetch({ data: [] });
 		assert.equal(await fetchOpenAICompatibleModelIds("https://integrate.api.nvidia.com/v1", "nvapi-xxx"), null);
+	});
+});
+
+describe("probeModelReachable — does a listed model actually respond", () => {
+	it("ok when the completion returns 200", async () => {
+		globalThis.fetch = (async () => ({ ok: true, status: 200 }) as unknown as Response) as typeof fetch;
+		assert.deepEqual(await probeModelReachable("https://x/v1", "k", "m"), { ok: true });
+	});
+
+	it("auth when the completion is 401", async () => {
+		globalThis.fetch = (async () => ({ ok: false, status: 401 }) as unknown as Response) as typeof fetch;
+		assert.deepEqual(await probeModelReachable("https://x/v1", "k", "m"), { ok: false, reason: "auth" });
+	});
+
+	it("model_unavailable on a 404", async () => {
+		globalThis.fetch = (async () =>
+			({ ok: false, status: 404, text: async () => "" }) as unknown as Response) as typeof fetch;
+		const r = await probeModelReachable("https://x/v1", "k", "m");
+		assert.equal(r.ok, false);
+		assert.equal((r as { reason?: string }).reason, "model_unavailable");
+	});
+
+	it("model_unavailable when the completion hangs but /models is reachable (the NVIDIA case)", async () => {
+		globalThis.fetch = (async (url: string | URL | Request) => {
+			if (String(url).includes("/chat/completions")) throw new Error("timed out");
+			return { ok: true, status: 200 } as unknown as Response; // /models is up
+		}) as typeof fetch;
+		assert.deepEqual(await probeModelReachable("https://x/v1", "k", "m"), {
+			ok: false,
+			reason: "model_unavailable",
+			detail: "no response",
+		});
+	});
+
+	it("provider_unreachable when both the completion AND /models fail", async () => {
+		globalThis.fetch = (async () => {
+			throw new Error("ECONNREFUSED");
+		}) as typeof fetch;
+		assert.deepEqual(await probeModelReachable("https://x/v1", "k", "m"), {
+			ok: false,
+			reason: "provider_unreachable",
+		});
+	});
+});
+
+describe("describeModelProbe — actionable, jargon-free copy", () => {
+	it("returns null for a healthy model (no message)", () => {
+		assert.equal(describeModelProbe({ ok: true }, "NVIDIA NIM", "m"), null);
+	});
+
+	it("guides to /model for a dead model", () => {
+		const msg = describeModelProbe(
+			{ ok: false, reason: "model_unavailable" },
+			"NVIDIA NIM",
+			"deepseek-ai/deepseek-v4-pro",
+		);
+		assert.match(msg!, /isn't responding/);
+		assert.match(msg!, /\/model/);
+		assert.match(msg!, /deepseek-v4-pro/);
+	});
+
+	it("distinguishes an unreachable provider from a dead model", () => {
+		assert.match(describeModelProbe({ ok: false, reason: "provider_unreachable" }, "NVIDIA NIM", "m")!, /reach/i);
 	});
 });

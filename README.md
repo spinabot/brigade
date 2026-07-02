@@ -970,7 +970,7 @@ A pride of contributors who make Brigade better. Thank you to everyone who has
 joined the crew!
 
 <!-- brigadiers:start -->
-[![Bhasvanth-Dev9380](https://avatars.githubusercontent.com/u/157608971?v=4&s=48)](https://github.com/Bhasvanth-Dev9380) [![Ranjithsingh2004](https://avatars.githubusercontent.com/u/122562396?v=4&s=48)](https://github.com/Ranjithsingh2004)
+<a href="https://github.com/Bhasvanth-Dev9380" title="Bhasvanth-Dev9380"><img src="https://avatars.githubusercontent.com/u/157608971?v=4&s=48" width="48" height="48" alt="Bhasvanth-Dev9380" /></a> <a href="https://github.com/Ranjithsingh2004" title="Ranjithsingh2004"><img src="https://avatars.githubusercontent.com/u/122562396?v=4&s=48" width="48" height="48" alt="Ranjithsingh2004" /></a>
 <!-- brigadiers:end -->
 
 Want to join the pride? See [CONTRIBUTING.md](CONTRIBUTING.md).

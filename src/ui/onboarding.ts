@@ -23,6 +23,7 @@ import { getEnvApiKey, getModels, type KnownProvider, type Model } from "@earend
 // The package.json "exports" map exposes "./oauth", so this is the supported
 // path (verified against node_modules @ pi-ai 0.79.9).
 import { getOAuthProvider } from "@earendil-works/pi-ai/oauth";
+import { ensureAntigravityRegistered } from "../integrations/antigravity/transport.js";
 import type { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { CancellableLoader, Input, type SelectItem, SelectList, Text, TUI } from "@earendil-works/pi-tui";
 
@@ -34,7 +35,7 @@ import {
 } from "../auth/profiles.js";
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveModelsPath } from "../config/paths.js";
 import { BRIGADE_DIR, saveConfig } from "../core/config.js";
-import { readClaudeCliLogin, readCodexCliLogin } from "../integrations/cli-login.js";
+import { readClaudeCliLogin, readCodexCliLogin, readGeminiCliLogin } from "../integrations/cli-login.js";
 import { writeCustomProviderToModelsJson } from "../integrations/custom-provider.js";
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
 import {
@@ -50,10 +51,12 @@ import { brand, selectListTheme } from "./theme.js";
 import { pickStorageMode, type StorageModeResult } from "./onboard-storage-mode.js";
 import { SearchableSelectList } from "./searchable-select.js";
 import {
+	describeModelProbe,
 	fetchOpenAICompatibleModelIds,
 	getCachedSubscriptionModels,
 	listOpenRouterModels,
 	prefetchSubscriptionModels,
+	probeModelReachable,
 } from "../integrations/provider-discovery.js";
 
 export interface OnboardingResult {
@@ -334,6 +337,60 @@ export async function runOnboarding(
 			continue;
 		}
 		modelId = result.modelId;
+		// Selection precheck: for live-catalog custom providers (e.g. NVIDIA NIM), a
+		// LISTED model can still hang — the catalog advertises models the account
+		// can't actually serve. Probe the picked model now so the operator isn't left
+		// discovering it's dead only on their first turn. Scoped to liveModels
+		// providers; a quick, bounded request that verifies the model responds.
+		const pinfo = findProvider(provider);
+		if (pinfo?.liveModels && pinfo.baseUrl && modelId) {
+			const probeKey =
+				(await authStorage.getApiKey(pinfo.providerId ?? pinfo.id).catch(() => undefined)) ??
+				readProviderEnvKey(pinfo);
+			if (probeKey) {
+				renderScreen(tui, "Step 4 of 5 · Default model");
+				tui.addChild(new Text(brand.dim(`  Checking ${modelId} responds on ${pinfo.name}…`), 0, 0));
+				tui.requestRender();
+				const warning = describeModelProbe(
+					await probeModelReachable(pinfo.baseUrl, probeKey, modelId),
+					pinfo.name,
+					modelId,
+				);
+				if (warning) {
+					renderScreen(tui, "Step 4 of 5 · Default model");
+					tui.addChild(new Text(`  ${brand.amber("⚠")} ${brand.amber(warning)}`, 0, 0));
+					tui.addChild(new Text("", 0, 0));
+					const choice = new SelectList(
+						[
+							{ value: "pick", label: "Pick another" },
+							{ value: "keep", label: "Use it anyway" },
+						],
+						2,
+						selectListTheme,
+						{ minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 16 },
+					);
+					choice.setSelectedIndex(0); // default: pick another
+					tui.addChild(choice);
+					tui.setFocus(choice);
+					tui.requestRender();
+					let decision: "pick" | "keep" = "pick";
+					try {
+						const chosen = await new Promise<SelectItem>((resolve, reject) => {
+							choice.onSelect = (item) => resolve(item);
+							choice.onCancel = () => reject(new Error("back"));
+						});
+						decision = chosen.value === "keep" ? "keep" : "pick";
+					} catch {
+						decision = "pick";
+					}
+					tui.removeChild(choice);
+					if (decision === "pick") {
+						step = "model"; // loop back to the picker
+						continue;
+					}
+				}
+			}
+		}
 		break;
 	}
 
@@ -402,7 +459,12 @@ async function pickProvider(tui: TUI): Promise<string> {
 		// A login the matching vendor CLI already minted on this machine?
 		let cliReady = false;
 		if (p.cliLogin) {
-			const cred = p.cliLogin.read === "claude" ? readClaudeCliLogin() : readCodexCliLogin();
+			const cred =
+				p.cliLogin.read === "claude"
+					? readClaudeCliLogin()
+					: p.cliLogin.read === "gemini"
+						? readGeminiCliLogin()
+						: readCodexCliLogin();
 			cliReady = cred !== null;
 		}
 		const hasEnvKey = !!readProviderEnvKey(p);
@@ -901,6 +963,11 @@ export async function ensureSubscriptionLogin(
 	provider: ProviderInfo,
 ): Promise<"ok" | "back"> {
 	const sub = provider.subscription!;
+	// Antigravity's OAuth provider is a Brigade-registered custom provider (not a Pi
+	// built-in), so register it before the lookup or `getOAuthProvider` returns
+	// undefined and the wizard reports "not supported yet". Idempotent + no-op once
+	// registered; gated so other subscription logins don't touch it.
+	if (sub.oauthProviderId === "antigravity") ensureAntigravityRegistered();
 	const oauthProvider = getOAuthProvider(sub.oauthProviderId);
 	if (!oauthProvider) {
 		// Pi build doesn't know this provider — fail cleanly back to the picker
@@ -1126,7 +1193,12 @@ async function ensureCliLogin(
 	authStorage: AuthStorage,
 	provider: ProviderInfo,
 ): Promise<"ok" | "back" | "other"> {
-	const cred = provider.cliLogin!.read === "claude" ? readClaudeCliLogin() : readCodexCliLogin();
+	const cred =
+		provider.cliLogin!.read === "claude"
+			? readClaudeCliLogin()
+			: provider.cliLogin!.read === "gemini"
+				? readGeminiCliLogin()
+				: readCodexCliLogin();
 	if (!cred) return "other"; // no CLI login present on this machine
 
 	// A login is already on this machine — but LEAD with browser sign-in: it works
@@ -1244,39 +1316,88 @@ async function ensureCustomProvider(
 	provider: ProviderInfo,
 ): Promise<"ok" | "back"> {
 	let lastError: string | null = null;
+	// If the operator already has this provider's key in their environment (e.g.
+	// NVIDIA_API_KEY), OFFER it — confirm-then-validate, never silent-adopt. A
+	// present env var isn't proof it works, and the operator may want to paste a
+	// different key; this mirrors the standard-provider env-confirm flow (a past
+	// bug let stale env values silently complete onboarding). On "No" (or a key
+	// that fails validation) we fall through to the normal paste prompt.
+	const envKeyRaw = readProviderEnvKey(provider);
+	let pendingEnvKey: string | null =
+		typeof envKeyRaw === "string" && envKeyRaw.trim().length > 0 ? envKeyRaw.trim() : null;
 	while (true) {
-		renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
-
-		if (lastError) {
-			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
-			tui.addChild(new Text(brand.dim("  Press Enter to try again, or Esc to choose a different provider."), 0, 0));
-			tui.addChild(new Text("", 0, 0));
-		}
-
-		tui.addChild(new Text(`  Paste your ${provider.name} key.`, 0, 0));
-		tui.addChild(new Text(brand.dim(`  Get one at ${provider.keyUrl}`), 0, 0));
-		tui.addChild(new Text(brand.dim("  Enter to continue  ·  Esc to go back"), 0, 0));
-		tui.addChild(new Text("", 0, 0));
-
-		const input = new Input();
-		tui.addChild(input);
-		tui.setFocus(input);
-		tui.requestRender();
-
 		let key: string;
-		try {
-			key = await new Promise<string>((resolve, reject) => {
-				input.onSubmit = (value: string) => resolve(sanitizePastedValue(value));
-				input.onEscape = () => reject(new Error("back"));
-			});
-		} catch {
-			return "back";
-		}
+		if (pendingEnvKey) {
+			const candidate = pendingEnvKey;
+			pendingEnvKey = null; // offer once; on decline/failure fall through to paste
+			renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
+			tui.addChild(
+				new Text(
+					`  ${brand.amber("?")} We found a saved ${provider.name} key on this computer (${formatApiKeyPreview(candidate)}). Use it?`,
+					0,
+					0,
+				),
+			);
+			tui.addChild(new Text("", 0, 0));
+			const confirmList = new SelectList(
+				[
+					{ value: "yes", label: "Yes" },
+					{ value: "no", label: "No" },
+				],
+				2,
+				selectListTheme,
+				{ minPrimaryColumnWidth: 6, maxPrimaryColumnWidth: 8 },
+			);
+			confirmList.setSelectedIndex(0); // default Yes
+			tui.addChild(confirmList);
+			tui.setFocus(confirmList);
+			tui.requestRender();
+			let useEnv: boolean;
+			try {
+				const chosen = await new Promise<SelectItem>((resolve, reject) => {
+					confirmList.onSelect = (item) => resolve(item);
+					confirmList.onCancel = () => reject(new Error("back"));
+				});
+				useEnv = chosen.value === "yes";
+			} catch {
+				return "back";
+			}
+			tui.removeChild(confirmList);
+			if (!useEnv) continue; // declined → paste prompt on the next pass
+			key = candidate;
+		} else {
+			renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
 
-		// Empty submit — show a one-line hint instead of silently re-rendering.
-		if (!key) {
-			lastError = "Please enter an API key.";
-			continue;
+			if (lastError) {
+				tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
+				tui.addChild(new Text(brand.dim("  Press Enter to try again, or Esc to choose a different provider."), 0, 0));
+				tui.addChild(new Text("", 0, 0));
+			}
+
+			tui.addChild(new Text(`  Paste your ${provider.name} key.`, 0, 0));
+			tui.addChild(new Text(brand.dim(`  Get one at ${provider.keyUrl}`), 0, 0));
+			tui.addChild(new Text(brand.dim("  Enter to continue  ·  Esc to go back"), 0, 0));
+			tui.addChild(new Text("", 0, 0));
+
+			const input = new Input();
+			tui.addChild(input);
+			tui.setFocus(input);
+			tui.requestRender();
+
+			try {
+				key = await new Promise<string>((resolve, reject) => {
+					input.onSubmit = (value: string) => resolve(sanitizePastedValue(value));
+					input.onEscape = () => reject(new Error("back"));
+				});
+			} catch {
+				return "back";
+			}
+
+			// Empty submit — show a one-line hint instead of silently re-rendering.
+			if (!key) {
+				lastError = "Please enter an API key.";
+				continue;
+			}
 		}
 
 		// Cheap, format-agnostic sanity check (length / whitespace). Custom
@@ -1298,7 +1419,9 @@ async function ensureCustomProvider(
 			tui.requestRender();
 			const ids = await fetchOpenAICompatibleModelIds(provider.baseUrl, key);
 			if (!ids || ids.length === 0) {
-				lastError = `Couldn't fetch models from ${provider.name} with that key. Check the key and try again.`;
+				// A null/empty result means either a rejected key OR an unreachable
+				// endpoint (firewall/proxy/offline) — don't accuse the key outright.
+				lastError = `Couldn't reach ${provider.name}, or the key was rejected. Check your connection and the key, then try again.`;
 				continue;
 			}
 			models = ids;

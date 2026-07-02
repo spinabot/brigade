@@ -231,6 +231,97 @@ export async function fetchOpenAICompatibleModelIds(
 	return ids.length > 0 ? ids : null;
 }
 
+/* ──────────────────── model reachability probe ──────────────────── */
+
+/**
+ * Result of probing whether a model actually RESPONDS — not just whether it's
+ * listed. `model_unavailable`: the endpoint is up but the model returns nothing
+ * (the NVIDIA-lists-dead-models case). `provider_unreachable`: the whole endpoint
+ * is down/blocked. `auth`: the key was rejected. `error`: an HTTP error with detail.
+ */
+export type ModelProbeResult =
+	| { ok: true }
+	| { ok: false; reason: "model_unavailable" | "provider_unreachable" | "auth" | "error"; detail?: string };
+
+/** Is the OpenAI-compatible endpoint reachable at all? (`/models`, incl. a 401 —
+ *  an auth rejection still proves the host is up.) Used to tell a dead MODEL apart
+ *  from an unreachable PROVIDER. Never throws. */
+async function isEndpointReachable(baseUrl: string, apiKey: string): Promise<boolean> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 6000);
+	try {
+		const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
+			signal: controller.signal,
+			headers: { Accept: "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+		});
+		return res.ok || res.status === 401 || res.status === 403;
+	} catch {
+		return false;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * Probe whether `modelId` on an OpenAI-compatible endpoint actually responds.
+ * Sends a 1-token completion with a short deadline; on a no-response (timeout /
+ * connection reset) it falls back to `isEndpointReachable` so we can distinguish
+ * a dead model from an unreachable provider. Catalog membership is NOT proof a
+ * model works — NVIDIA NIM advertises models in `/models` that hang with zero
+ * bytes. Never throws.
+ */
+export async function probeModelReachable(
+	baseUrl: string,
+	apiKey: string,
+	modelId: string,
+	opts?: { timeoutMs?: number },
+): Promise<ModelProbeResult> {
+	const timeoutMs = opts?.timeoutMs ?? 12_000;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+			method: "POST",
+			signal: controller.signal,
+			headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+			body: JSON.stringify({
+				model: modelId,
+				messages: [{ role: "user", content: "ping" }],
+				max_tokens: 1,
+				stream: false,
+			}),
+		});
+		if (res.ok) return { ok: true };
+		if (res.status === 401 || res.status === 403) return { ok: false, reason: "auth" };
+		if (res.status === 404) return { ok: false, reason: "model_unavailable", detail: "not found" };
+		const detail = (await res.text().catch(() => "")).slice(0, 120).replace(/\s+/g, " ").trim();
+		return { ok: false, reason: "error", detail: `HTTP ${res.status}${detail ? ` — ${detail}` : ""}` };
+	} catch {
+		// No response — separate a dead MODEL from an unreachable PROVIDER.
+		const providerUp = await isEndpointReachable(baseUrl, apiKey);
+		return providerUp
+			? { ok: false, reason: "model_unavailable", detail: "no response" }
+			: { ok: false, reason: "provider_unreachable" };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/** Turn a failed probe into a single, B2B-clean, actionable line — or `null` when the model is fine. */
+export function describeModelProbe(result: ModelProbeResult, providerName: string, modelId: string): string | null {
+	if (result.ok) return null;
+	switch (result.reason) {
+		case "model_unavailable":
+			return `${modelId} isn't responding — it may be unavailable on ${providerName}. Try /model to pick another.`;
+		case "provider_unreachable":
+			return `Can't reach ${providerName} right now — check your connection or the service status.`;
+		case "auth":
+			return `${providerName} rejected the API key.`;
+		default:
+			return `${providerName} returned an error${result.detail ? ` (${result.detail})` : ""}.`;
+	}
+}
+
 /* ──────────────────────── subscription live catalogs ──────────────────────── */
 
 /**

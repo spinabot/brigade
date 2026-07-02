@@ -33,6 +33,7 @@ import { FactStore, MEMORY_SEGMENTS, type MemoryRecordOrigin, type MemorySegment
 import { confineUntrustedSegment } from "./write-gate.js";
 import { balancedObjects } from "./json-scan.js";
 import { ensureOllamaNativeApiRegistered } from "../ollama-native/register.js";
+import { ensureAntigravityRegistered } from "../../integrations/antigravity/transport.js";
 import {
 	buildCandidateBlock,
 	DEFAULT_CANDIDATE_K,
@@ -594,6 +595,7 @@ export function makeIsolatedLlm(
 		// and this isolated session builds its own registry independent of the main
 		// agent loop. Idempotent + synchronous — a no-op when already registered.
 		ensureOllamaNativeApiRegistered();
+		ensureAntigravityRegistered();
 		// `inMemory()` skips ALL persistence (both modes) — the isolated sweep
 		// never touches disk. Convex mode additionally needs this so the sweep
 		// writes nothing under ~/.brigade.

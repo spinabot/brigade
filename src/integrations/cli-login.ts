@@ -99,6 +99,37 @@ export function readCodexCliLogin(): CliLogin | null {
 }
 
 /**
+ * Read the Gemini / Antigravity CLI's stored login from
+ * `~/.gemini/oauth_creds.json` (the google-auth-library credential the
+ * gemini-cli / antigravity-cli writes after `gemini`/`antigravity` login).
+ *
+ * Shape: `{ access_token, refresh_token, expiry_date }` where `expiry_date` is
+ * ALREADY epoch-ms (google-auth-library convention). Returns an `oauth`
+ * credential (Pi/Brigade can refresh it against Google). Returns `null` on any
+ * missing file / parse error / absent token — e.g. an IDE-only Antigravity user
+ * whose token lives in the OS keyring, which we can't read (they use the browser
+ * login path instead). Never throws.
+ */
+export function readGeminiCliLogin(): CliLogin | null {
+	try {
+		const credPath = path.join(homedir(), ".gemini", "oauth_creds.json");
+		if (!fs.existsSync(credPath)) return null;
+		const parsed = JSON.parse(fs.readFileSync(credPath, "utf8")) as {
+			access_token?: string;
+			refresh_token?: string;
+			expiry_date?: number;
+		};
+		const access = parsed.access_token;
+		const refresh = parsed.refresh_token;
+		if (!access || !refresh) return null;
+		const expires = typeof parsed.expiry_date === "number" ? parsed.expiry_date : undefined;
+		return { provider: "antigravity", type: "oauth", access, refresh, expires };
+	} catch {
+		return null;
+	}
+}
+
+/**
  * Decode the `exp` claim (seconds) of a JWT and return it as epoch-ms, or
  * `undefined` if the token isn't a parseable three-part JWT with a numeric
  * `exp`. Base64url-decodes the middle (payload) segment.
