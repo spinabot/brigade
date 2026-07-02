@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.20.0](https://github.com/spinabot/brigade/compare/brigade-v1.19.2...brigade-v1.20.0) (2026-07-02)
+
+
+### Features
+
+* **ollama:** native /api/chat transport for first-class tool-calling + thinking ([542d039](https://github.com/spinabot/brigade/commit/542d0398998c6ed91eaf2f4e73b22ba91dd7d75c))
+
+
+### Bug Fixes
+
+* **ollama:** make the native /api/chat transport work end-to-end ([ae2c434](https://github.com/spinabot/brigade/commit/ae2c43453c2000b71b0b7949f9356a65a0e66904))
+* **tui:** /model lists the current provider's full model set ([5e054f5](https://github.com/spinabot/brigade/commit/5e054f5ccef07906046089b6930aeee921ee485c))
+* **tui:** restore header divider + status line, scope /model to connected providers, strip &lt;thinking&gt; tags ([5ccbedf](https://github.com/spinabot/brigade/commit/5ccbedf8d3dc0f23829ba84e3bbdc0995af97b53))
+
 ## [1.19.2](https://github.com/spinabot/brigade/compare/brigade-v1.19.1...brigade-v1.19.2) (2026-06-30)
 
 
