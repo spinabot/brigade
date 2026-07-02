@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.19.4](https://github.com/spinabot/brigade/compare/brigade-v1.19.3...brigade-v1.19.4) (2026-07-02)
+
+
+### Bug Fixes
+
+* **memory:** strip reasoning, JSON5 fallback, and cap extraction retries ([75986be](https://github.com/spinabot/brigade/commit/75986be519acd157cc33e96ff7508f6030596f29))
+* **ollama:** inject num_ctx from the model context window; read real /api/show context_length ([d5918b7](https://github.com/spinabot/brigade/commit/d5918b792f9632bb132a49ae5f46525f78925052))
+* **prompt:** stop base-model identity leak on non-gpt/gemini/claude models ([ac11883](https://github.com/spinabot/brigade/commit/ac118830bc5b282139e06b931d5fe67c3d4b4620))
+* **tools:** reconcile misnamed tool calls (e.g. action-&gt;browser) before exact-match dispatch ([3fb043e](https://github.com/spinabot/brigade/commit/3fb043e7a9a4505d719f3e45f89942d1a0156d5a))
+* **tui:** strip inline &lt;think&gt;/&lt;thinking&gt;/&lt;thought&gt;/&lt;final&gt; reasoning via a shared util ([7e27980](https://github.com/spinabot/brigade/commit/7e279802d5297196f386d5be61d05b94f118f11a))
+
 ## [1.19.3](https://github.com/spinabot/brigade/compare/brigade-v1.19.2...brigade-v1.19.3) (2026-07-02)
 
 
