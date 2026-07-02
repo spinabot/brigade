@@ -2601,39 +2601,30 @@ export async function wireConnectUi(
 
 			const arg = trimmed === "/model" ? "" : trimmed.slice("/model ".length).trim();
 			if (!arg) {
-				// `/model` lists EVERY configured provider's models (it's a global
-				// switcher — picking a model on another provider switches provider
-				// too). Group by provider with the CURRENT one first so the operator
-				// sees the provider they're on up top instead of hunting through a
-				// flat list dominated by providers with huge catalogs (OpenRouter's
-				// live catalog is merged in gateway-side and runs to hundreds).
+				// Scope the list to the CURRENT provider and show ALL of its models,
+				// uncapped. `/model` is still a GLOBAL switcher — `/model <id>` switches
+				// to any model on any provider — but the LIST stays a clean, complete
+				// picker of what you're actually on, instead of a flat dump dominated by
+				// a 300+-model cloud catalog. Use `/provider` to change providers.
 				const current = lastSnapshot?.provider;
-				const byProvider = new Map<string, ModelSummary[]>();
-				for (const m of models) {
-					const arr = byProvider.get(m.provider) ?? [];
-					arr.push(m);
-					byProvider.set(m.provider, arr);
+				const currentModels = current ? models.filter((m) => m.provider === current) : models;
+				if (currentModels.length === 0) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.dim(`no models configured${current ? ` for ${current}` : ""} — type /model <id>, or /provider to switch.`)}`,
+							0,
+							0,
+						),
+					);
+					return;
 				}
-				const PER_PROVIDER_CAP = 20;
-				const order = [...byProvider.keys()].sort((a, b) =>
-					a === current ? -1 : b === current ? 1 : a.localeCompare(b),
-				);
-				const sections = order.map((prov) => {
-					const rows = byProvider.get(prov) ?? [];
-					const head =
-						prov === current
-							? `${brand.amber(prov)} ${brand.dim("(current)")}`
-							: brand.dim(prov);
-					const shown = rows.slice(0, PER_PROVIDER_CAP);
-					const body = shown.map((m) => `    ${brand.white(m.id)}`).join("\n");
-					const more = rows.length - shown.length;
-					const moreLine =
-						more > 0 ? `\n    ${brand.dim(`… +${more} more — type /model <id>`)}` : "";
-					return `  ${head}\n${body}${moreLine}`;
-				});
+				const head = current
+					? `${brand.amber(current)} ${brand.dim("(current)")}`
+					: brand.dim("models");
+				const body = currentModels.map((m) => `    ${brand.white(m.id)}`).join("\n");
 				insertBeforeEditor(
 					new Markdown(
-						`${brand.dim("configured models on the gateway (current provider first):")}\n\n${sections.join("\n\n")}\n\n${brand.dim("usage: /model <id>")}`,
+						`${brand.dim("models on your current provider:")}\n\n  ${head}\n${body}\n\n${brand.dim("usage: /model <id>  ·  switch provider with /provider")}`,
 						1,
 						0,
 						markdownTheme,
