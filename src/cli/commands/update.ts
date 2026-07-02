@@ -23,7 +23,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -92,6 +92,72 @@ function isSourceCheckout(root: string): boolean {
 	return existsSync(join(root, ".git")) && existsSync(join(root, "src"));
 }
 
+/** Newest file mtime (ms) under `dir`, recursively, filtered by extension.
+ *  Bounded by a file budget so a pathological tree can't stall the command;
+ *  skips `node_modules`/`.git`. Returns 0 when the dir is missing/empty. */
+function newestMtimeMs(dir: string, exts: string[]): number {
+	let max = 0;
+	let budget = 50000;
+	const stack = [dir];
+	while (stack.length > 0 && budget-- > 0) {
+		const d = stack.pop() as string;
+		let names: string[];
+		try {
+			names = readdirSync(d);
+		} catch {
+			continue;
+		}
+		for (const name of names) {
+			const p = join(d, name);
+			let st: ReturnType<typeof statSync>;
+			try {
+				st = statSync(p);
+			} catch {
+				continue;
+			}
+			if (st.isDirectory()) {
+				if (name === "node_modules" || name === ".git") continue;
+				stack.push(p);
+			} else if (st.isFile() && exts.some((x) => name.endsWith(x))) {
+				if (st.mtimeMs > max) max = st.mtimeMs;
+			}
+		}
+	}
+	return max;
+}
+
+/** Is the compiled `dist/` already current with the working tree? True only when
+ *  `dist/` exists AND its newest artifact is at least as new as the newest source
+ *  input (src/*.ts + package.json/lock). Lets `update` skip a redundant
+ *  reinstall+recompile when nothing actually changed since the last build. A
+ *  missing dist, or any newer source file, returns false → rebuild. */
+function buildIsCurrent(root: string): boolean {
+	const dist = join(root, "dist");
+	if (!existsSync(dist)) return false;
+	const distMax = newestMtimeMs(dist, [".js", ".cjs", ".mjs"]);
+	if (distMax === 0) return false;
+	let srcMax = newestMtimeMs(join(root, "src"), [".ts", ".tsx", ".js", ".json"]);
+	for (const f of ["package.json", "package-lock.json"]) {
+		try {
+			const m = statSync(join(root, f)).mtimeMs;
+			if (m > srcMax) srcMax = m;
+		} catch {
+			/* file may not exist */
+		}
+	}
+	return distMax >= srcMax;
+}
+
+/** Best-effort: the version PUBLISHED to npm (the released package). Returns
+ *  undefined when npm/the registry is unreachable. For a SOURCE checkout this is
+ *  only informational — that checkout tracks git (origin), not npm — but it lets
+ *  a dev see how their tree compares to the latest release. */
+function npmPublishedVersion(run: CommandRunner, name: string): string | undefined {
+	const view = run("npm", ["view", name, "version"], { capture: true });
+	if (view.code !== 0) return undefined;
+	return view.stdout.split("\n").pop()?.trim() || undefined;
+}
+
 const out = (s: string): void => void process.stdout.write(s);
 const err = (s: string): void => void process.stderr.write(s);
 const step = (s: string): void => out(`${chalk.cyan("→")} ${s}\n`);
@@ -114,6 +180,12 @@ export interface UpdateOptions {
 	check?: boolean;
 	/** Skip the final `gateway restart`. */
 	noRestart?: boolean;
+	/** Rebuild + restart even when the build is already current (source checkout)
+	 *  or already on the latest published version (npm global). */
+	force?: boolean;
+	/** Force the npm published-release path (fetch latest from the registry +
+	 *  install globally) even from a source checkout. */
+	npm?: boolean;
 	/** TEST SEAM — inject the subprocess runner. */
 	run?: CommandRunner;
 	/** TEST SEAM — override the resolved package root/info. */
@@ -173,19 +245,41 @@ function updateSourceCheckout(pkg: PackageInfo, opts: UpdateOptions, run: Comman
 
 	if (opts.check) {
 		if (!hasUpstream) out(`${chalk.dim("no upstream tracking branch — can't check remote.")}\n`);
-		else if (behind > 0)
-			out(`${chalk.yellow(`↑ ${behind} commit(s) behind upstream.`)} Run ${chalk.bold("brigade update")} to pull, rebuild + restart.\n`);
-		else out(`${chalk.green("✓ Up to date with upstream.")} (Run ${chalk.bold("brigade update")} to rebuild + restart anyway.)\n`);
+		else if (behind > 0) {
+			const blocked = dirty
+				? ` ${chalk.dim("(commit or stash your local changes first — a dirty tree blocks the pull).")}`
+				: "";
+			out(`${chalk.yellow(`↑ ${behind} commit(s) behind upstream.`)} Run ${chalk.bold("brigade update")} to pull, rebuild + restart.${blocked}\n`);
+		} else out(`${chalk.green("✓ Up to date with upstream.")} (Run ${chalk.bold("brigade update --force")} to rebuild + restart anyway.)\n`);
+		// Informational: how this checkout compares to the RELEASED (npm) version.
+		// The source of truth for a dev clone is git (origin) — `update` never
+		// installs from npm here (that would create a second, conflicting global
+		// copy) — but showing the published version explains version differences.
+		const published = npmPublishedVersion(run, pkg.name);
+		if (published) {
+			out(
+				`  ${chalk.dim(`published on npm: ${published}`)}` +
+					`${published !== pkg.version ? ` ${chalk.dim("(your checkout tracks git, not npm — pull from origin to advance it)")}` : ""}\n`,
+			);
+		}
 		return 0;
 	}
 
 	// 1) git pull — only fast-forward, only when clean. Never clobber local work.
+	let pulled = false;
 	if (!hasUpstream) {
-		out(`${chalk.dim("• no upstream — skipping git pull; rebuilding the working tree as-is.")}\n`);
+		out(`${chalk.dim("• no upstream — skipping git pull; using the working tree as-is.")}\n`);
 	} else if (dirty) {
+		// A dirty tree blocks the pull. If the remote is ALSO ahead, say so
+		// explicitly — otherwise the operator sees an unchanged version number
+		// and can't tell a newer release is waiting behind their local edits.
+		const behindNote =
+			behind > 0
+				? ` ${chalk.yellow(`A newer version is on the remote — you're ${behind} commit(s) behind.`)} ${chalk.dim("Commit or stash, then re-run to pull it.")}`
+				: "";
 		out(
 			`${chalk.yellow("• uncommitted changes present — skipping git pull")} (your work is left untouched); ` +
-				`rebuilding the working tree as-is.\n`,
+				`rebuilding the working tree as-is.${behindNote}\n`,
 		);
 	} else if (behind > 0) {
 		step(`git pull --ff-only  (${behind} commit(s) behind)`);
@@ -197,8 +291,22 @@ function updateSourceCheckout(pkg: PackageInfo, opts: UpdateOptions, run: Comman
 			);
 			return pull.code;
 		}
+		pulled = true;
 	} else {
-		out(`${chalk.dim("• already up to date with upstream — rebuilding to apply any local commits.")}\n`);
+		out(`${chalk.dim("• already up to date with upstream.")}\n`);
+	}
+
+	// 1b) Skip the reinstall+recompile when nothing actually changed — a pull, a
+	//     newer source file (local edit), or a missing dist all force a rebuild;
+	//     otherwise the built dist already matches the tree and there's nothing to
+	//     do. Answers "it's already the latest — why build again?". `--force`
+	//     overrides. The gateway isn't restarted either (it's already on this dist).
+	if (!opts.force && !pulled && buildIsCurrent(root)) {
+		out(
+			`${chalk.green("✓ Already up to date")} ${chalk.dim("— the build matches your working tree; nothing to rebuild.")} ` +
+				`${chalk.dim("Use")} ${chalk.bold("brigade update --force")} ${chalk.dim("to rebuild + restart anyway.")}\n`,
+		);
+		return 0;
 	}
 
 	// 2) npm install — deps may have changed. Captured so the upgrade stays quiet
@@ -235,8 +343,8 @@ function updateNpmGlobal(pkg: PackageInfo, opts: UpdateOptions, run: CommandRunn
 	const latest = view.code === 0 ? view.stdout.split("\n").pop()?.trim() : undefined;
 	out(`${chalk.dim("current:")} ${pkg.version}${latest ? `   ${chalk.dim("latest:")} ${latest}` : ""}\n`);
 
-	if (latest && latest === pkg.version) {
-		out(`${chalk.green("✓ Already on the latest version.")}\n`);
+	if (latest && latest === pkg.version && !opts.force) {
+		out(`${chalk.green("✓ Already on the latest version.")} ${chalk.dim("(Use")} ${chalk.bold("brigade update --force")} ${chalk.dim("to reinstall + restart anyway.)")}\n`);
 		return 0;
 	}
 	if (opts.check) {
@@ -262,5 +370,18 @@ function updateNpmGlobal(pkg: PackageInfo, opts: UpdateOptions, run: CommandRunn
 export async function runUpdateCommand(opts: UpdateOptions = {}): Promise<number> {
 	const pkg = opts.pkg ?? resolvePackageInfo();
 	const run = opts.run ?? defaultRunner;
+	// `--npm` forces the published-release path: fetch the latest from the npm
+	// registry and install it GLOBALLY (`npm i -g <pkg>@latest`), even from a
+	// source checkout. Note it updates the GLOBAL install, not this source tree —
+	// which `brigade` runs afterwards depends on your PATH.
+	if (opts.npm) {
+		if (isSourceCheckout(pkg.root)) {
+			out(
+				`${chalk.dim("• --npm: installing the latest PUBLISHED build globally")} ` +
+					`${chalk.dim("(this updates your global")} ${chalk.bold("brigade")}${chalk.dim(", not the source checkout at")} ${pkg.root}${chalk.dim(").")}\n`,
+			);
+		}
+		return updateNpmGlobal(pkg, opts, run);
+	}
 	return isSourceCheckout(pkg.root) ? updateSourceCheckout(pkg, opts, run) : updateNpmGlobal(pkg, opts, run);
 }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -73,6 +73,38 @@ test("source checkout, DIRTY tree → skips git pull but still installs/builds/r
 	assert.ok(ran(calls, "gateway restart"));
 });
 
+test("source checkout, clean + up-to-date + dist already current → skips reinstall/rebuild/restart", async () => {
+	// A dist/ newer than the (empty) src means the build already matches the tree.
+	mkdirSync(join(root, "dist"));
+	writeFileSync(join(root, "dist", "index.js"), "// built");
+	const { run, calls } = makeRunner({ upstream: true, dirty: false, behind: 0 });
+	const code = await runUpdateCommand({ pkg: PKG(), run });
+	assert.equal(code, 0);
+	assert.ok(!ran(calls, "npm install"), "should NOT reinstall when the build is current");
+	assert.ok(!ran(calls, "npm run build"), "should NOT rebuild when the build is current");
+	assert.ok(!ran(calls, "gateway restart"), "nothing rebuilt → nothing to restart");
+});
+
+test("source checkout, --force → rebuilds + restarts even when the build is current", async () => {
+	mkdirSync(join(root, "dist"));
+	writeFileSync(join(root, "dist", "index.js"), "// built");
+	const { run, calls } = makeRunner({ upstream: true, dirty: false, behind: 0 });
+	const code = await runUpdateCommand({ pkg: PKG(), run, force: true });
+	assert.equal(code, 0);
+	assert.ok(ran(calls, "npm run build"), "--force should rebuild regardless");
+	assert.ok(ran(calls, "gateway restart"));
+});
+
+test("source checkout, a git pull → forces a rebuild even if a prior dist exists", async () => {
+	mkdirSync(join(root, "dist"));
+	writeFileSync(join(root, "dist", "index.js"), "// stale build");
+	const { run, calls } = makeRunner({ upstream: true, dirty: false, behind: 2 });
+	const code = await runUpdateCommand({ pkg: PKG(), run });
+	assert.equal(code, 0);
+	assert.ok(ran(calls, "pull --ff-only"), "should git pull");
+	assert.ok(ran(calls, "npm run build"), "a pull must trigger a rebuild");
+});
+
 test("source checkout, build FAILS → does NOT restart the gateway", async () => {
 	const { run, calls } = makeRunner({ upstream: true, dirty: false, behind: 0, buildCode: 1 });
 	const code = await runUpdateCommand({ pkg: PKG(), run });
@@ -113,6 +145,21 @@ test("source checkout, no upstream → skips pull, still builds + restarts", asy
 	assert.equal(code, 0);
 	assert.ok(!ran(calls, "pull"));
 	assert.ok(ran(calls, "npm run build"));
+	assert.ok(ran(calls, "gateway restart"));
+});
+
+test("source checkout + --npm → forces the GLOBAL npm install (npm i -g @latest), not a git rebuild", async () => {
+	const { run, calls } = makeRunner({ upstream: true, dirty: true, behind: 0 });
+	// npm view returns a newer published version so it proceeds to install.
+	const wrapped: CommandRunner = (cmd, args, o) => {
+		if (args.includes("view")) return { code: 0, stdout: "9.9.9", stderr: "" };
+		return run(cmd, args, o);
+	};
+	const code = await runUpdateCommand({ pkg: PKG(), run: wrapped, npm: true });
+	assert.equal(code, 0);
+	assert.ok(calls.some((c) => c.includes("i -g @spinabot/brigade@latest")), "should npm i -g @latest");
+	assert.ok(!ran(calls, "pull --ff-only"), "must NOT git pull the source tree");
+	assert.ok(!ran(calls, "npm run build"), "must NOT rebuild the source tree");
 	assert.ok(ran(calls, "gateway restart"));
 });
 

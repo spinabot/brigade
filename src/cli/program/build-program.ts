@@ -650,15 +650,21 @@ export function buildProgram(): Command {
         "    • source clone → git pull (when clean) + npm install + build, then restart\n" +
         "  Examples:\n" +
         "    brigade update               # update + restart the gateway\n" +
+        "    brigade update --npm         # install the latest PUBLISHED build globally (npm i -g @latest)\n" +
         "    brigade update --check       # just report if newer code is available\n" +
+        "    brigade update --force       # rebuild + restart even if already up to date\n" +
         "    brigade update --no-restart  # update but leave the gateway for a manual restart",
     )
     .option("--check", "report current vs latest without changing anything", false)
+    .option("--npm", "fetch + install the latest PUBLISHED version globally from npm (even from a source checkout)", false)
+    .option("--force", "rebuild + restart even when the build is already current", false)
     .option("--no-restart", "update but don't restart the gateway")
-    .action(async (opts: { check?: boolean; restart?: boolean }) => {
+    .action(async (opts: { check?: boolean; npm?: boolean; force?: boolean; restart?: boolean }) => {
       const { runUpdateCommand } = await import("../commands/update.js");
       // Commander maps `--no-restart` to `restart: false`.
-      await exitAfterFlush(await runUpdateCommand({ check: opts.check, noRestart: opts.restart === false }));
+      await exitAfterFlush(
+        await runUpdateCommand({ check: opts.check, npm: opts.npm, force: opts.force, noRestart: opts.restart === false }),
+      );
     });
 
   /* ─────────────────────────────── config ─────────────────────────────── */
