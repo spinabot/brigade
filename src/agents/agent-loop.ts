@@ -96,6 +96,7 @@ import {
 // exact same derivation this build uses.
 import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
+import { wrapStreamFnWithToolNameRepair } from "./tool-name-repair.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
 import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
@@ -1024,9 +1025,18 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   if (sessionAgent && typeof sessionAgent.streamFn === "function") {
     const baseStreamFn = sessionAgent.streamFn;
     const idleTimeoutMs = resolveIdleTimeoutMs();
+    // Innermost: reconcile misnamed tool calls against the LIVE allowed-tool set
+    // (read per call so per-turn tool changes are honoured). Fixes weak local
+    // models that emit e.g. a tool named `action`/`navigate` instead of
+    // `browser` — Pi's exact-match dispatch would otherwise hard-fail the turn.
+    const nameRepaired = wrapStreamFnWithToolNameRepair(baseStreamFn, () => {
+      const tools = (session.agent?.state as { tools?: Array<{ name?: unknown }> } | undefined)?.tools;
+      if (!Array.isArray(tools)) return [];
+      return tools.map((t) => (typeof t?.name === "string" ? t.name : "")).filter(Boolean);
+    });
     sessionAgent.streamFn = wrapStreamFnWithIdleTimeout(
       wrapStreamFnWithStopReasonRecovery(
-        wrapStreamFnWithToolCallRepair(baseStreamFn),
+        wrapStreamFnWithToolCallRepair(nameRepaired),
       ),
       { timeoutMs: idleTimeoutMs },
     );
