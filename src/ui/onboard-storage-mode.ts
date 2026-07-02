@@ -347,6 +347,20 @@ async function pickConvexBackend(tui: TUI): Promise<string> {
 				0,
 			),
 		);
+		if (isConvexCloudUrl(url)) {
+			// A fresh cloud deployment has no functions yet — deploy them with a
+			// deploy key, otherwise boot fails with "functions aren't deployed".
+			tui.addChild(
+				new Text(`  ${brand.dim("Cloud deployment — deploy Brigade's functions with your deploy key:")}`, 0, 0),
+			);
+			tui.addChild(
+				new Text(
+					`  ${brand.dim("set CONVEX_DEPLOY_KEY (Convex dashboard → Settings → Deploy key), then run: npm run convex:push")}`,
+					0,
+					0,
+				),
+			);
+		}
 		tui.requestRender();
 		await delay(500);
 
@@ -383,18 +397,36 @@ interface ProbeResult {
 	instanceName?: string;
 }
 
+function isConvexCloudUrl(url: string): boolean {
+	try {
+		return /(^|\.)convex\.cloud$/i.test(new URL(url).hostname);
+	} catch {
+		return /\.convex\.cloud\b/i.test(url);
+	}
+}
+
 async function probeConvexBackend(url: string): Promise<ProbeResult> {
 	const cleaned = url.replace(/\/+$/, "");
-	const endpoint = `${cleaned}/instance_name`;
+	// `/instance_name` is a SELF-HOSTED backend route — it 200s on a local backend
+	// but 404s on a Convex Cloud deployment (a valid, reachable deployment that
+	// just doesn't expose that route). Treat cloud specially: a reachable cloud
+	// host is accepted here; its Brigade functions are deployed separately with a
+	// deploy key (npm run convex:push), and boot verifies health:ping after that.
+	const cloud = isConvexCloudUrl(cleaned);
+	const endpoint = cloud ? cleaned : `${cleaned}/instance_name`;
 	try {
 		const controller = new AbortController();
 		const t = setTimeout(() => controller.abort(), 5_000);
-		const res = await fetch(endpoint, { signal: controller.signal });
+		const res = await fetch(endpoint, { signal: controller.signal, redirect: "manual" });
 		clearTimeout(t);
+		if (cloud) {
+			// Any HTTP response from the deployment host = reachable Convex Cloud.
+			return { ok: true, reason: "ok", instanceName: "Convex Cloud" };
+		}
 		if (!res.ok) {
 			return {
 				ok: false,
-				reason: "That backend responded but didn't look like a Brigade backend. Double-check the URL.",
+				reason: "That backend responded but didn't look like a self-hosted Brigade backend. Double-check the URL.",
 			};
 		}
 		const text = (await res.text()).trim();
@@ -404,7 +436,9 @@ async function probeConvexBackend(url: string): Promise<ProbeResult> {
 		const localHint =
 			cleaned.includes("127.0.0.1") || cleaned.includes("localhost")
 				? "  · make sure your local backend is running before continuing."
-				: "";
+				: cloud
+					? "  · check the deployment URL from your Convex dashboard."
+					: "";
 		return { ok: false, reason: `Couldn't reach ${cleaned}: ${msg}${localHint}` };
 	}
 }

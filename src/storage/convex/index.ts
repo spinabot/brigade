@@ -121,11 +121,24 @@ export class ConvexBrigadeStore implements BrigadeStore {
 		// fails cryptically mid-turn.
 		const health = await this.healthcheck();
 		if (!health.ok) {
+			const detail = String(health.details.error ?? "no response");
+			// A reachable backend that doesn't know `health:ping` means the backend
+			// is UP but Brigade's functions were never deployed to it — the exact
+			// symptom of pointing at a fresh *.convex.cloud deployment (functions
+			// only land via `convex deploy`). Don't mislabel that as "unreachable";
+			// tell the operator to deploy, with the cloud path spelled out.
+			if (/Could not find public function/i.test(detail)) {
+				throw new Error(
+					`Convex backend reached, but Brigade's functions aren't deployed to it (${detail}).\n` +
+						`  • Cloud deployment  — set CONVEX_DEPLOY_KEY (Convex dashboard → deployment → Settings → Deploy key), then run: npm run convex:push\n` +
+						`  • Self-hosted local — npm run convex:dev (auto-deploys), or npm run convex:push\n` +
+						`  Or switch back to filesystem: brigade store mode set filesystem`,
+				);
+			}
 			throw new Error(
-				`convex backend unreachable — ${String(health.details.error ?? "no response")}. ` +
-					`Start your deployment (npm run convex:dev for self-hosted) or check ` +
-					`BRIGADE_CONVEX_URL / ~/.brigade/mode.sentinel. To work without it, switch ` +
-					`back with: brigade store mode set filesystem`,
+				`Convex backend unreachable — ${detail}. Check the deployment URL is running ` +
+					`(BRIGADE_CONVEX_URL / ~/.brigade/mode.sentinel), or switch back with: ` +
+					`brigade store mode set filesystem`,
 			);
 		}
 	}

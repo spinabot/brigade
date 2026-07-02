@@ -506,7 +506,8 @@ function buildStaleBundleError(remote: string): Error {
 				`(backend: ${remote}, this build needs: v${EXPECTED_CONVEX_BUNDLE_VERSION}).\n` +
 				`  Push the current functions, then retry:\n` +
 				`    npm run convex:push\n` +
-				`  (restarting \`npm run convex:dev\` also pushes automatically at startup)`,
+				`  • Cloud: set CONVEX_DEPLOY_KEY first (Convex dashboard → Settings → Deploy key).\n` +
+				`  • Self-hosted: restarting \`npm run convex:dev\` also pushes automatically at startup.`,
 		),
 		{ brigadeStaleBundle: true as const },
 	);
