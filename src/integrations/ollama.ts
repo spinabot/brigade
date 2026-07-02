@@ -155,23 +155,45 @@ export function inferOllamaModelCapabilities(modelId: string): InferredCapabilit
 }
 
 /** Subset of Ollama's POST /api/show response we read. `capabilities` is the
- *  authoritative signal — e.g. ["completion","tools","thinking","vision"]. */
+ *  authoritative capability signal — e.g. ["completion","tools","thinking",
+ *  "vision"]; `model_info` carries `<arch>.context_length` (the model's real
+ *  trained context window). */
 interface OllamaShowResponse {
 	capabilities?: unknown;
+	model_info?: Record<string, unknown>;
+}
+
+/** What `/api/show` tells us about a model — all best-effort / nullable. */
+export interface OllamaModelInfo {
+	/** Lower-cased capability tags, or null when the probe failed. */
+	capabilities: string[] | null;
+	/** The model's real max context window (tokens), or null when unknown. */
+	contextLength: number | null;
+}
+
+/** Pull `<arch>.context_length` out of `/api/show`'s `model_info` (the key is
+ *  architecture-prefixed, e.g. `qwen3.context_length`). */
+function extractContextLength(modelInfo: unknown): number | null {
+	if (!modelInfo || typeof modelInfo !== "object") return null;
+	for (const [k, v] of Object.entries(modelInfo as Record<string, unknown>)) {
+		if (k.endsWith(".context_length") && typeof v === "number" && Number.isFinite(v) && v > 0) {
+			return Math.floor(v);
+		}
+	}
+	return null;
 }
 
 /**
- * AUTHORITATIVE capability probe — POST /api/show for one model and return its
- * lower-cased `capabilities` array. This is the source of truth for whether a
- * model REASONS (`"thinking"`), supports TOOLS (`"tools"`), and accepts IMAGES
- * (`"vision"`) — far better than guessing from the model name. Best-effort:
- * returns null on any failure (older Ollama, daemon down, timeout) so callers
- * fall back to `inferOllamaModelCapabilities`.
+ * AUTHORITATIVE model probe — POST /api/show for one model and return its
+ * capabilities (`"thinking"`/`"tools"`/`"vision"`) AND its real context window.
+ * This is the source of truth — far better than guessing from the model name.
+ * Best-effort: any failure (older Ollama, daemon down, timeout) yields nulls so
+ * callers fall back to `inferOllamaModelCapabilities`.
  */
-export async function fetchOllamaCapabilities(
+export async function fetchOllamaModelInfo(
 	modelId: string,
 	baseUrl: string = DEFAULT_BASE_URL,
-): Promise<string[] | null> {
+): Promise<OllamaModelInfo> {
 	const url = `${baseUrl.replace(/\/$/, "")}/api/show`;
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -182,15 +204,25 @@ export async function fetchOllamaCapabilities(
 			body: JSON.stringify({ model: modelId }),
 			signal: controller.signal,
 		});
-		if (!res.ok) return null;
+		if (!res.ok) return { capabilities: null, contextLength: null };
 		const body = (await res.json()) as OllamaShowResponse;
-		if (!Array.isArray(body.capabilities)) return null;
-		return body.capabilities.map((c) => String(c).toLowerCase());
+		const capabilities = Array.isArray(body.capabilities)
+			? body.capabilities.map((c) => String(c).toLowerCase())
+			: null;
+		return { capabilities, contextLength: extractContextLength(body.model_info) };
 	} catch {
-		return null;
+		return { capabilities: null, contextLength: null };
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+/** Back-compat helper — capability tags only. Prefer `fetchOllamaModelInfo`. */
+export async function fetchOllamaCapabilities(
+	modelId: string,
+	baseUrl: string = DEFAULT_BASE_URL,
+): Promise<string[] | null> {
+	return (await fetchOllamaModelInfo(modelId, baseUrl)).capabilities;
 }
 
 /**
@@ -221,16 +253,21 @@ export async function writeOllamaToModelsJson(
 	const modelDefs = await Promise.all(
 		models.map(async (m) => {
 			const guess = inferOllamaModelCapabilities(m.id);
-			const caps = await fetchOllamaCapabilities(m.id, baseUrl);
+			const info = await fetchOllamaModelInfo(m.id, baseUrl);
+			const caps = info.capabilities;
 			const reasoning = caps ? caps.includes("thinking") : guess.reasoning;
 			const vision = caps ? caps.includes("vision") : guess.input.includes("image");
 			const input: ("text" | "image")[] = vision ? ["text", "image"] : ["text"];
+			// Prefer the model's REAL context window from /api/show; the name-based
+			// guess (32k) is only a fallback. This value also drives the runtime
+			// num_ctx we inject, so an accurate number prevents silent truncation.
+			const contextWindow = info.contextLength ?? guess.contextWindow;
 			return {
 				id: m.id,
 				name: m.name + (m.parameterSize ? ` (${m.parameterSize})` : ""),
 				reasoning,
 				input,
-				contextWindow: guess.contextWindow,
+				contextWindow,
 				maxTokens: guess.maxTokens,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, // local = free
 			};

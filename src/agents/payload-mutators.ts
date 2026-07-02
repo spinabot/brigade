@@ -998,6 +998,60 @@ export function isMinimaxAnthropicModel(model: Model<any>): boolean {
   return provider === "minimax" || provider === "minimax-portal";
 }
 
+/* ─────────────────────────── 9. Ollama context-window (num_ctx) ─────────────────────────── */
+
+/** Whether the active model is served by a local Ollama daemon. */
+export function isOllamaModel(model: Model<any>): boolean {
+  if (!model) return false;
+  const provider = (model.provider ?? "").toLowerCase();
+  if (provider === "ollama") return true;
+  // Fallback: any openai-completions model pointed at Ollama's default port.
+  const baseUrl = (model as { baseUrl?: unknown }).baseUrl;
+  return typeof baseUrl === "string" && /:11434(?:\/|$)/.test(baseUrl);
+}
+
+/**
+ * Resolve the num_ctx to inject: `BRIGADE_OLLAMA_NUM_CTX` env override wins,
+ * else the model's own context window (models.json, seeded from `/api/show`).
+ * Returns undefined when nothing usable is known (leave Ollama's default).
+ */
+export function resolveOllamaNumCtx(model: Model<any>): number | undefined {
+  const envRaw = process.env.BRIGADE_OLLAMA_NUM_CTX;
+  if (envRaw) {
+    const n = Number.parseInt(envRaw, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const ctx = (model as { contextWindow?: unknown }).contextWindow;
+  if (typeof ctx === "number" && Number.isFinite(ctx) && ctx > 0) return Math.floor(ctx);
+  return undefined;
+}
+
+/**
+ * Inject `options.num_ctx` for Ollama requests.
+ *
+ * Ollama's OpenAI-compatible endpoint defaults num_ctx to ~2048–4096 and
+ * SILENTLY truncates anything longer. That shreds Brigade's large system prompt
+ * (identity / tool guidance gets cut → the model leaks its base-model identity),
+ * cuts replies off mid-stream, and degrades tool discipline. Pi never sets
+ * num_ctx, so we set it from the model's real context window. Ollama clamps the
+ * value down to the model's true maximum, so an over-estimate is safe (it can
+ * only ever raise the ceiling above the tiny default, never below it). Never
+ * overrides an explicit caller/model value.
+ */
+export function injectOllamaNumCtx(payload: unknown, model: Model<any>): void {
+  if (!isOllamaModel(model)) return;
+  if (!payload || typeof payload !== "object") return;
+  const ctx = resolveOllamaNumCtx(model);
+  if (!ctx) return;
+  const p = payload as { options?: unknown };
+  const options =
+    p.options && typeof p.options === "object"
+      ? (p.options as Record<string, unknown>)
+      : ((p.options = {}) as Record<string, unknown>);
+  if (typeof options.num_ctx === "number" && options.num_ctx > 0) return;
+  options.num_ctx = ctx;
+}
+
 /* ─────────────────────────── composition ─────────────────────────── */
 
 /**
@@ -1021,6 +1075,7 @@ export function applyAllPayloadMutations(payload: unknown, model: Model<any>): v
   sanitizeGeminiThinkingPayload(payload, model);
   normalizeSiliconFlowThinking(payload, model);
   disableMinimaxThinking(payload, model);
+  injectOllamaNumCtx(payload, model);
 }
 
 /**

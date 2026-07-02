@@ -9,6 +9,9 @@ import {
   sweepStaleAnthropicCacheControl,
   buildBrigadeTransformContext,
   wrapStreamFnWithPayloadMutations,
+  injectOllamaNumCtx,
+  isOllamaModel,
+  resolveOllamaNumCtx,
 } from "./payload-mutators.js";
 import { CACHE_BOUNDARY_MARKER } from "../system-prompt/cache-boundary.js";
 
@@ -287,4 +290,51 @@ test("wrapStreamFnWithPayloadMutations: preserves a caller's headers for non-Ope
   );
   // No attribution added, but the caller's own headers pass through untouched.
   assert.deepEqual(opts?.headers, { "X-Trace": "abc" });
+});
+
+// ─────────────────────────── Ollama num_ctx injection ───────────────────────────
+
+test("isOllamaModel: detects by provider and by :11434 base URL", () => {
+  assert.equal(isOllamaModel({ provider: "ollama", id: "ornith:35b" } as any), true);
+  assert.equal(
+    isOllamaModel({ provider: "custom", id: "x", baseUrl: "http://localhost:11434/v1" } as any),
+    true,
+  );
+  assert.equal(isOllamaModel({ provider: "openai", id: "gpt-4o" } as any), false);
+  assert.equal(isOllamaModel({ provider: "anthropic", id: "claude" } as any), false);
+});
+
+test("injectOllamaNumCtx: sets options.num_ctx from the model context window for Ollama", () => {
+  const payload: any = { model: "ornith:35b", messages: [] };
+  injectOllamaNumCtx(payload, { provider: "ollama", id: "ornith:35b", contextWindow: 32768 } as any);
+  assert.equal(payload.options.num_ctx, 32768);
+});
+
+test("injectOllamaNumCtx: no-op for non-Ollama providers", () => {
+  const payload: any = { model: "gpt-4o", messages: [] };
+  injectOllamaNumCtx(payload, { provider: "openai", id: "gpt-4o", contextWindow: 128000 } as any);
+  assert.equal(payload.options, undefined);
+});
+
+test("injectOllamaNumCtx: never overrides an explicit num_ctx", () => {
+  const payload: any = { options: { num_ctx: 8192 } };
+  injectOllamaNumCtx(payload, { provider: "ollama", id: "x", contextWindow: 32768 } as any);
+  assert.equal(payload.options.num_ctx, 8192);
+});
+
+test("resolveOllamaNumCtx: BRIGADE_OLLAMA_NUM_CTX env override wins", () => {
+  const prev = process.env.BRIGADE_OLLAMA_NUM_CTX;
+  process.env.BRIGADE_OLLAMA_NUM_CTX = "16384";
+  try {
+    assert.equal(resolveOllamaNumCtx({ provider: "ollama", id: "x", contextWindow: 32768 } as any), 16384);
+  } finally {
+    if (prev === undefined) delete process.env.BRIGADE_OLLAMA_NUM_CTX;
+    else process.env.BRIGADE_OLLAMA_NUM_CTX = prev;
+  }
+});
+
+test("injectOllamaNumCtx: no-op when no context window is known", () => {
+  const payload: any = { messages: [] };
+  injectOllamaNumCtx(payload, { provider: "ollama", id: "x" } as any);
+  assert.equal(payload.options, undefined);
 });
