@@ -47,6 +47,7 @@
 <p align="center">
   <a href="https://github.com/spinabot/brigade/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spinabot/brigade/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI status"></a>
   <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://img.shields.io/npm/v/@spinabot/brigade?style=for-the-badge&logo=npm&logoColor=white&color=CB3837" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://img.shields.io/npm/dt/@spinabot/brigade?style=for-the-badge&logo=npm&logoColor=white&color=CB3837&label=downloads" alt="npm total downloads"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/@spinabot/brigade?style=for-the-badge&logo=nodedotjs&logoColor=white&color=5FA04E&label=node" alt="node engine"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="MIT License"></a>
   <a href="https://brigade.spinabot.com"><img src="https://img.shields.io/badge/website-brigade.spinabot.com-E8B021?style=for-the-badge&logo=googlechrome&logoColor=white" alt="website"></a>
