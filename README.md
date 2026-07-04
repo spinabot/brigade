@@ -750,7 +750,6 @@ wipes everything it knows.
 | `BRIGADE_CONVEX_URL` | Convex deployment URL (implies convex mode) |
 | `BRIGADE_ENCRYPTION_KEY` | At-rest encryption master key (hex) |
 | `BRIGADE_ENABLE_INBOX_PERSIST` | Persist the sub-agent inbox to JSONL (auto-on at gateway boot) |
-| `BRIGADE_HOST_ENV` | Override the host-environment tag in the system prompt's runtime line |
 
 ---
 
