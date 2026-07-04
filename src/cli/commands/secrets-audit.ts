@@ -26,6 +26,7 @@ const PATTERNS: { name: string; re: RegExp }[] = [
 	{ name: "anthropic-key", re: /sk-ant-[a-z0-9-_]{30,}/i },
 	{ name: "openai-key", re: /sk-(?:proj-)?[A-Za-z0-9]{32,}/ },
 	{ name: "google-key", re: /AIza[0-9A-Za-z\-_]{30,}/ },
+	{ name: "google-key-aq", re: /\bAQ\.[0-9A-Za-z\-_]{30,}/ },
 	{ name: "aws-access-key", re: /AKIA[0-9A-Z]{16}/ },
 	{ name: "bearer-token-long", re: /Bearer\s+[A-Za-z0-9._-]{30,}/i },
 	{ name: "generic-secret-line", re: /\b(?:secret|api[_-]?key|token|password)\s*[:=]\s*['"]?[A-Za-z0-9._\-+/=]{24,}/i },

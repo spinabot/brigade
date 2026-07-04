@@ -15,8 +15,10 @@
  *   - AWS access keys (`AKIA…`, `ASIA…`) → `<redacted:aws-key>`
  *   - GitHub PATs (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` + 36 alnum) →
  *     `<redacted:github-token>`
- *   - OpenAI / Anthropic / Google AI keys (`sk-…`, `sk-ant-…`, `AIza…`) →
- *     `<redacted:provider-key>`
+ *   - OpenAI / Anthropic / Google AI keys (`sk-…`, `sk-ant-…`, `AIza…`) , 
+ *     AQ.…) → <redacted:provider-key>. Google issues both the legacy 
+ *     AIza… and the newer AQ.… prefixes for Gemini / AI Studio keys; 
+ *     both shapes must be caught so a fresh key doesn't leak into logs. 
  *   - Phone numbers in `+CCNNNNNNNNNN` form (≥10 digits after `+`) →
  *     `<redacted:phone>`
  *   - Email addresses → `<redacted:email>`
@@ -32,6 +34,7 @@ const PATTERNS: Array<{ re: RegExp; replacement: string }> = [
 	{ re: /\bgh[opusr]_[A-Za-z0-9]{36}\b/g, replacement: "<redacted:github-token>" },
 	{ re: /\bsk-(?:ant-)?[A-Za-z0-9_\-]{20,}\b/g, replacement: "<redacted:provider-key>" },
 	{ re: /\bAIza[A-Za-z0-9_\-]{35}\b/g, replacement: "<redacted:provider-key>" },
+	{ re: /\bAQ\.[A-Za-z0-9_\-]{30,}\b/g, replacement: "<redacted:provider-key>" },
 	{ re: /\+\d{10,15}\b/g, replacement: "<redacted:phone>" },
 	{ re: /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, replacement: "<redacted:email>" },
 ];
