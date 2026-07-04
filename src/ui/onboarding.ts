@@ -315,7 +315,12 @@ export async function runOnboarding(
 			// Custom (catalog-defined) providers — a key + a known
 			// Anthropic-compatible endpoint (GLM, Kimi, Qwen, MiniMax, DeepSeek).
 			// Paste the key, register the endpoint + models into models.json, done.
-			if (providerInfo?.custom && providerInfo.baseUrl) {
+			// Also handles the generic "Custom (OpenAI-compatible)" entry, which
+			// has `custom: true` but no pre-set `baseUrl`. `ensureCustomProvider`
+			// prompts for the URL when it's missing. Without this, the generic
+			// custom path falls through to `ensureApiKey`, which never writes
+			// `models.json` — leaving the model unresolvable at gateway startup.
+			if (providerInfo?.custom) {
 				const r = await ensureCustomProvider(tui, authStorage, modelRegistry, providerInfo);
 				if (r === "back") {
 					step = "provider";
@@ -1309,6 +1314,45 @@ async function ensureCustomProvider(
 	modelRegistry: ModelRegistry,
 	provider: ProviderInfo,
 ): Promise<"ok" | "back"> {
+	// Generic custom provider — the catalog entry has `custom: true` but no
+	// pre-set `baseUrl` (it varies per user). Prompt for the URL before the
+	// key-entry loop, then attach it to a shallow copy so the downstream
+	// write path sees a fully resolved provider without mutating the catalog.
+	if (!provider.baseUrl) {
+		while (true) {
+			renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
+			tui.addChild(new Text(`  Enter your OpenAI-compatible base URL.`, 0, 0));
+			tui.addChild(new Text(brand.dim("  Example: https://api.example.com/v1"), 0, 0));
+			tui.addChild(new Text(brand.dim("  Enter to continue  ·  Esc to go back"), 0, 0));
+			tui.addChild(new Text("", 0, 0));
+			const urlInput = new Input();
+			tui.addChild(urlInput);
+			tui.setFocus(urlInput);
+			tui.requestRender();
+			let rawUrl: string;
+			try {
+				rawUrl = await new Promise<string>((resolve, reject) => {
+					urlInput.onSubmit = (value: string) => resolve(value.trim());
+					urlInput.onEscape = () => reject(new Error("back"));
+				});
+			} catch {
+				return "back";
+			}
+			if (!rawUrl) {
+				// Empty submit — re-render with a hint.
+				continue;
+			}
+			// Minimal URL sanity check — must start with http(s)://.
+			if (!/^https?:\/\//i.test(rawUrl)) {
+				renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
+				tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error("URL must start with http:// or https://")}`, 0, 0));
+				tui.addChild(new Text("", 0, 0));
+				continue;
+			}
+			provider = { ...provider, baseUrl: rawUrl, api: provider.api ?? "openai-completions" };
+			break;
+		}
+	}
 	let lastError: string | null = null;
 	// If the operator already has this provider's key in their environment (e.g.
 	// NVIDIA_API_KEY), OFFER it — confirm-then-validate, never silent-adopt. A
