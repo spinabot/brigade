@@ -67,15 +67,13 @@ export function registerGatewayCommand(program: import("commander").Command): vo
 		.option("-v, --verbose", "raise log level to debug")
 		.option("-q, --quiet", "disable the console stream entirely")
 		.option("--log-level <level>", "trace|debug|info|warn|error|fatal")
-		.option("--replace", "stop an existing gateway before starting (avoids 'already running' errors)")
-		.action(async (opts: { port?: number; host?: string; verbose?: boolean; quiet?: boolean; logLevel?: string; replace?: boolean }) => {
+		.action(async (opts: { port?: number; host?: string; verbose?: boolean; quiet?: boolean; logLevel?: string }) => {
 			await runGatewayCommand({
 				port: opts.port,
 				host: opts.host,
 				verbose: opts.verbose,
 				quiet: opts.quiet,
 				logLevel: opts.logLevel as LogLevel | undefined,
-				replace: opts.replace,
 			});
 			await new Promise<void>(() => {});
 		});
@@ -87,15 +85,13 @@ export function registerGatewayCommand(program: import("commander").Command): vo
 		.option("-v, --verbose", "raise log level to debug")
 		.option("-q, --quiet", "disable the console stream entirely")
 		.option("--log-level <level>", "trace|debug|info|warn|error|fatal")
-		.option("--replace", "stop an existing gateway before starting (avoids 'already running' errors)")
-		.action(async (opts: { port?: number; host?: string; verbose?: boolean; quiet?: boolean; logLevel?: string; replace?: boolean }) => {
+		.action(async (opts: { port?: number; host?: string; verbose?: boolean; quiet?: boolean; logLevel?: string }) => {
 			await runGatewayCommand({
 				port: opts.port,
 				host: opts.host,
 				verbose: opts.verbose,
 				quiet: opts.quiet,
 				logLevel: opts.logLevel as LogLevel | undefined,
-				replace: opts.replace,
 			});
 			await new Promise<void>(() => {});
 		});
@@ -538,8 +534,6 @@ export interface GatewayCommandOptions {
 	quiet?: boolean;
 	/** Explicit log level override. Wins over both --verbose and the default. */
 	logLevel?: LogLevel;
-	/** Stop an existing gateway before starting. Avoids lock/port conflicts. */
-	replace?: boolean;
 }
 
 /**
@@ -606,26 +600,10 @@ export async function runGatewayCommand(opts: GatewayCommandOptions = {}): Promi
 		// shape is `Gateway failed to start: ...\nIf the gateway is
 		// supervised, stop it with: brigade gateway stop`.
 		if (isGatewayLockError(err)) {
-			// --replace: stop the existing gateway and retry once.
-			if (opts.replace) {
-				process.stderr.write(
-					chalk.yellow(`brigade-gateway: replacing existing gateway (pid ${err.holderPid ?? "unknown"})…\n`),
-				);
-				const stopCode = await runGatewayStopCommand({ port, timeout: 5000 });
-				if (stopCode !== 0) {
-					process.stderr.write(chalk.red(`brigade-gateway: failed to stop the existing gateway.\n`));
-					process.exit(EXIT_FAILURE);
-				}
-				// Brief pause to let the OS release the port (TIME_WAIT).
-				await new Promise((resolve) => setTimeout(resolve, 500));
-				// Retry — call ourselves WITHOUT --replace to avoid infinite loops.
-				return await runGatewayCommand({ ...opts, replace: false });
-			}
 			const listeners = inspectPortListeners(port);
 			let body =
 				`brigade-gateway: failed to start: ${chalk.red(msg)}\n` +
 				chalk.dim(`  If the gateway is supervised, stop it with: ${chalk.bold("brigade gateway stop")}\n`) +
-				chalk.dim(`  Or restart in-place with: ${chalk.bold("brigade gateway --replace")}\n`) +
 				`Port ${port} is already in use.\n`;
 			if (listeners.length > 0) {
 				for (const l of listeners) {
@@ -689,14 +667,20 @@ export async function runGatewayCommand(opts: GatewayCommandOptions = {}): Promi
 	// Banner already printed by startServer (verbose path uses consoleStream;
 	// quiet path writes the two plain lines). No additional banner needed here.
 
-	// Proactively warn when a subscription login can't auto-refresh — so the
-	// operator fixes it with `brigade login` up front instead of discovering it
-	// as a silent 401 mid-turn (the credential dies a day or two after onboarding
-	// if it was stored without a refresh token). Best-effort; never blocks boot.
+	// A subscription login stored without a refresh token dies a day or two after
+	// onboarding (silent 401 mid-turn). First try to SELF-HEAL it from the vendor
+	// CLI login (Claude Code) so it becomes auto-refreshing with no user action;
+	// only warn about what we couldn't heal. Best-effort; never blocks boot.
 	try {
-		const { detectUnrefreshableSubscriptions, formatUnrefreshableWarning } = await import(
+		const { autoHealSubscriptions, detectUnrefreshableSubscriptions, formatUnrefreshableWarning } = await import(
 			"../../auth/auth-health.js"
 		);
+		const healed = autoHealSubscriptions();
+		if (healed.length > 0) {
+			process.stderr.write(
+				`brigade-gateway: re-synced ${healed.join(", ")} from your Claude Code login — auto-refreshing now (no action needed).\n`,
+			);
+		}
 		const stale = detectUnrefreshableSubscriptions();
 		if (stale.length > 0) {
 			process.stderr.write(`\nbrigade-gateway: ${formatUnrefreshableWarning(stale)}\n\n`);

@@ -11,7 +11,9 @@
  *   - type "api_key" holding an `sk-ant-oat…` subscription access token (pasted
  *                      or written by an older onboarding path).
  *   - type "oauth"   with no refresh token.
- * The fix in every case is `brigade login` (browser OAuth → refresh token).
+ * `autoHealSubscriptions` recovers these at gateway boot by re-syncing from the
+ * vendor CLI login (Claude Code) — no user action. `brigade login` is only the
+ * manual fallback when there is no CLI login present to adopt.
  *
  * Reads through the mode-aware `readProfiles` choke point, so it is correct in
  * BOTH filesystem and Convex mode (it never touches a raw file or the store
@@ -19,8 +21,9 @@
  */
 
 import { DEFAULT_AGENT_ID } from "../config/paths.js";
+import { readClaudeCliLogin } from "../integrations/cli-login.js";
 import { PROVIDERS } from "../providers/catalog.js";
-import { readProfiles } from "./profiles.js";
+import { readProfiles, upsertOAuthProfile } from "./profiles.js";
 
 export interface UnrefreshableSubscription {
 	/** Stored provider id (where the credential lives, e.g. "anthropic"). */
@@ -104,6 +107,40 @@ export function detectUnrefreshableSubscriptions(
 		}
 	}
 	return out;
+}
+
+/**
+ * SELF-HEAL: silently upgrade unrefreshable subscription logins to a refreshable
+ * OAuth credential by re-reading the vendor CLI's CURRENT login (which carries a
+ * refresh token Pi can rotate). Zero user action — this turns the "static token"
+ * warning into an automatic fix at gateway boot instead of a manual `brigade
+ * login`.
+ *
+ * Claude: reads the Claude Code CLI login (`~/.claude/.credentials.json`, a
+ * plaintext file on Windows/Linux). If it carries a refresh token, the stored
+ * `anthropic` profile is rewritten as `type:"oauth"` and Pi keeps it refreshed
+ * from then on (auth-bridge persists each rotation). Best-effort + defensive: a
+ * missing/refresh-less CLI login leaves the credential untouched (the caller then
+ * warns). Returns the provider labels it healed, for a one-line boot log.
+ */
+export function autoHealSubscriptions(agentId: string = DEFAULT_AGENT_ID): string[] {
+	const healed: string[] = [];
+	for (const sub of detectUnrefreshableSubscriptions(agentId)) {
+		// Claude only for now — its CLI login is an on-disk file we can read on
+		// every OS (Codex/Copilot heal paths can slot in the same way later).
+		if (sub.provider !== "anthropic") continue;
+		const cli = readClaudeCliLogin();
+		if (cli?.type === "oauth" && cli.access && cli.refresh) {
+			upsertOAuthProfile(agentId, {
+				provider: "anthropic",
+				access: cli.access,
+				refresh: cli.refresh,
+				...(cli.expires !== undefined ? { expires: cli.expires } : {}),
+			});
+			healed.push(sub.label);
+		}
+	}
+	return healed;
 }
 
 /** One-line-per-provider operator warning, or "" when healthy. */
