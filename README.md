@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/spinabot-brigade-badge.png)](https://mseep.ai/app/spinabot-brigade)
+
 # 🦁 Brigade — Your personal intelligence, built enterprise-grade
 
 <p align="center">
