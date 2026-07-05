@@ -16,6 +16,8 @@ import { AuthStorage } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_AGENT_ID } from "../config/paths.js";
 import { PROVIDERS } from "../providers/catalog.js";
+import { adoptNewerClaudeCliLogin } from "../auth/auth-health.js";
+import { CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "../agents/claude-cli/catalog.js";
 import { readProfiles, updateOAuthTokens } from "../auth/profiles.js";
 
 // Minimal shape we read from auth-profiles.json. Mirrors `AuthProfile` in
@@ -175,6 +177,11 @@ export function loadBrigadeAuthStorage(agentId: string = DEFAULT_AGENT_ID): unkn
 
 export function readBrigadeCredentials(agentId: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
+  // A credential borrowed from the Claude Code CLI may have been rotated by
+  // the CLI since we stored it — adopt the newer tokens BEFORE building the
+  // map so we never refresh (and thereby rotate) a stale copy of a grant the
+  // CLI is still using. No-op for independent `brigade login` grants.
+  adoptNewerClaudeCliLogin(agentId);
   // Route through the mode-aware `readProfiles` choke point: filesystem mode
   // reads auth-profiles.json, convex mode reads the in-process cache primed
   // at boot from the sealed authProfiles table. Either way the bridge sees
@@ -228,6 +235,15 @@ export function readBrigadeCredentials(agentId: string): Record<string, unknown>
       if (out[provider] !== undefined) continue;
       out[provider] = cred;
     }
+  }
+  // claude-cli sentinel — the subprocess backend needs no credential (the
+  // `claude` binary uses its own stored login), but Pi's auth resolution still
+  // requires SOME key for the provider or it throws "No API key for provider:
+  // claude-cli" before ever reaching the transport. Seed a non-secret sentinel
+  // (never sent on the wire). Always safe: it only makes a claude-cli turn
+  // dispatchable; every other provider is untouched.
+  if (out[CLAUDE_CLI_PROVIDER] === undefined) {
+    out[CLAUDE_CLI_PROVIDER] = { type: "api_key", key: CLAUDE_CLI_SENTINEL_KEY };
   }
   return out;
 }

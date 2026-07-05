@@ -24,6 +24,7 @@
 
 import * as fs from "node:fs";
 
+import { isClaudeCliProvider, synthClaudeCliModel } from "./claude-cli/register.js";
 import { isLikelyReasoningModelId } from "../core/model-caps.js";
 import { rediscoverOllamaModel } from "../integrations/ollama.js";
 import { discoverCloudModelMeta, type DiscoveredModelMeta } from "../integrations/provider-discovery.js";
@@ -31,6 +32,64 @@ import { discoverCloudModelMeta, type DiscoveredModelMeta } from "../integration
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 8192;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
+
+/**
+ * Per-provider context window INCLUDED in a subscription login. A request whose
+ * input exceeds this draws from that provider's pay-as-you-go / overage bucket
+ * ("extra usage", "credits") instead of the flat plan — even while the plan's
+ * session/weekly quota is untouched.
+ *
+ * Only list a provider whose subscription ACTUALLY bills long context as overage.
+ * A provider whose subscription is purely rate/quota-limited (a message cap, a
+ * requests-per-window limit — no per-token-context overage) must NOT be listed,
+ * or we'd compact early for zero billing benefit and hurt its UX. Add a provider
+ * here only once its overage-context boundary is confirmed.
+ *
+ *   anthropic — Claude Pro/Max include the 200K standard window; a request >200K
+ *               uses the long-context (1M) capability, billed as extra usage.
+ *               Catalogued models such as claude-opus-4-8 carry a 1,000,000
+ *               window, so without this clamp pre-emptive compaction wouldn't
+ *               fire until ~850K tokens (0.85 × 1M) and every large turn would
+ *               sail past 200K into extra usage (the "You're out of extra usage"
+ *               400 seen with plenty of plan left).
+ */
+export const SUBSCRIPTION_INCLUDED_CONTEXT_WINDOW: Readonly<Record<string, number>> = {
+	anthropic: 200_000,
+};
+
+/** Back-compat alias for the Anthropic included-tier boundary. */
+export const ANTHROPIC_SUBSCRIPTION_CONTEXT_WINDOW =
+	SUBSCRIPTION_INCLUDED_CONTEXT_WINDOW.anthropic;
+
+/**
+ * The context window a request should be SIZED against for billing safety.
+ *
+ * On a subscription login (OAuth / setup-token) the window is capped to the
+ * provider's included tier (see `SUBSCRIPTION_INCLUDED_CONTEXT_WINDOW`), so
+ * pre-emptive compaction fires before a request crosses into overage territory
+ * and the operator never draws pay-as-you-go credits while their plan has room.
+ * For API-key auth (pay-per-token — no overage concept), for a subscription
+ * provider we haven't confirmed has a context-overage boundary, and for any
+ * window already inside the included tier, the model's real window is returned
+ * unchanged. Provider-generic + pure.
+ */
+export function billingSafeContextWindow(
+	provider: string,
+	contextWindow: number | undefined,
+	isSubscription: boolean,
+): number | undefined {
+	if (!isSubscription) return contextWindow;
+	const included = SUBSCRIPTION_INCLUDED_CONTEXT_WINDOW[provider];
+	if (
+		included !== undefined &&
+		typeof contextWindow === "number" &&
+		Number.isFinite(contextWindow) &&
+		contextWindow > included
+	) {
+		return included;
+	}
+	return contextWindow;
+}
 
 /** Loose Pi Model shape — we clone templates rather than construct from scratch. */
 type LooseModel = Record<string, unknown> & {
@@ -70,6 +129,16 @@ export async function resolveModelNeverMiss(args: ResolveModelArgs): Promise<unk
 	const { provider, modelId, modelsFile } = args;
 	const registry = args.modelRegistry as LooseRegistry;
 	if (typeof registry.find !== "function") return undefined;
+
+	// 0. claude-cli backend — a subprocess transport, not an HTTP provider, so
+	// its models never live in Pi's catalog or models.json. Synthesize directly
+	// so `claude-cli/<model>` always resolves to an `api: "claude-cli"` Model
+	// (the registered transport dispatches it; the CLI validates the concrete id
+	// at spawn time). Checked FIRST so a stray built-in `claude-*` catalog entry
+	// can't shadow the subscription backend.
+	if (isClaudeCliProvider(provider)) {
+		return synthClaudeCliModel(modelId);
+	}
 
 	// 1. Static.
 	const direct = registry.find(provider, modelId);

@@ -35,6 +35,9 @@ import {
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveModelsPath } from "../config/paths.js";
 import { BRIGADE_DIR, saveConfig } from "../core/config.js";
 import { readClaudeCliLogin, readCodexCliLogin } from "../integrations/cli-login.js";
+import { isClaudeCliAvailable } from "../agents/claude-cli/availability.js";
+import { CLAUDE_CLI_DEFAULT_MODEL, CLAUDE_CLI_MODELS } from "../agents/claude-cli/catalog.js";
+import { hasBrigadeClaudeLogin, writeBrigadeClaudeCredential } from "../agents/claude-cli/claude-config.js";
 import { writeCustomProviderToModelsJson } from "../integrations/custom-provider.js";
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
 import {
@@ -275,6 +278,20 @@ export async function runOnboarding(
 				continue;
 			}
 
+			// claude-cli backend — no key + no browser flow: the `claude` binary
+			// authenticates with its OWN login. Validate the binary is installed
+			// and logged in; if not, guide the operator to run `claude` once. Models
+			// are synthesized, so nothing is written to models.json.
+			if (providerInfo?.id === "claude-cli") {
+				const result = await ensureClaudeCli(tui, authStorage);
+				if (result === "back") {
+					step = "provider";
+					continue;
+				}
+				step = "model";
+				continue;
+			}
+
 			// CLI-login reuse — if the provider can adopt an already-logged-in
 			// vendor CLI's token on this machine (Claude Code, Codex), offer the
 			// one-keystroke "reuse this login" path FIRST. "other" means no CLI
@@ -346,6 +363,17 @@ export async function runOnboarding(
 
 		// step === "model"
 		renderScreen(tui, "Step 4 of 5 · Default model");
+		// claude-cli models are synthesized (not in the registry), so pick from the
+		// backend's own catalog instead of the registry-backed picker.
+		if (provider === "claude-cli") {
+			const result = await pickClaudeCliModel(tui);
+			if (result === "back") {
+				step = "provider";
+				continue;
+			}
+			modelId = result.modelId;
+			break; // model chosen — exit the wizard loop to persist + finish
+		}
 		const result = await pickModel(tui, modelRegistry, findProvider(provider)?.providerId ?? provider);
 		if (result === "back") {
 			step = "provider"; // go all the way back so they can change provider too
@@ -485,10 +513,21 @@ async function pickProvider(tui: TUI): Promise<string> {
 
 		let rank: number;
 		let badge: string;
-		// A subscription provider stays "log in" (browser-first, multi-account) even
-		// when a CLI login is on disk — reuse is offered as a secondary option inside
-		// the flow. Only a pure CLI-login provider gets the rank-0 "reuse" treatment.
-		if (cliReady && !isSubscription) {
+		// The claude-cli backend: it's `local+noAuth` in the catalog, but it's a
+		// SUBSCRIPTION path, not a local server. Rank it with the subscription tier
+		// and surface it at the very top when the binary is installed + logged in
+		// (the cleanest "no extra-usage" route). Checked BEFORE the generic
+		// cliReady / local branches so it doesn't get the wrong badge.
+		if (p.id === "claude-cli") {
+			const ready = isClaudeCliAvailable() && (readClaudeCliLogin() !== null || hasBrigadeClaudeLogin());
+			rank = ready ? 0 : 2;
+			badge = ready
+				? "installed + signed in — subscription, no key, no extra-usage"
+				: "your Claude subscription — browser sign-in, no key, no extra-usage";
+		} else if (cliReady && !isSubscription) {
+			// A subscription provider stays "log in" (browser-first, multi-account)
+			// even when a CLI login is on disk — reuse is offered as a secondary
+			// option inside the flow. Only a pure CLI-login provider gets rank-0.
 			rank = 0;
 			badge = "logged in — reuse, no key";
 		} else if (hasEnvKey) {
@@ -1180,6 +1219,287 @@ export async function ensureSubscriptionLogin(
 	}
 }
 
+/** True when EITHER the operator's own `claude` login OR Brigade's managed
+ *  dedicated login is present — the backend can run with either. */
+function claudeCliLoggedIn(): boolean {
+	return readClaudeCliLogin() !== null || hasBrigadeClaudeLogin();
+}
+
+/**
+ * Connect the claude-cli backend end to end — no terminal, no token paste:
+ *   1. Ensure the `claude` binary is installed (offer to `npm i -g` it).
+ *   2. Ensure a login exists — if not, drive the SAME browser OAuth Brigade uses
+ *      for Claude Pro/Max and write the result into Brigade's OWN Claude config
+ *      dir (a dedicated grant, isolated from the operator's personal ~/.claude).
+ * Turns then run on the Claude subscription via the binary (no extra-usage).
+ *
+ * Returns "ok" to proceed to model selection, or "back" to re-pick the provider.
+ */
+export async function ensureClaudeCli(tui: TUI, authStorage: AuthStorage): Promise<"ok" | "back"> {
+	while (true) {
+		renderScreen(tui, "Step 3 of 5 · Connect Claude");
+
+		// ── 1. binary present? ──
+		if (!isClaudeCliAvailable({ force: true })) {
+			tui.addChild(new Text(`  ${brand.white("Brigade runs on your Claude subscription via the Claude Code engine.")}`, 0, 0));
+			tui.addChild(new Text(brand.dim("  The `claude` command isn't installed yet. Brigade can install it for you."), 0, 0));
+			tui.addChild(new Text("", 0, 0));
+			const choice = new SelectList(
+				[
+					{ value: "install", label: "Install it now", description: "runs: npm i -g @anthropic-ai/claude-code" },
+					{ value: "recheck", label: "I'll install it myself — re-check", description: "" },
+				],
+				2,
+				selectListTheme,
+				{ minPrimaryColumnWidth: 18, maxPrimaryColumnWidth: 24 },
+			);
+			tui.addChild(choice);
+			tui.setFocus(choice);
+			tui.requestRender();
+			let pick: "install" | "recheck";
+			try {
+				const chosen = await new Promise<SelectItem>((resolve, reject) => {
+					choice.onSelect = (item) => resolve(item);
+					choice.onCancel = () => reject(new Error("back"));
+				});
+				pick = chosen.value === "install" ? "install" : "recheck";
+			} catch {
+				return "back";
+			}
+			if (pick === "install") {
+				renderScreen(tui, "Step 3 of 5 · Connect Claude");
+				const loader = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Installing Claude Code (npm i -g @anthropic-ai/claude-code)…");
+				tui.addChild(loader);
+				tui.requestRender();
+				const ok = await installClaudeCode();
+				loader.stop?.();
+				if (!ok) {
+					renderScreen(tui, "Step 3 of 5 · Connect Claude");
+					tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error("Install failed. Run `npm i -g @anthropic-ai/claude-code` manually, then Enter.")}`, 0, 0));
+					const c = new Input();
+					tui.addChild(c);
+					tui.setFocus(c);
+					tui.requestRender();
+					try {
+						await new Promise<void>((res, rej) => {
+							c.onSubmit = () => res();
+							c.onEscape = () => rej(new Error("back"));
+						});
+					} catch {
+						return "back";
+					}
+				}
+			}
+			continue; // re-loop: re-check install state
+		}
+
+		// ── 2. login present? ──
+		if (claudeCliLoggedIn()) {
+			tui.addChild(new Text(`  ${brand.amber("✓")} ${brand.dim("Claude is installed and signed in.")}`, 0, 0));
+			tui.addChild(new Text(brand.dim("  Turns run on your Claude subscription — no key, no extra-usage billing."), 0, 0));
+			tui.addChild(new Text("", 0, 0));
+			tui.addChild(new Text(brand.dim("  Enter to continue  ·  Esc to go back"), 0, 0));
+			const confirm = new Input();
+			tui.addChild(confirm);
+			tui.setFocus(confirm);
+			tui.requestRender();
+			try {
+				await new Promise<void>((resolve, reject) => {
+					confirm.onSubmit = () => resolve();
+					confirm.onEscape = () => reject(new Error("back"));
+				});
+			} catch {
+				return "back";
+			}
+			return "ok";
+		}
+
+		// ── 3. no login → drive the browser OAuth ourselves, write Brigade's grant ──
+		tui.addChild(new Text(`  ${brand.white("Sign in to your Claude account")}`, 0, 0));
+		tui.addChild(new Text(brand.dim("  We'll open your browser. Approve it there — no key, no terminal."), 0, 0));
+		tui.addChild(new Text(brand.dim("  Enter to start  ·  Esc to go back"), 0, 0));
+		const start = new Input();
+		tui.addChild(start);
+		tui.setFocus(start);
+		tui.requestRender();
+		try {
+			await new Promise<void>((resolve, reject) => {
+				start.onSubmit = () => resolve();
+				start.onEscape = () => reject(new Error("back"));
+			});
+		} catch {
+			return "back";
+		}
+		tui.removeChild(start);
+
+		const result = await runClaudeBrowserLogin(tui, authStorage);
+		if (result === "ok") {
+			tui.addChild(new Text("", 0, 0));
+			tui.addChild(new Text(`  ${brand.amber("✓")} Signed in — your Claude subscription is connected.`, 0, 0));
+			tui.requestRender();
+			await delay(600);
+			return "ok";
+		}
+		if (result === "back") return "back";
+		// "retry" → loop shows the sign-in prompt again.
+	}
+}
+
+/**
+ * Install Claude Code globally via npm. Returns true on success. Best-effort +
+ * bounded; surfaces nothing itself (the caller renders status).
+ */
+async function installClaudeCode(): Promise<boolean> {
+	return await new Promise<boolean>((resolve) => {
+		try {
+			const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+			const child = spawn(npm, ["install", "-g", "@anthropic-ai/claude-code"], {
+				stdio: "ignore",
+				shell: process.platform === "win32",
+			});
+			const timer = setTimeout(() => {
+				try {
+					child.kill();
+				} catch {
+					/* already gone */
+				}
+				resolve(false);
+			}, 180_000);
+			timer.unref?.();
+			child.on("close", (code) => {
+				clearTimeout(timer);
+				resolve(code === 0 && isClaudeCliAvailable({ force: true }));
+			});
+			child.on("error", () => {
+				clearTimeout(timer);
+				resolve(false);
+			});
+		} catch {
+			resolve(false);
+		}
+	});
+}
+
+/**
+ * Drive Brigade's browser OAuth for Anthropic (the same flow Claude Pro/Max
+ * onboarding uses — pi-ai requests the full Claude Code scopes) and write the
+ * result into Brigade's OWN managed Claude config dir, so the `claude` binary
+ * authenticates + refreshes from Brigade's dedicated grant. Also mirrors the
+ * credential into Brigade's anthropic profile so the HTTP path is available too.
+ *
+ * Returns "ok" on success, "back" on user abort, "retry" on a recoverable error.
+ */
+async function runClaudeBrowserLogin(tui: TUI, authStorage: AuthStorage): Promise<"ok" | "back" | "retry"> {
+	const oauthProvider = getOAuthProvider("anthropic");
+	if (!oauthProvider) {
+		tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error("Browser sign-in isn't available in this build.")}`, 0, 0));
+		tui.requestRender();
+		await delay(1200);
+		return "back";
+	}
+	const controller = new AbortController();
+	let creds: { access: string; refresh: string; expires?: number; [k: string]: unknown };
+	try {
+		creds = (await oauthProvider.login({
+			onAuth: (info: { url: string; instructions?: string }) => {
+				tui.addChild(new Text(`  ${brand.amber("→")} Opening your browser to sign in…`, 0, 0));
+				openSubscriptionBrowser(info.url);
+				tui.addChild(new Text("", 0, 0));
+				tui.addChild(new Text("  " + brand.amber(info.url), 0, 0));
+				tui.addChild(new Text(brand.dim("  If your browser didn't open, copy the link above. Paste the code here if asked."), 0, 0));
+				const waiter = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Waiting for you to authorize…");
+				waiter.onAbort = () => controller.abort();
+				tui.addChild(waiter);
+				tui.setFocus(waiter);
+				tui.requestRender();
+			},
+			onManualCodeInput: () =>
+				new Promise<string>((resolve, reject) => {
+					tui.addChild(new Text("", 0, 0));
+					tui.addChild(new Text(brand.dim("  Paste the code or redirect URL, then press Enter  ·  Esc to cancel"), 0, 0));
+					const input = new Input();
+					tui.addChild(input);
+					tui.setFocus(input);
+					tui.requestRender();
+					input.onSubmit = (value: string) => resolve(sanitizePastedValue(value));
+					input.onEscape = () => reject(new Error("cancelled"));
+				}),
+			onProgress: (msg: string) => {
+				tui.addChild(new Text(brand.dim("  " + msg), 0, 0));
+				tui.requestRender();
+			},
+			// Anthropic's loopback flow never uses these, but the callback contract
+			// requires them — provide minimal implementations so the type + runtime
+			// are both satisfied.
+			onDeviceCode: () => {
+				/* not used by the anthropic loopback flow */
+			},
+			onPrompt: (p: { message: string; allowEmpty?: boolean }) =>
+				new Promise<string>((resolve, reject) => {
+					tui.addChild(new Text("", 0, 0));
+					tui.addChild(new Text(`  ${p.message}`, 0, 0));
+					const input = new Input();
+					tui.addChild(input);
+					tui.setFocus(input);
+					tui.requestRender();
+					input.onSubmit = (value: string) => {
+						const v = value.trim();
+						if (!v && !p.allowEmpty) return;
+						resolve(v);
+					};
+					input.onEscape = () => reject(new Error("cancelled"));
+				}),
+			onSelect: (p: { message: string; options: Array<{ id: string; label: string }> }) =>
+				new Promise<string | undefined>((resolve) => {
+					const list = new SelectList(
+						p.options.map((o) => ({ value: o.id, label: o.label })),
+						Math.min(p.options.length, 6),
+						selectListTheme,
+						{ minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 28 },
+					);
+					tui.addChild(list);
+					tui.setFocus(list);
+					tui.requestRender();
+					list.onSelect = (item) => resolve(item.value);
+					list.onCancel = () => resolve(undefined);
+				}),
+			signal: controller.signal,
+		})) as typeof creds;
+	} catch (err) {
+		controller.abort();
+		const reason = err instanceof Error ? err.message : String(err);
+		const softCancel = /^login cancelled$/i.test(reason) || reason === "cancelled" || reason === "back";
+		tui.addChild(
+			new Text(
+				`  ${brand.error("✗")} ${brand.error(softCancel ? "Sign-in cancelled." : "Couldn't finish signing in — check your connection and try again.")}`,
+				0,
+				0,
+			),
+		);
+		tui.requestRender();
+		await delay(1000);
+		return softCancel ? "back" : "retry";
+	}
+
+	// Write Brigade's dedicated Claude login ONLY into the managed config dir.
+	// The `claude` binary owns this grant from here on: it authenticates AND
+	// refreshes (rotating the refresh token) in-place. We deliberately DON'T
+	// also mirror it into Brigade's anthropic auth-profile — that would create a
+	// SECOND independent refresher (Brigade's HTTP-path backend) for the same
+	// grant, and the two would rotate each other's refresh token to death
+	// (the split-brain failure). Single grant, single owner (the binary).
+	void authStorage; // intentionally unused now — kept for signature stability
+	try {
+		writeBrigadeClaudeCredential({ access: creds.access, refresh: creds.refresh, expires: creds.expires });
+	} catch (err) {
+		tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(`Couldn't save the login: ${(err as Error).message}`)}`, 0, 0));
+		tui.requestRender();
+		await delay(1200);
+		return "retry";
+	}
+	return "ok";
+}
+
 /**
  * Connect a subscription provider that ALSO has a vendor CLI login on disk
  * (Claude Code / Codex). When such a login exists we present a choice that LEADS
@@ -1243,6 +1563,12 @@ async function ensureCliLogin(
 			access: cred.access,
 			refresh: cred.refresh,
 			expires: cred.expires,
+			// Borrowed from the vendor CLI's on-disk login — mark the family so
+			// `adoptNewerClaudeCliLogin` keeps adopting the CLI's rotations
+			// instead of refreshing (and rotating) a stale shared grant.
+			...(provider.cliLogin!.read === "claude"
+				? { metadata: { importedFrom: "claude-cli" } }
+				: {}),
 		});
 		authStorage.set(cred.provider, {
 			type: "oauth",
@@ -1567,6 +1893,42 @@ async function pickModel(tui: TUI, modelRegistry: ModelRegistry, providerId: str
 	tui.setFocus(list);
 	tui.requestRender();
 
+	try {
+		const chosen = await new Promise<SelectItem>((resolve, reject) => {
+			list.onSelect = (item) => resolve(item);
+			list.onCancel = () => reject(new Error("back"));
+		});
+		return { modelId: chosen.value };
+	} catch {
+		return "back";
+	}
+}
+
+/** Model picker for the claude-cli backend — its models are synthesized (not in
+ *  the registry), so we present the backend's own catalog. */
+async function pickClaudeCliModel(tui: TUI): Promise<"back" | { modelId: string }> {
+	const items: SelectItem[] = CLAUDE_CLI_MODELS.map((m) => ({
+		value: m.id,
+		label: m.id,
+		description: m.name,
+	}));
+	// Default first = the catalog default (Sonnet), then the rest as listed.
+	items.sort((a, b) =>
+		a.value === CLAUDE_CLI_DEFAULT_MODEL ? -1 : b.value === CLAUDE_CLI_DEFAULT_MODEL ? 1 : 0,
+	);
+	const list = new SearchableSelectList(items, 8, selectListTheme, {
+		minPrimaryColumnWidth: 26,
+		maxPrimaryColumnWidth: 38,
+		formatHeader: (q, matchCount, total) =>
+			brand.dim(
+				q.length > 0
+					? `  search: ${q}▌  (${matchCount}/${total})`
+					: `  ${total} models · ↑↓ move · Enter select · Esc back`,
+			),
+	});
+	tui.addChild(list);
+	tui.setFocus(list);
+	tui.requestRender();
 	try {
 		const chosen = await new Promise<SelectItem>((resolve, reject) => {
 			list.onSelect = (item) => resolve(item);

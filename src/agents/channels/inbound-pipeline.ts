@@ -150,6 +150,12 @@ function buildOperatorFacingErrorReply(err: unknown): string {
 				"",
 				"The owner needs to top it up before I can answer. Back the moment they do.",
 			].join("\n");
+		case "subscription_limit":
+			return [
+				"⏳  My subscription's usage window is used up for now.",
+				"",
+				"It resets on its own within a few hours — try me again then.",
+			].join("\n");
 		case "auth":
 		case "auth_permanent":
 			return [

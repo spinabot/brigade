@@ -118,6 +118,24 @@ export const PROVIDERS: ProviderInfo[] = [
 		cliLogin: { read: "claude", label: "Use your existing Claude Code login" },
 	},
 	{
+		// The claude-cli backend: Brigade drives the installed `claude` binary as
+		// the inference transport, so a turn bills against the Claude subscription
+		// EXACTLY like the Claude Code CLI / IDE extension (the binary uses its own
+		// login; Anthropic never routes it into the metered "extra usage" tier the
+		// raw-HTTP OAuth path can hit). No key + no browser flow here — the binary
+		// authenticates itself; if it isn't logged in, the operator runs
+		// `claude` once (or `claude /login`). `local:true` makes onboarding skip
+		// key entry and validate the binary instead; models are synthesized (see
+		// src/agents/claude-cli), so there's no catalog/models.json entry to seed.
+		id: "claude-cli",
+		name: "Claude (via Claude Code CLI)",
+		description: "Run on your Claude subscription through the installed claude binary — no key, no extra-usage",
+		keyUrl: "https://claude.ai/download",
+		envVar: "",
+		noAuth: true,
+		local: true,
+	},
+	{
 		id: "openai",
 		name: "OpenAI",
 		description: "GPT-5, GPT-4o",

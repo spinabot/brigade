@@ -125,6 +125,8 @@ import { clearChannelMetaRegistry, registerChannelMeta } from "../agents/channel
 import type { GroupToolPolicyConfig } from "../agents/channels/access-control/index.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
+import { isClaudeCliAvailable } from "../agents/claude-cli/availability.js";
+import { listClaudeCliModels } from "../agents/claude-cli/register.js";
 import {
 	getCachedSubscriptionModels,
 	listOpenRouterModels,
@@ -3461,6 +3463,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 							/* best-effort — the merged list above already stands */
 						}
 					})();
+				}
+				// claude-cli subscription backend — advertise its models only when the
+				// `claude` binary is actually installed, so the operator never picks a
+				// backend that can't run. These are synthesized (not in the registry),
+				// so merge them explicitly; registry entries win on id collision.
+				if (isClaudeCliAvailable()) {
+					const seenCli = new Set(merged.map((m) => `${m.provider}/${m.id}`));
+					for (const cm of listClaudeCliModels()) {
+						if (!seenCli.has(`${cm.provider}/${cm.id}`)) merged.push(cm as unknown as Model<any>);
+					}
 				}
 				const models = merged.map((m: Model<any>) => modelToSummary(m));
 				return models as ResponseFor[M];

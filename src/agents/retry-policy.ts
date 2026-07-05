@@ -14,6 +14,7 @@
 //   timeout            yes        3        1s+jitter    yes             econn*, deadline
 //   unknown            yes        2        1s+jitter    yes             collapse-into-retry
 //   billing            no         0        n/a          rotate-model    402 → failover chain / surface
+//   subscription_limit no         0        n/a          rotate-model    plan window exhausted → failover chain / surface
 //   format             no         0        n/a          n/a             same body re-fails
 //   model_not_found    no         0        n/a          rotate-model    fallback chain
 //   auth               no         0        n/a          yes             try other profile
@@ -93,6 +94,23 @@ export function getRetryPolicy(reason: RetryReason): RetryPolicy {
       // fallback chain try a different (provider, model); if none is
       // configured, the error surfaces immediately. Same shape as
       // model_not_found ("fallback chain", not "probe again").
+      return {
+        reason,
+        transient: false,
+        maxRetries: 0,
+        baseBackoffMs: 0,
+        rotateAuthProfile: false,
+        rotateModel: true,
+        consumesProbeSlot: false,
+      };
+    case "subscription_limit":
+      // The subscription plan's usage window (e.g. Claude Max 5-hour /
+      // weekly) is exhausted. Same-model retry is guaranteed to re-fail
+      // until the window resets on its own wall clock — hours, not seconds
+      // — and rotating auth profiles doesn't help (same account, same
+      // window). Fail fast and let the model fallback chain try a
+      // different (provider, model); with no fallback configured the error
+      // surfaces immediately with the reset hint (see RetryExhaustedError).
       return {
         reason,
         transient: false,
@@ -242,13 +260,20 @@ export class RetryExhaustedError extends Error {
     const lastReason: RetryReason = last?.reason ?? "unknown";
     const summary =
       last?.errorSummary ?? (lastError instanceof Error ? lastError.message : String(lastError));
+    // Operator-facing hint: a subscription-window error otherwise reads like
+    // "buy credits", which sends the operator to the wrong fix (topping up an
+    // API account) when the real state is "plan window used up, resets soon".
+    const hint =
+      lastReason === "subscription_limit"
+        ? "\nYour subscription's usage window is used up — it resets on its own (check /usage or claude.ai/settings/usage). This is the plan limit, not missing API credits."
+        : "";
     // Chain the underlying error as `cause`. Recipient-facing classification
     // walks `.cause` to find a known reason; without this, a 402 OpenRouter
     // billing error wrapped in a retry-exhausted shell was being classified
     // as `unknown` and recipients got the generic "Sorry I hit an error"
     // reply instead of the friendly "I'm out of credits" message.
     super(
-      `Retry exhausted after ${attempts.length} attempt(s); last reason=${lastReason}: ${summary}`,
+      `Retry exhausted after ${attempts.length} attempt(s); last reason=${lastReason}: ${summary}${hint}`,
       lastError instanceof Error ? { cause: lastError } : undefined,
     );
     this.name = "RetryExhaustedError";

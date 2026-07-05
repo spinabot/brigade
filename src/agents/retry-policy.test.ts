@@ -254,3 +254,52 @@ test("isRetryExhaustedError type guard accepts RetryExhaustedError, rejects othe
   assert.equal(isRetryExhaustedError(undefined), false);
   assert.equal(isRetryExhaustedError({ name: "RetryExhaustedError" }), false, "name alone insufficient");
 });
+
+// ─── subscription_limit policy ───
+
+test("getRetryPolicy: subscription_limit → fail fast, rotate model only", () => {
+  const p = getRetryPolicy("subscription_limit");
+  assert.equal(p.transient, false);
+  assert.equal(p.maxRetries, 0);
+  assert.equal(p.rotateAuthProfile, false); // same account = same window
+  assert.equal(p.rotateModel, true);        // a fallback provider may be configured
+  assert.equal(p.consumesProbeSlot, false);
+});
+
+test("RetryExhaustedError: subscription_limit message carries the reset hint, others don't", () => {
+  const subInfo = {
+    attemptIndex: 0,
+    reason: "subscription_limit" as const,
+    policy: getRetryPolicy("subscription_limit"),
+    willRetry: false,
+    backoffMs: 0,
+    errorSummary: "out of extra usage",
+    error: new Error("out of extra usage"),
+  };
+  const err = new RetryExhaustedError([subInfo], subInfo.error);
+  assert.match(err.message, /resets on its own/);
+  assert.match(err.message, /not missing API credits/);
+
+  const plain = new RetryExhaustedError(
+    [{ ...subInfo, reason: "timeout" as const, policy: getRetryPolicy("timeout") }],
+    subInfo.error,
+  );
+  assert.doesNotMatch(plain.message, /resets on its own/);
+});
+
+test("runWithRetry: subscription_limit fails fast — exactly one attempt, no backoff burn", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runWithRetry({
+      attempt: async () => {
+        calls++;
+        throw Object.assign(
+          new Error("You're out of extra usage. Add more at claude.ai/settings/usage and keep going."),
+          { status: 400 },
+        );
+      },
+    }),
+    (e: unknown) => isRetryExhaustedError(e) && e.lastReason === "subscription_limit",
+  );
+  assert.equal(calls, 1);
+});

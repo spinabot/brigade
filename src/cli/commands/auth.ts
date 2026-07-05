@@ -132,6 +132,24 @@ async function runAuthLogin(provider?: string): Promise<number> {
 	};
 	process.once("SIGINT", onSigint);
 	try {
+		// claude-cli backend — its own zero-key browser-login flow (installs the
+		// binary if needed, drives the OAuth, writes Brigade's managed grant). It's
+		// a noAuth provider so it can't go through the subscription/key path below.
+		const cliArg = provider?.trim().toLowerCase();
+		if (cliArg && ["claude-cli", "cli", "claude-code-cli", "claudecli"].includes(cliArg)) {
+			const { ensureClaudeCli } = await import("../../ui/onboarding.js");
+			const r = await ensureClaudeCli(tui, authStorage);
+			tui.stop();
+			restoreTerminal();
+			await flushAllPendingWrites();
+			if (r === "back") {
+				console.error(chalk.dim("Cancelled."));
+				return 0;
+			}
+			console.error(chalk.green("✓ Claude subscription connected (via the Claude Code CLI backend)."));
+			console.error(chalk.dim("Select it in chat with `/provider claude-cli`."));
+			return 0;
+		}
 		let info: ProviderInfo | null;
 		if (provider) {
 			const found = findProvider(provider);

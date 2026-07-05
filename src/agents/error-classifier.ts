@@ -23,6 +23,7 @@ export type RetryReason =
   | "rate_limit"       // 429 / quota — backoff + cooldown + rotate profile
   | "overloaded"       // 503 / 529 / "high demand" — backoff, then probe
   | "billing"          // 402 / insufficient credits — semi-persistent, may need user action
+  | "subscription_limit" // plan usage window exhausted (Claude Max/Pro, ChatGPT) — resets on wall clock; fail fast + fallback chain
   | "timeout"          // network/connect/read timeout — retry transient
   | "context_overflow" // input + output exceeds context — compact then retry, don't burn fallbacks
   | "model_not_found"  // provider doesn't know this model — rotate to fallback
@@ -109,6 +110,30 @@ const BILLING_PATTERNS: RegExp[] = [
   /insufficient balance/i,
   /upgrade (?:your )?plan/i,
   /"code"\s*:\s*1311\b/, // ZAI quota
+];
+
+// Subscription-plan usage-window exhaustion. Distinct from `billing` (missing
+// API credits — needs a top-up) AND from `rate_limit` (seconds-to-minutes
+// backoff): the plan's 5-hour / weekly window is used up and resets on its own
+// wall clock, hours away. Retrying the same model is pointless; the right
+// moves are the model-fallback chain (a different provider may be configured)
+// or waiting for the reset. Observed surfaces:
+//   • Anthropic (Claude Max/Pro via OAuth): 400 invalid_request_error
+//     "You're out of extra usage. Add more at claude.ai/settings/usage and
+//     keep going." — plan window exhausted AND extra usage disabled/spent.
+//   • Anthropic: "Claude usage limit reached. Your limit will reset at …"
+//     (sometimes a 429 — the message must win over the bare status).
+//   • OpenAI subscription (Codex): "You've hit your usage limit",
+//     usage_limit_reached / usage_not_included error codes.
+const SUBSCRIPTION_LIMIT_PATTERNS: RegExp[] = [
+  /out of extra usage/i,
+  /claude\.ai\/settings\/usage/i,
+  /(?:claude|plan|subscription) usage limit/i,
+  /usage limit (?:reached|hit|exceeded)/i,
+  /hit your usage limit/i,
+  /usage_limit_reached/i,
+  /usage_not_included/i,
+  /limit will reset at/i,
 ];
 
 // Substrings inside a 402 message that flip "billing" → "rate_limit" because
@@ -213,6 +238,7 @@ function classifyByStatus(status: number, message: string): RetryReason | null {
     case 402:
       // 402 is overloaded with meanings — providers use it for both "you owe
       // money" and "you've hit the daily cap, try again". Inspect the body.
+      if (matchAny(message, SUBSCRIPTION_LIMIT_PATTERNS)) return "subscription_limit";
       if (matchAny(message, RATE_LIMITED_402_HINTS)) return "rate_limit";
       return "billing";
     case 404:
@@ -224,6 +250,10 @@ function classifyByStatus(status: number, message: string): RetryReason | null {
     case 422:
       return matchAny(message, FORMAT_PATTERNS) ? "format" : null;
     case 429:
+      // A 429 carrying a plan-window message ("Claude usage limit reached …
+      // resets at …") is a subscription limit, not a transient rate spike —
+      // a 30s backoff can't fix a window that resets hours from now.
+      if (matchAny(message, SUBSCRIPTION_LIMIT_PATTERNS)) return "subscription_limit";
       return "rate_limit";
     case 499:
       // Cloudflare "client closed request" — sometimes reported by edge
@@ -336,6 +366,11 @@ export function classifyErrorReason(value: unknown, _ctx?: ClassificationContext
 function classifyByMessage(message: string): RetryReason | null {
   if (!message) return null;
   if (matchAny(message, AUTH_PERMANENT_PATTERNS)) return "auth_permanent";
+  // Subscription-window exhaustion MUST be checked before billing and
+  // rate_limit: its phrasings ("out of extra usage", "usage limit reached")
+  // overlap both sets, and the recovery differs (wall-clock reset + fallback
+  // chain, not top-up or a 30s backoff).
+  if (matchAny(message, SUBSCRIPTION_LIMIT_PATTERNS)) return "subscription_limit";
   if (matchAny(message, BILLING_PATTERNS)) {
     return matchAny(message, RATE_LIMITED_402_HINTS) ? "rate_limit" : "billing";
   }
@@ -423,6 +458,7 @@ export function summariseError(value: unknown): string {
 
 export type ErrorClass =
   | "rate_limit"
+  | "subscription_limit"
   | "server_5xx"
   | "network"
   | "timeout"
@@ -545,6 +581,14 @@ export function classifyErrorDetailed(err: unknown): ClassifiedError {
         "This model can't use tools, so memory / recall (and any tool call) won't work. Switch to a tool-capable model — e.g. Claude, GPT, or a Gemini *-pro — with /model.",
       retryableOnSameModel: false,
     };
+  }
+
+  // Subscription-window exhaustion — checked BEFORE the status block because
+  // providers ship it under conflicting statuses (Anthropic: 400 "out of
+  // extra usage"; sometimes 429 "usage limit reached"). Same-model retry is
+  // useless (the window resets on wall clock); advance to fallback.
+  if (SUBSCRIPTION_LIMIT_PATTERNS.some((p) => p.test(message))) {
+    return { class: "subscription_limit", message, retryableOnSameModel: false };
   }
 
   if (code && NETWORK_ERROR_CODES_DETAILED.has(code)) {

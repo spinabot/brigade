@@ -26,6 +26,7 @@
  */
 
 import process from "node:process";
+import readline from "node:readline/promises";
 
 import chalk from "chalk";
 
@@ -534,6 +535,10 @@ export interface GatewayCommandOptions {
 	quiet?: boolean;
 	/** Explicit log level override. Wins over both --verbose and the default. */
 	logLevel?: LogLevel;
+	/** Internal: set on the automatic retry after the operator answered "yes" to
+	 *  the "a gateway is already running — restart it?" prompt. Guards against
+	 *  looping if the fresh start ALSO finds the port held. */
+	_restarted?: boolean;
 }
 
 /**
@@ -600,10 +605,43 @@ export async function runGatewayCommand(opts: GatewayCommandOptions = {}): Promi
 		// shape is `Gateway failed to start: ...\nIf the gateway is
 		// supervised, stop it with: brigade gateway stop`.
 		if (isGatewayLockError(err)) {
+			const holderPid = err.holderPid;
+			// Interactive terminal: don't dead-end the operator with "go run another
+			// command" — ASK, right here, whether to stop the already-running gateway
+			// and start fresh, and do it on "yes". Guarded by `_restarted` so we
+			// prompt at most once (a fresh start that STILL finds the port held falls
+			// through to the message below instead of looping). Non-interactive /
+			// supervised runs have no stdin to read, so they skip to the message.
+			if (process.stdin.isTTY && !opts._restarted) {
+				const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+				let restart = false;
+				try {
+					const answer = (
+						await rl.question(
+							`A Brigade gateway is already running${holderPid ? ` (pid ${holderPid})` : ""}. ` +
+								"Stop it and start a fresh one? [y/N] ",
+						)
+					)
+						.trim()
+						.toLowerCase();
+					restart = answer === "y" || answer === "yes";
+				} finally {
+					rl.close();
+				}
+				if (restart) {
+					// Graceful stop waits for the old process to exit + release the
+					// port, then the retry pass starts fresh on the current code.
+					process.stderr.write(chalk.dim("Stopping the running gateway…\n"));
+					await runGatewayStopCommand({ port, host: opts.host });
+					return await runGatewayCommand({ ...opts, _restarted: true });
+				}
+				process.stderr.write(chalk.dim("Left the running gateway untouched.\n"));
+				process.exit(EXIT_FAILURE);
+			}
 			const listeners = inspectPortListeners(port);
 			let body =
 				`brigade-gateway: failed to start: ${chalk.red(msg)}\n` +
-				chalk.dim(`  If the gateway is supervised, stop it with: ${chalk.bold("brigade gateway stop")}\n`) +
+				chalk.dim(`  Stop it with: ${chalk.bold("brigade gateway stop")} (interactive runs are offered a restart prompt).\n`) +
 				`Port ${port} is already in use.\n`;
 			if (listeners.length > 0) {
 				for (const l of listeners) {
@@ -672,9 +710,25 @@ export async function runGatewayCommand(opts: GatewayCommandOptions = {}): Promi
 	// CLI login (Claude Code) so it becomes auto-refreshing with no user action;
 	// only warn about what we couldn't heal. Best-effort; never blocks boot.
 	try {
-		const { autoHealSubscriptions, detectUnrefreshableSubscriptions, formatUnrefreshableWarning } = await import(
-			"../../auth/auth-health.js"
-		);
+		const {
+			autoHealSubscriptions,
+			detectUnrefreshableSubscriptions,
+			formatUnrefreshableWarning,
+			healDeadSubscriptionLogin,
+		} = await import("../../auth/auth-health.js");
+		// Dead-grant heal FIRST: an expired anthropic OAuth profile whose refresh
+		// token was rotated out (e.g. the Claude Code CLI rotated a shared grant
+		// while the gateway was down) is repaired here — refresh-probe, then adopt
+		// the CLI's live login. Without this the first turns after boot fail with
+		// "No API key for provider: anthropic".
+		const deadHeal = await healDeadSubscriptionLogin();
+		if (deadHeal !== "none") {
+			process.stderr.write(
+				deadHeal === "refreshed"
+					? "brigade-gateway: refreshed the expired Claude login in place (no action needed).\n"
+					: "brigade-gateway: adopted this machine's Claude Code login — the stored one had expired (no action needed).\n",
+			);
+		}
 		const healed = autoHealSubscriptions();
 		if (healed.length > 0) {
 			process.stderr.write(

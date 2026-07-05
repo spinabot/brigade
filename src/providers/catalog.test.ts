@@ -128,6 +128,7 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 		assert.deepEqual(ids, [
 			"anthropic",
 			"cerebras",
+			"claude-cli",
 			"claude-code",
 			"custom",
 			"deepseek",

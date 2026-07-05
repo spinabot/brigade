@@ -171,3 +171,52 @@ test("summariseError: BrigadeRetryError formats reason+provider+status", () => {
   assert.match(s, /anthropic/);
   assert.match(s, /429/);
 });
+
+// ─── subscription_limit (plan usage window exhausted) ───
+
+test("classifyError: Anthropic 'out of extra usage' (Claude Max window + extra usage off) → subscription_limit", () => {
+  // The exact live surface: pi wraps the 400 body into the message string.
+  const err = new Error(
+    'Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"You\'re out of extra usage. Add more at claude.ai/settings/usage and keep going."},"request_id":"req_x"}',
+  );
+  assert.equal(classifyErrorReason(err), "subscription_limit");
+});
+
+test("classifyError: 429 carrying 'Claude usage limit reached' → subscription_limit, not rate_limit", () => {
+  const err = Object.assign(
+    new Error("Claude usage limit reached. Your limit will reset at 3am."),
+    { status: 429 },
+  );
+  assert.equal(classifyErrorReason(err), "subscription_limit");
+});
+
+test("classifyError: bare 429 without plan phrasing stays rate_limit", () => {
+  const err = Object.assign(new Error("too many requests"), { status: 429 });
+  assert.equal(classifyErrorReason(err), "rate_limit");
+});
+
+test("classifyError: OpenAI subscription 'hit your usage limit' → subscription_limit", () => {
+  assert.equal(classifyErrorReason(new Error("You've hit your usage limit.")), "subscription_limit");
+  assert.equal(classifyErrorReason(new Error('{"code":"usage_limit_reached"}')), "subscription_limit");
+  assert.equal(classifyErrorReason(new Error('{"code":"usage_not_included"}')), "subscription_limit");
+});
+
+test("classifyError: subscription phrasing wins over billing patterns", () => {
+  // "Add more at claude.ai/settings/usage" must not fall into billing
+  // ("top up your API account") — the fix paths differ completely.
+  const err = Object.assign(
+    new Error("You're out of extra usage. Add more at claude.ai/settings/usage and keep going."),
+    { status: 402 },
+  );
+  assert.equal(classifyErrorReason(err), "subscription_limit");
+});
+
+test("classifyErrorDetailed: 'out of extra usage' → subscription_limit, no same-model retry", () => {
+  const r = classifyErrorDetailed(
+    Object.assign(new Error("You're out of extra usage. Add more at claude.ai/settings/usage and keep going."), {
+      status: 400,
+    }),
+  );
+  assert.equal(r.class, "subscription_limit");
+  assert.equal(r.retryableOnSameModel, false);
+});

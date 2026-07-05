@@ -4,7 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
-import { resolveModelNeverMiss } from "./model-resolution.js";
+import {
+	ANTHROPIC_SUBSCRIPTION_CONTEXT_WINDOW,
+	billingSafeContextWindow,
+	resolveModelNeverMiss,
+} from "./model-resolution.js";
 
 /**
  * A template Pi-shaped model for a provider — what `getAvailable()` would
@@ -130,5 +134,42 @@ describe("resolveModelNeverMiss — static hit short-circuits", () => {
 			modelsFile: "/does/not/exist.json",
 		});
 		assert.strictEqual(model, real);
+	});
+});
+
+describe("billingSafeContextWindow — never draw extra-usage credits on a subscription", () => {
+	it("clamps a >200K window to the included tier for an Anthropic subscription", () => {
+		// claude-opus-4-8 ships a 1,000,000 window; on a subscription that must be
+		// sized as 200K so compaction fires before the long-context / extra-usage
+		// boundary.
+		assert.strictEqual(
+			billingSafeContextWindow("anthropic", 1_000_000, true),
+			ANTHROPIC_SUBSCRIPTION_CONTEXT_WINDOW,
+		);
+		assert.strictEqual(billingSafeContextWindow("anthropic", 1_000_000, true), 200_000);
+	});
+
+	it("leaves a subscription's already-small window untouched", () => {
+		// A 200K (or smaller) model is already inside the included tier.
+		assert.strictEqual(billingSafeContextWindow("anthropic", 200_000, true), 200_000);
+		assert.strictEqual(billingSafeContextWindow("anthropic", 128_000, true), 128_000);
+	});
+
+	it("does NOT clamp an API key — pay-per-token has no extra-usage concept", () => {
+		// An operator paying per token keeps the full 1M window if they want it.
+		assert.strictEqual(billingSafeContextWindow("anthropic", 1_000_000, false), 1_000_000);
+	});
+
+	it("passes through subscription providers absent from the included-window table", () => {
+		// Table-driven: a provider is clamped ONLY once its context-overage
+		// boundary is confirmed and added to SUBSCRIPTION_INCLUDED_CONTEXT_WINDOW.
+		// Providers not in the table (rate/quota-limited subscriptions, not
+		// context-overage-billed) are passed through unchanged.
+		assert.strictEqual(billingSafeContextWindow("openai", 1_000_000, true), 1_000_000);
+		assert.strictEqual(billingSafeContextWindow("google", 2_000_000, true), 2_000_000);
+	});
+
+	it("passes an undefined window through unchanged", () => {
+		assert.strictEqual(billingSafeContextWindow("anthropic", undefined, true), undefined);
 	});
 });

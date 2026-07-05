@@ -75,8 +75,9 @@ import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { runWithRetry } from "./retry-policy.js";
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { cleanProviderError } from "../core/model-caps.js";
+import { adoptNewerClaudeCliLogin, healDeadSubscriptionLogin } from "../auth/auth-health.js";
 import { persistentAuthBackend } from "../core/auth-bridge.js";
-import { resolveModelNeverMiss } from "./model-resolution.js";
+import { billingSafeContextWindow, resolveModelNeverMiss } from "./model-resolution.js";
 import { buildAutoRecallBlock, resolveAutoRecallOrigin } from "./memory/auto-recall.js";
 import { runPreCompactionExtraction } from "./memory/extract.js";
 import type { MemoryRecordOrigin } from "./memory/records.js";
@@ -96,6 +97,8 @@ import {
 // exact same derivation this build uses.
 import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
+import { CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catalog.js";
+import { ensureClaudeCliApiRegistered } from "./claude-cli/register.js";
 import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
 import { migrateOllamaProviderToNative } from "../integrations/ollama.js";
 import { describeModelProbe, probeModelReachable } from "../integrations/provider-discovery.js";
@@ -385,6 +388,16 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // longer interleave their snapshots — each waits for the previous
   // mark to land on disk before reading.
   let cooldownState = await loadProfileStateLocked(agentId);
+  // Dead-grant heal before the credential map builds: an EXPIRED anthropic
+  // OAuth profile whose refresh token no longer works (rotated out by the
+  // Claude Code CLI while this process was idle/down) would otherwise turn
+  // into "No API key for provider: anthropic" mid-turn. Refresh-probe first
+  // (an independent `brigade login` grant is refreshed in place, never
+  // clobbered); only a DEAD grant adopts the machine's CLI login. No-op in the
+  // common case (unexpired profile) — one cheap read, no network.
+  if (args.provider === "anthropic") {
+    await healDeadSubscriptionLogin(agentId).catch(() => "none");
+  }
   const authBuild = buildAuthStorage(
     authProfilesPath,
     {
@@ -396,11 +409,16 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   );
   const authStorage = authBuild.storage;
   const selectedProfileId = authBuild.selectedProfileId;
+  const subscriptionProviders = authBuild.subscriptionProviders;
   // Register the native Ollama transport (api:"ollama" → /api/chat) before the
   // registry/session resolve, so any Ollama model dispatches to it via Pi's
   // api-registry (getApiProvider). Idempotent + process-global; no-op for every
   // other provider. This is what makes Ollama tool-calling first-class.
   ensureOllamaNativeApiRegistered();
+  // Register the claude-cli subprocess transport (api:"claude-cli" → drives the
+  // installed `claude` binary on the operator's subscription). Same idempotent,
+  // process-global seam as Ollama; no-op for every other provider.
+  ensureClaudeCliApiRegistered();
   // Migrate any pre-existing OpenAI-compat Ollama entry (api:"openai-completions"
   // + /v1) to the native shape so upgraders don't stay silently on the degraded
   // /v1 path. Idempotent + best-effort; a no-op read once migrated.
@@ -492,6 +510,7 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
       authStorage,
       modelRegistry,
       selectedProfileId,
+      subscriptionProviders,
       model,
     });
   } finally {
@@ -526,6 +545,7 @@ interface RunSingleTurnLockedArgs {
   authStorage: unknown;
   modelRegistry: unknown;
   selectedProfileId: string | undefined;
+  subscriptionProviders: Set<string>;
   model: unknown;
 }
 
@@ -533,6 +553,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   const { args, agentId, agentDir, cwd, workspaceDir, resolved, model, authStorage, modelRegistry } = p;
   let cooldownState = p.cooldownState;
   const selectedProfileId = p.selectedProfileId;
+  const subscriptionProviders = p.subscriptionProviders;
 
   // Filesystem mode: SessionManager.open creates the JSONL on first write;
   // passing the canonical transcript path keeps Pi and brigade aligned on
@@ -957,6 +978,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // registered api providers. This (idempotent, self-healing) call re-registers
   // "ollama" so the session's streamFn dispatches to the native transport.
   ensureOllamaNativeApiRegistered();
+  ensureClaudeCliApiRegistered();
   const { session } = await createAgentSession({
     cwd,
     agentDir,
@@ -1070,6 +1092,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // never REPLACE — Pi's auth wrapper stays at the bottom of the stack.
     sessionAgent.streamFn = ((model: { api?: string }, context: unknown, options: unknown) => {
       if (model?.api === "ollama") ensureOllamaNativeApiRegistered();
+      else if (model?.api === "claude-cli") ensureClaudeCliApiRegistered();
       return (wrappedStreamFn as (m: unknown, c: unknown, o: unknown) => unknown)(model, context, options);
     }) as typeof baseStreamFn;
     log.debug("stream wrappers installed", {
@@ -1527,9 +1550,22 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // request, so the 85% trigger fires LATE and the turn is likelier to
   // fall through to Pi's mid-stream auto-compaction. Thread both in so the
   // decision sees the true pre-prompt fill.
+  // Size compaction against the BILLING-SAFE window. On an Anthropic
+  // subscription the included tier is 200K; a request over that uses
+  // long-context and bills the pay-as-you-go "extra usage" bucket even while
+  // the plan's session/weekly quota is untouched. Clamping the window here makes
+  // the 85% trigger fire before 200K, so a subscription never draws extra-usage
+  // credits. API-key auth (pay-per-token, no extra-usage concept) keeps the
+  // model's real window unchanged.
+  const rawContextWindow = (model as { contextWindow?: number })?.contextWindow;
+  const effectiveContextWindow = billingSafeContextWindow(
+    args.provider,
+    rawContextWindow,
+    subscriptionProviders.has(args.provider),
+  );
   await maybeTriggerCompaction({
     session: session as AgentSession,
-    model: model as { contextWindow?: number } | unknown,
+    model: { contextWindow: effectiveContextWindow },
     agentId,
     sessionId: resolved.sessionId,
     // The pinned persona prompt — empty string when the workspace is empty
@@ -2077,6 +2113,27 @@ interface AuthStorageBuildResult {
   // The profileId that was selected for the active provider, if any. Used
   // by the run lifecycle to update cooldown state on success/failure.
   selectedProfileId?: string;
+  // Providers whose active credential is a SUBSCRIPTION login (OAuth, or a
+  // setup-token Bearer-authed via its `sk-ant-oat…` value) rather than a
+  // pay-per-token API key. Drives the included-tier context clamp so a
+  // subscription never spills into pay-as-you-go "extra usage" credits.
+  subscriptionProviders: Set<string>;
+}
+
+/** True when a resolved credential is a Claude/Codex-style SUBSCRIPTION login
+ *  (OAuth, or a setup-token Pi Bearer-auths via its `sk-ant-oat…` value) rather
+ *  than a pay-per-token API key. Subscriptions have an included-usage ceiling
+ *  plus a separate pay-as-you-go "extra usage" bucket; we must stay inside the
+ *  included tier (see `billingSafeContextWindow`). */
+function isSubscriptionCredential(cred: unknown): boolean {
+  if (!cred || typeof cred !== "object") return false;
+  const type = (cred as { type?: unknown }).type;
+  if (type === "oauth" || type === "token") return true;
+  if (type === "api_key") {
+    const key = (cred as { key?: unknown }).key;
+    return typeof key === "string" && key.includes("sk-ant-oat");
+  }
+  return false;
 }
 
 function buildAuthStorage(
@@ -2104,6 +2161,12 @@ function buildAuthStorage(
   const hasOAuth = Object.values(credentials).some(
     (c) => !!c && typeof c === "object" && (c as { type?: unknown }).type === "oauth",
   );
+  // Which providers are on a subscription login this turn — used to clamp the
+  // request size to the included tier so we never draw extra-usage credits.
+  const subscriptionProviders = new Set<string>();
+  for (const [prov, cred] of Object.entries(credentials)) {
+    if (isSubscriptionCredential(cred)) subscriptionProviders.add(prov);
+  }
   let storage: unknown;
   if (hasOAuth && agentId && typeof Storage.fromStorage === "function") {
     storage = Storage.fromStorage(persistentAuthBackend(agentId, credentials));
@@ -2124,7 +2187,7 @@ function buildAuthStorage(
       "Pi AuthStorage exposes neither inMemory nor fromStorage; pin to 0.70.x or update brigade.",
     );
   }
-  return { storage, selectedProfileId };
+  return { storage, selectedProfileId, subscriptionProviders };
 }
 
 // Brigade's auth-profiles.json shape matches the Pi SDK contract: profiles
@@ -2156,6 +2219,11 @@ export function readAuthProfilesAsCredentialMap(
   cooldownFilter?: AuthStorageCooldownFilter,
   agentId?: string,
 ): ReadCredentialsResult {
+  // Sync a credential borrowed from the Claude Code CLI before reading: the
+  // CLI rotates the shared grant as the operator uses it, so refreshing our
+  // stale copy would race the CLI's rotation and kill one of the two logins.
+  // Mode-aware + best-effort; no-op without an agentId or for own grants.
+  if (agentId) adoptNewerClaudeCliLogin(agentId);
   const out: Record<string, unknown> = {};
   let selectedProfileId: string | undefined;
   let parsed: {
@@ -2289,6 +2357,15 @@ export function readAuthProfilesAsCredentialMap(
       if (out[provider] !== undefined) continue;
       out[provider] = cred;
     }
+  }
+
+  // claude-cli sentinel — the subprocess backend authenticates via the `claude`
+  // binary's OWN login, but Pi still demands SOME key for the provider or it
+  // throws "No API key for provider: claude-cli" before the transport runs.
+  // Seed a non-secret sentinel (never sent on the wire). See auth-bridge for
+  // the parallel seam on the gateway boot path.
+  if (out[CLAUDE_CLI_PROVIDER] === undefined) {
+    out[CLAUDE_CLI_PROVIDER] = { type: "api_key", key: CLAUDE_CLI_SENTINEL_KEY };
   }
 
   return { credentials: out, selectedProfileId };

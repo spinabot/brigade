@@ -27,6 +27,9 @@ import {
 } from "../../config/paths.js";
 import { readProfiles } from "../../auth/profiles.js";
 import { detectUnrefreshableSubscriptions } from "../../auth/auth-health.js";
+import { isClaudeCliAvailable } from "../../agents/claude-cli/availability.js";
+import { hasBrigadeClaudeLogin } from "../../agents/claude-cli/claude-config.js";
+import { readClaudeCliLogin } from "../../integrations/cli-login.js";
 import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { FactStore } from "../../agents/memory/records.js";
 import { discoverEligibleSkills } from "../../agents/skills/index.js";
@@ -73,6 +76,7 @@ export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise
 	checks.push(checkAuthProfiles());
 	checks.push(checkConfiguredProvider(await safeLoadConfig()));
 	checks.push(checkSubscriptionRefresh());
+	checks.push(checkClaudeCliBackend());
 	checks.push(checkWorkspace());
 	checks.push(await checkMemory());
 	checks.push(checkSkills());
@@ -360,6 +364,47 @@ function checkSubscriptionRefresh(): CheckResult {
 		status: "warn",
 		message: `${names} can't auto-refresh and will eventually 401`,
 		hint: "run `brigade login` to replace it with a refreshable credential",
+	};
+}
+
+function checkClaudeCliBackend(): CheckResult {
+	// Reports the claude-cli subscription backend's readiness: binary on PATH +
+	// a detectable login. "ok" when both, "warn" (not fail) when partial — the
+	// backend is optional, so absence is informational, not an error.
+	let installed = false;
+	try {
+		installed = isClaudeCliAvailable({ force: true });
+	} catch {
+		installed = false;
+	}
+	if (!installed) {
+		return {
+			name: "claude-cli backend",
+			status: "ok",
+			message: "not installed (optional — run turns on your Claude subscription via the CLI)",
+			hint: "install with `npm i -g @anthropic-ai/claude-code`, then `claude` to sign in",
+		};
+	}
+	let loggedIn = false;
+	let viaBrigade = false;
+	try {
+		viaBrigade = hasBrigadeClaudeLogin();
+		loggedIn = viaBrigade || readClaudeCliLogin() !== null;
+	} catch {
+		loggedIn = false;
+	}
+	if (!loggedIn) {
+		return {
+			name: "claude-cli backend",
+			status: "warn",
+			message: "`claude` is installed but no login was detected",
+			hint: "run `brigade onboard` and pick 'Claude (via Claude Code CLI)' to sign in via browser (no key)",
+		};
+	}
+	return {
+		name: "claude-cli backend",
+		status: "ok",
+		message: `installed + signed in (${viaBrigade ? "Brigade-managed login" : "your Claude Code login"}) — select with \`/provider claude-cli\``,
 	};
 }
 

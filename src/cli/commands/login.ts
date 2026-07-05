@@ -33,15 +33,53 @@ import { ensureSubscriptionLogin } from "../../ui/onboarding.js";
 import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { brand, selectListTheme } from "../../ui/theme.js";
 
+/** Friendly aliases → the provider that carries the subscription descriptor. */
+const SUBSCRIPTION_LOGIN_ALIASES: Record<string, string> = {
+	claude: "claude-code",
+	"claude-pro": "claude-code",
+	"claude-max": "claude-code",
+	anthropic: "claude-code",
+	chatgpt: "openai-codex",
+	openai: "openai-codex",
+	codex: "openai-codex",
+	copilot: "github-copilot",
+	github: "github-copilot",
+};
+
+/**
+ * Resolve a subscription-login provider from a CLI arg, tolerantly. Accepts the
+ * provider's own id (`claude-code`), its underlying OAuth id (`anthropic`), or a
+ * friendly alias (`claude` / `chatgpt` / `copilot`). Returns undefined when
+ * nothing maps to a SUBSCRIPTION provider.
+ *
+ * Without this, `brigade login anthropic` failed: `anthropic` is the API-KEY
+ * provider (no `subscription` descriptor) — the Claude Pro/Max login lives under
+ * the `claude-code` provider whose `oauthProviderId` is `anthropic`.
+ */
+function resolveSubscriptionProvider(arg: string): ProviderInfo | undefined {
+	const a = arg.trim().toLowerCase();
+	// 1. Direct id match that actually carries a subscription descriptor.
+	const direct = findProvider(a);
+	if (direct?.subscription) return direct;
+	// 2. A subscription provider whose underlying OAuth id matches (anthropic → claude-code).
+	const byOauth = PROVIDERS.find(
+		(p) => p.subscription && p.subscription.oauthProviderId.toLowerCase() === a,
+	);
+	if (byOauth) return byOauth;
+	// 3. A friendly alias.
+	const aliased = SUBSCRIPTION_LOGIN_ALIASES[a];
+	if (aliased) {
+		const p = findProvider(aliased);
+		if (p?.subscription) return p;
+	}
+	return undefined;
+}
+
 /**
  * Run the subscription-login flow and exit. Resolves once the flow completes
  * (success or cancellation) — no long-running event loop to keep alive.
  */
 export async function runLoginCommand(opts: { provider?: string } = {}): Promise<number> {
-	// Login drives a browser OAuth flow through a TUI confirm-gate (raw mode +
-	// cursor manipulation) — opt into the on-exit terminal cleanup so a Ctrl+C
-	// mid-flow doesn't leave the terminal in raw mode.
-	markTuiActive();
 	if (!process.stdin.isTTY || !process.stdout.isTTY) {
 		console.error(chalk.red("brigade login needs an interactive terminal."));
 		console.error(
@@ -52,6 +90,64 @@ export async function runLoginCommand(opts: { provider?: string } = {}): Promise
 		);
 		return EXIT_CONFIG_ERROR;
 	}
+
+	// claude-cli backend — its own zero-key browser-login flow (installs the
+	// binary if needed, drives the OAuth, writes Brigade's managed Claude grant).
+	// Recognized by its id or a few natural aliases. Handled BEFORE the
+	// subscription picker since it isn't a `subscription` provider.
+	const cliArg = opts.provider?.trim().toLowerCase();
+	if (cliArg && ["claude-cli", "cli", "claude-code-cli", "claudecli"].includes(cliArg)) {
+		markTuiActive();
+		initAuthProfiles(DEFAULT_AGENT_ID);
+		const authStorage = AuthStorage.inMemory();
+		const tui = new TUI(new ProcessTerminal());
+		tui.start();
+		const onSigintCli = (): void => {
+			tui.stop();
+			restoreTerminal();
+			const t = setTimeout(() => process.exit(130), 2000);
+			t.unref?.();
+			void flushAllPendingWrites().finally(() => process.exit(130));
+		};
+		process.once("SIGINT", onSigintCli);
+		try {
+			const { ensureClaudeCli } = await import("../../ui/onboarding.js");
+			const result = await ensureClaudeCli(tui, authStorage);
+			tui.stop();
+			restoreTerminal();
+			await flushAllPendingWrites();
+			if (result === "back") {
+				console.error(chalk.dim("Login cancelled."));
+				return 0;
+			}
+			console.error(chalk.green("✓ Claude subscription connected (via the Claude Code CLI backend)."));
+			console.error(chalk.dim("Select it in chat with `/provider claude-cli`, or set it as default with `brigade onboard`."));
+			return 0;
+		} finally {
+			restoreTerminal();
+		}
+	}
+
+	const subs = PROVIDERS.filter((p) => p.subscription);
+
+	// Resolve an explicit provider arg BEFORE touching the terminal: a bad arg
+	// then errors cleanly instead of starting the TUI (raw mode + a device-
+	// attributes query) and leaking a `\x1b[?…c` escape into the shell under the
+	// error text. Accepts the provider id, the OAuth id (`anthropic`), or aliases.
+	let info: ProviderInfo | undefined;
+	if (opts.provider) {
+		info = resolveSubscriptionProvider(opts.provider);
+		if (!info) {
+			console.error(chalk.red(`'${opts.provider}' isn't a subscription provider.`));
+			console.error(chalk.dim(`  Try one of: ${subs.map((s) => `${s.name} (${s.id})`).join(", ")}`));
+			return EXIT_CONFIG_ERROR;
+		}
+	}
+
+	// Login drives a browser OAuth flow through a TUI confirm-gate (raw mode +
+	// cursor manipulation) — opt into the on-exit terminal cleanup so a Ctrl+C
+	// mid-flow doesn't leave the terminal in raw mode.
+	markTuiActive();
 
 	// The runtime context was already booted by build-program's preAction hook
 	// (login is a normal mutating command — NOT in BOOT_SKIP — so a dead backend
@@ -77,25 +173,10 @@ export async function runLoginCommand(opts: { provider?: string } = {}): Promise
 	process.once("SIGINT", onSigint);
 
 	try {
-		// Only providers that advertise a subscription descriptor can OAuth-login.
-		const subs = PROVIDERS.filter((p) => p.subscription);
-
-		// Resolve the target provider — explicit arg, else interactive picker.
-		let info: ProviderInfo;
-		if (opts.provider) {
-			const found = findProvider(opts.provider);
-			if (!found?.subscription) {
-				tui.stop();
-				restoreTerminal();
-				console.error(
-					chalk.red(
-						`'${opts.provider}' isn't a subscription provider. Options: ${subs.map((s) => `${s.name} (${s.id})`).join(", ")}`,
-					),
-				);
-				return EXIT_CONFIG_ERROR;
-			}
-			info = found;
-		} else {
+		// Interactive picker — only when no (valid) provider arg was supplied (an
+		// explicit arg was already resolved to `info` above, before the TUI
+		// started, so a bad arg never reaches here).
+		if (!info) {
 			tui.addChild(new Text("", 0, 0));
 			tui.addChild(new Text(`  ${brand.amber("Log in to a subscription provider")}`, 0, 0));
 			tui.addChild(
@@ -140,6 +221,13 @@ export async function runLoginCommand(opts: { provider?: string } = {}): Promise
 			info = picked;
 		}
 
+		if (!info) {
+			// Unreachable — the picker either assigns info or returns above — but
+			// this keeps TypeScript's narrowing happy and is a safe fallback.
+			tui.stop();
+			restoreTerminal();
+			return EXIT_CONFIG_ERROR;
+		}
 		const result = await ensureSubscriptionLogin(tui, authStorage, info);
 
 		tui.stop();
