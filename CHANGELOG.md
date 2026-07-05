@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.24.1](https://github.com/spinabot/brigade/compare/brigade-v1.24.0...brigade-v1.24.1) (2026-07-05)
+
+
+### Bug Fixes
+
+* **claude-cli:** type stream-test CTX fixture as never to unblock CI typecheck ([6f010c4](https://github.com/spinabot/brigade/commit/6f010c4332f5daaad9ef979cd70a7dc9d5e2c185))
+
 ## [1.24.0](https://github.com/spinabot/brigade/compare/brigade-v1.23.0...brigade-v1.24.0) (2026-07-05)
 
 
