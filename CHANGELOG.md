@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.24.0](https://github.com/spinabot/brigade/compare/brigade-v1.23.0...brigade-v1.24.0) (2026-07-05)
+
+
+### Features
+
+* run Brigade on your Claude subscription via the Claude Code CLI backend ([97ec84b](https://github.com/spinabot/brigade/commit/97ec84b823079b45663aeaacb1da53237edef95f))
+* run Brigade on your Claude subscription via the Claude Code CLI backend ([e713162](https://github.com/spinabot/brigade/commit/e7131629ac203160d65adc6192bd69f4db83d343))
+
 ## [1.23.0](https://github.com/spinabot/brigade/compare/brigade-v1.22.1...brigade-v1.23.0) (2026-07-04)
 
 
