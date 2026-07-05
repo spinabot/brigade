@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.25.0](https://github.com/spinabot/brigade/compare/brigade-v1.24.2...brigade-v1.25.0) (2026-07-05)
+
+
+### Features
+
+* **tools:** add render_video — HTML→MP4 via @hyperframes/producer ([70cbd6e](https://github.com/spinabot/brigade/commit/70cbd6e6276f871f1a006dfd66502dd61c736aaa))
+
+
+### Bug Fixes
+
+* **render-video:** keep @hyperframes/producer resolve-if-present; document render_video ([5dcda68](https://github.com/spinabot/brigade/commit/5dcda683f1832bb087bf73214d1cb5d77495cd43))
+
 ## [1.24.2](https://github.com/spinabot/brigade/compare/brigade-v1.24.1...brigade-v1.24.2) (2026-07-05)
 
 
