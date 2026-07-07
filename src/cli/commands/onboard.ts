@@ -33,6 +33,7 @@ import { bootRuntimeContext } from "../../storage/boot.js";
 import { flushAllPendingWrites } from "../../storage/flush.js";
 import { deleteSentinel, readSentinel, sentinelExists, writeSentinel, writeSentinelNow } from "../../storage/sentinel.js";
 import type { ModeSentinel } from "../../storage/runtime-context.js";
+import { probeTerminalAnimationSupport } from "../../ui/animations.js";
 import { pickStorageMode, type StorageModeResult } from "../../ui/onboard-storage-mode.js";
 import { runOnboarding } from "../../ui/onboarding.js";
 import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
@@ -74,6 +75,10 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 		);
 		return EXIT_CONFIG_ERROR;
 	}
+
+	// Ask the terminal whether it can repaint atomically (DECRQM 2026) while
+	// stdin is still ours — decides animated vs static chrome. ≤150 ms once.
+	await probeTerminalAnimationSupport();
 
 	const tui = new TUI(new ProcessTerminal());
 	tui.start();

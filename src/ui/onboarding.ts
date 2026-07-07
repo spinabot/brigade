@@ -49,6 +49,7 @@ import {
 	type ProviderInfo,
 } from "../providers/catalog.js";
 import { validateApiKeyOnline } from "../providers/validate-key.js";
+import { loaderIndicator } from "./animations.js";
 import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
 import { pickStorageMode, type StorageModeResult } from "./onboard-storage-mode.js";
@@ -705,6 +706,7 @@ export async function ensureApiKey(
 			(s) => brand.amber(s),
 			(s) => brand.dim(s),
 			`Verifying ${provider.name}…`,
+			loaderIndicator(),
 		);
 		tui.addChild(envLoader);
 		tui.requestRender();
@@ -849,6 +851,7 @@ async function promptTypedKey(
 			(s) => brand.amber(s),
 			(s) => brand.dim(s),
 			`Verifying with ${provider.name}…`,
+			loaderIndicator(),
 		);
 		tui.addChild(loader);
 		tui.requestRender();
@@ -958,6 +961,7 @@ async function ensureLocalOllama(
 			(s) => brand.amber(s),
 			(s) => brand.dim(s),
 			"Scanning Ollama…",
+			loaderIndicator(),
 		);
 		tui.addChild(loader);
 		tui.requestRender();
@@ -1079,7 +1083,7 @@ export async function ensureSubscriptionLogin(
 					// Wire Escape to abort the in-flight login. The loader only
 					// receives key input (handleInput) while it holds focus, so set
 					// focus AND point onAbort at the login controller.
-					const waitLoaderAuth = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Waiting for you to authorize…");
+					const waitLoaderAuth = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Waiting for you to authorize…", loaderIndicator());
 					waitLoaderAuth.onAbort = () => controller.abort();
 					tui.addChild(waitLoaderAuth);
 					tui.setFocus(waitLoaderAuth);
@@ -1112,7 +1116,7 @@ export async function ensureSubscriptionLogin(
 					// Wire Escape to abort the in-flight login (device-code path). The
 					// loader only receives key input while focused, so set focus AND
 					// point onAbort at the login controller.
-					const waitLoaderDevice = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Waiting for you to authorize…");
+					const waitLoaderDevice = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Waiting for you to authorize…", loaderIndicator());
 					waitLoaderDevice.onAbort = () => controller.abort();
 					tui.addChild(waitLoaderDevice);
 					tui.setFocus(waitLoaderDevice);
@@ -1268,7 +1272,7 @@ export async function ensureClaudeCli(tui: TUI, authStorage: AuthStorage): Promi
 			}
 			if (pick === "install") {
 				renderScreen(tui, "Step 3 of 5 · Connect Claude");
-				const loader = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Installing Claude Code (npm i -g @anthropic-ai/claude-code)…");
+				const loader = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Installing Claude Code (npm i -g @anthropic-ai/claude-code)…", loaderIndicator());
 				tui.addChild(loader);
 				tui.requestRender();
 				const ok = await installClaudeCode();
@@ -1407,7 +1411,7 @@ async function runClaudeBrowserLogin(tui: TUI, authStorage: AuthStorage): Promis
 				tui.addChild(new Text("", 0, 0));
 				tui.addChild(new Text("  " + brand.amber(info.url), 0, 0));
 				tui.addChild(new Text(brand.dim("  If your browser didn't open, copy the link above. Paste the code here if asked."), 0, 0));
-				const waiter = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Waiting for you to authorize…");
+				const waiter = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Waiting for you to authorize…", loaderIndicator());
 				waiter.onAbort = () => controller.abort();
 				tui.addChild(waiter);
 				tui.setFocus(waiter);

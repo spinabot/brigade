@@ -40,6 +40,7 @@ import chalk from "chalk";
 // italic spans to `*text*` so the renderer applies italic styling instead
 // of leaking literal underscores. Same shape as Pi-TUI's `Markdown` — drop-in.
 import { Markdown } from "../../ui/markdown.js";
+import { loaderIndicator, probeTerminalAnimationSupport } from "../../ui/animations.js";
 import { renderBrandHeader } from "../../ui/brand.js";
 import { formatCrewLabel, formatSessionLabel } from "../../ui/format-session.js";
 import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
@@ -146,6 +147,10 @@ export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promi
 	const host = opts.host ?? "127.0.0.1";
 	const port = opts.port ?? 7777;
 	const url = `ws://${host}:${port}`;
+
+	// Ask the terminal whether it can repaint atomically (DECRQM 2026) while
+	// stdin is still ours — decides animated vs static chrome. ≤150 ms once.
+	await probeTerminalAnimationSupport();
 
 	const tui = new TUI(new ProcessTerminal());
 	tui.start();
@@ -1286,6 +1291,7 @@ export async function wireConnectUi(
 					(s) => brand.amber(s),
 					(s) => brand.dim(s),
 					"thinking",
+					loaderIndicator(),
 				);
 				insertBeforeEditor(activeLoader);
 				break;

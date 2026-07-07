@@ -29,6 +29,7 @@ import { BrigadeExtensionRegistry } from "../../agents/extensions/registry.js";
 import { BUNDLED_MODULES } from "../../agents/extensions/modules/index.js";
 import { DEFAULT_AGENT_ID } from "../../config/paths.js";
 import { loadConfig, saveConfig } from "../../core/config.js";
+import { probeTerminalAnimationSupport } from "../../ui/animations.js";
 import { renderBrandHeader } from "../../ui/brand.js";
 import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { brand, selectListTheme } from "../../ui/theme.js";
@@ -124,6 +125,8 @@ export async function runWebSetupStandalone(opts: RunWebSetupOptions = {}): Prom
 		return 1;
 	}
 	markTuiActive();
+	// Terminal capability probe (animated vs static chrome) — see animations.ts.
+	await probeTerminalAnimationSupport();
 	const tui = new TUI(new ProcessTerminal());
 	tui.start();
 	const onSigint = (): void => {

@@ -8,13 +8,18 @@
  *     [tagline below the whole thing — cornsilk fullwidth]
  *     [pad]
  *
- * The video is a 56-col × 30-row × 89-frame char-based ASCII clip baked at
- * module-build time (see scripts/gen-brand-frames-cli.mjs and brand-frames-cli.ts).
- * Each cell carries a unicode codepoint and an RGB colour; we paint cells with
- * `chalk.hex(toHex(r,g,b))(char)`, plus a skip-on-space-and-black optimisation
- * that emits a literal space (no chalk wrapper) for empty/black cells so the
- * pre-rendered string size stays sane while remaining visually identical.
- * 89 frames at 15 fps play once, then the last frame holds.
+ * The video is a VIDEO_COLS × VIDEO_ROWS × VIDEO_FRAME_COUNT char-based ASCII
+ * clip baked at module-build time (see scripts/gen-brand-frames-cli.mjs and
+ * brand-frames-cli.ts). Each cell carries a unicode codepoint and an RGB
+ * colour; we paint cells with `chalk.hex(toHex(r,g,b))(char)`, plus a
+ * skip-on-space-and-black optimisation that emits a literal space (no chalk
+ * wrapper) for empty/black cells so the rendered string size stays sane while
+ * remaining visually identical.
+ *
+ * Playback policy: the clip plays ONCE per process (VIDEO_FPS ticks), then
+ * the last frame holds forever — and it plays at all only on terminals the
+ * animation gate (./animations.ts) recognises as smooth. Everywhere else the
+ * header is the static last frame, which is always correct and never janky.
  *
  * Wordmark colours are unchanged from the prior pure-text mark: a 4-stop
  * vertical metallic gradient (cornsilk → gold → amber → bronze) so the
@@ -29,6 +34,7 @@ const { render } = cfontsPkg;
 
 import { type Component, type TUI, Text } from "@earendil-works/pi-tui";
 import chalk from "chalk";
+import { terminalAnimationsEnabled } from "./animations.js";
 import { VIDEO_COLS, VIDEO_FPS, VIDEO_FRAME_COUNT, VIDEO_FRAMES, VIDEO_ROWS } from "./brand-frames-cli.js";
 
 // Wordmark palette — unchanged from the prior pure-text version.
@@ -82,22 +88,31 @@ const RAW_ART = cfontsResult === false ? "BRIGADE" : cfontsResult.string;
 
 // Strip every ANSI colour escape cfonts injected and split into rows. cfonts
 // inserts blank padding rows even with `space: false`, which would shift the
-// per-row colour mapping if we kept them. Then pixel-double (nearest-neighbour)
-// each row by WORDMARK_SCALE in both axes — codepoint-aware via Array.from so
-// multi-byte box-drawing glyphs ('╗','║','═','╔','╚','╝') aren't split between
-// their UTF-16 surrogate halves.
-const STRIPPED_ROWS = RAW_ART.replace(/\x1b\[[0-9;]*m/g, "")
+// per-row colour mapping if we kept them. The BASE rows (unscaled, ~59 cells
+// wide × 6 rows) are kept for the small-screen wordmark; the display rows are
+// then pixel-doubled (nearest-neighbour) by WORDMARK_SCALE in both axes —
+// codepoint-aware via Array.from so multi-byte box-drawing glyphs
+// ('╗','║','═','╔','╚','╝') aren't split between their UTF-16 surrogate
+// halves.
+const STRIPPED_BASE_ROWS = RAW_ART.replace(/\x1b\[[0-9;]*m/g, "")
 	.split("\n")
-	.filter((row) => row.trim().length > 0)
-	.flatMap((row) => {
-		const widened = Array.from(row)
-			.flatMap((ch) => Array.from({ length: WORDMARK_SCALE }, () => ch))
-			.join("");
-		return Array.from({ length: WORDMARK_SCALE }, () => widened);
-	});
+	.filter((row) => row.trim().length > 0);
+
+const STRIPPED_ROWS = STRIPPED_BASE_ROWS.flatMap((row) => {
+	const widened = Array.from(row)
+		.flatMap((ch) => Array.from({ length: WORDMARK_SCALE }, () => ch))
+		.join("");
+	return Array.from({ length: WORDMARK_SCALE }, () => widened);
+});
 
 const COLORED_WORDMARK_ROWS: string[] = STRIPPED_ROWS.map((row, idx) =>
 	chalk.hex(colorForRow(idx, STRIPPED_ROWS.length))(row),
+);
+
+// Unscaled variant for small terminals (~59×6 instead of ~118×12) — same
+// 4-stop metallic gradient, distributed over the 6 base rows.
+const COLORED_WORDMARK_ROWS_SMALL: string[] = STRIPPED_BASE_ROWS.map((row, idx) =>
+	chalk.hex(colorForRow(idx, STRIPPED_BASE_ROWS.length))(row),
 );
 
 // Convert ASCII letters/digits/printable punctuation to their Unicode
@@ -128,43 +143,85 @@ function toFullwidth(s: string): string {
 
 const TAGLINE = chalk.hex(BRIGADE_HIGHLIGHT)(toFullwidth("🦁  your personal AI crew  ·  by spinabot"));
 
+// Compact taglines for the small-screen modes. The fullwidth TAGLINE above is
+// ~80 visible cells (fullwidth glyphs are 2 cells each) — far too wide for an
+// 80-col terminal — so the small wordmark gets a plain-text version, and the
+// one-line mark inlines its own.
+const TAGLINE_SMALL = chalk.hex(BRIGADE_HIGHLIGHT)("🦁  your personal AI crew · by spinabot");
+
+// One-line brand mark for tiny terminals (SSH from a phone, split panes,
+// quake-style dropdowns). Two widths: with and without the tagline.
+const LINE_MARK_FULL = `🦁 ${chalk.hex(BRIGADE_GOLD).bold("BRIGADE")} ${chalk.hex(BRIGADE_HIGHLIGHT)("· your personal AI crew")}`;
+const LINE_MARK_MIN = `🦁 ${chalk.hex(BRIGADE_GOLD).bold("BRIGADE")}`;
+
 // Three spaces between the video block and the wordmark. The video is now
 // 56 cells wide (the char-based render) and the wordmark is ~146 cells once
 // pixel-doubled, so the whole composite is ~205 cols wide and requires a
 // wide terminal — that's expected for the brand splash.
 const GAP = " ".repeat(25);
 
-// Minimum terminal width (in cells) needed for the side-by-side layout to
-// fit comfortably. The math:
+// ─────────────────────────── responsive layout ladder ───────────────────────────
+// The brand header adapts to BOTH terminal dimensions. Width decides which
+// marks physically fit; height decides how much vertical budget the header
+// may spend — the header must never be taller than the screen, and must
+// always leave room for the actual content (prompts, chat) below it.
+//
+// Height gates are load-bearing, not cosmetic: Pi-TUI repaints the animation
+// by rewriting the block's rows in place. If the block overflows the
+// viewport, parts of it live in scrollback and every frame degenerates into
+// a full clear-and-redraw — a violent strobe on small windows (a stock
+// 80×24 macOS Terminal, IDE panes, split panes). The ladder guarantees the
+// video only ever plays when it fits WITH margin, and that every smaller
+// size still gets a deliberately designed mark, down to a one-liner.
+
+// Minimum terminal width (in cells) for the side-by-side layout. The math:
 //   EFFECTIVE_WORDMARK_WIDTH (4 + 118 = 122)
 // + GAP.length              (25)
 // + VIDEO_COLS              (56)
-// = 203 cells exactly. We add ~7 cells of breathing room so the user isn't
-// staring at a layout pinned to the right edge of their terminal, giving
-// THRESHOLD = 210. Below this width we stack the wordmark on top of the
-// video instead of placing them side by side.
+// = 203 cells exactly, plus ~7 cells of breathing room.
 export const SIDE_BY_SIDE_THRESHOLD = 210;
-// Wordmark column visible width is ~122 cells (WORDMARK_INDENT + WORDMARK_WIDTH);
-// pad a few cells for safety so the wordmark never wraps into the gutter.
+// Scaled wordmark column ~122 cells (WORDMARK_INDENT + WORDMARK_WIDTH) + safety.
 export const WORDMARK_MIN_WIDTH = 125;
-// VIDEO_COLS exactly. Below this width the ASCII video can't fit either, so we
-// render nothing at all rather than something visually broken.
-export const ASCII_MIN_WIDTH = 56;
+// VIDEO_COLS + the WORDMARK_INDENT the ascii-only layout prepends + margin —
+// below this the indented video would wrap and shred the block.
+export const ASCII_MIN_WIDTH = 62;
+// One-line mark: "🦁 BRIGADE" ≈ 10 visible cells + margin.
+export const LINE_MIN_WIDTH = 12;
 
-type LayoutMode = "side" | "stack" | "ascii-only" | "empty";
+// Vertical budgets. Video modes need the 30-row clip + padding + ~12 rows for
+// the content below the header; the wordmark modes are budgeted the same way
+// (mark height + padding + room to actually use the app).
+export const VIDEO_MODE_MIN_ROWS = 44; //  2 pad + 30 video + content room
+export const STACK_MIN_ROWS = 66; //       23 wordmark col + 30 video + content room
+export const WORDMARK_MIN_ROWS = 28; //     2 pad + 12 rows + tagline + content room
+export const WORDMARK_SMALL_MIN_ROWS = 16; // 2 pad + 6 rows + tagline + content room
+export const LINE_MIN_ROWS = 4;
 
-// Pick layout mode based on current terminal width. Pi-TUI's TUI exposes
-// `tui.terminal.columns` (see node_modules/@earendil-works/pi-tui/dist/terminal.d.ts);
-// we accept that as an optional override. Otherwise we fall back to
-// process.stdout.columns. If neither is available (non-TTY pipe etc.) we
-// assume the terminal is wide enough and keep the side-by-side layout —
-// 999 is just a sentinel that comfortably exceeds THRESHOLD.
-function pickLayout(termCols?: number): LayoutMode {
+export type LayoutMode = "side" | "stack" | "ascii-only" | "wordmark" | "wordmark-small" | "line" | "empty";
+
+/** Layout modes that include the animated video clip. */
+export function layoutShowsVideo(mode: LayoutMode): boolean {
+	return mode === "side" || mode === "stack" || mode === "ascii-only";
+}
+
+// Pick the layout for the current terminal size. Pi-TUI's TUI exposes the
+// live `tui.terminal.columns/rows`; we accept those as optional overrides
+// and fall back to process.stdout. If neither is available (non-TTY pipe)
+// we assume a large surface — 999 comfortably exceeds every threshold.
+//
+// First match wins, preferring the richest mark that fits: the full video
+// experience on big surfaces, the wordmark family on short-but-wide windows,
+// the one-liner on tiny ones.
+export function pickLayout(termCols?: number, termRows?: number): LayoutMode {
 	const cols = termCols ?? process.stdout.columns ?? 999;
-	if (cols < ASCII_MIN_WIDTH) return "empty";
-	if (cols < WORDMARK_MIN_WIDTH) return "ascii-only";
-	if (cols < SIDE_BY_SIDE_THRESHOLD) return "stack";
-	return "side";
+	const rows = termRows ?? process.stdout.rows ?? 999;
+	if (cols >= SIDE_BY_SIDE_THRESHOLD && rows >= VIDEO_MODE_MIN_ROWS) return "side";
+	if (cols >= WORDMARK_MIN_WIDTH && rows >= STACK_MIN_ROWS) return "stack";
+	if (cols >= ASCII_MIN_WIDTH && rows >= VIDEO_MODE_MIN_ROWS) return "ascii-only";
+	if (cols >= WORDMARK_MIN_WIDTH && rows >= WORDMARK_MIN_ROWS) return "wordmark";
+	if (cols >= WORDMARK_SMALL_MIN_WIDTH && rows >= WORDMARK_SMALL_MIN_ROWS) return "wordmark-small";
+	if (cols >= LINE_MIN_WIDTH && rows >= LINE_MIN_ROWS) return "line";
+	return "empty";
 }
 
 // Blank rows prepended directly to the composed brand block so the wordmark
@@ -173,22 +230,50 @@ function pickLayout(termCols?: number): LayoutMode {
 // so a leading "\n\n" Text padder doesn't reliably reserve visible rows.
 const TOP_PAD_LINES = 8;
 
-// Pre-render every video frame as an array of `VIDEO_ROWS` chalk-coloured
-// strings. Each cell is a single Unicode glyph painted with `chalk.hex(rgb)`
-// — one truecolor escape per cell. We skip the chalk wrapper for cells that
-// are both a literal space AND fully black (invisible anyway), keeping the
-// pre-rendered string size sane while remaining visually identical.
+// Render one video frame as an array of `VIDEO_ROWS` chalk-coloured strings,
+// LAZILY and memoized per frame index. Each cell is a single Unicode glyph
+// painted with `chalk.hex(rgb)` — one truecolor escape per cell. We skip the
+// chalk wrapper for cells that are both a literal space AND fully black
+// (invisible anyway), keeping the rendered string size sane while remaining
+// visually identical.
 //
-// Doing this once at module load means animation ticks are just an array
-// lookup + setText — no per-tick chalk allocation.
+// Lazy matters: rendering ALL frames eagerly at module load (the previous
+// approach) burned VIDEO_FRAME_COUNT × VIDEO_ROWS × VIDEO_COLS chalk calls
+// (~400k) before any UI painted — a visible multi-second startup stall on
+// EVERY surface that imports this module, including chat/connect which only
+// ever show the single static hold frame. Rendering on demand keeps first
+// paint instant (one frame ≈ 1.7k cells), and memoization makes any replay
+// an array lookup.
 //
 // Iteration is codepoint-aware via Array.from(chars) so multi-byte glyphs
 // (Braille, box-drawing, etc.) aren't split between their UTF-16 surrogate
 // halves. Source frames carry exactly VIDEO_COLS * VIDEO_ROWS codepoints and
 // VIDEO_COLS * VIDEO_ROWS * 3 RGB bytes (validated at generation time).
-const PRE_RENDERED_FRAMES: string[][] = VIDEO_FRAMES.map(({ chars, rgb }) => {
-	const buf = Buffer.from(rgb, "base64");
-	const cps = Array.from(chars);
+const FRAME_CACHE: (string[] | undefined)[] = new Array(VIDEO_FRAME_COUNT);
+
+// chalk.hex(...) builds a fresh styler function on every call — ~1.7k of
+// those per frame adds real work to each first-render tick. The clip is
+// generated from a GIF, so its palette is bounded (≤256 colours globally):
+// memoising styler-per-colour makes repeat cells a map hit instead of a
+// styler allocation. Bounded by the palette, so the cache can't grow past
+// a few hundred entries.
+const STYLER_CACHE = new Map<string, (s: string) => string>();
+function stylerFor(hex: string): (s: string) => string {
+	let styler = STYLER_CACHE.get(hex);
+	if (!styler) {
+		styler = chalk.hex(hex);
+		STYLER_CACHE.set(hex, styler);
+	}
+	return styler;
+}
+
+function getFrame(frameIdx: number): string[] {
+	const cached = FRAME_CACHE[frameIdx];
+	if (cached) return cached;
+	const src = VIDEO_FRAMES[frameIdx] ?? VIDEO_FRAMES[0];
+	if (!src) return [];
+	const buf = Buffer.from(src.rgb, "base64");
+	const cps = Array.from(src.chars);
 	const rows: string[] = [];
 	for (let y = 0; y < VIDEO_ROWS; y++) {
 		let line = "";
@@ -202,13 +287,14 @@ const PRE_RENDERED_FRAMES: string[][] = VIDEO_FRAMES.map(({ chars, rgb }) => {
 				line += " ";
 			} else {
 				const hex = `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
-				line += chalk.hex(hex)(ch);
+				line += stylerFor(hex)(ch);
 			}
 		}
 		rows.push(line);
 	}
+	FRAME_CACHE[frameIdx] = rows;
 	return rows;
-});
+}
 
 // Visible width of an arbitrary string after stripping ANSI colour escapes.
 // Used to right-pad the tagline row so its leftColumn entry matches the
@@ -219,7 +305,7 @@ const PRE_RENDERED_FRAMES: string[][] = VIDEO_FRAMES.map(({ chars, rgb }) => {
 // each but count as ONE codepoint in JavaScript. Counting visual cells — not
 // codepoints — keeps the tagline row's width matched to the wordmark rows so
 // the ASCII video doesn't shift right on the tagline row.
-function visibleWidth(s: string): number {
+export function visibleWidth(s: string): number {
 	// Strip ANSI escapes first.
 	const stripped = s.replace(/\x1b\[[0-9;]*m/g, "");
 	// Count visual cells: fullwidth / wide characters take 2 cells, the rest 1.
@@ -255,6 +341,14 @@ function visibleWidth(s: string): number {
 // using visibleWidth() just adds robustness if the wordmark ever changes.
 const WORDMARK_WIDTH = COLORED_WORDMARK_ROWS[0] ? visibleWidth(COLORED_WORDMARK_ROWS[0]) : 0;
 
+// Width the unscaled small wordmark needs: indent + glyph width (~59 cells)
+// + a safety cell. Exported so the layout tests can pin the ladder against
+// the real cfonts output instead of a hard-coded guess. (Referenced by
+// pickLayout above — safe, module consts are initialised long before any
+// render call.)
+export const WORDMARK_SMALL_MIN_WIDTH =
+	WORDMARK_INDENT + (COLORED_WORDMARK_ROWS_SMALL[0] ? visibleWidth(COLORED_WORDMARK_ROWS_SMALL[0]) : 0) + 1;
+
 // Build the LEFT COLUMN once at module load: wordmark rows, then a vertical
 // gap, then the indented tagline. This mirrors the OpenTUI layout in
 // asciify-engine/tui-demo/brand.tsx where the Wordmark component is a column
@@ -280,27 +374,72 @@ const leftColumn: string[] = [
 	`${taglineRow}${" ".repeat(taglinePadding)}`,
 ];
 
-// Compose one complete brand block (wordmark || video) for a given frame
-// index. Returns the multiline string ready to drop into a single Text
-// component — keeping it a single component lets Pi-TUI redraw it atomically
-// with no row-tearing during animation.
+// Compose one complete brand block for a given frame index. Returns the
+// multiline string ready to drop into a single Text component — keeping it a
+// single component lets Pi-TUI redraw it atomically with no row-tearing
+// during animation.
 //
-// Layout adapts to terminal width via pickLayout():
-//   - "side":  wordmark column LEFT + GAP + video rows RIGHT, paired row-by-row.
-//   - "stack": wordmark column on top, blank separator row, then video rows
-//              indented with WORDMARK_INDENT so the video lines up flush-left
-//              with the wordmark column instead of hugging column 0.
-function composeFrame(frameIdx: number, termCols?: number): string {
-	const videoRows = PRE_RENDERED_FRAMES[frameIdx] ?? PRE_RENDERED_FRAMES[0] ?? [];
-	const mode = pickLayout(termCols);
+// Layout adapts to terminal size via pickLayout() (see the ladder above):
+//   - "side":           wordmark column LEFT + GAP + video rows RIGHT, paired row-by-row.
+//   - "stack":          wordmark column on top, blank separator, then the video.
+//   - "ascii-only":     the video alone (narrow but tall windows).
+//   - "wordmark":       the full 12-row wordmark + tagline, no video (wide, short).
+//   - "wordmark-small": the unscaled 6-row wordmark + plain tagline (a stock
+//                       80×24 terminal lands here).
+//   - "line":           a one-line mark for tiny panes.
+//
+// The video frame is rendered ONLY when the chosen mode shows it — on small
+// terminals no frame is ever built, so the 2.5 MB frame data stays untouched
+// (getFrame is lazy) and the header costs a handful of short strings.
+//
+// Exported for the layout tests: they assert the composed block's height
+// against the ladder's row budgets so no future tweak can overflow a small
+// screen again.
+export function composeFrame(frameIdx: number, termCols?: number, termRows?: number): string {
+	const mode = pickLayout(termCols, termRows);
 	if (mode === "empty") {
 		return "";
 	}
+	if (mode === "line") {
+		const cols = termCols ?? process.stdout.columns ?? 999;
+		const mark = cols >= 40 ? LINE_MARK_FULL : LINE_MARK_MIN;
+		return `\n  ${mark}`;
+	}
+	if (mode === "wordmark-small") {
+		const indent = " ".repeat(WORDMARK_INDENT);
+		const lines: string[] = ["", ""];
+		for (const row of COLORED_WORDMARK_ROWS_SMALL) lines.push(`${indent}${row}`);
+		lines.push("");
+		lines.push(`${indent}${TAGLINE_SMALL}`);
+		return lines.join("\n");
+	}
+	if (mode === "wordmark") {
+		const indent = " ".repeat(WORDMARK_INDENT);
+		const lines: string[] = ["", ""];
+		for (const row of COLORED_WORDMARK_ROWS) lines.push(`${indent}${row}`);
+		lines.push("");
+		lines.push(taglineRow);
+		return lines.join("\n");
+	}
+	const videoRows = getFrame(frameIdx);
 	if (mode === "ascii-only") {
+		// Slimmer top pad than the side/stack layouts — this mode exists for
+		// narrow windows where vertical space is the scarce resource.
 		const videoIndent = " ".repeat(WORDMARK_INDENT);
-		const lines: string[] = [];
-		for (let i = 0; i < TOP_PAD_LINES; i++) lines.push("");
+		const lines: string[] = ["", ""];
 		for (const row of videoRows) lines.push(`${videoIndent}${row}`);
+		// The brand TEXT must read at every size, not only in the wide
+		// layouts — lock up the small wordmark + tagline under the clip
+		// whenever the width allows it (movie-title-card arrangement). The
+		// 62–63-col sliver below WORDMARK_SMALL_MIN_WIDTH shows the clip
+		// alone rather than a wrapped, shredded wordmark.
+		const cols = termCols ?? process.stdout.columns ?? 999;
+		if (cols >= WORDMARK_SMALL_MIN_WIDTH) {
+			lines.push("");
+			for (const row of COLORED_WORDMARK_ROWS_SMALL) lines.push(`${videoIndent}${row}`);
+			lines.push("");
+			lines.push(`${videoIndent}${TAGLINE_SMALL}`);
+		}
 		return lines.join("\n");
 	}
 	if (mode === "stack") {
@@ -332,20 +471,32 @@ function composeFrame(frameIdx: number, termCols?: number): string {
 // over the brand row.
 let liveHeaderTimer: NodeJS.Timeout | undefined;
 let liveHeaderOnResize: (() => void) | undefined;
+// The intro clip plays at most ONCE per process. Surfaces that rebuild the
+// screen per step (onboarding calls renderBrandHeader once per step) get the
+// animated intro on their first screen only; every later render holds the
+// static last frame instantly.
+let clipPlayedThisProcess = false;
 
 /**
- * Render the wordmark + video clip + tagline. By default spawns a setInterval
- * that drives the animation; the frame index wraps via modulo so the clip
- * loops continuously for the rest of the session. Pass `{ animate: false }` to
- * render a single still frame (the last frame, which is the intended "hold"
- * state) and skip the interval entirely — used by the chat surface where the
- * looping clip would compete with the conversation for attention.
+ * Render the wordmark + video clip + tagline. By default plays the clip ONCE
+ * (a setInterval at VIDEO_FPS advances the frames), then holds the last frame
+ * and retires the interval — no perpetual repaint load. The clip also plays
+ * at most once per PROCESS: surfaces that re-render the header per step
+ * (onboarding) get the animated intro on their first screen and the instant
+ * static hold frame on every later one.
+ *
+ * Animation is additionally gated by terminalAnimationsEnabled() — terminals
+ * that can't repaint smoothly (no DEC 2026 synchronized output: legacy
+ * conhost/cmd, classic xterm, SSH sessions, …) always get the static hold
+ * frame; on slow consoles the frame writes back the event loop up until the
+ * whole app reads as hung and shaking. Pass `{ animate: false }` to force the
+ * still frame regardless — used by the chat surface where even a one-shot
+ * clip would compete with the conversation for attention.
  *
  * Returns the components added to the TUI (caller can use these to remove or
  * inspect them).
  */
 export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): Component[] {
-	const animate = opts.animate ?? true;
 	const components: Component[] = [];
 
 	// Tear down the previous header's timer + resize listener before installing
@@ -359,11 +510,24 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 		liveHeaderOnResize = undefined;
 	}
 
-	// Pi-TUI's TUI exposes the underlying Terminal which has a `columns` getter
-	// (see node_modules/@earendil-works/pi-tui/dist/terminal.d.ts). Prefer that
-	// over process.stdout.columns since it's the value pi-tui itself uses for
-	// rendering, but pickLayout falls back if either is unavailable.
+	// Pi-TUI's TUI exposes the underlying Terminal with live `columns` / `rows`
+	// getters (see node_modules/@earendil-works/pi-tui/dist/terminal.d.ts).
+	// Prefer those over process.stdout since they're the values pi-tui itself
+	// renders with; pickLayout falls back if either is unavailable.
 	const getCols = (): number | undefined => tui.terminal?.columns ?? process.stdout.columns;
+	const getRows = (): number | undefined => tui.terminal?.rows ?? process.stdout.rows;
+
+	// Animate only when (a) the caller wants it, (b) the clip hasn't already
+	// played this process, (c) the terminal proved it repaints smoothly
+	// (env allowlist OR a positive DECRQM 2026 probe — see animations.ts),
+	// and (d) the CURRENT layout actually shows the video — on a small window
+	// there are no frames to play, only a static mark, so spinning up the
+	// interval would be pure waste.
+	const animate =
+		(opts.animate ?? true) &&
+		!clipPlayedThisProcess &&
+		terminalAnimationsEnabled() &&
+		layoutShowsVideo(pickLayout(getCols(), getRows()));
 
 	// Static mode (chat/connect) holds the LAST frame — the clip's resting pose.
 	// Animated mode starts at frame 0 and advances from there.
@@ -373,7 +537,7 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	tui.addChild(padTop);
 	components.push(padTop);
 
-	const block = new Text(composeFrame(initialFrameIdx, getCols()), 0, 0);
+	const block = new Text(composeFrame(initialFrameIdx, getCols(), getRows()), 0, 0);
 	tui.addChild(block);
 	components.push(block);
 
@@ -384,68 +548,85 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	tui.requestRender();
 
 	// --- Scrollback-friendly render scheduling ---------------------------------
-	// pi-tui's differential renderer (see node_modules/@earendil-works/pi-tui/dist/tui.js
-	// `doRender`, lines ~674-971) repaints animation frames by moving the
-	// hardware cursor up with `\x1b[{n}A`, clearing each row with `\x1b[2K`, and
-	// writing the new content. Windows Terminal (and other Conhost-derived
-	// emulators) treat any write that targets the bottom region of the buffer
-	// as "active output" and snap the viewport to the cursor — fighting the
-	// user's scrollback. Two complementary mitigations:
+	// Two rules keep animation repaints clean:
 	//
 	// 1. Skip the call entirely when the composed frame is byte-identical to
-	//    what we already pushed (e.g. when terminal width hasn't changed and
-	//    the layout produced the same string for an empty/clamped layout).
-	//    This avoids a no-op render that still emits cursor-move bytes.
+	//    what we already pushed (resize to an unchanged layout, backpressure
+	//    catch-up landing on the same frame). A no-op render would still emit
+	//    cursor-move bytes that make some terminals re-anchor the viewport.
 	//
-	// 2. Wrap each tui.requestRender() in DEC mode 2026 (synchronized output
-	//    begin/end) AND VT100 save/restore-cursor (`\x1b[s` / `\x1b[u`). pi-tui
-	//    already opens 2026 inside doRender, but it does so AROUND its cursor
-	//    moves; wrapping at the outer scope means Windows Terminal sees the
-	//    full repaint as one atomic frame and won't auto-scroll the viewport
-	//    to follow intermediate cursor moves. The save/restore pair is a
-	//    belt-and-braces signal that the terminal can keep its viewport pinned
-	//    where the user put it. Both sequences are cheap (≤8 bytes each) and
-	//    are no-ops on terminals that don't honour them.
-	//
-	// References:
-	//   - pi-tui differential renderer: node_modules/@earendil-works/pi-tui/dist/tui.js:674-971
-	//   - Synchronized Output (DEC 2026): https://gitlab.com/gnachman/iterm2/-/wikis/synchronized-updates-spec
-	//   - Cursor save/restore (DECSC / DECRC, ANSI \x1b[s/\x1b[u): VT100 spec
-	const SYNC_BEGIN = "\x1b[?2026h\x1b[s"; // begin sync + save cursor
-	const SYNC_END = "\x1b[u\x1b[?2026l"; // restore cursor + end sync
+	// 2. Never write to stdout from the animation timer. The timer only
+	//    mutates component state and calls tui.requestRender(); pi-tui
+	//    coalesces requests (min 16 ms between paints), builds each frame as
+	//    ONE buffer, and brackets that single write in DEC 2026 synchronized
+	//    output itself (node_modules/@earendil-works/pi-tui/dist/tui.js,
+	//    doRender). Terminals that can't repaint atomically never reach this
+	//    code at all — the animation gate (./animations.ts) holds them on the
+	//    static frame. (An earlier revision wrote its own 2026 + save/restore
+	//    -cursor brackets around requestRender here; requestRender only
+	//    SCHEDULES the paint for a later tick, so those bytes bracketed
+	//    nothing and are gone.)
 	let lastFrameStr: string | undefined;
 	const safeRender = (next: string): void => {
 		if (next === lastFrameStr) {
-			// No visible change — don't re-emit cursor-move bytes that would
-			// make the terminal re-anchor the viewport.
+			// No visible change — nothing to schedule.
 			return;
 		}
 		lastFrameStr = next;
 		block.setText(next);
-		try {
-			process.stdout.write(SYNC_BEGIN);
-			tui.requestRender();
-		} finally {
-			process.stdout.write(SYNC_END);
-		}
+		tui.requestRender();
 	};
 
-	// Drive the animation. The interval fires every 1000/VIDEO_FPS ms and the
-	// frame index wraps via modulo so the clip loops continuously for the rest
-	// of the session — no early-exit clearInterval. We refetch the terminal
-	// width on every tick so resizes are reflected within ~1/VIDEO_FPS s
-	// even if the dedicated resize listener below misses for some reason.
+	// Drive the animation. The interval fires every 1000/VIDEO_FPS ms and
+	// advances the frame index until the clip's LAST frame, then retires
+	// itself — the last frame is the designed hold pose, so a finished clip
+	// and a static header are pixel-identical. We refetch the terminal width
+	// on every tick so resizes are reflected within ~1/VIDEO_FPS s even if
+	// the dedicated resize listener below misses for some reason.
 	//
-	// In static mode (animate: false) we skip the setInterval entirely — the
+	// Backpressure guard, two tiers (thresholds per Node's stream semantics:
+	// on Windows TTYs writes queue in JS and `writableLength` grows when the
+	// console can't drain — the default high-water mark there is only 16 KiB;
+	// on POSIX TTYs writes are synchronous so writableLength stays ~0 and the
+	// checks are inert-but-free):
+	//
+	//   1. DROP  — any queued bytes mean the previous frame hasn't left Node
+	//      yet; painting another on top only deepens the backlog. Advance the
+	//      frame index (shortening the clip) but skip the write, so a slow
+	//      terminal gets a choppier-but-responsive intro, never a wedge.
+	//   2. ABORT — a backlog past ~4× the stream's high-water mark means the
+	//      terminal is drowning; per the stream docs unbounded queueing ends
+	//      in GC pressure and ballooning RSS. Jump to the hold frame and let
+	//      the finish branch retire the interval.
+	//
+	// In static mode (animate false) we skip the setInterval entirely — the
 	// initial composeFrame(initialFrameIdx) above already painted the still
 	// frame, so there's nothing to drive. The resize handler still runs so the
 	// still frame re-lays-out (side / stack / ascii-only / empty) on resize.
+	const ABORT_BACKPRESSURE_BYTES = 4 * (process.stdout.writableHighWaterMark || 16 * 1024);
 	let frameIdx = initialFrameIdx;
 	if (animate) {
 		const tickMs = Math.max(1, Math.round(1000 / VIDEO_FPS));
 		const timer: NodeJS.Timeout = setInterval(() => {
-			frameIdx = (frameIdx + 1) % VIDEO_FRAME_COUNT;
-			safeRender(composeFrame(frameIdx, getCols()));
+			if (frameIdx >= VIDEO_FRAME_COUNT - 1) {
+				// Clip finished. Make sure the hold pose is actually on screen
+				// (intermediate frames may have been skipped under backpressure;
+				// safeRender dedups if it already is), then retire the interval.
+				safeRender(composeFrame(VIDEO_FRAME_COUNT - 1, getCols(), getRows()));
+				clipPlayedThisProcess = true;
+				clearInterval(timer);
+				if (liveHeaderTimer === timer) liveHeaderTimer = undefined;
+				return;
+			}
+			frameIdx += 1;
+			const queued = process.stdout.writableLength ?? 0;
+			if (queued > ABORT_BACKPRESSURE_BYTES) {
+				// Terminal is drowning — end the show at the hold pose.
+				frameIdx = VIDEO_FRAME_COUNT - 1;
+				return;
+			}
+			if (queued > 0) return;
+			safeRender(composeFrame(frameIdx, getCols(), getRows()));
 		}, tickMs);
 		// Don't keep the event loop alive just for this animation — once the user
 		// quits, the process should be free to exit even if the timer hasn't yet
@@ -460,7 +641,7 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	// cache makes this a no-op when the layout didn't actually change. In
 	// static mode this is the only thing that ever re-renders the block.
 	const onResize = () => {
-		safeRender(composeFrame(frameIdx, getCols()));
+		safeRender(composeFrame(frameIdx, getCols(), getRows()));
 	};
 	process.stdout.on("resize", onResize);
 	liveHeaderOnResize = onResize;

@@ -17,6 +17,7 @@ import * as path from "node:path";
 
 import { CancellableLoader, Input, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
 
+import { loaderIndicator } from "./animations.js";
 import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
 import { resolveStateDir } from "../config/paths.js";
@@ -328,6 +329,7 @@ async function pickConvexBackend(tui: TUI): Promise<string> {
 			(s) => brand.amber(s),
 			(s) => brand.dim(s),
 			`Probing ${url}…`,
+			loaderIndicator(),
 		);
 		tui.addChild(loader);
 		tui.requestRender();
@@ -735,6 +737,7 @@ async function confirmAndErase(
 		(s) => brand.amber(s),
 		(s) => brand.dim(s),
 		"Erasing the previous Brigade…",
+		loaderIndicator(),
 	);
 	tui.addChild(loader);
 	tui.requestRender();
