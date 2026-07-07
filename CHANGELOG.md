@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.25.3](https://github.com/spinabot/brigade/compare/brigade-v1.25.2...brigade-v1.25.3) (2026-07-07)
+
+
+### Bug Fixes
+
+* **doctor:** diagnose broken installations — local no-g installs and PATH shadowing ([b595a42](https://github.com/spinabot/brigade/commit/b595a42fda33bde8c15b18b3404bcc40b3fa3e4b))
+
 ## [1.25.2](https://github.com/spinabot/brigade/compare/brigade-v1.25.1...brigade-v1.25.2) (2026-07-07)
 
 
