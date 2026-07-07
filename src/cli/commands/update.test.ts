@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -114,6 +114,36 @@ test("source checkout, no upstream → skips pull, still builds + restarts", asy
 	assert.ok(!ran(calls, "pull"));
 	assert.ok(ran(calls, "npm run build"));
 	assert.ok(ran(calls, "gateway restart"));
+});
+
+test("source checkout wipes the previous dist before building — no stale compiled files survive", async () => {
+	mkdirSync(join(root, "dist"));
+	writeFileSync(join(root, "dist", "renamed-away-module.js"), "// stale output of a deleted src file");
+	const { run } = makeRunner({ upstream: true, dirty: false, behind: 0 });
+	const code = await runUpdateCommand({ pkg: PKG(), run });
+	assert.equal(code, 0);
+	assert.ok(!existsSync(join(root, "dist", "renamed-away-module.js")), "stale dist file must be gone");
+});
+
+test("npm-global upgrade verifies the PATH binary and flags a shadowing stale install", async () => {
+	const npmRoot = mkdtempSync(join(tmpdir(), "brigade-npm-"));
+	try {
+		const { run, calls } = makeRunner({});
+		const wrapped: CommandRunner = (cmd, args, o) => {
+			if (args.includes("view")) return { code: 0, stdout: "2.0.0", stderr: "" };
+			// The shell's `brigade --version` still resolves an OLD copy.
+			if (cmd === "brigade" && args.includes("--version")) return { code: 0, stdout: "1.9.0", stderr: "" };
+			return run(cmd, args, o);
+		};
+		const code = await runUpdateCommand({ pkg: { name: "@spinabot/brigade", version: "1.9.0", root: npmRoot }, run: wrapped });
+		assert.equal(code, 0, "a shadowed PATH is a loud warning, not a failure");
+		assert.ok(ran(calls, "i -g @spinabot/brigade@latest"));
+		// It must have asked the PATH binary for its version and then looked
+		// up every copy on PATH to show the user where the stale one lives.
+		assert.ok(calls.some((c) => c === "where brigade" || c === "which -a brigade"));
+	} finally {
+		rmSync(npmRoot, { recursive: true, force: true });
+	}
 });
 
 test("npm-global install (no .git/src) → npm i -g @latest + restart", async () => {

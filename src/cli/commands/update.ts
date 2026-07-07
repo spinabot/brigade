@@ -11,9 +11,18 @@
  *        git pull --ff-only   (only when the tree is clean + behind upstream;
  *                              a dirty tree is left untouched and built as-is)
  *        npm install          (deps may have changed)
+ *        rm -rf dist          (tsc never deletes output for renamed/removed
+ *                              source files — a from-scratch dist is the only
+ *                              guaranteed-fresh build)
  *        npm run build        (recompile src → dist — Brigade runs from dist)
  *        brigade gateway restart
  *     i.e. the steps we used to just print, now executed.
+ *
+ * After an npm-global upgrade the command VERIFIES that the `brigade` the
+ * user's shell resolves actually reports the new version — installing into
+ * one Node installation while PATH resolves another (nvm vs system npm) is
+ * the classic way a machine keeps running a stale Brigade while every update
+ * "succeeds". A mismatch is called out loudly with every copy found on PATH.
  *
  * Flags: `--check` (report only, change nothing) · `--no-restart` (do the update
  * but leave the gateway for a manual restart).
@@ -23,7 +32,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -208,7 +217,19 @@ function updateSourceCheckout(pkg: PackageInfo, opts: UpdateOptions, run: Comman
 		return 1;
 	}
 
-	// 3) npm run build — recompile src → dist (Brigade runs dist, not src).
+	// 3) clean the previous build. tsc doesn't delete output for source files
+	//    that were renamed or removed, so stale compiled .js would otherwise
+	//    survive in dist across updates forever — the "old code still runs
+	//    after updating" class of bug. From-scratch dist = guaranteed fresh.
+	out(`${chalk.cyan("→")} cleaning previous build … `);
+	try {
+		rmSync(join(root, "dist"), { recursive: true, force: true });
+		out(`${chalk.green("✓")}\n`);
+	} catch {
+		out(`${chalk.yellow("⚠ couldn't remove dist — building over it")}\n`);
+	}
+
+	// 4) npm run build — recompile src → dist (Brigade runs dist, not src).
 	if (runStep(run, "building", "npm", ["run", "build"], root).code !== 0) {
 		err(
 			`${chalk.red("✗ Build failed — NOT restarting the gateway")} (it keeps running the previous good build). ` +
@@ -217,7 +238,7 @@ function updateSourceCheckout(pkg: PackageInfo, opts: UpdateOptions, run: Comman
 		return 1;
 	}
 
-	// 4) restart so the new dist is live (honest about the foreground case).
+	// 5) restart so the new dist is live (honest about the foreground case).
 	return restartAndReport(run, true, root, opts);
 }
 
@@ -254,6 +275,28 @@ function updateNpmGlobal(pkg: PackageInfo, opts: UpdateOptions, run: CommandRunn
 				`(sudo / an Administrator shell), or run: ${chalk.bold(`npm i -g ${pkg.name}@latest`)}\n`,
 		);
 		return 1;
+	}
+
+	// Verify the binary the user's SHELL resolves actually reports the new
+	// version. `npm i -g` into one Node installation while PATH resolves
+	// another (nvm vs system npm, an old brew Node, …) is the classic way a
+	// machine keeps launching a stale Brigade while every update "succeeds".
+	if (latest) {
+		const v = run("brigade", ["--version"], { capture: true });
+		const reported = v.code === 0 ? v.stdout.split("\n").pop()?.trim() : undefined;
+		if (reported && reported !== latest) {
+			out(`${chalk.yellow(`⚠ Installed ${latest}, but the brigade on your PATH reports ${reported}.`)}\n`);
+			const which =
+				process.platform === "win32"
+					? run("where", ["brigade"], { capture: true })
+					: run("which", ["-a", "brigade"], { capture: true });
+			if (which.code === 0 && which.stdout) {
+				out(`${chalk.dim("  copies on PATH:")}\n`);
+				for (const line of which.stdout.split("\n")) out(`${chalk.dim(`    ${line.trim()}`)}\n`);
+			}
+			out(`  ${chalk.dim("A stale install is shadowing the new one — remove it or fix your PATH ordering,")}\n`);
+			out(`  ${chalk.dim("then re-run")} ${chalk.bold("brigade --version")} ${chalk.dim("to confirm.")}\n`);
+		}
 	}
 
 	return restartAndReport(run, false, pkg.root, opts);
