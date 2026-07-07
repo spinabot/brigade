@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.25.1](https://github.com/spinabot/brigade/compare/brigade-v1.25.0...brigade-v1.25.1) (2026-07-07)
+
+
+### Bug Fixes
+
+* **tui:** responsive terminal-aware brand header — end launch hang and repaint shake ([8429202](https://github.com/spinabot/brigade/commit/8429202e54705e050b52d88dcf24979052a8c1b1))
+
 ## [1.25.0](https://github.com/spinabot/brigade/compare/brigade-v1.24.2...brigade-v1.25.0) (2026-07-05)
 
 
