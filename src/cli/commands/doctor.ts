@@ -14,6 +14,7 @@
  * each problem has a one-line "run X to fix" hint embedded in the message.
  */
 
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -39,6 +40,7 @@ import {
 	listChannelSecurityAdapters,
 } from "../../agents/channels/channel-security-registry.js";
 import { readConfigOrInit } from "../../config/io.js";
+import { isSourceCheckout, resolvePackageInfo } from "./update.js";
 import { BRIGADE_DIR, loadConfig } from "../../core/config.js";
 import { loadBrigadeAuthStorage } from "../../core/auth-bridge.js";
 import { getTodayLogPath } from "../../core/event-logger.js";
@@ -70,6 +72,7 @@ const MIN_NODE_MINOR = 12;
 export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise<number> {
 	const checks: CheckResult[] = [];
 	checks.push(checkNodeVersion());
+	checks.push(checkInstallation());
 	checks.push(checkTlsCaBundle());
 	checks.push(checkBrigadeDir());
 	checks.push(await checkBrigadeConfig());
@@ -119,6 +122,74 @@ function checkNodeVersion(): CheckResult {
 		status: "fail",
 		message: `Node ${process.versions.node} is below the required ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}`,
 		hint: `nvm install ${MIN_NODE_MAJOR} && nvm use ${MIN_NODE_MAJOR}`,
+	};
+}
+
+/**
+ * Installation health — catches the "a stale Brigade keeps running while
+ * updates claim success" class of breakage:
+ *
+ *   1. Brigade installed WITHOUT `-g` — npm then puts it in some project
+ *      folder's node_modules where no shell ever resolves it, while the
+ *      binary on PATH stays whatever old thing it was.
+ *   2. Multiple `brigade` copies on PATH (nvm vs system npm, an old manual
+ *      install) — the shell resolves one while `npm i -g` updates another.
+ *
+ * Source checkouts (.git + src/) skip the npm-shape check — a dev tree is
+ * its own install story — but still get the multiple-copies warning.
+ */
+function checkInstallation(): CheckResult {
+	const name = "installation";
+	const pkg = resolvePackageInfo();
+	const source = isSourceCheckout(pkg.root);
+
+	// Every `brigade` the shell can resolve, deduped by DIRECTORY — npm on
+	// Windows creates several shims (brigade / brigade.cmd / brigade.ps1) in
+	// one directory for one install, so raw line count over-reports.
+	const which = spawnSync(
+		process.platform === "win32" ? "where" : "which",
+		process.platform === "win32" ? ["brigade"] : ["-a", "brigade"],
+		{ shell: true, encoding: "utf8", timeout: 5_000 },
+	);
+	const binDirs = [
+		...new Set(
+			(which.stdout ?? "")
+				.split("\n")
+				.map((l) => l.trim())
+				.filter(Boolean)
+				.map((l) => path.dirname(l)),
+		),
+	];
+	if (binDirs.length > 1) {
+		return {
+			name,
+			status: "warn",
+			message: `multiple brigade installs on PATH: ${binDirs.join("  ·  ")}`,
+			hint: "the shell resolves the FIRST one — remove the stale copy (or fix PATH order), then `brigade --version` to confirm",
+		};
+	}
+
+	if (!source && /[\\/]node_modules[\\/]/.test(pkg.root)) {
+		// Running from inside a node_modules — fine when it's npm's GLOBAL
+		// root, the classic missing `-g` trap when it's some project folder.
+		const g = spawnSync("npm", ["root", "-g"], { shell: true, encoding: "utf8", timeout: 10_000 });
+		const globalRoot = (g.stdout ?? "").trim();
+		if (globalRoot && !pkg.root.toLowerCase().startsWith(globalRoot.toLowerCase())) {
+			return {
+				name,
+				status: "fail",
+				message: `installed LOCALLY (no -g) at ${pkg.root}`,
+				hint: `npm install -g ${pkg.name}@latest — then delete the accidental local node_modules`,
+			};
+		}
+	}
+
+	return {
+		name,
+		status: "ok",
+		message: source
+			? `source checkout at ${pkg.root} (v${pkg.version})`
+			: `v${pkg.version}${binDirs[0] ? ` via ${binDirs[0]}` : ""}`,
 	};
 }
 

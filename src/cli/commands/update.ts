@@ -76,8 +76,9 @@ const defaultRunner: CommandRunner = (cmd, args, opts) => {
 	};
 };
 
-/** Walk up from this module to the package.json that owns it. */
-function resolvePackageInfo(): PackageInfo {
+/** Walk up from this module to the package.json that owns it.
+ *  Exported for `brigade doctor`'s installation-health check. */
+export function resolvePackageInfo(): PackageInfo {
 	let dir = dirname(fileURLToPath(import.meta.url));
 	for (let i = 0; i < 8; i++) {
 		const pkgPath = join(dir, "package.json");
@@ -96,8 +97,9 @@ function resolvePackageInfo(): PackageInfo {
 	return { name: FALLBACK_PKG, version: "0.0.0", root: dir };
 }
 
-/** A package dir with `.git` + `src/` is a dev checkout, not a global install. */
-function isSourceCheckout(root: string): boolean {
+/** A package dir with `.git` + `src/` is a dev checkout, not a global install.
+ *  Exported for `brigade doctor`'s installation-health check. */
+export function isSourceCheckout(root: string): boolean {
 	return existsSync(join(root, ".git")) && existsSync(join(root, "src"));
 }
 
