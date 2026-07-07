@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.25.2](https://github.com/spinabot/brigade/compare/brigade-v1.25.1...brigade-v1.25.2) (2026-07-07)
+
+
+### Bug Fixes
+
+* **tui:** close the audit findings on the animation gate and header ladder ([3c3a7e0](https://github.com/spinabot/brigade/commit/3c3a7e0c150896ac9c351406c4b52d92df57b66e))
+* **tui:** pause the intro clip while the terminal window is unfocused ([ab1ef9c](https://github.com/spinabot/brigade/commit/ab1ef9c2a7e29a696fc814338ec90eb3664f726f))
+* **update:** clean-rebuild dist and verify the PATH binary after upgrade ([8223440](https://github.com/spinabot/brigade/commit/82234401b246b792d127dd48679ef2279cc62ac0))
+
 ## [1.25.1](https://github.com/spinabot/brigade/compare/brigade-v1.25.0...brigade-v1.25.1) (2026-07-07)
 
 
