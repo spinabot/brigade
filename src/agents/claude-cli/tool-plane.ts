@@ -33,6 +33,14 @@
 export interface ClaudeCliToolPlane {
 	agentId: string;
 	senderIsOwner: boolean;
+	/**
+	 * When the gateway registered this turn's FULL guarded tool surface with the
+	 * MCP tool-plane host, its loopback HTTP endpoint
+	 * (`http://127.0.0.1:<port>/mcp/<token>`). Present => the transport hands the
+	 * binary the full plane over HTTP instead of the memory-only stdio server.
+	 * Owner-gated + gateway-only upstream.
+	 */
+	mcpHttpUrl?: string;
 }
 
 // Property key used to stamp the tool-plane onto Pi's per-turn context object.
@@ -61,9 +69,15 @@ export function readClaudeCliToolPlane(context: unknown): ClaudeCliToolPlane | u
 	if (!context || typeof context !== "object") return undefined;
 	const v = (context as Record<string, unknown>)[TOOL_PLANE_KEY];
 	if (!v || typeof v !== "object") return undefined;
-	const plane = v as { agentId?: unknown; senderIsOwner?: unknown };
+	const plane = v as { agentId?: unknown; senderIsOwner?: unknown; mcpHttpUrl?: unknown };
 	if (typeof plane.agentId !== "string" || plane.agentId.length === 0) return undefined;
-	return { agentId: plane.agentId, senderIsOwner: plane.senderIsOwner === true };
+	return {
+		agentId: plane.agentId,
+		senderIsOwner: plane.senderIsOwner === true,
+		...(typeof plane.mcpHttpUrl === "string" && plane.mcpHttpUrl.length > 0
+			? { mcpHttpUrl: plane.mcpHttpUrl }
+			: {}),
+	};
 }
 
 // Agent ids are directory names (`~/.brigade/agents/<id>/`) — enforce the safe
@@ -97,4 +111,18 @@ export function buildClaudeCliMcpConfig(agentId: string): string | undefined {
 		},
 	};
 	return JSON.stringify(config);
+}
+
+/**
+ * The HTTP MCP config pointing the binary at the gateway's in-process tool-plane
+ * endpoint (`http://127.0.0.1:<port>/mcp/<token>`). The token in the URL both
+ * authenticates the caller and selects the turn context. `claude` 2.1.x accepts
+ * an `{type:"http", url}` server in `--mcp-config`. Returns undefined (=> fall
+ * back / no plane) for a malformed non-loopback URL — the endpoint is
+ * loopback-only, so we refuse to emit anything else.
+ */
+export function buildClaudeCliHttpMcpConfig(url: string): string | undefined {
+	if (typeof url !== "string") return undefined;
+	if (!/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\/mcp\/[0-9a-f]{64}$/.test(url)) return undefined;
+	return JSON.stringify({ mcpServers: { brigade: { type: "http", url } } });
 }

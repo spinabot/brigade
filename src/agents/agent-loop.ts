@@ -101,6 +101,7 @@ import { CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catal
 import { ensureClaudeCliApiRegistered } from "./claude-cli/register.js";
 import { stampClaudeCliToolPlane } from "./claude-cli/tool-plane.js";
 import { makeTransportDispatch } from "./transport-dispatch.js";
+import { getActiveMcpToolPlaneHost } from "./mcp/tool-plane-host.js";
 import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
 import { migrateOllamaProviderToNative } from "../integrations/ollama.js";
 import { describeModelProbe, probeModelReachable } from "../integrations/provider-discovery.js";
@@ -1045,14 +1046,24 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // `gateCtxRef.value = {runId, agentId, sessionKey}` once it has those
   // (just before the prompt() call) and clears it in the finally block.
   const gateCtxRef: GuardContextRef = { value: {} };
+  // Captured so the MCP tool-plane (claude-cli harness) can reuse the EXACT same
+  // composed guard for its tool calls — approval/exec-gate/unknown-tool/
+  // path-write/loop, closing over the same gateCtxRef so prompts route to the
+  // right operator. Registered below once gateCtxRef is populated; disposed in
+  // the finally. `mcpToolPlaneUrl` (when set) signals the claude-cli stream fn to
+  // hand the binary the full guarded surface over HTTP instead of memory-only.
+  let brigadeGuard: BrigadeBeforeToolCallHook | undefined;
+  let mcpToolPlaneUrl: string | undefined;
+  let mcpToolPlaneDispose: (() => void) | undefined;
   if (sessionWithBeforeHook.agent) {
     // SHARED guard chain — identical to the one buildAgent installs:
     //   unknown-tool guard → loop detector → exec-gate.
-    sessionWithBeforeHook.agent.beforeToolCall = composeBrigadeBeforeToolCall({
+    brigadeGuard = composeBrigadeBeforeToolCall({
       enabledToolNames: allEnabledToolNames,
       gateCtxRef,
       displayCwd: cwd,
     });
+    sessionWithBeforeHook.agent.beforeToolCall = brigadeGuard;
   }
 
   // Compose stream-fn wrappers around Pi's auth-aware streamFn. Order
@@ -1115,6 +1126,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         stampClaudeCliToolPlane(context, {
           agentId,
           senderIsOwner: effectiveSenderIsOwner,
+          // When the full guarded tool-plane is registered for this turn, hand
+          // the transport its HTTP endpoint (else it falls back to the
+          // memory-only stdio config).
+          ...(mcpToolPlaneUrl !== undefined ? { mcpHttpUrl: mcpToolPlaneUrl } : {}),
         });
       }
       return (wrappedStreamFn as (m: unknown, c: unknown, o: unknown) => unknown)(model, context, options);
@@ -1500,6 +1515,29 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       ? { channelRoute: args.channelApprovalRoute }
       : {}),
   };
+  // Register this turn's toolset + guard with the gateway MCP tool-plane so the
+  // claude-cli binary can call Brigade's FULL guarded surface (not just the 3
+  // memory tools). Gated identically to the memory stamp: claude-cli provider +
+  // OWNER turn. Requires the in-process host — present ONLY in the gateway
+  // process; on the cold `brigade agent` path getActiveMcpToolPlaneHost() is null
+  // and we skip (memory-only stdio still applies). We reuse the turn's OWN
+  // `brigadeCustomTools` (already ownerOnly-wrapped + origin-bound) and the SAME
+  // guard captured above (now closing over the freshly-populated gateCtxRef), so
+  // an MCP tool call is byte-identical to a Pi-loop dispatch.
+  if (args.provider === CLAUDE_CLI_PROVIDER && effectiveSenderIsOwner && brigadeGuard) {
+    const mcpHost = getActiveMcpToolPlaneHost();
+    if (mcpHost) {
+      const reg = mcpHost.registry.register({
+        customTools: brigadeCustomTools,
+        guard: brigadeGuard,
+        ...(args.signal ? { signal: args.signal } : {}),
+        agentId,
+        sessionKey: resolved.sessionKey,
+      });
+      mcpToolPlaneUrl = `${mcpHost.baseUrl}/mcp/${reg.token}`;
+      mcpToolPlaneDispose = reg.dispose;
+    }
+  }
   // Duck-typed Pi session subscription. We assert the SHAPE we want
   // rather than coupling to a specific Pi version's exported type. If
   // a future Pi changes `subscribe` to return `Promise<() => void>` or
@@ -1931,6 +1969,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // outside a prompt() call (e.g. a steer-triggered tool retry that
     // races the turn boundary).
     gateCtxRef.value = {};
+    // Dispose the MCP tool-plane token (if this turn registered one) so it can
+    // never outlive the turn — the binary's endpoint 404s the instant we return.
+    mcpToolPlaneDispose?.();
+    mcpToolPlaneDispose = undefined;
   }
 }
 

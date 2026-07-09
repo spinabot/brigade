@@ -70,6 +70,8 @@ import { flattenAssistantContent, runResilientTurn, type RunSingleTurnResult } f
 import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
 import { setActiveRegistry } from "../agents/extensions/active-registry.js";
 import type { GatewayCaller, GatewayMethodHandler, HttpRoute, Service } from "../agents/extensions/index.js";
+import { createMcpHttpRoute } from "../agents/mcp/http-route.js";
+import { createMcpTurnRegistry, setActiveMcpToolPlaneHost } from "../agents/mcp/tool-plane-host.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
 import { extractFrameTags, shouldDeliverFrame } from "./ws-subscription-filter.js";
 import { setActiveChannelManager } from "../agents/channels/active-manager.js";
@@ -1006,7 +1008,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// Module-registered HTTP routes. We carry the full `HttpRoute` (not just the
 	// handler) so the request dispatcher can apply `auth` / `match` / `maxBodyBytes`
 	// / `timeoutMs` per-route before delegating to the plugin's handler.
-	let httpRoutes: HttpRoute[] = [];
+	//
+	// CORE routes (below) are non-extension and must survive a config hot-reload,
+	// which rebuilds `httpRoutes` from the extension registry. The MCP tool-plane
+	// route (`/mcp/<token>`) lets the claude-cli harness backend call Brigade's
+	// full guarded tool surface in-process — so it lives here, ahead of extension
+	// routes, and is re-merged on every rebuild.
+	const mcpTurnRegistry = createMcpTurnRegistry();
+	const coreHttpRoutes: HttpRoute[] = [createMcpHttpRoute(mcpTurnRegistry)];
+	let httpRoutes: HttpRoute[] = [...coreHttpRoutes];
 	const startedServices: { id: string; service: Service }[] = [];
 	let serviceAbort: AbortController | undefined;
 
@@ -5281,6 +5291,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		});
 	});
 
+	// Publish the MCP tool-plane host now the loopback HTTP server is bound. The
+	// claude-cli harness backend registers each eligible turn's toolset + guard in
+	// `mcpTurnRegistry` and points the binary at `${baseUrl}/mcp/<token>`. Bound to
+	// loopback — the token-gated route is never remotely reachable.
+	setActiveMcpToolPlaneHost({ baseUrl: `http://127.0.0.1:${port}`, registry: mcpTurnRegistry });
+
 	// Phase 7 — agent model resolved. Emits the standard
 	// `agent model: <provider>/<model>` line for the boot agent.
 	{
@@ -5708,7 +5724,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// HTTP routes — swap in the live list the request handler reads. We carry
 		// the full `HttpRoute` (auth / match / maxBodyBytes / timeoutMs) so the
 		// request dispatcher can apply each route's guards before delegating.
-		httpRoutes = [...registry.httpRoutes];
+		httpRoutes = [...coreHttpRoutes, ...registry.httpRoutes];
 
 		// Channels — inbound runs through the SAME serialized turn queue as TUI
 		// prompts (`runGatewayTurn`), so a channel turn never overlaps a TUI turn.
@@ -6159,6 +6175,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// Detach the approval bridge so a late-arriving exec-gate call
 			// after stop() doesn't broadcast to dead clients.
 			setActiveApprovalBridge(null);
+			// Detach the MCP tool-plane host so a late claude-cli turn can't
+			// register against a dead gateway (falls back to memory-only stdio).
+			setActiveMcpToolPlaneHost(null);
 			// Disarm the cron timer + detach the active-service singleton so
 			// the agent tool can no longer mutate state and the next CLI
 			// invocation gets a clean "not initialised" error rather than a

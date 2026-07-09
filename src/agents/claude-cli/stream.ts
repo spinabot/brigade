@@ -30,7 +30,7 @@ import {
 	CLAUDE_CLI_API,
 	CLAUDE_CLI_PROVIDER,
 } from "./catalog.js";
-import { buildClaudeCliMcpConfig, readClaudeCliToolPlane } from "./tool-plane.js";
+import { buildClaudeCliHttpMcpConfig, buildClaudeCliMcpConfig, readClaudeCliToolPlane } from "./tool-plane.js";
 import { spawnClaudeCli, type SpawnClaudeCliArgs } from "./spawn.js";
 import {
 	classifyResultFrame,
@@ -312,10 +312,17 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				// tool-less on every backend). buildClaudeCliMcpConfig itself fails open
 				// (undefined) when the CLI entry path or agent id can't be resolved safely.
 				const toolPlane = readClaudeCliToolPlane(context);
-				const mcpConfigJson =
-					!structured && toolPlane?.senderIsOwner === true
-						? buildClaudeCliMcpConfig(toolPlane.agentId)
-						: undefined;
+				// Precedence: a STRUCTURED distiller turn gets NO tools (every backend).
+				// Otherwise, if the gateway registered this turn's FULL guarded surface,
+				// hand the binary that loopback HTTP endpoint; else fall back to the owner
+				// memory-only stdio server. Both fail open to undefined.
+				const mcpConfigJson = structured
+					? undefined
+					: toolPlane?.mcpHttpUrl
+						? buildClaudeCliHttpMcpConfig(toolPlane.mcpHttpUrl)
+						: toolPlane?.senderIsOwner === true
+							? buildClaudeCliMcpConfig(toolPlane.agentId)
+							: undefined;
 				const args = buildClaudeCliArgs({ modelId: model.id, structured });
 				// System prompt goes via a file (not argv) — see spawn.ts. Composed here so
 				// the right nudge (prose vs JSON-only vs memory-tools-allowed) is included.
