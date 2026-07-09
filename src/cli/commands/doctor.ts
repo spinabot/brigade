@@ -82,6 +82,7 @@ export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise
 	checks.push(checkClaudeCliBackend());
 	checks.push(checkWorkspace());
 	checks.push(await checkMemory());
+	checks.push(checkMemoryFreshness());
 	checks.push(checkSkills());
 	checks.push(checkMediaUnderstanding());
 	checks.push(checkLogDirWritable());
@@ -558,6 +559,67 @@ async function checkMemory(): Promise<CheckResult> {
 		name: "memory",
 		status: "ok",
 		message: `${factCount} fact${factCount === 1 ? "" : "s"} across all origins · ${summary.fileCount} note file${summary.fileCount === 1 ? "" : "s"}, ${kb} KB (embedder: ${embedderLabel})`,
+	};
+}
+
+/**
+ * Dark-moat guard (ADDITIVE — deliberately does NOT change `checkMemory`'s
+ * empty-is-ok semantics). `checkMemory` reports "ok" on an empty corpus because a
+ * fresh install legitimately has no facts yet. But an EMPTY moat sitting next to
+ * real conversation history AND an extraction cursor that has NEVER advanced is
+ * not "fresh" — it's a silent failure (the exact state where a month of use
+ * produced zero facts and nothing noticed). Surface THAT as a `warn` so it stops
+ * being invisible, while staying "ok" for a genuinely fresh workspace (no
+ * sessions) or one where extraction ran but found nothing durable — so a first
+ * boot / CI never trips `--strict`.
+ */
+function checkMemoryFreshness(): CheckResult {
+	const name = "memory freshness";
+	const workspaceDir = resolveAgentWorkspaceDir(DEFAULT_AGENT_ID);
+	let factCount = 0;
+	try {
+		factCount = new FactStore(workspaceDir).list().length;
+	} catch {
+		/* no fact store yet */
+	}
+	if (factCount > 0) {
+		return { name, status: "ok", message: `moat is live — ${factCount} fact${factCount === 1 ? "" : "s"} distilled` };
+	}
+	// No facts. Distinguish "fresh / nothing durable said" (ok) from "dark failure" (warn).
+	const sessionsDir = resolveSessionsDir(DEFAULT_AGENT_ID);
+	const sessionCount = fs.existsSync(sessionsDir)
+		? fs.readdirSync(sessionsDir).filter((n) => n.endsWith(".jsonl")).length
+		: 0;
+	if (sessionCount === 0) {
+		return { name, status: "ok", message: "no conversations yet — nothing to distill" };
+	}
+	// Has the post-turn extraction cursor EVER advanced for any session? Cursor file
+	// shape is `{ version, cursors: { <sessionId>: <processedCount> } }` — read the
+	// `cursors` map only (the top-level `version: 1` must not read as "advanced").
+	let cursorAdvanced = false;
+	try {
+		const cursorFile = path.join(workspaceDir, "memory", ".dreams", "extract-cursor.json");
+		const raw = JSON.parse(fs.readFileSync(cursorFile, "utf8")) as { cursors?: Record<string, unknown> };
+		const cursors = raw?.cursors ?? {};
+		cursorAdvanced = Object.values(cursors).some((n) => typeof n === "number" && n > 0);
+	} catch {
+		/* no cursor file → never advanced */
+	}
+	if (!cursorAdvanced) {
+		return {
+			name,
+			status: "warn",
+			message: `moat is DARK — ${sessionCount} session${sessionCount === 1 ? "" : "s"} on disk but 0 facts and extraction has never advanced`,
+			hint:
+				"Memory extraction has produced nothing. Ensure the gateway is running (it drives the background sweep) and " +
+				"check its logs for `[memory/extract]` warnings.",
+		};
+	}
+	// Cursor advanced but no facts kept = genuinely nothing durable was said. Fine.
+	return {
+		name,
+		status: "ok",
+		message: `no durable facts yet — extraction ran over ${sessionCount} session${sessionCount === 1 ? "" : "s"} but found nothing worth keeping`,
 	};
 }
 
