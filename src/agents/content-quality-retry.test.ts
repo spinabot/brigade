@@ -253,3 +253,51 @@ describe("runWithContentQualityRetry — slop gate forces rewrites until clean",
 		assert.equal(messages.length, 2, "exactly two messages: initial empty + clean recovery reply");
 	});
 });
+
+describe("harness backends: the recovery tier must not re-run side effects", () => {
+	// A harness (claude-cli) runs tools in an external binary, so its assistant
+	// message can only ever hold text/thinking. Every recovery heuristic reads
+	// "never called a tool" and would re-prompt — and a re-prompt RESPAWNS the
+	// binary, re-running `bash ./deploy.sh`. `toolActivity` is how the backend
+	// says "I acted". A re-prompt is `session.prompt(...)`, so that is what we count.
+	const plannedButActed = {
+		role: "assistant",
+		content: [{ type: "text", text: "Let me run the deploy for you." }],
+	};
+
+	function fakeSession(messages: unknown[]) {
+		const state = { reprompts: 0 };
+		const session = {
+			messages,
+			agent: { state: { tools: [{ name: "bash" }] } },
+			prompt: async () => {
+				state.reprompts++;
+			},
+		};
+		return { session: session as never, state };
+	}
+
+	it("planning-only text does NOT re-prompt when the harness reports tool activity", async () => {
+		const { session, state } = fakeSession([plannedButActed]);
+		await runWithContentQualityRetry(session, async () => {}, { toolActivity: () => true });
+		assert.equal(state.reprompts, 0, "the deploy must not run a second time");
+	});
+
+	it("...but WITHOUT that signal the same turn IS re-prompted (loop-backend behaviour, unchanged)", async () => {
+		const { session, state } = fakeSession([plannedButActed]);
+		await runWithContentQualityRetry(session, async () => {}, {});
+		assert.equal(state.reprompts, 1, "recovery tier still fires for loop backends");
+	});
+
+	it("an empty reply after real harness work is accepted, not re-driven", async () => {
+		const { session, state } = fakeSession([{ role: "assistant", content: [] }]);
+		await runWithContentQualityRetry(session, async () => {}, { toolActivity: () => true });
+		assert.equal(state.reprompts, 0);
+	});
+
+	it("toolActivity=false leaves loop-backend behaviour untouched", async () => {
+		const { session, state } = fakeSession([plannedButActed]);
+		await runWithContentQualityRetry(session, async () => {}, { toolActivity: () => false });
+		assert.equal(state.reprompts, 1);
+	});
+});

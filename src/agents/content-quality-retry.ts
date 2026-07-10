@@ -129,6 +129,25 @@ export interface ContentQualityRetryOptions {
 	 *  (empty / reasoning-only / planning-only) always get exactly ONE re-prompt,
 	 *  regardless of this value — looping those is pathological, not a quality bar. */
 	maxSlopRewrites?: number;
+	/**
+	 * Did the turn actually DO something, even though the assistant message shows
+	 * no `toolCall` blocks?
+	 *
+	 * Every recovery heuristic below reads tool activity off the assistant message.
+	 * That is sound when Pi loop dispatched the tools. It is structurally FALSE for
+	 * a HARNESS backend (claude-cli), where an external binary runs the loop and
+	 * calls Brigade tools back over MCP: the assistant message it returns can only
+	 * ever contain text/thinking, so `toolCallBlocks.length === 0` ALWAYS.
+	 *
+	 * Without this, a harness turn that ran `bash ./deploy.sh` and then said "Let me
+	 * run the deploy for you" is judged planning-only, gets re-prompted, and the
+	 * re-prompt RESPAWNS THE BINARY — which runs the deploy a second time. Same for
+	 * a terse or empty reply after real work.
+	 *
+	 * So a backend that executed tools out-of-band reports it here and the recovery
+	 * tier stands down. Omitted (every loop backend) => behaviour unchanged.
+	 */
+	toolActivity?: () => boolean;
 }
 
 /**
@@ -169,7 +188,13 @@ export async function runWithContentQualityRetry(
 	const issue = inspectLast();
 	if (!issue) return;
 
-	// RECOVERY issues — a single steer re-prompt (Pi's `agent.steer` is for mid-turn
+	// A harness backend ran tools out-of-band, so the assistant message cannot
+	// carry toolCall blocks and the recovery heuristics all misread it as "never
+	// acted". Re-prompting would respawn the binary and re-run every side effect.
+	// The slop gate still applies: rewriting prose is safe, re-running a deploy is not.
+	if (issue !== "slop" && options.toolActivity?.() === true) return;
+
+	// RECOVERY issues — a single steer re-prompt (Pi `agent.steer` is for mid-turn
 	// injection; this fires AFTER the turn, so we re-prompt directly).
 	if (issue !== "slop") {
 		options.onRetry?.(issue);

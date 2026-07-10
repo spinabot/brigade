@@ -122,6 +122,25 @@ export function buildHarnessToolMessages(rec: HarnessToolRecord, model: HarnessM
 	return [assistant, result];
 }
 
+/**
+ * One tool call's messages, tagged with WHERE they belong in the live array —
+ * its length at the moment the tool finished.
+ *
+ * Why a position rather than "append at the end": a turn can produce SEVERAL
+ * assistant messages (Brigade's continuation loop when a reply is cut off at
+ * `stopReason: "length"`). A tool that ran before continuation #2 must land
+ * before it, not after all of them. Capturing the index as the tool completes
+ * makes the reconstruction exact instead of a heuristic, and keeps each
+ * `assistant(toolCall)` adjacent to its `toolResult` even when the binary runs
+ * several tools in parallel.
+ */
+export interface HarnessRecordBatch {
+	/** `session.messages.length` when the tool completed. */
+	insertAt: number;
+	/** The assistant(toolCall) + toolResult pair, in order. */
+	messages: unknown[];
+}
+
 /** Minimal shape we need off a Pi session — kept structural so tests need no Pi. */
 interface HarnessSession {
 	messages?: unknown[];
@@ -141,9 +160,12 @@ export function recordHarnessToolCall(
 	session: unknown,
 	rec: HarnessToolRecord,
 	model: HarnessModelInfo,
-): unknown[] {
+): HarnessRecordBatch {
 	const messages = buildHarnessToolMessages(rec, model);
-	const sm = (session as HarnessSession | undefined)?.sessionManager;
+	const s = session as HarnessSession | undefined;
+	// Where this pair belongs: everything the turn has emitted so far precedes it.
+	const insertAt = Array.isArray(s?.messages) ? s.messages.length : 0;
+	const sm = s?.sessionManager;
 	if (typeof sm?.appendMessage === "function") {
 		for (const m of messages) {
 			try {
@@ -156,43 +178,44 @@ export function recordHarnessToolCall(
 			}
 		}
 	}
-	return messages;
+	return { insertAt, messages };
 }
 
 /**
  * Reconcile the in-memory context with what we already wrote to the JSONL.
  *
- * Called once the turn has stopped streaming. The turn's final assistant message
- * is currently LAST in `session.messages` (Pi pushed it on `message_end`), but in
- * the JSONL it comes AFTER our records — because the binary ran the tools before
- * it spoke. So we lift that message out, append the records, and put it back on
- * the end. Both views then read in true chronological order.
+ * MUST be called once `session.prompt()` has settled — the loop is done by then
+ * and the array is ours to touch. Each batch is inserted at the index it occupied
+ * when its tool finished, so the live array ends up in exactly the order the
+ * JSONL already holds. That is correct even for a turn with several assistant
+ * messages (Brigade's continuation loop) and for tools the binary ran in
+ * parallel; each `assistant(toolCall)` stays adjacent to its `toolResult`, which
+ * is what an API provider requires if this session is later switched to one.
  *
- * No-ops while streaming (Pi's own rule for out-of-loop message injection), and
- * when there is nothing to merge.
+ * If the session still reports `isStreaming` we WARN and proceed rather than
+ * skip. Pi's guard exists to stop a mutation racing a LIVE run, and by contract
+ * we are past that (`isStreaming` lingers until `agent_end` listeners settle).
+ * Skipping is the worse failure: the JSONL would hold the tool history while the
+ * live context silently lost it for the rest of the process — the model would
+ * forget, mid-conversation, that it had just written a file.
  */
-export function mergeHarnessRecordsIntoSession(session: unknown, records: unknown[]): void {
-	if (records.length === 0) return;
+export function mergeHarnessRecordsIntoSession(session: unknown, batches: HarnessRecordBatch[]): void {
+	if (batches.length === 0) return;
 	const s = session as HarnessSession | undefined;
 	const messages = s?.messages;
 	if (!Array.isArray(messages)) return;
 	if (s?.isStreaming === true) {
-		// Would race the live loop. The JSONL already has them, so a resume recovers.
-		log.debug("skipped in-memory merge — session still streaming", { records: records.length });
-		return;
+		log.warn("merging harness tool records while the session still reports streaming", {
+			batches: batches.length,
+		});
 	}
 
-	let lastAssistant = -1;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		if ((messages[i] as { role?: unknown } | undefined)?.role === "assistant") {
-			lastAssistant = i;
-			break;
-		}
+	// Ascending by position; each insertion shifts everything after it.
+	const ordered = [...batches].sort((a, b) => a.insertAt - b.insertAt);
+	let offset = 0;
+	for (const batch of ordered) {
+		const at = Math.min(Math.max(batch.insertAt, 0) + offset, messages.length);
+		messages.splice(at, 0, ...batch.messages);
+		offset += batch.messages.length;
 	}
-	if (lastAssistant === -1) {
-		messages.push(...records);
-		return;
-	}
-	const [finalAssistant] = messages.splice(lastAssistant, 1);
-	messages.push(...records, finalAssistant);
 }

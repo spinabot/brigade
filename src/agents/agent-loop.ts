@@ -97,17 +97,12 @@ import {
 // exact same derivation this build uses.
 import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
-import { CLAUDE_CLI_API, CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catalog.js";
+import { CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catalog.js";
 import { ensureClaudeCliApiRegistered } from "./claude-cli/register.js";
 import { stampClaudeCliToolPlane } from "./claude-cli/tool-plane.js";
 import { makeTransportDispatch } from "./transport-dispatch.js";
-import { getActiveMcpToolPlaneHost } from "./mcp/tool-plane-host.js";
-import {
-  mergeHarnessRecordsIntoSession,
-  recordHarnessToolCall,
-  type HarnessToolRecord,
-} from "./harness-transcript.js";
-import { createGuardedBuiltinTools } from "./mcp/builtin-tools.js";
+import { claudeCliHarnessBackend } from "./claude-cli/harness-backend.js";
+import { NOOP_HARNESS_HANDLE, type HarnessTurnHandle } from "./harness/types.js";
 import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
 import { migrateOllamaProviderToNative } from "../integrations/ollama.js";
 import { describeModelProbe, probeModelReachable } from "../integrations/provider-discovery.js";
@@ -1056,15 +1051,12 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // composed guard for its tool calls — approval/exec-gate/unknown-tool/
   // path-write/loop, closing over the same gateCtxRef so prompts route to the
   // right operator. Registered below once gateCtxRef is populated; disposed in
-  // the finally. `mcpToolPlaneUrl` (when set) signals the claude-cli stream fn to
-  // hand the binary the full guarded surface over HTTP instead of memory-only.
+  // the finally. The harness backend (below) turns it into the guarded tool-plane
+  // it serves to the external binary.
   let brigadeGuard: BrigadeBeforeToolCallHook | undefined;
-  let mcpToolPlaneUrl: string | undefined;
-  let mcpToolPlaneDispose: (() => void) | undefined;
-  // Tool calls the external harness (the claude-cli binary) made on our behalf.
-  // Written to the JSONL as they happen; merged into the in-memory context once
-  // the turn stops streaming. See ./harness-transcript.ts.
-  const harnessToolMessages: unknown[] = [];
+  // A HARNESS backend (claude-cli) installs itself for the turn below. Every other
+  // provider keeps the frozen no-op, so loop backends are byte-identical to before.
+  let harnessHandle: HarnessTurnHandle = NOOP_HARNESS_HANDLE;
   if (sessionWithBeforeHook.agent) {
     // SHARED guard chain — identical to the one buildAgent installs:
     //   unknown-tool guard → loop detector → exec-gate.
@@ -1127,20 +1119,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       if (model?.api === "ollama") ensureOllamaNativeApiRegistered();
       else if (model?.api === "claude-cli") {
         ensureClaudeCliApiRegistered();
-        // Stamp the per-turn tool-plane context for the claude-cli transport
-        // (memory MCP on the harness backend — see claude-cli/tool-plane.ts).
-        // `effectiveSenderIsOwner` is the SAME signal the tool registry gates
-        // on (incl. the poisoned-inbox demotion), so the MCP surface can never
-        // be broader than the in-process tool surface. Gated to claude-cli
-        // dispatches only — raw-API providers never see the stamp.
-        stampClaudeCliToolPlane(context, {
-          agentId,
-          senderIsOwner: effectiveSenderIsOwner,
-          // When the full guarded tool-plane is registered for this turn, hand
-          // the transport its HTTP endpoint (else it falls back to the
-          // memory-only stdio config).
-          ...(mcpToolPlaneUrl !== undefined ? { mcpHttpUrl: mcpToolPlaneUrl } : {}),
-        });
+        // Hand the transport this turn's harness context (owner flag + tool-plane
+        // callback URL). Gated to claude-cli dispatches — raw-API providers never
+        // see it, and on any other provider the handle is the frozen no-op.
+        harnessHandle.stampContext(context);
       }
       return (wrappedStreamFn as (m: unknown, c: unknown, o: unknown) => unknown)(model, context, options);
     }) as typeof baseStreamFn;
@@ -1566,54 +1548,32 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   };
 
   try {
-  // Register this turn's toolset + guard with the gateway MCP tool-plane so the
-  // claude-cli binary can call Brigade's FULL guarded surface (not just the 3
-  // memory tools). Gated identically to the memory stamp: claude-cli provider +
-  // OWNER turn. Requires the in-process host — present ONLY in the gateway
-  // process; on the cold `brigade agent` path getActiveMcpToolPlaneHost() is null
-  // and we skip (memory-only stdio still applies). We reuse the turn's OWN
-  // `brigadeCustomTools` (already ownerOnly-wrapped + origin-bound) and the SAME
-  // guard (closing over the populated gateCtxRef), so an MCP tool call is
-  // byte-identical to a Pi-loop dispatch.
+  // Install the HARNESS backend for this turn, if one owns it.
   //
-  // MUST live INSIDE this try: its `finally` is what disposes the token. Any
-  // throw between registration and the try would otherwise strand the entry in
-  // the process-global registry for the gateway's lifetime, retaining the whole
-  // turn context (tools + guard + signal).
-  if (args.provider === CLAUDE_CLI_PROVIDER && effectiveSenderIsOwner && brigadeGuard) {
-    const mcpHost = getActiveMcpToolPlaneHost();
-    if (mcpHost) {
-      // Pi's builtins (read/write/edit/bash/grep/ls) reach the toolset only as
-      // NAMES — Pi's loop builds them, and that loop does not run on claude-cli.
-      // Construct them here against the turn's cwd and serve them alongside the
-      // native tools, so the harness backend has a filesystem + shell at all.
-      // They go through the SAME guard on every call: bash hits the exec-gate
-      // (approval prompt), write/edit hit the path-write + config-write guards.
-      const builtinTools = createGuardedBuiltinTools({ cwd, allow: toolset.builtinToolNames });
-      const reg = mcpHost.registry.register({
-        customTools: [...brigadeCustomTools, ...builtinTools],
-        guard: brigadeGuard,
-        ...(args.signal ? { signal: args.signal } : {}),
-        agentId,
-        sessionKey: resolved.sessionKey,
-        // Lets the MCP route mint pi-shaped tool events for the TUI.
-        runId,
-        // ...and record what the binary actually did into the transcript, so a
-        // resumed session, compaction and the next turn's replayed context all
-        // know a file was written / a command was run.
-        recordToolCall: (rec: HarnessToolRecord) => {
-          harnessToolMessages.push(
-            ...recordHarnessToolCall(session, rec, {
-              api: CLAUDE_CLI_API,
-              provider: args.provider,
-              model: args.modelId,
-            }),
-          );
-        },
-      });
-      mcpToolPlaneUrl = `${mcpHost.baseUrl}/mcp/${reg.token}`;
-      mcpToolPlaneDispose = reg.dispose;
-    }
+  // MUST live INSIDE this try: its `finally` is what disposes the handle. A throw
+  // between install and the try would otherwise strand the tool-plane token in the
+  // process-global registry for the gateway lifetime, retaining the whole turn
+  // context (tools + guard + signal).
+  //
+  // The backend registers the guarded tool-plane, threads runId (TUI tool events)
+  // and the transcript sink, and hands back a disposable handle. It fails open: a
+  // peer turn, or the cold `brigade agent` path (no gateway host), registers
+  // nothing and the turn proceeds exactly as before.
+  if (claudeCliHarnessBackend.owns({ provider: args.provider })) {
+    harnessHandle = claudeCliHarnessBackend.installTurn({
+      agentId,
+      provider: args.provider,
+      modelId: args.modelId,
+      cwd,
+      sessionKey: resolved.sessionKey,
+      runId,
+      session,
+      senderIsOwner: effectiveSenderIsOwner,
+      customTools: brigadeCustomTools,
+      builtinToolNames: toolset.builtinToolNames,
+      ...(brigadeGuard ? { guard: brigadeGuard } : {}),
+      ...(args.signal ? { signal: args.signal } : {}),
+    });
   }
 
   log.info("turn starting", {
@@ -1853,6 +1813,12 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
                   reason,
                 });
               },
+              // A HARNESS backend runs tools out-of-band, so the assistant message
+              // can never carry toolCall blocks and the recovery heuristics would
+              // read "never acted" on a turn that just ran a deploy. Re-prompting
+              // respawns the binary and repeats every side effect. No-op (false)
+              // for every loop backend.
+              toolActivity: () => harnessHandle.hadToolActivity(),
             },
           );
         },
@@ -1899,6 +1865,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       sessionId: resolved.sessionId,
       continuationIndex: continuations,
     });
+    // A harness re-prompt RESPAWNS the external binary, which replays the context
+    // and would re-run any tool it can't see it already ran. Flush this attempt's
+    // records into the context first, so the continuation reads `[called tool: X]`
+    // and its result. Idempotent + a no-op for every loop backend.
+    harnessHandle.afterTurn();
     await runWithRetry({
       ctx: { provider: args.provider, model: args.modelId },
       signal: args.signal,
@@ -1966,11 +1937,12 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       ? joinAssistantTextFrom(session as AgentSession, messageCountBeforeTurn)
       : extractLastAssistantText(session as AgentSession);
 
-  // Reconcile the in-memory context with the tool records already written to the
-  // JSONL. Done AFTER `reply` so the synthetic messages (which carry no text)
-  // cannot affect what the operator sees, and after streaming has stopped —
-  // mutating `agent.state.messages` mid-stream would race Pi's own loop.
-  mergeHarnessRecordsIntoSession(session, harnessToolMessages);
+  // Reconcile whatever the harness recorded out-of-band into the in-memory
+  // context. AFTER `reply` so the synthetic messages (which carry no text) cannot
+  // affect what the operator sees, and after streaming has stopped — mutating
+  // `agent.state.messages` mid-stream would race Pi's own loop. No-op for every
+  // loop backend.
+  harnessHandle.afterTurn();
 
   // After-turn lifecycle:
   //
@@ -2012,10 +1984,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // outside a prompt() call (e.g. a steer-triggered tool retry that
     // races the turn boundary).
     gateCtxRef.value = {};
-    // Dispose the MCP tool-plane token (if this turn registered one) so it can
+    // Tear down whatever the harness installed (the tool-plane token), so it can
     // never outlive the turn — the binary's endpoint 404s the instant we return.
-    mcpToolPlaneDispose?.();
-    mcpToolPlaneDispose = undefined;
+    harnessHandle.dispose();
+    harnessHandle = NOOP_HARNESS_HANDLE;
   }
 }
 
