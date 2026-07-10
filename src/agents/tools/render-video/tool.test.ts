@@ -233,7 +233,13 @@ test("render_video: engine spawn failure → render_unavailable with install hin
 			undefined,
 		);
 		assert.equal((res.details as { errorType?: string }).errorType, "render_unavailable");
-		assert.match(res.content.map((c) => ("text" in c ? c.text : "")).join("\n"), /@hyperframes\/producer/);
+		const text = res.content.map((c) => ("text" in c ? c.text : "")).join("\n");
+		// The hint must name the command that WORKS. It used to say `npm i
+		// @hyperframes/producer`, which — run from a global install — walks up to the
+		// operator's home directory and puts the engine where Brigade never resolves it.
+		// An agent read that hint and did exactly that.
+		assert.match(text, /brigade video install/);
+		assert.match(text, /do NOT `npm i`/, "and it must warn against the thing that broke");
 	});
 });
 

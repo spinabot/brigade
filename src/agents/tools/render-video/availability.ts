@@ -15,9 +15,17 @@ import { accessSync, constants, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
+import { resolveEnginesDir } from "../../../config/paths.js";
+
 /** Resolve packages the same way Brigade's own modules do (from its node_modules),
  *  so the OPTIONAL `@hyperframes/producer` dep is found when installed. */
 const requireFromHere = createRequire(import.meta.url);
+
+/** The npm package that carries the render pipeline. */
+export const HYPERFRAMES_PACKAGE = "@hyperframes/producer";
+
+/** The command that actually installs it. Named in every hint we print. */
+export const HYPERFRAMES_INSTALL_COMMAND = "brigade video install";
 
 /** Minimum Node major HyperFrames needs. */
 const MIN_NODE_MAJOR = 22;
@@ -132,7 +140,18 @@ function checkChrome(): DepStatus {
  * Resolve the `@hyperframes/producer` render pipeline (the OPTIONAL dependency we
  * drive programmatically). Precedence:
  *   1. `BRIGADE_HYPERFRAMES_PATH` — an explicit producer entry FILE (advanced / tests).
- *   2. `@hyperframes/producer` resolvable from Brigade's node_modules.
+ *   2. Resolvable from Brigade's own node_modules (a source checkout, or a global
+ *      install whose tree happens to carry it).
+ *   3. Brigade's ENGINES dir — `~/.brigade/engines/node_modules`, where
+ *      `brigade video install` puts it.
+ *
+ * (3) exists because (2) alone is unreachable for the common case. An operator who
+ * ran `npm i -g @spinabot/brigade` cannot install into Brigade's node_modules from
+ * their shell, and our own hint used to tell them (and the agent) to
+ * `npm i @hyperframes/producer` — which, run anywhere under `~/.brigade`, walks up
+ * past a directory with no package.json and lands in the operator's HOME. The
+ * package ends up installed somewhere Brigade will never look.
+ *
  * Returns the resolved module entry path, or null when the engine isn't installed.
  */
 export function resolveProducerEntry(): string | null {
@@ -145,7 +164,15 @@ export function resolveProducerEntry(): string | null {
 		}
 	}
 	try {
-		return requireFromHere.resolve("@hyperframes/producer");
+		return requireFromHere.resolve(HYPERFRAMES_PACKAGE);
+	} catch {
+		/* not in Brigade's own tree — try the engines dir below */
+	}
+	try {
+		// Anchor on a file path INSIDE the engines dir; `createRequire` resolves
+		// `<dir>/node_modules/...` from there. The anchor need not exist.
+		const anchor = path.join(resolveEnginesDir(), "package.json");
+		return createRequire(anchor).resolve(HYPERFRAMES_PACKAGE);
 	} catch {
 		return null;
 	}
@@ -162,9 +189,13 @@ function checkHyperFrames(): DepStatus {
 			detail: `BRIGADE_HYPERFRAMES_PATH is set but no file was found at "${override}"`,
 		};
 	}
+	// Never say `npm i @hyperframes/producer`. Run from a global install that command
+	// installs into whatever package.json npm finds by walking UP from the cwd — the
+	// operator's home directory, most likely — and Brigade never resolves it. Name the
+	// command that puts it where Brigade actually looks.
 	return {
 		ok: false,
-		detail: "hyperframes render engine not installed — run `npm i @hyperframes/producer`",
+		detail: `hyperframes render engine not installed — run \`${HYPERFRAMES_INSTALL_COMMAND}\``,
 	};
 }
 

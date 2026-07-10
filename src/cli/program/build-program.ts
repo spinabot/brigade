@@ -957,6 +957,42 @@ export function buildProgram(): Command {
       await exitAfterFlush(await runSkillsInfo({ name }, { json: opts.json }));
     });
 
+  /* ───────────────────────────── video ───────────────────────────── */
+  // `brigade video <install|status>` — the OPTIONAL motion-graphics render engine.
+  // NOT an extension: no manifest, nothing to load, just a plain npm library Brigade
+  // drives programmatically. It installs into `~/.brigade/engines`, a directory
+  // Brigade owns and gives its own package.json, because `npm i @hyperframes/producer`
+  // run from the operator's shell walks UP to the first package.json it finds — their
+  // home directory — and leaves the engine where Brigade will never resolve it.
+  const video = program
+    .command("video")
+    .description("Manage the optional motion-graphics render engine (`render_video`)");
+
+  video
+    .command("install")
+    .description(
+      "Install the render engine so the `render_video` tool becomes available.\n" +
+        "  Examples:\n" +
+        "    brigade video install           # install into ~/.brigade/engines\n" +
+        "    brigade video install --force   # reinstall even if already present\n" +
+        "    brigade video install --json    # machine-readable",
+    )
+    .option("--force", "reinstall even when the engine already resolves", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { force?: boolean; json?: boolean }) => {
+      const { runVideoInstallCommand } = await import("../commands/video.js");
+      await exitAfterFlush(await runVideoInstallCommand({ force: opts.force, json: opts.json }));
+    });
+
+  video
+    .command("status")
+    .description("Report whether `render_video` is available, and what is missing")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runVideoStatusCommand } = await import("../commands/video.js");
+      await exitAfterFlush(await runVideoStatusCommand({ json: opts.json }));
+    });
+
   /* ───────────────────────────── extensions ───────────────────────────── */
   // `brigade extensions <list|doctor|init>` — author + operator surface over
   // the extension engine. `list`/`doctor` only read the filesystem extensions

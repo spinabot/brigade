@@ -347,6 +347,19 @@ export function resolveExtensionsDir(): string {
   return path.join(resolveStateDir(), "extensions");
 }
 
+// Optional heavyweight ENGINES Brigade drives programmatically but does not ship:
+// the HyperFrames render pipeline today, anything similar tomorrow. These are plain
+// npm libraries, not Brigade plugins — they carry no manifest and `extensions/` would
+// be the wrong home.
+//
+// A directory Brigade owns, with its own `package.json`, is the point. Without one,
+// `npm i <pkg>` run anywhere under `~/.brigade` walks UP looking for a package.json
+// and installs into the operator's HOME — which is exactly what happened, and the
+// package still wasn't resolvable afterwards.
+export function resolveEnginesDir(): string {
+  return path.join(resolveStateDir(), "engines");
+}
+
 // Per-channel access-control files: the list of allowed senders + any pending
 // pairing codes. Co-located with the channel's other state so the existing
 // `rm -rf ~/.brigade/channels/<id>` reset wipes them along with the creds.

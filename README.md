@@ -308,8 +308,10 @@ GSAP-timeline composition (the `hyperframes` skill teaches the conventions) and
 Brigade renders it frame-by-frame in an **isolated worker** (headless Chrome +
 FFmpeg), then hands back the file with `send_media`. It's the deterministic,
 data-driven counterpart to `generate_video` (generative AI footage). The engine is
-an **optional** dependency — the tool stays dormant until you install it
-(`npm i @hyperframes/producer`), so it adds nothing to a lean setup.
+an **optional** dependency — the tool stays dormant until you install it with
+`brigade video install`, so it adds nothing to a lean setup. (Install it that way,
+not with a bare `npm i`: Brigade keeps engine dependencies in its own directory, and
+npm run from your shell would put it somewhere Brigade never looks.)
 
 ### 🧩 MCP
 Run `brigade mcp` to expose your long-term memory to any MCP client (Claude Desktop,

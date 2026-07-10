@@ -29,7 +29,7 @@ import { Type } from "typebox";
 import { resolveCacheDir } from "../../../config/paths.js";
 import { failedTextResult, readBooleanParam, readNumberParam, readStringParam, textResult } from "../common.js";
 import type { AgentToolResult, BrigadeTool } from "../types.js";
-import { renderVideoDoctor } from "./availability.js";
+import { HYPERFRAMES_INSTALL_COMMAND, renderVideoDoctor } from "./availability.js";
 import { runRender, writeRenderWorker } from "./engine.js";
 
 /** Keep subprocess error text short in user/model-facing copy (peers cap ~200). */
@@ -201,7 +201,8 @@ export function makeRenderVideoTool(deps: RenderVideoDeps = {}): BrigadeTool<typ
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					return failedTextResult(
-						`Could not start the render engine (${message}). Install it with \`npm i @hyperframes/producer\`.`,
+						`Could not start the render engine (${message}). Install it with \`${HYPERFRAMES_INSTALL_COMMAND}\` — ` +
+							"do NOT `npm i` it yourself; npm would install it where Brigade cannot find it.",
 						{ status: "failed", ok: false, errorType: "render_unavailable", error: message },
 					);
 				}
