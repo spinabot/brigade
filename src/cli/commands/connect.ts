@@ -450,6 +450,33 @@ export async function wireConnectUi(
 	const activeAssistants = new Map<string, Markdown>();
 	let activeLoader: CancellableLoader | null = null;
 	const pendingTools = new Map<string, Text>();
+	// HARNESS backends (claude-cli) stream ONE assistant message for the whole turn:
+	// the external binary emits text, calls a tool, then keeps writing into the SAME
+	// message. So `asstKey` — which identity-keys a block by `<depth>:<timestamp>` —
+	// resolves the post-tool continuation back to the block that was opened BEFORE the
+	// tool. The chip stays pinned below while new prose grows above it, which reads as
+	// a frozen UI. (A loop backend is unaffected: Pi genuinely starts a new message
+	// after each tool result, so its continuation gets a new timestamp and a new key.)
+	//
+	// So when a tool fires we remember how much of that message's text was already on
+	// screen; every later update for the same key renders only the text BEYOND that
+	// mark, into a fresh block below the chip. `message_end`, which carries the whole
+	// message, lands as the same tail — never a duplicate of the pre-tool prose.
+	const asstTextLen = new Map<string, number>();
+	const asstKeyByDepth = new Map<number, string>();
+	const asstContinuation = new Map<string, { prefixLen: number; block?: Markdown }>();
+	/** Turn boundary: these track ONE turn's message identities, like `activeAssistants`. */
+	const clearHarnessContinuations = (): void => {
+		asstTextLen.clear();
+		asstKeyByDepth.clear();
+		asstContinuation.clear();
+	};
+	/** Take the "thinking" spinner down. Called only when a paint is about to land. */
+	const dismissLoader = (): void => {
+		if (!activeLoader) return;
+		removeChild(activeLoader);
+		activeLoader = null;
+	};
 	// `asstKey` (identity key for an assistant block) is imported from
 	// `connect-transcript.js` so the live path + the resume rebuild + the unit
 	// tests all share one definition.
@@ -917,6 +944,7 @@ export async function wireConnectUi(
 		}
 		activeAssistants.clear();
 		pendingTools.clear();
+		clearHarnessContinuations();
 		if (activeLoader) {
 			removeChild(activeLoader);
 			activeLoader = null;
@@ -1307,10 +1335,11 @@ export async function wireConnectUi(
 				// prefix added below is Brigade-internal chalk and stays intact.
 				const text = scrubRenderable(extractAssistantText(msg));
 				if (!text) break;
-				if (activeLoader) {
-					removeChild(activeLoader);
-					activeLoader = null;
-				}
+				// NOTE: the loader is dismissed further down, only once we know this
+				// update actually paints something. A harness re-emits its partial on
+				// every `thinking_delta`, carrying the SAME text — dismissing here would
+				// clear the "thinking" spinner and leave a dead screen for the whole
+				// reasoning window.
 				// Label assistant turns with the agent's chosen name (from
 				// IDENTITY.md, exposed via state snapshot). Falls back to
 				// the runtime container name when the operator hasn't named
@@ -1319,6 +1348,30 @@ export async function wireConnectUi(
 				const label = lastSnapshot?.agentName ?? "brigade";
 				const labelPrefix = depth > 0 ? "sub-agent" : label;
 				const renderedText = `${subIndent}${brand.agent(labelPrefix)}  ${text}`;
+
+				// A harness turn keeps ONE message across its tool calls (see
+				// `asstContinuation`). Render only what arrived after the last chip.
+				const contKey = asstKey(depth, msg);
+				asstTextLen.set(contKey, text.length);
+				asstKeyByDepth.set(depth, contKey);
+				const cont = asstContinuation.get(contKey);
+				if (cont) {
+					const tail = text.slice(cont.prefixLen);
+					// Nothing new since the chip — the model is still thinking. Leave the
+					// spinner up and paint nothing.
+					if (!tail.trim()) break;
+					dismissLoader();
+					const tailText = `${subIndent}${brand.agent(labelPrefix)}  ${tail}`;
+					if (!cont.block) {
+						cont.block = new Markdown(tailText, 1, 0, markdownTheme);
+						insertBeforeEditor(cont.block);
+					} else {
+						cont.block.setText(tailText);
+					}
+					if (event.type === "message_end") flushStreamingRender();
+					else scheduleStreamingRender();
+					break;
+				}
 				// Identity-keyed streaming block (see `asstKey`). Each logical
 				// message — top-level or sub-agent — owns ONE growing Markdown
 				// block, resolved by `${depth}:${timestamp}`. A continuation after
@@ -1326,6 +1379,7 @@ export async function wireConnectUi(
 				// that lands BELOW the tool; a late/duplicate update for an
 				// earlier message resolves to its existing block and updates it in
 				// place, so nothing is ever misplaced or duplicated.
+				dismissLoader();
 				const key = asstKey(depth, msg);
 				const existing = activeAssistants.get(key);
 				if (!existing) {
@@ -1381,6 +1435,16 @@ export async function wireConnectUi(
 				// gone. We still flush any pending debounced paint so the assistant
 				// text above renders in full BEFORE the tool indicator lands.
 				flushStreamingRender();
+				// …but a HARNESS backend never starts that new message: its binary
+				// writes text, calls a tool, and keeps writing into the same one. Mark
+				// how much of it is already rendered, so the continuation opens a fresh
+				// block BELOW this chip instead of silently growing the one above it.
+				// (Loop backends never take this path — their next update carries a new
+				// timestamp, hence a new key, which has no mark.)
+				const openKey = asstKeyByDepth.get(depth);
+				if (openKey !== undefined) {
+					asstContinuation.set(openKey, { prefixLen: asstTextLen.get(openKey) ?? 0 });
+				}
 				const indicator = new Text(
 					`${subIndent}  ${brand.tool("⚡")} ${brand.tool(event.toolName)}`,
 					0,
@@ -1439,6 +1503,23 @@ export async function wireConnectUi(
 					}
 					tui.requestRender();
 					pendingTools.delete(event.toolCallId);
+				}
+				// A harness backend goes quiet after a tool: its binary resumes the SAME
+				// message and can think for half a minute before the next token. The
+				// `agent_start` loader is long gone (the chip removed it), so the screen
+				// sits dead and the turn reads as hung. Re-arm it until text resumes.
+				// Gated on an OPEN continuation with no block yet — a condition only a
+				// harness turn can produce, so loop backends render exactly as before.
+				const openCont = asstContinuation.get(asstKeyByDepth.get(depth) ?? "");
+				if (openCont && !openCont.block && !activeLoader && isAgentRunning) {
+					activeLoader = new CancellableLoader(
+						tui,
+						(s) => brand.amber(s),
+						(s) => brand.dim(s),
+						"thinking",
+						loaderIndicator(),
+					);
+					insertBeforeEditor(activeLoader);
 				}
 				break;
 			}
@@ -1530,6 +1611,7 @@ export async function wireConnectUi(
 				// when a model aborts mid-tool and they otherwise pin a Text
 				// node in the children list per orphaned tool.
 				pendingTools.clear();
+				clearHarnessContinuations();
 				updateHeader();
 				break;
 			}
@@ -2782,6 +2864,7 @@ export async function wireConnectUi(
 			}
 			pendingTools.clear();
 			activeAssistants.clear();
+			clearHarnessContinuations();
 			insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.dim("aborted")}`, 0, 0));
 			updateHeader();
 			return true;
