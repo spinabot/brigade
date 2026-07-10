@@ -136,6 +136,52 @@ test("stream fn: emits start → text deltas → done with accumulated text + us
 	assert.equal(captured.stdin, "hey");
 });
 
+test("usage.input is the FIRST step's prompt, not the binary's cumulative total", async () => {
+	// The binary runs its own tool loop inside one turn: a message_start per internal
+	// step, each with a bigger prompt, and a `result` frame carrying the CUMULATIVE
+	// usage of the whole run (prompt caching re-counts cache_read on every step).
+	//
+	// Pi reads an assistant message's usage as "tokens currently in the context window"
+	// (calculateContextTokens = input + output + cacheRead + cacheWrite) and compacts
+	// when it crosses the threshold. Feeding it the cumulative total made a 39%-full
+	// session report 889% of a 200k window — and Pi "compacted" it twice, discarding
+	// real history both times.
+	const lines = [
+		'{"type":"system","subtype":"init","session_id":"s1"}',
+		// step 1 — the conversation Brigade actually handed the binary
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":40000,"cache_read_input_tokens":38000}}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}',
+		// steps 2..N — the binary's own scratch context, which Pi cannot compact
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":5000,"cache_read_input_tokens":190000}}}}',
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":9000,"cache_read_input_tokens":195000}}}}',
+		'{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":12941}}}',
+		// the result frame's usage is a BILLING total for the run, not a context size
+		'{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":54000,"cache_read_input_tokens":1702936,"output_tokens":12941}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+
+	assert.equal(message.usage.input, 78000, "first step's prompt (40000 + 38000 cached)");
+	assert.notEqual(message.usage.input, 1_756_936, "must NOT be the run's cumulative total");
+	assert.equal(message.usage.output, 12941);
+	// 78k of a 200k window is 39% — the honest figure. The bug reported 889%.
+	assert.ok(message.usage.input / 200_000 < 0.5, "a healthy session must not look overfull");
+});
+
+test("usage.input falls back to the result frame when no partial frames stream", async () => {
+	// An older CLI emits no message_start; the run is a single step, so its cumulative
+	// total IS that step's prompt. Filling in a missing input is correct there.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}',
+		'{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":1200,"output_tokens":8}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.usage.input, 1200);
+	assert.equal(message.usage.output, 8);
+});
+
 test("stream fn: survives stdout chunk splitting mid-line", async () => {
 	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, splitChunks: true }) });
 	const { message } = await drain(fn(MODEL, CTX, undefined) as never);

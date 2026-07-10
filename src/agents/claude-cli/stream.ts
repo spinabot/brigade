@@ -268,7 +268,18 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				switch (ev.type) {
 					case "message_start": {
 						const u = foldUsage(ev.message?.usage);
-						if (u.input) usageInput = u.input;
+						// FIRST step only. Pi reads an assistant message's `usage.input` as
+						// "how many tokens are in the context window right now"
+						// (`calculateContextTokens` = input + output + cacheRead + cacheWrite)
+						// and compacts when that crosses its threshold.
+						//
+						// The binary runs its OWN tool loop inside one turn, emitting a
+						// message_start per internal step whose prompt has grown by its own
+						// tool output. Only the FIRST step's prompt is the conversation
+						// Brigade handed it — the context Pi owns and can actually compact.
+						// Taking the last step (or the cumulative total) reports the binary's
+						// private scratch space as our context.
+						if (u.input && usageInput === 0) usageInput = u.input;
 						break;
 					}
 					case "content_block_delta": {
@@ -411,7 +422,18 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 									onTextDelta(rf.result);
 								}
 								const u = foldUsage(rf.usage);
-								if (u.input) usageInput = u.input;
+								// The result frame's usage is CUMULATIVE over every internal
+								// step of the binary's loop — with prompt caching, its
+								// `cache_read_input_tokens` is re-counted on each one. It is a
+								// BILLING total, never a context size: a 40-step turn on a
+								// 39%-full transcript reported 1,756,936 input tokens, which Pi
+								// read as 889% of a 200k window and "compacted" a healthy
+								// session, twice, discarding real history each time.
+								//
+								// So it may only ever FILL IN a missing input (an older CLI that
+								// streams no partial frames, where the run is a single step and
+								// the cumulative total IS that step's prompt).
+								if (u.input && usageInput === 0) usageInput = u.input;
 								if (u.output) usageOutput = u.output;
 							}
 							break;
