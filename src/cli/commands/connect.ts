@@ -1944,9 +1944,9 @@ export async function wireConnectUi(
 		// context), clears the screen, and re-subscribes. This is the ONE true
 		// clean-slate affordance: a normal launch lands you back in your existing
 		// thread WITH its (bounded) history — the best-in-class default — and
-		// `/new` is how you deliberately start over. Mirrors OpenClaw's `/new` and
-		// Claude.ai/ChatGPT "new chat"; `/sessions` lists threads, `/session <key>`
-		// jumps back to one.
+		// `/new` is how you deliberately start over — the same affordance as the
+		// "new chat" button in Claude.ai / ChatGPT. `/sessions` lists threads,
+		// `/session <key>` jumps back to one.
 		if (trimmed === "/new") {
 			editor.setText("");
 			const agentForNew = boundAgentId ?? lastSnapshot?.agentId ?? "main";
