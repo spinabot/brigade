@@ -7,8 +7,8 @@
 //   3. a headless Chrome (puppeteer auto-downloads one; soft signal only)
 // plus the `@hyperframes/producer` package itself (an OPTIONAL dependency —
 // install it to enable video). The doctor folds these into ONE payload the
-// gateway/TUI/`brigade` CLI can render — same shape as hermes-agent's
-// `computer_use_status`. A pure PATH scan (no subprocess), cached with a short
+// gateway/TUI/`brigade` CLI can render, in the same shape as the other
+// capability-status payloads. A pure PATH scan (no subprocess), cached with a short
 // TTL so a mid-session install is picked up without a restart.
 
 import { accessSync, constants, statSync } from "node:fs";

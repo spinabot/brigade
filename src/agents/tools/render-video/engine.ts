@@ -4,9 +4,8 @@
 // occasionally hangs, can leak a browser process. Running it IN-PROCESS would
 // put puppeteer/Chrome control on the gateway event loop, where a crash or leak
 // takes the whole agent runtime down. So we render in an ISOLATED Node worker
-// (a child `process.execPath`), exactly like Brigade isolates the `claude` CLI
-// and hermes-agent isolates ffmpeg / its heavy TTS model — with a hard timeout,
-// tree-kill, and a force-settle backstop.
+// (a child `process.execPath`), exactly like Brigade isolates the `claude` CLI —
+// with a hard timeout, tree-kill, and a force-settle backstop.
 //
 // The producer accepts a standalone HTML `inputPath` and serves it from its own
 // local file server; the caller writes the composition to a temp project dir

@@ -1106,8 +1106,8 @@ export async function wireConnectUi(
 	// its current truth." It fires identically on initial connect AND on
 	// reconnect/resync — both land the operator in the SAME thread with its
 	// history, so the screen never disagrees with what the agent actually
-	// remembers (best-in-class default: ChatGPT/Claude.ai/Cursor/Hermes all land
-	// you in your thread WITH history). A genuinely clean slate is `/new` (a real
+	// remembers (best-in-class default: every serious chat client lands you back
+	// in your thread WITH history). A genuinely clean slate is `/new` (a real
 	// empty thread), never a blanked view of a thread that's secretly full.
 	// The replay is BOUNDED server-side — the `resume` RPC caps how many
 	// transcript messages it ships — so a 10k-message thread stays snappy.

@@ -315,6 +315,33 @@ an **optional** dependency — the tool stays dormant until you install it
 Run `brigade mcp` to expose your long-term memory to any MCP client (Claude Desktop,
 editors, etc.) as add/search/context tools over stdio, owner-bound.
 
+Brigade is also an MCP **server for its own agent**. See below.
+
+### 🔌 Subscription backends — your Claude login, Brigade's tools
+Already signed into **Claude Code**? Pick `claude-cli` as your provider and Brigade
+drives that binary directly, on your existing subscription. No API key, no per-token
+bill.
+
+Most tools that wrap a CLI give the model whatever the CLI already had. Brigade does
+the opposite: it **denies the binary's own filesystem, shell, network and sub-agent
+tools**, and serves it Brigade's entire guarded surface — all 30+ native tools plus
+`read`/`write`/`edit`/`bash`/`grep`/`ls` — over a loopback MCP endpoint scoped to that
+single turn.
+
+The consequence is the point: every call the binary makes runs through the *same*
+objects a normal turn uses. The same ownership gate, the same exec approval prompt,
+the same path-write and config-write guards, the same memory origin, bound to your
+real working directory. It cannot reach anything a normal turn could not, because it
+is holding the same tools. Tool calls appear live in the TUI, land in the session
+transcript, and are remembered on the next turn.
+
+```
+[mcp/tool-plane] tool-plane connected  agentId=main tools=39
+[mcp/tool-plane] tool call  tool=bash  ms=63
+```
+
+The per-turn credential is a 256-bit token, is never logged, and dies with the turn.
+
 ### 🛡️ Safety & ownership
 Privileged tools use either a **per-call ownership gate** (`cron list` is visible to
 peers; `cron add` is not) or a blanket owner-only refusal. The `bash` tool is gated
@@ -718,6 +745,12 @@ and billing? Use the subscription you already pay for. Two ways, both keyless:
 
 Keys still work if you prefer them; either way the credential is sealed on your own
 machine (auto-refreshed when the provider supports it).
+
+The `claude-cli` provider goes one step further: it runs the `claude` binary as
+Brigade's engine, with the binary's own tools denied and **Brigade's guarded toolset
+served back to it** over a per-turn loopback MCP endpoint. Your crew, your memory,
+your approval prompts — on a subscription, at no marginal token cost. See
+[Subscription backends](#-subscription-backends--your-claude-login-brigades-tools).
 
 **Web search** is pluggable and auto-selected by what you've configured: Tavily,
 Brave, Exa, Perplexity, Firecrawl, SearXNG (keyed) and DuckDuckGo, Wikipedia, Hacker
