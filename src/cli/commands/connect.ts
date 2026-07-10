@@ -49,7 +49,7 @@ import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveClientToken } from "../../core/gateway-auth.js";
-import { asstKey, clipOneLine, extractUserText, joinToolResultText } from "./connect-transcript.js";
+import { asstKey, clipOneLine, extractUserText } from "./connect-transcript.js";
 import { UPDATE_PRESERVES_MESSAGE } from "../../core/update-check.js";
 import { runUpdateCommand } from "./update.js";
 import { ApprovalPrompt, type ApprovalResolution } from "../../tui/approval-prompt.js";
@@ -947,8 +947,9 @@ export async function wireConnectUi(
 	// `message_update` that arrives after the rebuild updates the rebuilt block
 	// in place rather than spawning a copy.
 
-	// `extractUserText`, `joinToolResultText`, `clipOneLine` are imported from
-	// `connect-transcript.js` (pure + unit-tested).
+	// `extractUserText`, `clipOneLine` are imported from `connect-transcript.js`
+	// (pure + unit-tested). Tool-result previews go through the SHARED
+	// `summarizeToolResult`, so the resume view and the live view cannot drift.
 
 	/** Remove the rendered transcript (everything between the header+divider
 	 *  chrome and the editor); the editor + trailing chrome stay. Resets the
@@ -1029,8 +1030,13 @@ export async function wireConnectUi(
 		if (m.role === "toolResult" && typeof m.toolCallId === "string") {
 			const mark = m.isError ? brand.error("✗") : brand.tool("✓");
 			const name = typeof m.toolName === "string" ? m.toolName : "tool";
-			// Join → scrub terminal escapes → collapse/clip to one line.
-			const clipped = clipOneLine(scrubRenderable(joinToolResultText(m.content)));
+			// The SAME summariser the live path uses, not a second one. This view used
+			// `joinToolResultText` + `clipOneLine` with an 80-char budget while live used
+			// 120, so a `resume` silently re-clipped every tool result — and
+			// `joinToolResultText` filters to text blocks, so an image-only result
+			// rendered as a bare chip here and `[image …]` there. A transcript that
+			// disagrees with what you just watched is worse than no transcript.
+			const clipped = scrubRenderable(summarizeToolResult(m.content, { preserveNewlines: false }).preview);
 			const preview = clipped ? ` ${brand.dim(`· ${clipped}`)}` : "";
 			const line = `  ${mark} ${brand.tool(name)}${preview}`;
 			const indicator = pendingTools.get(m.toolCallId);
@@ -1683,6 +1689,10 @@ export async function wireConnectUi(
 					// `✓ spawn_agent` chip lands when the tool returns. Touch no parent state —
 					// just close the child's section so the operator can see the seam.
 					flushStreamingRender();
+					// …except the spinner, which is a single shared widget. A loader armed by
+					// the CHILD's last `tool_execution_end` would otherwise linger across the
+					// seam and read as the parent thinking, until the parent's next paint.
+					dismissLoader();
 					insertBeforeEditor(
 						new Text(`${subIndent}  ${brand.dim("↲ sub-agent done — back to the main agent")}`, 0, 0),
 					);
@@ -1705,6 +1715,19 @@ export async function wireConnectUi(
 				// `tool_execution_end` — a long session can accumulate these
 				// when a model aborts mid-tool and they otherwise pin a Text
 				// node in the children list per orphaned tool.
+				// These clear EVERY depth, not just this turn's. That is deliberate — a
+				// child completes inside its parent's turn, so by the time the parent's
+				// `agent_end` lands, the child's blocks and chips are finished artifacts.
+				//
+				// It is also the one asymmetry in the depth guard: the child cannot tear
+				// down the parent, but the parent still tears down every depth. Safe only
+				// because a sub-agent is fully awaited before the parent's turn ends —
+				// `spawn_agent` awaits `runSubagent`, and `spawn_agents` awaits
+				// `Promise.allSettled`. If a future fan-out lets a descendant's frames
+				// arrive AFTER the parent's `agent_end`, that child would find its render
+				// maps wiped, re-open a fresh block, and re-render its answer from the top:
+				// exactly the bug the depth guard above exists to prevent. Gate these by
+				// depth before shipping any detached sub-agent.
 				pendingTools.clear();
 				clearHarnessContinuations();
 				updateHeader();

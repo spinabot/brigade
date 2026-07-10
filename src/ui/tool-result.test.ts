@@ -5,10 +5,29 @@ import { summarizeToolResult } from "./tool-result.js";
 
 describe("summarizeToolResult — success mode", () => {
 	it("collapses whitespace to a single line", () => {
-		const r = summarizeToolResult("line1\nline2\n\nline3");
+		const r = summarizeToolResult("line1\nline2\nline3");
 		assert.equal(r.hasContent, true);
 		assert.equal(r.multiline, false);
 		assert.equal(r.preview, "line1 line2 line3");
+	});
+
+	it("previews only the FIRST PARAGRAPH — a blank line means prose, not output", () => {
+		// Collapsing the whole result turned a 5,814-char `spawn_agent` reply into a
+		// one-line mash that cut through the middle of a sentence two paragraphs down.
+		const r = summarizeToolResult("Verdict: ship it.\n\nHere is the long reasoning that follows, at length…");
+		assert.equal(r.preview, "Verdict: ship it.");
+		assert.equal(r.multiline, false);
+	});
+
+	it("output-shaped results (no blank line) still collapse whole", () => {
+		const r = summarizeToolResult("total 12\ndrwxr-xr-x  a\n-rw-r--r--  b");
+		assert.equal(r.preview, "total 12 drwxr-xr-x a -rw-r--r-- b");
+	});
+
+	it("a result that OPENS with a blank line still previews its content", () => {
+		const r = summarizeToolResult("\n\nActual content here.");
+		assert.equal(r.preview, "Actual content here.");
+		assert.equal(r.hasContent, true);
 	});
 
 	it("truncates at 120 chars with ellipsis", () => {

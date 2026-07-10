@@ -125,10 +125,19 @@ export function summarizeToolResult(
 		};
 	}
 
-	// Success path: collapse whitespace so a multi-line bash output renders
-	// on one line. Tabs → space, CR/LF → space, runs of whitespace → single
-	// space. Same shape as before.
-	const collapsed = text.replace(/\s+/g, " ").trim();
+	// Success path: one line, beside the ✓ chip.
+	//
+	// Collapse only the FIRST PARAGRAPH, not the whole result. A blank line means the
+	// tool returned prose — a `spawn_agent` reply, a `read` of a document — and
+	// collapsing all of it produced a 119-character mash running through the middle of
+	// a sentence two paragraphs down. The first paragraph is the gist; past it is noise
+	// in a one-line chip.
+	//
+	// Output-shaped results (bash, grep, ls) carry no blank line, so they collapse
+	// exactly as before. A result that OPENS with blank lines falls back to the whole
+	// text rather than previewing nothing.
+	const firstParagraph = text.split(/\n[ \t]*\n/, 1)[0] ?? "";
+	const collapsed = (firstParagraph.trim() ? firstParagraph : text).replace(/\s+/g, " ").trim();
 	if (!collapsed) return { preview: "", hasContent: false, multiline: false };
 
 	if (collapsed.length <= maxLength) {
