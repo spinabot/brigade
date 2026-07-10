@@ -1642,10 +1642,14 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			/* session torn down — keep last value */
 		}
 		try {
-			const usage = s.getContextUsage();
-			if (usage?.percent != null) lastContextUsagePercent = usage.percent;
+			// Assign unconditionally, INCLUDING null. Pi returns null right after a
+			// compaction by design (its token estimate needs a fresh response), and a
+			// guard that only overwrote non-null values pinned the pre-compaction
+			// figure forever: a turn compacted at 889% then reported "usage now 889%".
+			// A stale number is worse than no number.
+			lastContextUsagePercent = s.getContextUsage()?.percent ?? null;
 		} catch {
-			/* ignore */
+			/* session torn down — keep last value */
 		}
 		try {
 			cachedSupportsThinking = s.supportsThinking();

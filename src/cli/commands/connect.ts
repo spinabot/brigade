@@ -1550,18 +1550,24 @@ export async function wireConnectUi(
 				if (event.aborted) {
 					insertBeforeEditor(new Text(`  ${brand.dim("compaction aborted")}`, 0, 0));
 				} else {
-					// Pi's getContextUsage returns null right after compaction by
-					// design — token estimates need a fresh LLM response. Show
-					// that explicitly via the snapshot's percent (server pushes
-					// a fresh snapshot post-compact).
-					const after = lastSnapshot?.contextUsagePercent;
-					const afterStr =
-						after != null
-							? `usage now ${Math.round(after)}%`
-							: "usage refreshes after your next message";
+					// Do NOT read `lastSnapshot` for an "after" figure. Pi's
+					// getContextUsage() returns null right after compaction by design
+					// (its estimate needs a fresh response), and the server's refreshed
+					// snapshot arrives AFTER this event — so the snapshot in hand still
+					// holds the PRE-compaction percent. Printing it read as "compacted ·
+					// usage now 889%" on a turn that had just compacted from 889%.
+					//
+					// Drop our own stale copy too, so the header stops advertising a
+					// context figure that no longer describes the session.
+					if (lastSnapshot) lastSnapshot = { ...lastSnapshot, contextUsagePercent: null };
 					insertBeforeEditor(
-						new Text(`  ${brand.amber("✓")} ${brand.dim(`compacted · ${afterStr}`)}`, 0, 0),
+						new Text(
+							`  ${brand.amber("✓")} ${brand.dim("compacted · usage refreshes on the next reply")}`,
+							0,
+							0,
+						),
 					);
+					updateHeader();
 				}
 				break;
 			}
