@@ -146,7 +146,7 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 			...(c.sessionKey !== undefined ? { sessionKey: c.sessionKey } : {}),
 		});
 	};
-	return async (ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> => {
+	return async (ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> => {
 		const rawName = (ctx as { toolCall?: { name?: unknown }; name?: unknown })?.toolCall?.name
 			?? (ctx as { name?: unknown })?.name
 			?? "";
@@ -317,7 +317,8 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 			];
 			try {
 				const c = ctxRef.value;
-				const decision = await bridge.requestApproval({
+				const decision = await bridge.requestApproval(
+					{
 					command: cmd,
 					toolName: name,
 					cwd: displayCwd,
@@ -335,7 +336,16 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 					// would see (and could answer) someone else's approval.
 					...(c.agentId !== undefined ? { agentId: c.agentId } : {}),
 					...(c.sessionKey !== undefined ? { sessionId: c.sessionKey } : {}),
-				});
+									},
+					signal,
+				);
+				// Turn cancelled while awaiting the operator. Fail CLOSED, and return
+				// before `applyApprovalDecision` so a dead turn can never persist an
+				// allowlist entry. No `emitBlocked`: a cancel is not a policy refusal,
+				// and this result is discarded as the turn unwinds anyway.
+				if (decision.aborted) {
+					return { block: true, reason: "Bash refused: the turn was cancelled before the operator answered." };
+				}
 				if (decision.timedOut) {
 					const reason =
 						`Bash refused: approval timed out (no operator reply within 5 minutes). Command was "${preview}". ` +

@@ -28,6 +28,7 @@ import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
 	type ChannelApprovalRoute,
+	cancelChannelApprovalById,
 	dispatchChannelApproval,
 } from "./channels/approval-router.js";
 
@@ -53,6 +54,15 @@ export interface ApprovalDecision {
 	pattern?: string;
 	/** When falsy, the bridge timed out instead of getting a real reply. */
 	timedOut?: boolean;
+	/**
+	 * The awaiting turn was aborted before the operator answered — a Pi abort, or
+	 * the claude-cli child dying so the MCP route's per-call controller fired.
+	 * Distinct from `timedOut` on purpose: a timeout is an operator-visible 5-minute
+	 * event with its own message and log line, an abort is a turn-lifecycle event
+	 * that may happen in milliseconds. `kind` stays "deny" so the gate fails closed
+	 * even if the abort branch is ever bypassed.
+	 */
+	aborted?: boolean;
 }
 
 export interface ApprovalRequest {
@@ -98,6 +108,7 @@ export interface ApprovalBridge {
 	 */
 	requestApproval(
 		req: Omit<ApprovalRequest, "id"> & { id?: string },
+		signal?: AbortSignal,
 	): Promise<ApprovalDecision>;
 	/**
 	 * Resolve a pending request (called by the WS request handler).
@@ -116,6 +127,9 @@ interface PendingEntry {
 	request: ApprovalRequest;
 	resolve: (decision: ApprovalDecision) => void;
 	timer: ReturnType<typeof setTimeout>;
+	/** Removes the abort listener. Called on EVERY settle path so a long-lived
+	 *  turn signal never accumulates one listener per approval. */
+	detachAbort: () => void;
 }
 
 /**
@@ -126,8 +140,21 @@ export class InMemoryApprovalBridge implements ApprovalBridge {
 	private readonly pending = new Map<string, PendingEntry>();
 	constructor(private readonly broadcast: ApprovalBroadcaster) {}
 
+	/** Single exit for every settle path: drop the entry, clear the timer, detach
+	 *  the abort listener, resolve once. Idempotent — an absent id returns false. */
+	private settle(id: string, decision: ApprovalDecision): boolean {
+		const entry = this.pending.get(id);
+		if (!entry) return false;
+		this.pending.delete(id);
+		clearTimeout(entry.timer);
+		entry.detachAbort();
+		entry.resolve(decision);
+		return true;
+	}
+
 	requestApproval(
 		req: Omit<ApprovalRequest, "id"> & { id?: string },
+		signal?: AbortSignal,
 	): Promise<ApprovalDecision> {
 		const id = req.id ?? crypto.randomUUID();
 		const request: ApprovalRequest = {
@@ -145,15 +172,34 @@ export class InMemoryApprovalBridge implements ApprovalBridge {
 			...(req.channelRoute !== undefined ? { channelRoute: req.channelRoute } : {}),
 		};
 		return new Promise<ApprovalDecision>((resolve) => {
+			// Already dead on arrival: never register, never broadcast. Prompting the
+			// operator about a turn that no longer exists is pure noise.
+			if (signal?.aborted) {
+				resolve({ kind: "deny", aborted: true });
+				return;
+			}
 			const timer = setTimeout(() => {
-				const entry = this.pending.get(id);
-				if (!entry) return;
-				this.pending.delete(id);
+				if (!this.pending.has(id)) return;
 				log.warn("approval timed out", { id, command: request.command, timeoutMs: request.timeoutMs });
-				entry.resolve({ kind: "deny", timedOut: true });
+				this.settle(id, { kind: "deny", timedOut: true });
 			}, request.timeoutMs);
 			if (typeof timer.unref === "function") timer.unref();
-			this.pending.set(id, { request, resolve, timer });
+
+			// Abort => withdraw the prompt. Without this the entry lingers for the
+			// full 5-minute window: it keeps showing in `listPending()` (so a
+			// reconnecting client re-renders a dead prompt), and a channel-routed
+			// prompt keeps its own watchdog armed — meaning the operator's NEXT
+			// unrelated WhatsApp/Telegram message would be consumed as a yes/no.
+			let detachAbort = (): void => {};
+			if (signal) {
+				const onAbort = (): void => {
+					if (request.channelRoute) cancelChannelApprovalById(id);
+					this.settle(id, { kind: "deny", aborted: true });
+				};
+				signal.addEventListener("abort", onAbort, { once: true });
+				detachAbort = () => signal.removeEventListener("abort", onAbort);
+			}
+			this.pending.set(id, { request, resolve, timer, detachAbort });
 			// WS broadcast ALWAYS fires — even on the channel-routed path,
 			// because a connect-mode TUI watching the gateway should still
 			// see the prompt (diagnostic + a power user might prefer to
@@ -190,12 +236,9 @@ export class InMemoryApprovalBridge implements ApprovalBridge {
 	}
 
 	resolveApproval(id: string, decision: ApprovalDecision): boolean {
-		const entry = this.pending.get(id);
-		if (!entry) return false;
-		this.pending.delete(id);
-		clearTimeout(entry.timer);
-		entry.resolve(decision);
-		return true;
+		// Still returns false for an absent id — the WS handler relies on that to
+		// silently no-op when the operator answers a prompt we already withdrew.
+		return this.settle(id, decision);
 	}
 
 	listPending(): ApprovalRequest[] {

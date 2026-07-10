@@ -548,3 +548,72 @@ describe("makeExecGate — schema-version-error passthrough", () => {
 		assert.match(r?.reason ?? "", /upgrade Brigade/);
 	});
 });
+
+describe("makeExecGate — abort while awaiting the operator", () => {
+	const ABORT_SESSION = "agent:main:abort-test";
+	const gateFor = (sessionKey: string) => makeExecGate({ ctxRef: { value: { sessionKey } } });
+
+	beforeEach(() => clearExecAllowAllForTests());
+
+	it("forwards the turn's AbortSignal to the bridge", async () => {
+		let sawSignal: unknown = "never-called";
+		approvalBridgeMod.setActiveApprovalBridge({
+			requestApproval: async (_req: unknown, signal?: AbortSignal) => {
+				sawSignal = signal;
+				return { kind: "deny" as const, aborted: true };
+			},
+			resolveApproval: () => true,
+			listPending: () => [],
+		} as never);
+		try {
+			const ac = new AbortController();
+			await gateFor(ABORT_SESSION)(
+				{ toolCall: { name: "bash", arguments: { command: "node oauth.mjs" } } } as never,
+				ac.signal,
+			);
+			assert.ok(sawSignal instanceof AbortSignal, "the gate must hand its signal to the bridge");
+		} finally {
+			approvalBridgeMod.setActiveApprovalBridge(null);
+		}
+	});
+
+	it("an aborted approval BLOCKS, arms nothing, and persists nothing", async () => {
+		approvalBridgeMod.setActiveApprovalBridge({
+			requestApproval: async () => ({ kind: "deny" as const, aborted: true }),
+			resolveApproval: () => true,
+			listPending: () => [],
+		} as never);
+		try {
+			const r = await gateFor(ABORT_SESSION)({
+				toolCall: { name: "bash", arguments: { command: "node oauth.mjs" } },
+			} as never);
+			assert.equal(r?.block, true, "fails closed");
+			assert.match(r?.reason ?? "", /cancelled before the operator answered/i);
+			// The killer property: a dead turn must never leave an allowlist entry
+			// behind, and must never arm allow-all for the session.
+			assert.equal(isExecAllowAll(ABORT_SESSION), false, "allow-session not armed");
+			const approvalsPath = getApprovalsFilePath();
+			const persisted = fs.existsSync(approvalsPath) ? fs.readFileSync(approvalsPath, "utf8") : "";
+			assert.doesNotMatch(persisted, /oauth\.mjs/, "nothing persisted for a cancelled turn");
+		} finally {
+			approvalBridgeMod.setActiveApprovalBridge(null);
+		}
+	});
+
+	it("an aborted approval is distinguishable from a timeout (different message)", async () => {
+		approvalBridgeMod.setActiveApprovalBridge({
+			requestApproval: async () => ({ kind: "deny" as const, timedOut: true }),
+			resolveApproval: () => true,
+			listPending: () => [],
+		} as never);
+		try {
+			const r = await gateFor(ABORT_SESSION)({
+				toolCall: { name: "bash", arguments: { command: "node oauth.mjs" } },
+			} as never);
+			assert.match(r?.reason ?? "", /timed out/i, "timeout keeps its own operator-facing message");
+			assert.doesNotMatch(r?.reason ?? "", /cancelled/i);
+		} finally {
+			approvalBridgeMod.setActiveApprovalBridge(null);
+		}
+	});
+});

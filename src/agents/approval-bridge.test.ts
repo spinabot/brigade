@@ -130,3 +130,84 @@ describe("InMemoryApprovalBridge", () => {
 		assert.equal(getActiveApprovalBridge(), null);
 	});
 });
+
+/* ─────────────────── abort-aware cancellation ─────────────────── */
+
+describe("requestApproval — abort cancels the prompt", () => {
+	it("aborting a pending request settles as deny+aborted and withdraws it", async () => {
+		const seen: ApprovalRequest[] = [];
+		const bridge = new InMemoryApprovalBridge((r) => seen.push(r));
+		const ac = new AbortController();
+		const pending = bridge.requestApproval(
+			{ command: "rm -rf /", toolName: "bash", cwd: "/tmp", timeoutMs: 60_000, decisions: ["allow-once", "deny"] },
+			ac.signal,
+		);
+		assert.equal(bridge.listPending().length, 1, "prompt is live");
+		assert.equal(seen.length, 1, "operator was asked");
+
+		ac.abort();
+		const decision = await pending;
+		assert.equal(decision.kind, "deny", "fails closed");
+		assert.equal(decision.aborted, true);
+		assert.equal(decision.timedOut, undefined, "an abort is not a timeout");
+		assert.equal(bridge.listPending().length, 0, "withdrawn — a reconnecting client won't re-render it");
+	});
+
+	it("an already-aborted signal never registers or broadcasts a prompt", async () => {
+		const seen: ApprovalRequest[] = [];
+		const bridge = new InMemoryApprovalBridge((r) => seen.push(r));
+		const ac = new AbortController();
+		ac.abort();
+		const decision = await bridge.requestApproval(
+			{ command: "ls", toolName: "bash", cwd: "/tmp", timeoutMs: 60_000, decisions: ["allow-once", "deny"] },
+			ac.signal,
+		);
+		assert.equal(decision.aborted, true);
+		assert.deepEqual(seen, [], "never bothers the operator about a dead turn");
+		assert.equal(bridge.listPending().length, 0);
+	});
+
+	it("an operator answering a withdrawn prompt is safely ignored", async () => {
+		const bridge = new InMemoryApprovalBridge(() => {});
+		const ac = new AbortController();
+		const pending = bridge.requestApproval(
+			{ command: "ls", toolName: "bash", cwd: "/tmp", timeoutMs: 60_000, decisions: ["allow-once", "deny"] },
+			ac.signal,
+		);
+		const id = bridge.listPending()[0]?.id as string;
+		ac.abort();
+		await pending;
+		// the late answer lands on an absent entry — the WS handler treats false as a no-op
+		assert.equal(bridge.resolveApproval(id, { kind: "allow-once" as ApprovalDecisionKind }), false);
+	});
+
+	it("the timeout path is unchanged when a live signal never fires", async () => {
+		const bridge = new InMemoryApprovalBridge(() => {});
+		const ac = new AbortController();
+		const decision = await bridge.requestApproval(
+			{ command: "ls", toolName: "bash", cwd: "/tmp", timeoutMs: 20, decisions: ["allow-once", "deny"] },
+			ac.signal,
+		);
+		assert.equal(decision.kind, "deny");
+		assert.equal(decision.timedOut, true);
+		assert.equal(decision.aborted, undefined);
+		assert.equal(bridge.listPending().length, 0);
+	});
+
+	it("abort listeners do not accumulate across approvals sharing one turn signal", async () => {
+		const bridge = new InMemoryApprovalBridge(() => {});
+		const ac = new AbortController();
+		for (let i = 0; i < 3; i++) {
+			const p = bridge.requestApproval(
+				{ command: `echo ${i}`, toolName: "bash", cwd: "/tmp", timeoutMs: 60_000, decisions: ["allow-once", "deny"] },
+				ac.signal,
+			);
+			const id = bridge.listPending()[0]?.id as string;
+			bridge.resolveApproval(id, { kind: "allow-once" as ApprovalDecisionKind });
+			await p;
+		}
+		assert.equal(bridge.listPending().length, 0, "all drained");
+		// every settle detached its listener; aborting now must not throw or resolve anything
+		assert.doesNotThrow(() => ac.abort());
+	});
+});
