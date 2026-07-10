@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.28.0](https://github.com/spinabot/brigade/compare/brigade-v1.27.1...brigade-v1.28.0) (2026-07-10)
+
+
+### Features
+
+* **tui:** open an existing thread at startup, and stop a short label orphaning one ([2afea07](https://github.com/spinabot/brigade/commit/2afea079a031bf6aaf22a8ec3fc0ea3148624963))
+* **video:** install the render engine where Brigade can actually find it ([324f8c9](https://github.com/spinabot/brigade/commit/324f8c994257d862fb782f385908bbb83f75a590))
+
+
+### Bug Fixes
+
+* **claude-cli:** thinking blocks fused too, and the continuation opened with a blank line ([e251acd](https://github.com/spinabot/brigade/commit/e251acd9a11eef2e0e35d8f65ad81f81444c789d))
+* **claude-cli:** usage.output re-opened half the compaction inflation I had just closed ([b6fd1ae](https://github.com/spinabot/brigade/commit/b6fd1aef7358ed6d7b44b518c3dbd7e5aef4f7bd))
+* **providers:** a media API key had no supported way in ([2bd57ee](https://github.com/spinabot/brigade/commit/2bd57ee4302c232da9ad8f2600e95271af333aa2))
+* **sessions:** `sessions.list` answered "what's running", not "what threads do I have" ([32aa3f9](https://github.com/spinabot/brigade/commit/32aa3f92d5f4c069e52b00c13886b5f1f08dd9c7))
+* streaming shape, sub-agent lifecycle, and session continuity ([aca56bb](https://github.com/spinabot/brigade/commit/aca56bb8c1b923e6a49fc42ee9976fa26ff33a69))
+* **tui:** a sub-agent's lifecycle was tearing down the parent's turn ([4ff1737](https://github.com/spinabot/brigade/commit/4ff17370879e8a30db7954cbf439f14b1903c2e2))
+* **tui:** pull the state snapshot at startup — the push is a race we can lose ([c5db103](https://github.com/spinabot/brigade/commit/c5db103e3c072fc0805c21f96f2ef2e3e5ae5652))
+* **tui:** shape the tool-result preview, and stop the live view disagreeing with resume ([476416a](https://github.com/spinabot/brigade/commit/476416a83090af434167930fa4932ca3000536a3))
+
 ## [1.27.1](https://github.com/spinabot/brigade/compare/brigade-v1.27.0...brigade-v1.27.1) (2026-07-10)
 
 
