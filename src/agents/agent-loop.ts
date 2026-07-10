@@ -102,6 +102,7 @@ import { ensureClaudeCliApiRegistered } from "./claude-cli/register.js";
 import { stampClaudeCliToolPlane } from "./claude-cli/tool-plane.js";
 import { makeTransportDispatch } from "./transport-dispatch.js";
 import { getActiveMcpToolPlaneHost } from "./mcp/tool-plane-host.js";
+import { createGuardedBuiltinTools } from "./mcp/builtin-tools.js";
 import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
 import { migrateOllamaProviderToNative } from "../integrations/ollama.js";
 import { describeModelProbe, probeModelReachable } from "../integrations/provider-discovery.js";
@@ -1573,8 +1574,15 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   if (args.provider === CLAUDE_CLI_PROVIDER && effectiveSenderIsOwner && brigadeGuard) {
     const mcpHost = getActiveMcpToolPlaneHost();
     if (mcpHost) {
+      // Pi's builtins (read/write/edit/bash/grep/ls) reach the toolset only as
+      // NAMES — Pi's loop builds them, and that loop does not run on claude-cli.
+      // Construct them here against the turn's cwd and serve them alongside the
+      // native tools, so the harness backend has a filesystem + shell at all.
+      // They go through the SAME guard on every call: bash hits the exec-gate
+      // (approval prompt), write/edit hit the path-write + config-write guards.
+      const builtinTools = createGuardedBuiltinTools({ cwd, allow: toolset.builtinToolNames });
       const reg = mcpHost.registry.register({
-        customTools: brigadeCustomTools,
+        customTools: [...brigadeCustomTools, ...builtinTools],
         guard: brigadeGuard,
         ...(args.signal ? { signal: args.signal } : {}),
         agentId,

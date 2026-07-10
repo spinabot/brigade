@@ -310,19 +310,21 @@ const CLAUDE_CLI_TOOL_PLANE_SUFFIX =
 // the model to ignore the 31 tools we just handed it (and it obeys: it answers in
 // prose and apologises that it cannot act).
 //
-// It also states the real limits honestly. The binary's own built-ins are denied
-// (they would act on a throwaway temp cwd, not the operator's workspace), and
-// Brigade's Pi builtins (read/write/edit/bash/grep/ls) are executed by Pi's loop,
-// which does not run on this backend — so there is genuinely no filesystem/shell
-// capability here yet. Telling the model to say so plainly beats letting it
-// invent a `bash` call that cannot exist.
+// The binary's OWN built-ins stay denied — they would act on the throwaway temp
+// cwd rather than the operator's workspace, and they bypass Brigade's guards
+// entirely. The plane instead serves Brigade's GUARDED equivalents (see
+// mcp/builtin-tools.ts): `mcp__brigade__bash` runs through the exec-gate (which
+// may pause for the operator's approval) and `mcp__brigade__write` through the
+// path-write guard. So the model is told it HAS a filesystem + shell, and told
+// that a pause is expected rather than a failure.
 const CLAUDE_CLI_FULL_PLANE_SUFFIX =
 	"You are answering as part of an ongoing conversation. Brigade's tools are available to you " +
-	"over MCP, named `mcp__brigade__<tool>` (memory, sub-agents, channels, cron, media generation, " +
-	"and more). Call them whenever they help — that is what they are for; do not describe what you " +
-	"would do instead of doing it. Your own built-in tools are disabled: use the Brigade ones. " +
-	"You currently have NO filesystem or shell access on this backend, so if a request needs one, " +
-	"say so plainly rather than pretending you ran something.";
+	"over MCP, named `mcp__brigade__<tool>` — including read, write, edit, bash, grep and ls on the " +
+	"operator's real workspace, plus memory, sub-agents, channels, cron and media generation. Call " +
+	"them whenever they help; do not describe what you would do instead of doing it. Your own " +
+	"built-in tools are disabled — always use the `mcp__brigade__` ones. Some commands (via bash) " +
+	"may pause for the operator's approval before they run; that is expected, so wait for the " +
+	"result rather than assuming it failed.";
 
 /** Flag delivering the MCP server config file (the Brigade tool-plane). */
 export const CLAUDE_CLI_MCP_CONFIG_FLAG = "--mcp-config";

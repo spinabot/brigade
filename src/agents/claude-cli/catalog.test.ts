@@ -186,8 +186,9 @@ test("composeClaudeCliSystemPrompt: the FULL plane tells the model to USE its to
 	assert.doesNotMatch(sys, /respond directly in prose/i, "must not be nudged into prose-only");
 	assert.match(sys, /mcp__brigade__/, "names the MCP tool namespace");
 	assert.match(sys, /Call them whenever they help/i);
-	// ...and it is honest about the one capability it genuinely lacks.
-	assert.match(sys, /NO filesystem or shell access/i);
+	// ...and it names the guarded filesystem/shell it now actually has.
+	assert.match(sys, /read, write, edit, bash, grep and ls/i);
+	assert.match(sys, /pause for the operator's approval/i);
 });
 
 test("composeClaudeCliSystemPrompt: precedence structured > fullPlane > toolPlane", () => {
