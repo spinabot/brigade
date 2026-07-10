@@ -1573,6 +1573,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       builtinToolNames: toolset.builtinToolNames,
       ...(brigadeGuard ? { guard: brigadeGuard } : {}),
       ...(args.signal ? { signal: args.signal } : {}),
+      // Mirrors what a Pi-loop sub-agent's real tool events carry, so the TUI
+      // indents a harness sub-agent's calls instead of attributing them to the parent.
+      ...(callerSubagentDepth > 0 ? { subagentDepth: callerSubagentDepth } : {}),
+      ...(args.subagentLabel !== undefined ? { subagentLabel: args.subagentLabel } : {}),
     });
   }
 
@@ -1676,6 +1680,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     ctx: { provider: args.provider, model: args.modelId },
     signal: args.signal,
     onAttemptFailed: async (info) => {
+      // A retryable failure (timeout / overloaded / 5xx) re-invokes the attempt,
+      // which for a harness backend RESPAWNS the binary. Its tool calls so far live
+      // only in the JSONL — `appendMessage` never touches `session.messages`, which
+      // is what the next attempt serializes. Drain them in before the respawn, or a
+      // watchdog kill mid-turn makes the retry re-run every side effect it already
+      // committed. Idempotent, and a no-op for every loop backend.
+      harnessHandle.afterTurn();
       const fields = {
         agentId,
         sessionId: resolved.sessionId,
@@ -1819,6 +1830,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
               // respawns the binary and repeats every side effect. No-op (false)
               // for every loop backend.
               toolActivity: () => harnessHandle.hadToolActivity(),
+              // The slop gate re-prompts even on a harness turn. Drain the harness's
+              // tool records into `session.messages` first, so the rewrite request
+              // carries them and the respawned binary doesn't redo the work.
+              beforeRetry: () => harnessHandle.afterTurn(),
             },
           );
         },

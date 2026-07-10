@@ -300,4 +300,61 @@ describe("harness backends: the recovery tier must not re-run side effects", () 
 		await runWithContentQualityRetry(session, async () => {}, { toolActivity: () => false });
 		assert.equal(state.reprompts, 1);
 	});
+
+	// The slop gate is deliberately EXEMPT from the toolActivity stand-down — a bad
+	// rewrite is worth a respawn. But a harness records its tool calls to the JSONL
+	// only; they reach `session.messages` (what a re-prompt serializes) at drain time.
+	// Re-prompting before that drain hands the binary a request with no evidence it
+	// ever ran the deploy, so it runs it again. `beforeRetry` is the drain, and it
+	// MUST happen before `session.prompt`.
+	const sloppy = {
+		role: "assistant",
+		content: [
+			{
+				type: "text",
+				text:
+					"At the end of the day, it's important to note that we need to leverage synergy to unlock value. " +
+					"In today's fast-paced world, let's circle back and move the needle going forward to take it to the next level.",
+			},
+		],
+	};
+
+	function orderTrackingSession(messages: unknown[]) {
+		const order: string[] = [];
+		const session = {
+			messages,
+			agent: { state: { tools: [{ name: "bash" }] } },
+			prompt: async () => {
+				order.push("prompt");
+			},
+		};
+		return { session: session as never, order };
+	}
+
+	it("the slop gate flushes harness tool records BEFORE it re-prompts", async () => {
+		const { session, order } = orderTrackingSession([sloppy]);
+		await runWithContentQualityRetry(session, async () => {}, {
+			toolActivity: () => true,
+			beforeRetry: () => order.push("flush"),
+			maxSlopRewrites: 1,
+		});
+		assert.deepEqual(order, ["flush", "prompt"], "the rewrite request must already carry the tool calls");
+	});
+
+	it("the recovery tier also flushes first, when it fires at all", async () => {
+		const { session, order } = orderTrackingSession([plannedButActed]);
+		// No toolActivity => a loop backend => the recovery tier fires.
+		await runWithContentQualityRetry(session, async () => {}, { beforeRetry: () => order.push("flush") });
+		assert.deepEqual(order, ["flush", "prompt"]);
+	});
+
+	it("no re-prompt means no flush — the drain is not busywork on a clean turn", async () => {
+		const clean = { role: "assistant", content: [{ type: "text", text: "Deployed. Build 41ee88f is live on prod." }] };
+		const { session, order } = orderTrackingSession([clean]);
+		await runWithContentQualityRetry(session, async () => {}, {
+			toolActivity: () => true,
+			beforeRetry: () => order.push("flush"),
+		});
+		assert.deepEqual(order, []);
+	});
 });
