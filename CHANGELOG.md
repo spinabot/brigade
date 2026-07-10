@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.26.1](https://github.com/spinabot/brigade/compare/brigade-v1.26.0...brigade-v1.26.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* **harness:** the parent's idle watchdog was killing turns the child was healthy for ([cb71236](https://github.com/spinabot/brigade/commit/cb712362ca4f782ca6b7101f00efdcb9c83a4cf0))
+* **test:** stop the dispatch test from spawning a real `claude` child ([e9c89c2](https://github.com/spinabot/brigade/commit/e9c89c2ddf7078a8d1c97b300111beab0a84f17b))
+
 ## [1.26.0](https://github.com/spinabot/brigade/compare/brigade-v1.25.3...brigade-v1.26.0) (2026-07-10)
 
 
