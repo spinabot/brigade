@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.27.0](https://github.com/spinabot/brigade/compare/brigade-v1.26.1...brigade-v1.27.0) (2026-07-10)
+
+
+### Features
+
+* **update:** tell the operator a newer Brigade exists, and ask before touching anything ([15089b7](https://github.com/spinabot/brigade/commit/15089b79e564f23ddbf27128ad5ad7fe6fb89ad7))
+
 ## [1.26.1](https://github.com/spinabot/brigade/compare/brigade-v1.26.0...brigade-v1.26.1) (2026-07-10)
 
 
