@@ -42,7 +42,12 @@ export interface ConsoleStreamOptions {
 
 export interface ConsoleStream {
 	/** Pi event from the agent loop. */
-	pi(event: AgentSessionEvent): void;
+	/**
+	 * A turn's Pi events. `subagentDepth` (≥1) marks a CHILD turn: its lines are
+	 * indented and marked `↳`, so a `spawn_agent` that runs for a minute is not a
+	 * minute of silence in the operator's terminal.
+	 */
+	pi(event: AgentSessionEvent, subagentDepth?: number): void;
 	/** Inbound WebSocket request from a client. */
 	wsRequest(method: RequestMethod, id: string, clientLabel?: string): void;
 	/** Response sent back to a client (durationMs measured at the call site). */
@@ -153,9 +158,15 @@ export function createConsoleStream(opts: ConsoleStreamOptions = {}): ConsoleStr
 	};
 
 	return {
-		pi(event) {
+		pi(event, subagentDepth) {
 			const t = event.type;
 			if (NOISY_EVENT_TYPES.has(t) && !allow("debug")) return;
+			// A child turn's lines are indented under the parent's, so a `spawn_agent`
+			// reads as work happening rather than as a stalled gateway.
+			const childMark =
+				typeof subagentDepth === "number" && subagentDepth > 0
+					? `${"  ".repeat(Math.min(subagentDepth, 4))}${c(chalk.dim, "↳")} `
+					: "";
 
 			// Pick subsystem + extract the most useful 2–3 fields per event type.
 			// Catch-all at the bottom keeps the stream COMPLETE — every event
@@ -257,7 +268,7 @@ export function createConsoleStream(opts: ConsoleStreamOptions = {}): ConsoleStr
 					body = `${arrow("event")} ${t}`;
 					levelFor = "debug";
 			}
-			line(levelFor, sub, body);
+			line(levelFor, sub, `${childMark}${body}`);
 		},
 
 		wsRequest(method, id, clientLabel) {

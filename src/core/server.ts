@@ -2549,6 +2549,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// events), Pi never saw it, so `attachTurnSession` will never broadcast it.
 		const isSynthetic = event.synthetic === true;
 		if (!isSynthetic && (!event.subagentDepth || event.subagentDepth <= 0)) return;
+		// The operator's terminal, too — not just attached WS clients.
+		//
+		// `opts.consoleStream.pi()` is wired inside `attachTurnSession`, and that is
+		// only ever called for a DEPTH-0 gateway turn. So a `spawn_agent` that ran for
+		// 57 seconds printed nothing between "sub-agent starting" and "sub-agent
+		// settled": the gateway looked wedged while a whole child turn was streaming.
+		if (event.subagentDepth && event.subagentDepth > 0) {
+			opts.consoleStream?.pi(event.piEvent as AgentSessionEvent, event.subagentDepth);
+		}
 		// Wave I — forward the parent's agentId + sessionId from the bus
 		// event so child pi frames carry the same routing tags as the
 		// top-level pi frames; the operator's subscription filter applies
