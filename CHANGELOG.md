@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.1](https://github.com/spinabot/brigade/compare/brigade-v1.29.0...brigade-v1.29.1) (2026-07-12)
+
+
+### Bug Fixes
+
+* **tui:** clipboard worker GDI+ handle leak + X11 target noise ([27cc83e](https://github.com/spinabot/brigade/commit/27cc83e05df6d188513f74a20858ad2735b9d6ba))
+
 ## [1.29.0](https://github.com/spinabot/brigade/compare/brigade-v1.28.0...brigade-v1.29.0) (2026-07-12)
 
 
