@@ -91,18 +91,25 @@ function Emit([string]$msg) {
 }
 
 function Save-ClipImage([string]$dest) {
+  # $img is disposed in FINALLY, not after Save. A Save() to a bad path throws, and
+  # the old catch returned without disposing — leaking a native GDI+ Bitmap on every
+  # failed save, in a process that lives for the whole session and polls every 150ms.
+  $img = $null
   try {
     if (-not [Windows.Forms.Clipboard]::ContainsImage()) { return $null }
     $img = [Windows.Forms.Clipboard]::GetImage()
     if ($null -eq $img) { return $null }
     $img.Save($dest, [System.Drawing.Imaging.ImageFormat]::Png)
-    $img.Dispose()
     # CONFIRM it landed. Save() to a bad path raises a NON-terminating error, so
     # without this the worker would report a path to a file it never wrote, and the
     # attachment would fail later with no explanation of why.
     if (-not (Test-Path -LiteralPath $dest)) { return $null }
     return $dest
-  } catch { return $null }
+  } catch {
+    return $null
+  } finally {
+    if ($img -ne $null) { $img.Dispose() }
+  }
 }
 
 # [Console]::In is a SYNCHRONIZED TextReader, and its ReadLineAsync() is a lie: it

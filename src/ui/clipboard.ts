@@ -375,7 +375,25 @@ const LINUX: ClipboardBackend = {
 			// Brigade instead of running `apt install wl-clipboard`.
 			return "no clipboard tool found — install wl-clipboard (Wayland) or xclip (X11).";
 		}
-		const list = types.split(/\r?\n/).filter(Boolean).slice(0, 5).join(", ");
+		// X11's TARGETS list leads with protocol bookkeeping (TIMESTAMP, TARGETS,
+		// MULTIPLE, SAVE_TARGETS) that is not clipboard CONTENT — reporting "the
+		// clipboard holds TIMESTAMP, TARGETS, MULTIPLE" as if it were the payload is
+		// noise. Filter it so the operator sees the actual MIME types.
+		const XCLIP_META = new Set([
+			"TIMESTAMP",
+			"TARGETS",
+			"MULTIPLE",
+			"SAVE_TARGETS",
+			"DELETE",
+			"INSERT_SELECTION",
+			"INSERT_PROPERTY",
+		]);
+		const list = types
+			.split(/\r?\n/)
+			.map((s) => s.trim())
+			.filter((s) => s && !XCLIP_META.has(s))
+			.slice(0, 5)
+			.join(", ");
 		if (!list) return "the clipboard appears to be empty.";
 		return `the clipboard holds ${list} — no image and no file.`;
 	},
