@@ -51,19 +51,46 @@ export interface StagedAttachment {
 
 /* ───────────────────────────── kind + mime ───────────────────────────── */
 
-const IMAGE_EXT: Record<string, string> = {
+/**
+ * Images we may safely send INLINE as a native `ImageContent` block.
+ *
+ * Deliberately only the four formats every major vision provider accepts
+ * (Anthropic: jpeg/png/gif/webp; OpenAI: png/jpeg/webp/gif). This list is a
+ * SAFETY list, not a completeness list. Inlining an `image/svg+xml` or
+ * `image/tiff` block is not a graceful degradation — the provider rejects the
+ * whole request, so a single attached SVG would 400 the entire turn instead of
+ * just being read by a tool.
+ */
+const INLINE_IMAGE_EXT: Record<string, string> = {
 	png: "image/png",
 	jpg: "image/jpeg",
 	jpeg: "image/jpeg",
 	gif: "image/gif",
 	webp: "image/webp",
+};
+
+/**
+ * Images the model CANNOT take inline, but `analyze_media` can still read (it
+ * routes bmp/heic/heif through the media-understanding subsystem).
+ *
+ * These are classified as `document` rather than `image` precisely so that
+ * `buildInboundImageBlocks` does not try to inline them. The kind name reads a
+ * little oddly in the media note ("[attached document (logo.bmp) → …]") and that
+ * is a deliberate trade: a slightly-off noun beats a hard provider 400.
+ */
+const NON_INLINE_IMAGE_EXT: Record<string, string> = {
 	bmp: "image/bmp",
+	heic: "image/heic",
+	heif: "image/heif",
 	tif: "image/tiff",
 	tiff: "image/tiff",
 	svg: "image/svg+xml",
-	heic: "image/heic",
 	avif: "image/avif",
 };
+
+// Kept in step with `analyze_media`'s own EXT_KIND table (analyze-media-tool.ts)
+// — that tool is the universal reader every non-inline attachment reaches, so a
+// format it can read should be a format you can attach.
 const VIDEO_EXT: Record<string, string> = {
 	mp4: "video/mp4",
 	mov: "video/quicktime",
@@ -71,6 +98,8 @@ const VIDEO_EXT: Record<string, string> = {
 	mkv: "video/x-matroska",
 	avi: "video/x-msvideo",
 	m4v: "video/x-m4v",
+	mpeg: "video/mpeg",
+	mpg: "video/mpeg",
 };
 const AUDIO_EXT: Record<string, string> = {
 	mp3: "audio/mpeg",
@@ -79,9 +108,12 @@ const AUDIO_EXT: Record<string, string> = {
 	aac: "audio/aac",
 	flac: "audio/flac",
 	ogg: "audio/ogg",
+	oga: "audio/ogg",
 	opus: "audio/opus",
 };
-const DOC_EXT: Record<string, string> = {
+
+/** Office, OpenDocument, e-book, and rich-document formats `analyze_media` parses. */
+const RICH_DOC_EXT: Record<string, string> = {
 	pdf: "application/pdf",
 	doc: "application/msword",
 	docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -89,12 +121,36 @@ const DOC_EXT: Record<string, string> = {
 	xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 	ppt: "application/vnd.ms-powerpoint",
 	pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-	csv: "text/csv",
+	odt: "application/vnd.oasis.opendocument.text",
+	ods: "application/vnd.oasis.opendocument.spreadsheet",
+	odp: "application/vnd.oasis.opendocument.presentation",
+	epub: "application/epub+zip",
+	rtf: "application/rtf",
+	ipynb: "application/x-ipynb+json",
+};
+
+/** Text/markup/data formats. Attachable, but never auto-attached from prose. */
+const TEXT_EXT: Record<string, string> = {
 	html: "text/html",
 	htm: "text/html",
+	csv: "text/csv",
+	tsv: "text/tab-separated-values",
 	md: "text/markdown",
+	markdown: "text/markdown",
 	txt: "text/plain",
+	text: "text/plain",
+	log: "text/plain",
 	json: "application/json",
+	jsonl: "application/x-ndjson",
+	ndjson: "application/x-ndjson",
+	xml: "application/xml",
+	yaml: "application/yaml",
+	yml: "application/yaml",
+	toml: "application/toml",
+	ini: "text/plain",
+	cfg: "text/plain",
+	conf: "text/plain",
+	env: "text/plain",
 };
 
 /**
@@ -102,23 +158,66 @@ const DOC_EXT: Record<string, string> = {
  *
  * `kind` is load-bearing, not cosmetic: ONLY `image` rides the turn inline as a
  * native `ImageContent` block. Everything else arrives as an `analyze_media`
- * call-to-action carrying its path, because Pi's content model is text + image
- * and there IS no other way in for a PDF or an MP4. Unknown extensions fall back
- * to `document`, which is the kind that always has a tool path available.
+ * call-to-action carrying its path — that tool is the universal reader (PDF,
+ * DOCX, XLSX, PPTX, ODF, EPUB, video, audio, text, source), and it is the ONLY
+ * way in for a non-image, because Pi's content model is text + image and there
+ * is no `document` or `video` content block to put an MP4 in.
+ *
+ * Anything unrecognised falls back to `document`, which always has a tool path
+ * available — so an attachment is never simply refused for being unusual.
  */
 export function inferAttachmentKind(filePath: string): PromptAttachment["kind"] {
 	const ext = path.extname(filePath).slice(1).toLowerCase();
-	if (ext in IMAGE_EXT) return "image";
+	if (ext in INLINE_IMAGE_EXT) return "image";
 	if (ext in VIDEO_EXT) return "video";
 	if (ext in AUDIO_EXT) return "audio";
+	// NON_INLINE_IMAGE_EXT deliberately lands here — see its comment.
 	return "document";
 }
 
-/** Best-effort MIME from the extension. `undefined` → the gateway infers. */
+/** Best-effort MIME from the extension. Unknown → octet-stream, still attachable. */
 export function inferMimeType(filePath: string): string {
 	const ext = path.extname(filePath).slice(1).toLowerCase();
 	return (
-		IMAGE_EXT[ext] ?? VIDEO_EXT[ext] ?? AUDIO_EXT[ext] ?? DOC_EXT[ext] ?? "application/octet-stream"
+		INLINE_IMAGE_EXT[ext] ??
+		NON_INLINE_IMAGE_EXT[ext] ??
+		VIDEO_EXT[ext] ??
+		AUDIO_EXT[ext] ??
+		RICH_DOC_EXT[ext] ??
+		TEXT_EXT[ext] ??
+		"application/octet-stream"
+	);
+}
+
+/**
+ * Would a person plausibly have meant to ATTACH this, having merely written its
+ * path in the middle of a sentence?
+ *
+ * ⚠ This gate governs ONE narrow case: a path we INFERRED from prose. It is not
+ * a list of what you're allowed to attach — `@token`, `/attach`, and a bare drop
+ * all bypass it entirely and take ANY file: a `.ts`, a `.log`, an extensionless
+ * binary, a 400 MB `.mkv`, anything.
+ *
+ * It exists because "the file EXISTS on disk" is not a sufficient rule on POSIX.
+ * `check /etc/hosts for me` names a file that really is there on every Linux and
+ * macOS box; an existence-only rule attaches it and rewrites the sentence to
+ * `check hosts for me`. Likewise `the bug is in /srv/app/index.js`.
+ *
+ * So prose-inferred paths must look like something a human ATTACHES — a picture,
+ * a recording, a video, a document — rather than something they merely CITE. That
+ * is why source, config, log, and data extensions are excluded here even though
+ * they are perfectly attachable by an explicit gesture: in a sentence, a path to
+ * `index.js` or `config.yaml` is overwhelmingly a reference, not an enclosure.
+ */
+export function isAttachableExtension(filePath: string): boolean {
+	const ext = path.extname(filePath).slice(1).toLowerCase();
+	if (!ext) return false;
+	return (
+		ext in INLINE_IMAGE_EXT ||
+		ext in NON_INLINE_IMAGE_EXT ||
+		ext in VIDEO_EXT ||
+		ext in AUDIO_EXT ||
+		ext in RICH_DOC_EXT
 	);
 }
 
@@ -203,20 +302,51 @@ export interface ExtractedAttachments {
  * note built from the attachment list. Deleting the token instead would leave
  * "look at  and tell me", stranding the referent.
  *
- * A token that does NOT resolve to a real file is left completely untouched, so
- * ordinary prose (`email me @ work`, `check /etc/hosts`) is never rewritten.
+ * ── What may be attached, and when ────────────────────────────────────────
+ * Silently attaching a file the operator merely MENTIONED is the worst failure
+ * this module can have, so intent is graded in three tiers:
+ *
+ *   EXPLICIT (`@token`)         — you named it deliberately, using a picker that
+ *                                 only completes real files. Any file, any
+ *                                 extension, relative paths resolved against cwd.
+ *   PURE DROP (line is nothing  — you dropped a file and pressed Enter with no
+ *   but paths)                    other words. Unambiguous. Any file.
+ *   INFERRED (a path sitting in  — could easily be a mention rather than an
+ *   the middle of a sentence)     attachment. Must be ABSOLUTE *and* carry a
+ *                                 recognised media/document extension.
+ *
+ * That last tier is what stops `check /etc/hosts for me` from attaching
+ * /etc/hosts on Linux (it exists! an existence-only rule attaches it) and stops
+ * `edit "package.json"` from attaching a cwd-relative file out of a quoted word.
  */
 export function extractAttachmentPaths(line: string): ExtractedAttachments {
 	const staged: StagedAttachment[] = [];
 	const seen = new Set<string>();
 	let text = line;
 
+	// Is this line nothing but paths? Strip every candidate token and see whether
+	// any words survive. A bare drop ("C:\shots\bug.png" + Enter) leaves nothing,
+	// which is unambiguous intent and lifts the extension gate below — so you can
+	// drop a `.ts` file or an extensionless binary and still have it attach.
+	let residue = line;
 	for (const pattern of TOKEN_PATTERNS) {
-		// Fresh regex per pass — these are module-level /g literals and carry
+		residue = residue.replace(new RegExp(pattern.source, pattern.flags), " ");
+	}
+	const isPureDrop = residue.trim() === "";
+
+	for (const pattern of TOKEN_PATTERNS) {
+		// Fresh regex per pass — these are module-level /g literals and would carry
 		// `lastIndex` state across calls otherwise.
 		const re = new RegExp(pattern.source, pattern.flags);
+		const isAtToken = pattern.source.startsWith("@");
 		text = text.replace(re, (whole, captured: string) => {
 			const candidate = decodeCandidate(captured);
+			const explicit = isAtToken || isPureDrop;
+			// INFERRED tier: must be absolute AND look like attachable media.
+			if (!explicit) {
+				if (!path.isAbsolute(expandHome(candidate))) return whole;
+				if (!isAttachableExtension(candidate)) return whole;
+			}
 			const att = stageAttachment(candidate);
 			// Not a real file → leave the ORIGINAL token exactly as the user typed it.
 			if (!att) return whole;
@@ -227,7 +357,20 @@ export function extractAttachmentPaths(line: string): ExtractedAttachments {
 		});
 	}
 
-	return { text: text.replace(/[ \t]{2,}/g, " ").trim(), staged };
+	// NOTHING matched → hand back the ORIGINAL line, byte for byte.
+	//
+	// This early return is load-bearing and the reason it exists is worth stating:
+	// this function runs on EVERY submitted line, so any normalisation it does
+	// (collapsing runs of spaces, trimming) happens to every message the operator
+	// ever sends — including a pasted Python snippet, a YAML block, a diff, or an
+	// ASCII table, whose leading indentation would be silently destroyed. An
+	// attachment parser has no business rewriting prose it found no paths in.
+	if (staged.length === 0) return { text: line, staged: [] };
+
+	// Something DID match, so `text` now carries basenames in place of paths. Even
+	// here we only trim the ends — we never collapse interior whitespace, because a
+	// message can perfectly well attach a screenshot AND paste indented code.
+	return { text: text.trim(), staged };
 }
 
 /** Undo the escaping a terminal applies when it pastes a dropped path. */
@@ -250,10 +393,47 @@ function decodeCandidate(raw: string): string {
 
 /* ──────────────────────────── clipboard ──────────────────────────────── */
 
-/** Where we spool clipboard bitmaps. OS temp — never `~/.brigade` (strict-zero). */
+/**
+ * Max files on one turn. Mirrors the gateway's `PROMPT_ATTACHMENT_MAX_COUNT`.
+ *
+ * It is enforced HERE, at staging, and not only there — because the gateway's
+ * copy of the cap can only reject, and a `prompt` rejection has nowhere to go (a
+ * `prompt` response carries no payload, so an over-cap file would be dropped with
+ * nothing but a gateway-side log line, after the operator had already watched it
+ * appear as a chip). Refusing at the moment of staging is the only way the
+ * operator actually learns about it.
+ */
+export const MAX_STAGED_ATTACHMENTS = 8;
+
+/** How long a spooled clipboard bitmap survives before it's swept. */
+const SPOOL_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Where we spool clipboard bitmaps. OS temp — never `~/.brigade`, which the
+ * convex-mode strict-zero guard requires to stay clean.
+ *
+ * Sweeps its own leavings on the way in. A pasted screenshot has no file behind
+ * it, so we must materialise one; without this, every `/paste` would leave a PNG
+ * on disk forever and the "temp" directory would grow without bound for the life
+ * of the machine. Best-effort by design — a locked or vanished file is not worth
+ * failing a paste over.
+ */
 function spoolDir(): string {
 	const dir = path.join(os.tmpdir(), "brigade-attachments");
 	fs.mkdirSync(dir, { recursive: true });
+	try {
+		const cutoff = Date.now() - SPOOL_TTL_MS;
+		for (const name of fs.readdirSync(dir)) {
+			const p = path.join(dir, name);
+			try {
+				if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
+			} catch {
+				/* in use, gone, or not ours — leave it */
+			}
+		}
+	} catch {
+		/* unreadable spool dir — pasting still works, we just don't sweep */
+	}
 	return dir;
 }
 

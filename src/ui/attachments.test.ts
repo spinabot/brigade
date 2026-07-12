@@ -19,6 +19,7 @@ import {
 	extractAttachmentPaths,
 	inferAttachmentKind,
 	inferMimeType,
+	isAttachableExtension,
 	stageAttachment,
 } from "./attachments.js";
 
@@ -99,6 +100,88 @@ describe("stageAttachment", () => {
 	});
 });
 
+/**
+ * `extractAttachmentPaths` runs on EVERY line the operator submits, so anything
+ * it normalises, it normalises for the entire product. The first version of it
+ * ended with `.replace(/[ \t]{2,}/g, " ").trim()` and therefore silently
+ * destroyed the indentation of every pasted code block, YAML document, diff and
+ * stack trace — on turns with no attachments at all. These tests exist so that
+ * can never come back.
+ */
+describe("extractAttachmentPaths — prose must survive byte-for-byte", () => {
+	it("returns a plain message completely unchanged", () => {
+		const line = "can you explain how the gateway resumes a session?";
+		assert.equal(extractAttachmentPaths(line).text, line);
+	});
+
+	it("preserves the indentation of pasted code — the regression that started this", () => {
+		const code = "fix this:\ndef f(x):\n    if x:\n        return 1";
+		const r = extractAttachmentPaths(code);
+		assert.equal(r.staged.length, 0);
+		assert.equal(r.text, code, "indentation must not be collapsed");
+	});
+
+	it("preserves deliberate column alignment", () => {
+		const line = "align these:  a=1   b=2";
+		assert.equal(extractAttachmentPaths(line).text, line);
+	});
+
+	it("preserves runs of spaces inside quotes", () => {
+		const line = 'say "hello  world" twice';
+		assert.equal(extractAttachmentPaths(line).text, line);
+	});
+
+	it("preserves a YAML block's structure", () => {
+		const yaml = "apply this:\nserver:\n  host: 0.0.0.0\n  port: 7777";
+		assert.equal(extractAttachmentPaths(yaml).text, yaml);
+	});
+});
+
+describe("isAttachableExtension — the prose gate only", () => {
+	it("accepts media and documents a person actually encloses", () => {
+		for (const f of ["a.png", "a.mp4", "a.mp3", "a.pdf", "a.docx", "a.xlsx", "a.epub"]) {
+			assert.equal(isAttachableExtension(f), true, f);
+		}
+	});
+
+	it("rejects source, config, data and log files — in a sentence those are CITED, not attached", () => {
+		for (const f of ["a.ts", "a.js", "a.json", "a.yaml", "a.log", "a.txt", "a.md"]) {
+			assert.equal(isAttachableExtension(f), false, f);
+		}
+	});
+
+	it("rejects an extensionless path — /etc/hosts, /usr/bin/python", () => {
+		assert.equal(isAttachableExtension("/etc/hosts"), false);
+	});
+});
+
+describe("inferAttachmentKind — only provider-safe images may be inlined", () => {
+	it("inlines exactly the four formats every vision provider accepts", () => {
+		for (const f of ["a.png", "a.jpg", "a.jpeg", "a.gif", "a.webp"]) {
+			assert.equal(inferAttachmentKind(f), "image", f);
+		}
+	});
+
+	it("does NOT mark svg/tiff/heic/bmp/avif as `image` — inlining those 400s the whole turn", () => {
+		// Anthropic accepts jpeg/png/gif/webp; OpenAI png/jpeg/webp/gif. An inline
+		// `image/svg+xml` block is a hard API error that kills the turn, rather than
+		// the graceful "a tool reads it instead" the design promises. So they are
+		// classified as `document` and reach the model via analyze_media.
+		for (const f of ["a.svg", "a.tiff", "a.heic", "a.bmp", "a.avif"]) {
+			assert.equal(inferAttachmentKind(f), "document", f);
+		}
+	});
+
+	it("classifies the full video and audio surface analyze_media can read", () => {
+		for (const f of ["a.mp4", "a.mkv", "a.avi", "a.mpeg", "a.mov", "a.webm"]) {
+			assert.equal(inferAttachmentKind(f), "video", f);
+		}
+		for (const f of ["a.mp3", "a.wav", "a.flac", "a.opus", "a.oga", "a.m4a"]) {
+			assert.equal(inferAttachmentKind(f), "audio", f);
+		}
+	});
+});
+
 describe("extractAttachmentPaths — the disambiguation rule", () => {
 	it("leaves prose with a bare @ completely untouched", () => {
 		const r = extractAttachmentPaths("email me @ work about it");
@@ -107,9 +190,53 @@ describe("extractAttachmentPaths — the disambiguation rule", () => {
 	});
 
 	it("does NOT attach a path in prose that isn't a real file", () => {
-		const r = extractAttachmentPaths("check /etc/hosts and /var/log/nope.log for me");
+		const r = extractAttachmentPaths("check /nope/ghost.png and /var/log/absent.pdf for me");
 		assert.equal(r.staged.length, 0);
-		assert.equal(r.text, "check /etc/hosts and /var/log/nope.log for me");
+		assert.equal(r.text, "check /nope/ghost.png and /var/log/absent.pdf for me");
+	});
+
+	it("does NOT attach an EXTENSIONLESS file mentioned in prose, even though it exists", () => {
+		// The one that matters on POSIX: /etc/hosts is a real file on every Linux and
+		// macOS box. An existence-only rule silently attaches it and rewrites the
+		// sentence to "check hosts for me". The extension gate is what stops that, so
+		// prove it against a file we KNOW exists on this machine, whatever the OS.
+		const extensionless = path.join(dir, "hosts");
+		fs.writeFileSync(extensionless, "127.0.0.1 localhost");
+		const r = extractAttachmentPaths(`check ${extensionless} for me`);
+		assert.equal(r.staged.length, 0);
+		assert.equal(r.text, `check ${extensionless} for me`);
+	});
+
+	it("does NOT attach a source file mentioned in prose — a mention is not an attachment", () => {
+		const ts = path.join(dir, "index.js");
+		fs.writeFileSync(ts, "console.log(1)");
+		const r = extractAttachmentPaths(`the bug is in ${ts} somewhere`);
+		assert.equal(r.staged.length, 0);
+	});
+
+	it("does NOT attach a quoted RELATIVE filename — it would resolve against cwd", () => {
+		// `edit "package.json"` sits in the repo root, so a cwd-relative resolve finds
+		// a real file. Quoted prose must not become an attachment.
+		const r = extractAttachmentPaths('edit "package.json" for me');
+		assert.equal(r.staged.length, 0);
+		assert.equal(r.text, 'edit "package.json" for me');
+	});
+
+	it("DOES attach an extensionless file on a pure drop — that's unambiguous intent", () => {
+		const extensionless = path.join(dir, "binary-blob");
+		fs.writeFileSync(extensionless, "\x00\x01\x02");
+		const r = extractAttachmentPaths(extensionless);
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.staged[0]?.kind, "document");
+	});
+
+	it("DOES attach a source file via an explicit @token — explicit intent lifts the gate", () => {
+		const ts = path.join(dir, "app.ts");
+		fs.writeFileSync(ts, "export const x = 1");
+		const r = extractAttachmentPaths(`review @${ts} please`);
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.staged[0]?.path, ts);
+		assert.equal(r.text, "review app.ts please");
 	});
 
 	it("leaves a non-existent @token exactly as typed", () => {

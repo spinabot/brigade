@@ -75,12 +75,7 @@ import {
 import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
 import { getActiveRegistry, setActiveRegistry } from "../agents/extensions/active-registry.js";
 import type { GatewayCaller, GatewayMethodHandler, HttpRoute, Service } from "../agents/extensions/index.js";
-import {
-	buildInboundImageBlocks,
-	buildMediaNote,
-	type InboundImageBlock,
-} from "../agents/channels/media-capture.js";
-import { resolvePromptAttachments } from "./prompt-attachments.js";
+import { composeAttachmentTurn } from "./prompt-attachments.js";
 import { createMcpHttpRoute } from "../agents/mcp/http-route.js";
 import { createMcpTurnRegistry, setActiveMcpToolPlaneHost } from "../agents/mcp/tool-plane-host.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
@@ -3036,30 +3031,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// for a voice note, an `analyze_media` call-to-action for a PDF.
 				// Undefined for every historical caller (cron / sub-agent / RPC / a
 				// pre-attachment TUI), whose turn stays byte-identical.
-				let promptText = p.text;
-				let promptImages: InboundImageBlock[] | undefined;
-				if (p.attachments && p.attachments.length > 0) {
-					const { media, rejected } = await resolvePromptAttachments(p.attachments);
-					if (rejected.length > 0) {
-						// Surfaced, never swallowed — an attachment that vanished with no
-						// explanation is worse than one that failed out loud.
-						createSubsystemLogger("gateway/attachments").warn("prompt attachments rejected", {
-							sessionKey: targetSessionKey,
-							rejected: rejected.map((r) => `${r.path}: ${r.reason}`),
-						});
-					}
-					if (media.length > 0) {
-						const note = await buildMediaNote(media, {
-							registry: getActiveRegistry(),
-							config: await loadConfig(),
-						});
-						// Note FIRST, then the operator's text — the same order the channel
-						// inbound pipeline composes (`inbound-pipeline.ts`), so the model
-						// sees an identical layout regardless of which surface sent the file.
-						promptText = [note, p.text.trim()].filter(Boolean).join("\n").trim();
-						const blocks = await buildInboundImageBlocks(media);
-						if (blocks.length > 0) promptImages = blocks;
-					}
+				const composed = await composeAttachmentTurn(p.text, p.attachments, {
+					registry: getActiveRegistry(),
+					config: await loadConfig(),
+				});
+				if (composed.rejected.length > 0) {
+					createSubsystemLogger("gateway/attachments").warn("prompt attachments rejected", {
+						sessionKey: targetSessionKey,
+						rejected: composed.rejected.map((r) => `${r.path}: ${r.reason}`),
+					});
 				}
 				// Wave N4 — no hasLiveSession pre-flight. The session-lane FIFO
 				// inside `runGatewayTurn` (sessionLane(turn.sessionKey)) already
@@ -3071,8 +3051,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// session multi-client (e.g. TUI + chat both attached to
 				// `agent:main:main`).
 				await runGatewayTurn({
-					text: promptText,
-					...(promptImages ? { images: promptImages } : {}),
+					text: composed.text,
+					...(composed.images ? { images: composed.images } : {}),
 					sessionKey: targetSessionKey,
 					agentId: targetAgentId,
 				});
@@ -3292,8 +3272,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					// session.prompt replay, which emitted no TUI events and mined no facts — so the
 					// operator now SEES the handoff reply stream and Tideline extracts from it.
 					await liveSession.abort().catch(() => {});
+					// Carry the replayed message's ATTACHMENTS across the switch. The most
+					// common reason to switch mid-turn is that the current model cannot see
+					// the image you just sent — replaying the text alone onto the vision
+					// model would leave the image behind and accomplish nothing.
+					const replay = await composeAttachmentTurn(p.replayMessage, p.replayAttachments, {
+						registry: getActiveRegistry(),
+						config: await loadConfig(),
+					});
 					await runGatewayTurn({
-						text: p.replayMessage,
+						text: replay.text,
+						...(replay.images ? { images: replay.images } : {}),
 						sessionKey: targetKey,
 						agentId: targetAgentId,
 					});

@@ -508,6 +508,14 @@ export interface RequestParams {
 		provider: string;
 		modelId: string;
 		replayMessage: string;
+		/**
+		 * Files that rode the message being replayed. Without these, the single most
+		 * likely reason to switch models mid-turn — "this model can't see images,
+		 * switch to one that can" — replays the TEXT onto the vision model but leaves
+		 * the image behind, so the new model still can't see it and the switch
+		 * accomplishes nothing. Re-resolved gateway-side exactly like `prompt`'s.
+		 */
+		replayAttachments?: ReadonlyArray<PromptAttachment>;
 		/** Session key whose in-flight session is hot-swapped; defaults to boot session. */
 		sessionKey?: string;
 		/** Agent id whose runtime entry + (if running) live session is swapped. */

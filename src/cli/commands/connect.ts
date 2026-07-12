@@ -21,6 +21,7 @@
 
 import process from "node:process";
 import { randomUUID } from "node:crypto";
+import * as nodePath from "node:path";
 
 import {
 	CancellableLoader,
@@ -36,6 +37,7 @@ import {
 	attachmentIcon,
 	extractAttachmentPaths,
 	formatBytes as formatAttachmentBytes,
+	MAX_STAGED_ATTACHMENTS,
 	readClipboardFiles,
 	readClipboardImage,
 	stageAttachment,
@@ -64,7 +66,7 @@ import { asstKey, clipOneLine, extractUserText } from "./connect-transcript.js";
 import { UPDATE_PRESERVES_MESSAGE } from "../../core/update-check.js";
 import { runUpdateCommand } from "./update.js";
 import { ApprovalPrompt, type ApprovalResolution } from "../../tui/approval-prompt.js";
-import type { AgentSummary, EventPayload, ModelSummary, SessionStateSnapshot, SessionSummary } from "../../protocol.js";
+import type { AgentSummary, EventPayload, ModelSummary, PromptAttachment, SessionStateSnapshot, SessionSummary } from "../../protocol.js";
 import {
 	computeExplain,
 	filterGraphToSubtree,
@@ -366,6 +368,10 @@ export async function wireConnectUi(
 	// The last text the user sent as a prompt — the replay message for a `/switch`
 	// (Carrow) mid-turn model handoff: abort the live turn, swap, re-run this on the new model.
 	let lastUserPrompt = "";
+	// …and the files that rode it. Replaying the text alone would silently drop the
+	// image, which is fatal to the single most common reason to switch mid-turn:
+	// the current model can't see it, so move to one that can.
+	let lastUserAttachments: PromptAttachment[] = [];
 	let isAgentRunning = false;
 	// `/provider <name>` for an UNCONFIGURED provider arms this — the NEXT line
 	// the operator submits is captured as that provider's API key (sent to the
@@ -1958,10 +1964,17 @@ export async function wireConnectUi(
 		// `analyze_media`) but the model does NOT see the picture, and an operator
 		// who doesn't know that reads the agent's tool-mediated description as
 		// vision. Say so up front, while they can still `/model` out of it.
-		const blind = lastSnapshot?.supportsVision === false;
+		//
+		// Tri-state, deliberately. `supportsVision` is absent on a gateway older than
+		// this feature — and such a gateway ignores `attachments` altogether, so the
+		// file rides NOWHERE. Treating absent as "can see" would have us cheerfully
+		// print "· seen inline" next to a file that was never sent at all, which is
+		// the worst thing this tray could say. Unknown ⇒ claim nothing.
+		const vision = lastSnapshot?.supportsVision;
+		const blind = vision === false;
 		const hasImage = stagedAttachments.some((a) => a.kind === "image");
 		for (const [i, a] of stagedAttachments.entries()) {
-			const inline = a.kind === "image" && !blind ? brand.dim(" · seen inline") : "";
+			const inline = a.kind === "image" && vision === true ? brand.dim(" · seen inline") : "";
 			const viaTool = a.kind !== "image" ? brand.dim(" · via analyze_media") : "";
 			insertBeforeEditor(
 				new Text(
@@ -1983,10 +1996,28 @@ export async function wireConnectUi(
 		}
 	};
 
-	/** Stage paths, reporting each one that didn't resolve rather than dropping it silently. */
+	/**
+	 * Stage paths, reporting every one we refuse rather than dropping it silently.
+	 *
+	 * The count cap is enforced HERE and not left to the gateway, even though the
+	 * gateway has one too. A `prompt` response carries no payload, so a gateway-side
+	 * rejection has no route back to the operator — they would watch nine chips echo
+	 * into their message and never learn that the ninth didn't travel. Refusing at
+	 * the moment of staging is the only point at which we can actually say so.
+	 */
 	const stagePaths = (paths: readonly string[]): number => {
 		let added = 0;
 		for (const p of paths) {
+			if (stagedAttachments.length >= MAX_STAGED_ATTACHMENTS) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error("✗")} ${brand.dim(`${MAX_STAGED_ATTACHMENTS} files is the limit for one turn — `)}${brand.amber("/detach")}${brand.dim(" to make room. Not attached:")} ${nodePath.basename(p)}`,
+						0,
+						0,
+					),
+				);
+				continue;
+			}
 			const att = stageAttachment(p);
 			if (!att) {
 				insertBeforeEditor(
@@ -3142,7 +3173,14 @@ export async function wireConnectUi(
 			try {
 				await client.request(
 					"switch-model-mid-turn",
-					withBinding({ provider: switchTarget.provider, modelId: switchTarget.id, replayMessage: lastUserPrompt }),
+					withBinding({
+						provider: switchTarget.provider,
+						modelId: switchTarget.id,
+						replayMessage: lastUserPrompt,
+						...(lastUserAttachments.length > 0
+							? { replayAttachments: lastUserAttachments }
+							: {}),
+					}),
 				);
 				insertBeforeEditor(
 					new Text(`  ${brand.amber("✓")} ${brand.dim("Carrow handoff →")} ${brand.white(`${switchTarget.provider} · ${switchTarget.id}`)}`, 0, 0),
@@ -3161,10 +3199,16 @@ export async function wireConnectUi(
 				showTray();
 				return;
 			}
-			// Reuse the submit-line parser so `/attach` accepts every shape a
-			// terminal might hand us — quoted, escaped, `file://`, or bare.
+			// Reuse the submit-line parser so `/attach` accepts every shape a terminal
+			// might hand us — quoted, escaped, `file://`, or bare. The arg is nothing
+			// but a path, so the parser reads it as a "pure drop" and applies no
+			// extension gate: `/attach` is explicit intent and takes ANY file.
 			const { staged } = extractAttachmentPaths(arg);
-			const added = staged.length > 0 ? stagePaths(staged.map((s) => s.path)) : stagePaths([arg]);
+			// Fallback for an unquoted path with spaces (`/attach C:\my files\a.png`),
+			// which no token pattern can bound — but which, as the whole argument, is
+			// unambiguous. Strip any wrapping the operator typed and take it verbatim.
+			const bare = arg.replace(/^@/, "").replace(/^["'](.*)["']$/, "$1");
+			const added = staged.length > 0 ? stagePaths(staged.map((s) => s.path)) : stagePaths([bare]);
 			if (added > 0) showTray();
 			return;
 		}
@@ -3279,6 +3323,26 @@ export async function wireConnectUi(
 		const attachments = stagedAttachments;
 		const outgoing = cleanedText || trimmed;
 
+		// `showTray` warns about a blind model when files are staged EXPLICITLY
+		// (/attach, /paste). But the most natural flow — drag an image in and press
+		// Enter — stages and sends in one breath and never opens the tray, so it
+		// would miss the warning entirely and the operator would read the agent's
+		// tool-mediated description as if the model had actually looked. Warn here
+		// too. Non-blocking: the turn still goes (analyze_media reads the file), we
+		// just refuse to let it look like vision when it isn't.
+		if (
+			attachments.some((a) => a.kind === "image") &&
+			lastSnapshot?.supportsVision === false
+		) {
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.error("⚠")} ${brand.dim(`${lastSnapshot?.modelName ?? "this model"} cannot see images — reading the file with a tool instead. `)}${brand.amber("/model")}${brand.dim(" to switch to a vision model.")}`,
+					0,
+					0,
+				),
+			);
+		}
+
 		const chips =
 			attachments.length > 0
 				? ` ${brand.dim("·")} ${attachments.map((a) => `${attachmentIcon(a.kind)} ${a.fileName}`).join(" ")}`
@@ -3294,7 +3358,11 @@ export async function wireConnectUi(
 			// routes this turn to that agent's session lane + runtime entry.
 			// Legacy single-agent gateways receive the same boot agent the
 			// snapshot reported, so behaviour is unchanged.
-			lastUserPrompt = outgoing; // remember it as the replay message for a later `/switch` (Carrow) handoff
+			// Remember the message AND its files as the replay payload for a later
+			// `/switch` (Carrow) handoff — replaying the text without the image would
+			// defeat the most common reason to switch (moving to a model that can see).
+			lastUserPrompt = outgoing;
+			lastUserAttachments = attachments.length > 0 ? toPromptAttachments(attachments) : [];
 			await client.request(
 				"prompt",
 				withBinding({
