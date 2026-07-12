@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.29.0](https://github.com/spinabot/brigade/compare/brigade-v1.28.0...brigade-v1.29.0) (2026-07-12)
+
+
+### Features
+
+* **claude-cli:** the backend can see images — it was never Opus that couldn't ([94d0b2a](https://github.com/spinabot/brigade/commit/94d0b2a89cac4927528dec35a2b4ce66e3f39b6d))
+* **tui:** attach files to a turn — [@path](https://github.com/path), drag-drop, and clipboard paste ([db0a019](https://github.com/spinabot/brigade/commit/db0a01957788e42adaaed59578fd5275c136ac0c))
+* **tui:** Ctrl+V attaches images, the way Claude Code does it ([9682335](https://github.com/spinabot/brigade/commit/9682335279a5b8f9e1657a9d28d1cd17f6f7c215))
+* **tui:** make attachments REAL — inline content, visible bar, Ctrl+V/Alt+V ([9d23c3b](https://github.com/spinabot/brigade/commit/9d23c3b9fac57af9502d4a93fdf5ddefccdf3815))
+* **tui:** screenshots auto-attach — no Ctrl+V, no /paste, no command ([e7e4363](https://github.com/spinabot/brigade/commit/e7e436390a77bd3d1afabed96d8d23a5e0e79b91))
+
+
+### Bug Fixes
+
+* **tui:** a dropped file becomes an attachment ON DROP, not on submit ([fec881c](https://github.com/spinabot/brigade/commit/fec881caf05f9b7af5e72ac09e8d46a1282069ee))
+* **tui:** detect a dropped path on ANY text change, not on a guessed "paste" ([31980c9](https://github.com/spinabot/brigade/commit/31980c98a12e24add492174990a6b9a64d851444))
+* **tui:** drop hook never fired — pastes ARE escape sequences ([320a4cf](https://github.com/spinabot/brigade/commit/320a4cf98645c1f25c03ca690f39d62641a06dae))
+* **tui:** harden attachments — prose passthrough, byte caps, safe MIMEs ([6720f2e](https://github.com/spinabot/brigade/commit/6720f2ef82bdc0af15bf585fcf674b58dfd4cb2a))
+* **tui:** harden attachments end-to-end — two adversarial audits' findings ([c24fddd](https://github.com/spinabot/brigade/commit/c24fddd189678bb9542dae54a8bf117cf3fece60))
+* **tui:** one send path, attachments above the steer gate ([3bcd215](https://github.com/spinabot/brigade/commit/3bcd215971bab437b03926a45e357cfd461edd6f))
+* unquoted spacey paths + stop the stale gateway after a rebuild ([004fc47](https://github.com/spinabot/brigade/commit/004fc4714f9f44c21c81f79554c0996f88a2970b))
+
+
+### Performance Improvements
+
+* **tui:** persistent clipboard worker — 2000ms paste becomes 72ms ([c0d2bf3](https://github.com/spinabot/brigade/commit/c0d2bf329ade3a0423a8b802296ead76df2f4feb))
+* **tui:** persistent clipboard worker on macOS and Linux too ([1be6ee2](https://github.com/spinabot/brigade/commit/1be6ee2bb054ec22e966598e736365769463c89a))
+
 ## [1.28.0](https://github.com/spinabot/brigade/compare/brigade-v1.27.1...brigade-v1.28.0) (2026-07-10)
 
 
