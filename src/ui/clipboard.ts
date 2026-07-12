@@ -465,74 +465,68 @@ export interface ClipboardService {
  * `onImage` is called with a saved PNG path whenever an image lands on the
  * clipboard — the auto-attach channel, and the reason Ctrl+V is unnecessary.
  */
+/** Read a whole snapshot via the per-call backend, all reads CONCURRENT. */
+async function backendSnapshot(
+	backend: ClipboardBackend,
+	imageDest: string,
+): Promise<ClipboardSnapshot> {
+	const [imageSaved, files, text, formats] = await Promise.all([
+		backend.hasImage().then((has) => (has ? backend.saveImage(imageDest) : false)),
+		backend.readFiles(),
+		backend.readText(),
+		backend.describe().then((d) => [d]),
+	]);
+	return {
+		...(imageSaved ? { imagePath: imageDest } : {}),
+		files: files.filter(Boolean),
+		text,
+		formats,
+	};
+}
+
 export function startClipboardService(onImage?: (imagePath: string) => void): ClipboardService {
 	// EVERY platform gets the persistent worker. One interpreter, held open, reading
 	// the whole clipboard in a single round-trip — the shape that was wrong before,
 	// on all three: four separate reads issued as four separate processes, in series,
 	// for one paste.
 	const worker = new ClipboardWorker();
-	worker.start(onImage);
-
-	if (worker.available) {
-		// PUSH. Windows carries change notification inside the worker itself (a free
-		// Win32 sequence counter). POSIX cannot: polling the clipboard from the worker
-		// loop would mean spawning `osascript` every tick — the exact per-tick process
-		// cost this design exists to remove. So the platform's own cheap primitive
-		// does it: `wl-paste --watch` is genuinely event-driven, and macOS gets ONE
-		// long-lived osascript `repeat` loop. Either way the operator sees the same
-		// thing: a screenshot attaches itself.
-		const backend = clipboardBackend();
-		const pushWatcher =
-			onImage && process.platform !== "win32"
-				? backend.watch(() => {
-						void (async () => {
-							const dest = path.join(clipboardSpoolDir(), `clipboard-${Date.now()}.png`);
-							const snap = await worker.snapshot(dest);
-							if (snap.imagePath) onImage(snap.imagePath);
-						})();
-					})
-				: null;
-
-		return {
-			read: (dest) => worker.snapshot(dest),
-			stop: () => {
-				pushWatcher?.stop();
-				worker.kill();
-			},
-		};
-	}
-
-	// The worker refused to start (no bash, no PowerShell, a locked-down box). Fall
-	// back to per-call reads rather than losing the clipboard entirely — correct, just
-	// slower. Losing a convenience beats losing the feature.
+	worker.start(onImage, clipboardSpoolDir());
 	const backend = clipboardBackend();
-	const watcher = onImage
-		? backend.watch(() => {
-				void (async () => {
-					const dest = path.join(clipboardSpoolDir(), `clipboard-${Date.now()}.png`);
-					if (await backend.saveImage(dest)) onImage(dest);
-				})();
-			})
-		: null;
+
+	// PUSH. Windows carries change notification inside the worker itself (a free
+	// Win32 sequence counter). POSIX cannot: polling the clipboard from the worker
+	// loop would mean spawning `osascript` every tick — the exact per-tick process
+	// cost this design exists to remove. So the platform's own cheap primitive does
+	// it: `wl-paste --watch` is genuinely event-driven, and macOS gets ONE long-lived
+	// osascript `repeat` loop. Either way the operator sees the same thing: a
+	// screenshot attaches itself.
+	const pushWatcher =
+		onImage && process.platform !== "win32"
+			? backend.watch(() => {
+					void (async () => {
+						const dest = path.join(clipboardSpoolDir(), `clipboard-${Date.now()}.png`);
+						const snap = await worker.snapshot(dest);
+						if (snap.imagePath) onImage(snap.imagePath);
+					})();
+				})
+			: null;
 
 	return {
-		read: async (imageDest) => {
-			// CONCURRENTLY, not in series. Even on the slow path there is no reason to
-			// wait for one spawn before starting the next — they are independent reads.
-			const [imageSaved, files, text, formats] = await Promise.all([
-				backend.hasImage().then((has) => (has ? backend.saveImage(imageDest) : false)),
-				backend.readFiles(),
-				backend.readText(),
-				backend.describe().then((d) => [d]),
-			]);
-			return {
-				...(imageSaved ? { imagePath: imageDest } : {}),
-				files: files.filter(Boolean),
-				text,
-				formats,
-			};
+		read: async (dest) => {
+			// `worker.available` is TRUE the instant spawn returns — but a missing
+			// interpreter (no bash on Alpine, powershell.exe off PATH, ExecutionPolicy
+			// still blocking) fails ASYNCHRONOUSLY, on a later tick, via the 'error'
+			// event. So availability can't be judged synchronously. Ask the worker
+			// whether it ACTUALLY became ready; only fall back to the slow per-call
+			// backend when it did not. On the happy path this adds nothing — readiness
+			// already resolved during boot.
+			if (await worker.whenReady()) return worker.snapshot(dest);
+			return backendSnapshot(backend, dest);
 		},
-		stop: () => watcher?.stop(),
+		stop: () => {
+			pushWatcher?.stop();
+			worker.kill();
+		},
 	};
 }
 

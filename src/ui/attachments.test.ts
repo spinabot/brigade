@@ -434,3 +434,39 @@ describe("extractAttachmentPaths — cwd-relative traps", () => {
 		assert.equal(r.staged[0]?.path, png);
 	});
 });
+
+/**
+ * `live` mode runs on every keystroke, so it must be cheap and must never rewrite
+ * text the operator is still typing. The full parse runs once at submit; this is
+ * only the instant-feedback path for a dropped absolute path.
+ */
+describe("extractAttachmentPaths — live mode (per-keystroke)", () => {
+	it("stages a whole-line absolute dropped path", () => {
+		const r = extractAttachmentPaths(png, { pill: true, live: true });
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.text, "[shot.png]");
+	});
+
+	it("does NOTHING to a long paste — no per-keystroke reparse of a log", () => {
+		const bigLog = ("2026-01-01 ERROR /var/log/x failed at /srv/app\n").repeat(5000);
+		const start = Date.now();
+		const r = extractAttachmentPaths(bigLog, { live: true });
+		const ms = Date.now() - start;
+		assert.equal(r.staged.length, 0, "a huge paste must not be scanned for paths");
+		assert.equal(r.text, bigLog, "and must be returned untouched");
+		assert.ok(ms < 20, `live parse of a big paste must be instant, was ${ms}ms`);
+	});
+
+	it("does NOT resolve a typed @mention against the cwd while typing", () => {
+		// The module's own stated worst case. `@package.json` names a real cwd file,
+		// but a typed mention must never be silently attached mid-keystroke.
+		const r = extractAttachmentPaths("ping @package.json about it", { live: true });
+		assert.equal(r.staged.length, 0);
+		assert.equal(r.text, "ping @package.json about it");
+	});
+
+	it("does NOT stage a relative word on the live path", () => {
+		const r = extractAttachmentPaths("package.json", { live: true });
+		assert.equal(r.staged.length, 0);
+	});
+});

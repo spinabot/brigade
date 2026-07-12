@@ -65,6 +65,14 @@ const EMPTY: ClipboardSnapshot = { files: [], text: "", formats: [] };
  */
 const WINDOWS_WORKER = String.raw`
 $ErrorActionPreference = 'SilentlyContinue'
+# FORCE UTF-8 on stdout. Windows PowerShell 5.1 writes a REDIRECTED console in the
+# OEM code page (CP437/CP1252), NOT UTF-8 — so a path or clipboard text containing
+# any non-ASCII byte (C:\Users\Björn\…, résumé.pdf, any CJK name) arrives at Node
+# as invalid UTF-8 and every such byte becomes U+FFFD. The screenshot then fails to
+# attach because the path we echoed back no longer names a real file. One line fixes
+# every non-English Windows install.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 Add-Type @"
 using System;
@@ -102,6 +110,13 @@ function Save-ClipImage([string]$dest) {
 # data yet, the worker blocked here forever and never announced itself — which the
 # operator experienced as "the clipboard is slow". A StreamReader over the raw
 # stdin handle is genuinely async.
+# Where PUSHED (auto-attach) images are written. Passed in as argv[0] so it lands
+# in the SAME directory the Node side sweeps after 24h — writing them to $env:TEMP
+# (its parent) meant every screenshot ever copied leaked a full-size PNG that
+# nothing ever deleted.
+$spool = $args[0]
+if ([string]::IsNullOrEmpty($spool)) { $spool = $env:TEMP }
+
 $stdin = New-Object System.IO.StreamReader([Console]::OpenStandardInput())
 $pending = $stdin.ReadLineAsync()
 $last = [BrigadeClip]::GetClipboardSequenceNumber()
@@ -145,7 +160,7 @@ while ($true) {
     $last = $n
     try {
       if ([Windows.Forms.Clipboard]::ContainsImage()) {
-        $p = Join-Path $env:TEMP ("brigade-clip-" + $n + ".png")
+        $p = Join-Path $spool ("clipboard-" + $n + ".png")
         $saved = Save-ClipImage $p
         if ($saved) { Emit ('IMAGE ' + $saved) }
       }
@@ -306,6 +321,28 @@ while IFS= read -r line; do
 done
 `.trim();
 
+/**
+ * Every live worker, so none can outlive the process that started it.
+ *
+ * `unref()` stops the worker from KEEPING Node alive — but it does not make Node
+ * kill it on the way out, and a non-detached child is not reaped automatically on
+ * Windows. Without this, every `brigade tui` that exited would leave a PowerShell
+ * behind, polling the clipboard forever, and after a week of use the operator
+ * would have a dozen of them and no idea why. `process.on("exit")` fires for every
+ * exit path — normal return, an uncaught throw, an explicit `process.exit()` — and
+ * the signal handlers in `terminal-cleanup.ts` funnel SIGINT/SIGTERM into it too.
+ */
+const LIVE_WORKERS = new Set<ClipboardWorker>();
+let reaperInstalled = false;
+
+function installReaper(): void {
+	if (reaperInstalled) return;
+	reaperInstalled = true;
+	process.on("exit", () => {
+		for (const w of LIVE_WORKERS) w.kill();
+	});
+}
+
 /** What a worker line turned out to mean. */
 export type WorkerEvent =
 	| { type: "ready" }
@@ -423,6 +460,10 @@ export class ClipboardWorker {
 	private nextId = 1;
 	private onImage: ((imagePath: string) => void) | undefined;
 	private dead = false;
+	/** The mkdtemp dir holding the worker script; removed on kill. */
+	private scriptDir: string | undefined;
+	/** Where auto-attach (pushed) images are written; passed to the worker as argv[0]. */
+	private spoolDir: string | undefined;
 	/** Whatever the worker last printed on stderr — the reason it is not answering. */
 	lastError = "";
 	/**
@@ -449,9 +490,12 @@ export class ClipboardWorker {
 	 * Start the worker. `onImage` is pushed a path whenever an image lands on the
 	 * clipboard — that is the auto-attach channel, and it costs Node nothing.
 	 */
-	start(onImage?: (imagePath: string) => void): void {
+	start(onImage?: (imagePath: string) => void, spoolDir?: string): void {
 		if (this.child) return;
 		this.onImage = onImage;
+		this.spoolDir = spoolDir;
+		installReaper();
+		LIVE_WORKERS.add(this);
 		// Build the readiness promise with LOCALS. Referring to `this.ready` inside its
 		// own executor reads the PREVIOUS promise — which cleared the boot timer the
 		// instant it was set, so readiness could never resolve and every snapshot
@@ -477,14 +521,23 @@ export class ClipboardWorker {
 			// died silently on a parse error and never announced itself, which read
 			// exactly like "the clipboard is slow". A file has no quoting layer at all.
 			const win = process.platform === "win32";
-			const scriptPath = path.join(
-				os.tmpdir(),
-				win ? "brigade-clipboard-worker.ps1" : "brigade-clipboard-worker.sh",
+			// SECURE the script's temp location. A fixed name in a world-writable /tmp
+			// (mode 1777) lets a local attacker pre-create or symlink that path — the
+			// sticky bit stops deletion but NOT creation — and then swap the file
+			// between our write and our spawn, running arbitrary code as the operator.
+			// `mkdtempSync` creates a fresh directory with a random suffix, owned by us
+			// at mode 0700, so there is no name to pre-claim.
+			this.scriptDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-clip-"));
+			const scriptPath = path.join(this.scriptDir, win ? "worker.ps1" : "worker.sh");
+			// A BOM on Windows: `powershell.exe -File` decodes a BOM-less file as the
+			// ANSI code page, so the day this script grows a non-ASCII character outside
+			// a comment (POSIX already has `«class PNGf»`) it would fail to parse. The
+			// BOM makes the decode unambiguous.
+			fs.writeFileSync(
+				scriptPath,
+				win ? `﻿${WINDOWS_WORKER}` : POSIX_WORKER,
+				win ? { encoding: "utf8" } : { encoding: "utf8", mode: 0o700 },
 			);
-			fs.writeFileSync(scriptPath, win ? WINDOWS_WORKER : POSIX_WORKER, {
-				encoding: "utf8",
-				...(win ? {} : { mode: 0o700 }),
-			});
 
 			const [bin, args] = win
 				? ([
@@ -502,14 +555,22 @@ export class ClipboardWorker {
 							scriptPath,
 						],
 					] as const)
-				: // `bash`, not `sh`: the script uses `${var#prefix}` / `${var%%suffix}`
-					// parameter expansion and `command -v`, and Debian's `sh` is dash.
+				: // `bash`, not `sh`: the script uses `command -v` and `set --` parsing,
+					// and Debian's `sh` is dash.
 					(["bash", [scriptPath, process.platform]] as const);
 
 			this.child = spawn(bin, [...args], {
 				stdio: ["pipe", "pipe", "pipe"],
 				windowsHide: true,
 			});
+			// unref the PIPES too, not just the process handle. `child.unref()` alone
+			// leaves the stdout/stderr libuv handles ref'd (attaching a 'data' listener
+			// resumes them), so a consumer that lets Node exit naturally — a test, an
+			// embedding — would hang on this never-exiting child. The reaper kills the
+			// process on exit; this lets the loop drain so exit can happen at all.
+			(this.child.stdout as { unref?: () => void } | undefined)?.unref?.();
+			(this.child.stderr as { unref?: () => void } | undefined)?.unref?.();
+			(this.child.stdin as { unref?: () => void } | undefined)?.unref?.();
 			// A worker that by design never exits must never be the reason the process
 			// stays alive. This hung the whole test suite once.
 			this.child.unref();
@@ -563,6 +624,11 @@ export class ClipboardWorker {
 	 * One call, one answer. The old shape asked four separate questions down four
 	 * separate PowerShell spawns — which is why a paste felt like it hung.
 	 */
+	/** Resolves true once the worker is answering, false if it never started. */
+	whenReady(): Promise<boolean> {
+		return this.ready;
+	}
+
 	async snapshot(imageDest: string, timeoutMs = 5000): Promise<ClipboardSnapshot> {
 		// Wait for boot. Skipping this is what made the first paste of a session time
 		// out, and then handed its late reply to whoever asked next.
@@ -591,6 +657,15 @@ export class ClipboardWorker {
 
 	kill(): void {
 		this.dead = true;
+		LIVE_WORKERS.delete(this);
+		if (this.scriptDir) {
+			try {
+				fs.rmSync(this.scriptDir, { recursive: true, force: true });
+			} catch {
+				/* best-effort */
+			}
+			this.scriptDir = undefined;
+		}
 		this.markReady(false);
 		for (const resolve of this.inflight.values()) resolve(EMPTY);
 		this.inflight.clear();

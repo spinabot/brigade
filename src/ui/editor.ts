@@ -66,6 +66,8 @@ const NO_REQUIRED_ARG = new Set([
 	"paste", // no arg — reads the clipboard
 	"attach", // [<path>] — optional (no arg lists what's staged)
 	"detach", // [<n>|all] — optional (no arg detaches everything)
+	"clipboard", // no arg — diagnose
+	"clip", // alias
 ]);
 
 export class BrigadeEditor extends Editor {

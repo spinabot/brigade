@@ -355,6 +355,19 @@ export interface ExtractedAttachments {
  * /etc/hosts on Linux (it exists! an existence-only rule attaches it) and stops
  * `edit "package.json"` from attaching a cwd-relative file out of a quoted word.
  */
+/**
+ * The longest line the LIVE (per-keystroke) parser will look at.
+ *
+ * A dropped or copied path is short — even a deep Windows path is a few hundred
+ * characters. A pasted log, diff, or JSON blob is not, and running the full
+ * six-pattern parse over it on EVERY keystroke costs 200-400 ms per key (measured
+ * on a 1 MB paste). That is the entire "the clipboard feels slow" complaint, and
+ * it isn't the clipboard at all — it's the editor re-scanning a megabyte per
+ * keypress. The submit-time parse still runs on the whole thing exactly once; only
+ * the live path is capped.
+ */
+const MAX_LIVE_PARSE_CHARS = 4096;
+
 export function extractAttachmentPaths(
 	line: string,
 	opts?: {
@@ -365,12 +378,37 @@ export function extractAttachmentPaths(
 		 * the operator typed. Pills are stripped again before the turn is sent.
 		 */
 		pill?: boolean;
+		/**
+		 * LIVE mode — this runs on every editor keystroke, so it must be cheap and
+		 * must never rewrite text the operator is still typing. It does ONLY the one
+		 * thing a drop needs: recognise a whole-line ABSOLUTE path. It does not run the
+		 * six-pattern tokeniser, does not resolve `@`-tokens against the cwd (a typed
+		 * `@name` mention that happens to match a cwd file must not be silently
+		 * attached — the module's own worst-case), and does not scan prose. The full
+		 * parse still runs once at submit; this is just the instant-feedback path for a
+		 * dropped file.
+		 */
+		live?: boolean;
 	},
 ): ExtractedAttachments {
 	const staged: StagedAttachment[] = [];
 	const seen = new Set<string>();
 	const label = (name: string): string => (opts?.pill ? `[${name}]` : name);
 	let text = line;
+
+	if (opts?.live) {
+		// Too long to be a path → it's a paste; leave it entirely alone and pay
+		// nothing. This is the guard that removes the per-keystroke stall.
+		if (line.length > MAX_LIVE_PARSE_CHARS) return { text: line, staged: [] };
+		// A drop arrives as a whole-line absolute path (optionally quoted). That is the
+		// ONLY thing the live path stages — nothing relative, nothing from prose.
+		const whole = line.trim().replace(/^["'](.*)["']$/, "$1");
+		if (whole && path.isAbsolute(expandHome(whole))) {
+			const att = stageAttachment(whole);
+			if (att) return { text: label(att.fileName), staged: [att] };
+		}
+		return { text: line, staged: [] };
+	}
 
 	// WHOLE-LINE PATH — checked before any tokenising, because tokenising is exactly
 	// what breaks here.

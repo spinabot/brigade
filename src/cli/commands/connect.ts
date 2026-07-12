@@ -61,6 +61,7 @@ import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
 import { DEFAULT_AGENT_ID } from "../../config/paths.js";
 import { loadConfig } from "../../core/config.js";
+import { getBuildInfo } from "../../version.js";
 import { resolveClientToken } from "../../core/gateway-auth.js";
 import { asstKey, clipOneLine, extractUserText } from "./connect-transcript.js";
 import { UPDATE_PRESERVES_MESSAGE } from "../../core/update-check.js";
@@ -775,6 +776,10 @@ export async function wireConnectUi(
 		{
 			name: "paste",
 			description: "attach the image or file on your clipboard (screenshot → paste)",
+		},
+		{
+			name: "clipboard",
+			description: "diagnose the clipboard: build, worker health, and what it holds",
 		},
 		{
 			name: "detach",
@@ -2329,6 +2334,108 @@ export async function wireConnectUi(
 	});
 
 	/**
+	 * The image you copied BEFORE you opened Brigade.
+	 *
+	 * The watcher fires on clipboard CHANGE, which is right — silently attaching an
+	 * image that was already sitting there when the TUI opened would mean a picture
+	 * you copied an hour ago, for something else entirely, riding your first message.
+	 * But the natural order of events is "take a screenshot, THEN open the terminal",
+	 * and under a change-only rule that image is invisible and the operator concludes
+	 * the feature is broken.
+	 *
+	 * So: notice it, and OFFER it. Never attach it. Fire-and-forget — the TUI must
+	 * not wait on a clipboard read to become usable.
+	 */
+	if (gatewayIsLocal) {
+		void (async () => {
+			try {
+				const { staged } = await readClipboardAttachments();
+				const img = staged.find((s) => s.kind === "image");
+				if (!img || stagedAttachments.length > 0) return;
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim("📋 there's an image on your clipboard —")} ${brand.amber("/paste")} ${brand.dim("to attach it.")}`,
+						0,
+						0,
+					),
+				);
+				tui.requestRender();
+			} catch {
+				/* a clipboard we can't read is not worth a word to the operator */
+			}
+		})();
+	}
+
+	/**
+	 * `/clipboard` — say exactly what Brigade sees, and which build is saying it.
+	 *
+	 * This exists because the single most expensive failure in this feature was not a
+	 * bug: it was not knowing WHICH BUILD was running. The TUI is a thin client, the
+	 * gateway is a long-lived daemon, and the globally-installed `brigade` is a third
+	 * binary again — so "it doesn't work" and "it works on my machine" were both true
+	 * at the same time, repeatedly, and we chased ghosts for hours.
+	 *
+	 * One command that prints the build stamp, whether the fast clipboard worker is
+	 * alive, and what the clipboard actually holds, ends that whole class of argument.
+	 */
+	const showClipboardDiagnostics = async (): Promise<void> => {
+		const build = getBuildInfo();
+		const stamp = build.head ? `${build.version} (${build.head.slice(0, 7)})` : build.version;
+		insertBeforeEditor(new Text(`  ${brand.dim("build   :")} ${brand.white(stamp)}`, 0, 0));
+		insertBeforeEditor(
+			new Text(
+				`  ${brand.dim("gateway :")} ${brand.white(gatewayHost)} ${gatewayIsLocal ? brand.dim("(local — attachments enabled)") : brand.error("(remote — attachments disabled)")}`,
+				0,
+				0,
+			),
+		);
+		insertBeforeEditor(new Text(`  ${brand.dim("reading clipboard…")}`, 0, 0));
+		tui.requestRender();
+
+		const started = Date.now();
+		const { staged, reason } = await readClipboardAttachments();
+		const ms = Date.now() - started;
+		insertBeforeEditor(
+			new Text(
+				`  ${brand.dim("clipboard read in")} ${brand.white(`${ms} ms`)} ${brand.dim(ms > 800 ? "(slow — the fast worker did not start)" : "(fast worker)")}`,
+				0,
+				0,
+			),
+		);
+		if (staged.length > 0) {
+			for (const s of staged) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.amber("✓")} ${attachmentIcon(s.kind)} ${brand.white(s.fileName)} ${brand.dim(`${s.kind} · ${formatAttachmentBytes(s.bytes)}`)} ${brand.dim("— attachable")}`,
+						0,
+						0,
+					),
+				);
+			}
+			insertBeforeEditor(
+				new Text(`  ${brand.dim("run")} ${brand.amber("/paste")} ${brand.dim("to attach.")}`, 0, 0),
+			);
+		} else {
+			insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.dim(reason ?? "nothing attachable.")}`, 0, 0));
+		}
+		insertBeforeEditor(
+			new Text(
+				`  ${brand.dim("note: Ctrl+V is consumed by your terminal (it binds it to its own paste), so Brigade")}`,
+				0,
+				0,
+			),
+		);
+		insertBeforeEditor(
+			new Text(
+				`  ${brand.dim("never receives the key. Use")} ${brand.amber("/paste")}${brand.dim(", or just take a screenshot — it attaches itself.")}`,
+				0,
+				0,
+			),
+		);
+		tui.requestRender();
+	};
+
+	/**
 	 * DRAG-AND-DROP, resolved the instant the file lands.
 	 *
 	 * A terminal answers a dropped file by pasting its PATH into stdin as text. The
@@ -2352,7 +2459,10 @@ export async function wireConnectUi(
 		// Cheap pre-filter: a path needs a separator. Skips the regex + stat work on
 		// the overwhelming majority of keystrokes, which are ordinary prose.
 		if (!/[\\/]/.test(line)) return;
-		const { text: pilled, staged } = extractAttachmentPaths(line, { pill: true });
+		// LIVE mode: length-capped, absolute-path-only. See the option's doc — this is
+		// what stops a pasted log from costing 200-400 ms per keystroke, and stops a
+		// typed `@mention` from silently attaching a cwd file while you type.
+		const { text: pilled, staged } = extractAttachmentPaths(line, { pill: true, live: true });
 		if (staged.length === 0) return;
 		if (stagePaths(staged.map((s) => s.path)) === 0) return;
 		// setText re-enters handleInput's change check; the flag keeps us from
@@ -3093,6 +3203,13 @@ export async function wireConnectUi(
 			const [gone] = stagedAttachments.splice(idx - 1, 1);
 			renderAttachBar();
 			insertBeforeEditor(new Text(`  ${brand.dim(`detached ${gone?.fileName ?? ""}.`)}`, 0, 0));
+			return;
+		}
+
+		// /clipboard — what does Brigade actually see, and which build is saying so.
+		if (trimmed === "/clipboard" || trimmed === "/clip") {
+			editor.setText("");
+			await showClipboardDiagnostics();
 			return;
 		}
 

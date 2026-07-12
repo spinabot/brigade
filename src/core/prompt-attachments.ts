@@ -134,6 +134,14 @@ const TEXT_INLINE_EXT: ReadonlySet<string> = new Set([
  */
 export const MAX_INLINE_TEXT_BYTES = 256 * 1024;
 
+/**
+ * Ceiling on TOTAL inlined text across every attachment on one turn. ~512 KB ≈
+ * 128K tokens — the per-file cap × 2, which keeps even a full set of text files
+ * comfortably inside a modern context window instead of eight separate 256 KB
+ * files summing to half a million tokens.
+ */
+export const MAX_TOTAL_INLINE_TEXT_BYTES = 512 * 1024;
+
 function isTextLike(m: InboundMediaAttachment): boolean {
 	if (m.kind !== "document") return false;
 	const base = path.basename(m.path).toLowerCase();
@@ -144,36 +152,72 @@ function isTextLike(m: InboundMediaAttachment): boolean {
 }
 
 /**
+ * Decode a text file's bytes, honouring the few encodings a Windows-first world
+ * actually produces. Returns null when the bytes are BINARY — an extension in the
+ * text list is a hint, not a guarantee (`.ts` is TypeScript AND MPEG transport
+ * stream; a `.h` can be a firmware blob), and inlining a binary as UTF-8 hands the
+ * model a screenful of mojibake.
+ */
+function decodeTextFile(buf: Buffer): string | null {
+	// BOM sniff first — Excel and Notepad on Windows emit UTF-16LE by default, and
+	// reading that as UTF-8 yields `n\0a\0m\0e\0`, pure noise.
+	if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) return buf.toString("utf16le");
+	if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+		return buf.subarray(3).toString("utf8");
+	}
+	// A NUL byte in the first block is the classic "this is binary" tell. UTF-16
+	// without a BOM also trips this, and that's fine — we'd rather decline than inline
+	// garbage; the agent still gets the path note and can reach for a tool.
+	const scan = buf.subarray(0, Math.min(buf.length, 8192));
+	if (scan.includes(0)) return null;
+	return buf.toString("utf8");
+}
+
+/**
  * Read a text attachment into a fenced block the model can just… read.
  *
- * Not wrapped in the untrusted-content envelope: the operator picked this file
- * off their own disk, which is exactly the trust position of the `read` tool,
- * and `read` doesn't wrap either. Wrapping here would be inconsistent theatre.
+ * Not wrapped in the untrusted-content envelope: the operator picked this file off
+ * their own disk, which is the trust position of the `read` tool, and `read`
+ * doesn't wrap either.
  */
 async function inlineTextAttachment(m: InboundMediaAttachment): Promise<string> {
-	let body: string;
+	const name = m.fileName ?? path.basename(m.path);
+	const stub = (why: string): string => `[attached file → ${m.path}] (${why})`;
+
+	let raw: Buffer;
 	try {
 		const fh = await fsp.open(m.path, "r");
 		try {
-			const buf = Buffer.alloc(MAX_INLINE_TEXT_BYTES);
-			const { bytesRead } = await fh.read(buf, 0, MAX_INLINE_TEXT_BYTES, 0);
-			body = buf.subarray(0, bytesRead).toString("utf8");
+			const b = Buffer.alloc(MAX_INLINE_TEXT_BYTES);
+			const { bytesRead } = await fh.read(b, 0, MAX_INLINE_TEXT_BYTES, 0);
+			raw = b.subarray(0, bytesRead);
 		} finally {
 			await fh.close();
 		}
 	} catch {
-		// Unreadable → fall back to the path stub so the agent can still try a tool.
-		return `[attached file → ${m.path}] (could not be read inline)`;
+		return stub("could not be read inline");
 	}
+
+	const body = decodeTextFile(raw);
+	if (body === null) return stub(`looks binary — use analyze_media on ${m.path}`);
 
 	const st = await fsp.stat(m.path).catch(() => null);
 	const truncated = st !== null && st.size > MAX_INLINE_TEXT_BYTES;
-	const name = m.fileName ?? path.basename(m.path);
 	const head = `[attached file: ${name} → ${m.path}]`;
 	const tail = truncated
 		? `\n… truncated at ${formatBytes(MAX_INLINE_TEXT_BYTES)} of ${formatBytes(st.size)} — read ${m.path} for the rest.`
 		: "";
-	return `${head}\n\`\`\`\n${body}\n\`\`\`${tail}`;
+
+	// FENCE SAFELY. A file whose content contains ``` would otherwise close our own
+	// fence, and everything after it — including anything crafted like "IGNORE PRIOR
+	// INSTRUCTIONS" — would land as top-level, model-directed text. CommonMark's own
+	// rule is the fix: an opening fence must be LONGER than any backtick run inside
+	// the block. So we count the longest run of backticks in the body and fence with
+	// one more than that. The file's content can no longer break out.
+	let longestTicks = 0;
+	for (const run of body.match(/`+/g) ?? []) longestTicks = Math.max(longestTicks, run.length);
+	const fence = "`".repeat(Math.max(3, longestTicks + 1));
+	return `${head}\n${fence}\n${body}\n${fence}${tail}`;
 }
 
 /** An attachment we refused, and why — surfaced to the operator verbatim. */
@@ -352,7 +396,23 @@ export async function composeAttachmentTurn(
 					config: deps.config,
 				})
 			: "";
-	const inlined = await Promise.all(textDocs.map((m) => inlineTextAttachment(m)));
+	// AGGREGATE cap across all inlined text. The per-file 256 KB bound protects
+	// against one giant log; it does nothing against eight of them. 8 × 256 KB ≈ 525K
+	// tokens — several times any context window. So stop inlining once the running
+	// total would exceed the ceiling, and turn the rest into a path note the agent can
+	// `read` on purpose. (Images already have their own aggregate guard in
+	// media-capture; this is the text equivalent.)
+	const inlined: string[] = [];
+	let inlinedBytes = 0;
+	for (const m of textDocs) {
+		if (inlinedBytes >= MAX_TOTAL_INLINE_TEXT_BYTES) {
+			inlined.push(`[attached file → ${m.path}] (read it — the turn's inline-text budget was full)`);
+			continue;
+		}
+		const block = await inlineTextAttachment(m);
+		inlinedBytes += Buffer.byteLength(block, "utf8");
+		inlined.push(block);
+	}
 
 	// Note + inlined files FIRST, the operator's words LAST — the same order the
 	// channel inbound pipeline composes, so the model sees an identical layout
