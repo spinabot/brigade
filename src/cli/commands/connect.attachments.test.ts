@@ -283,3 +283,38 @@ describe("TUI attachments — a drop must work however the terminal delivers it"
 		assert.equal(editor.getText(), "/model");
 	});
 });
+
+/**
+ * Ctrl+V for an image — the Claude-CLI model. The terminal handles the Ctrl+V key
+ * itself but still emits a PASTE EVENT (bracketed paste). The editor reacts to
+ * that event, reads the clipboard, and attaches any image found. This test proves
+ * the wiring fires; the actual clipboard read is exercised live in dev.
+ */
+describe("TUI attachments — Ctrl+V fires the paste hook", () => {
+	it("a bracketed paste triggers onPaste (the clipboard-image check)", async () => {
+		const { editor } = await bootUi();
+		let fired = 0;
+		(editor as unknown as { onPaste?: () => void }).onPaste = () => {
+			fired++;
+		};
+		// EXACTLY what a terminal sends on Ctrl+V: bracketed-paste markers.
+		editor.handleInput("\x1b[200~\x1b[201~");
+		assert.equal(fired, 1, "a bracketed paste must fire the paste hook");
+	});
+
+	it("the pasted TEXT still lands in the editor (paste is not swallowed)", async () => {
+		const { editor } = await bootUi();
+		editor.handleInput("\x1b[200~hello world\x1b[201~");
+		assert.match(editor.getText(), /hello world/);
+	});
+
+	it("ordinary typing does NOT fire the paste hook", async () => {
+		const { editor } = await bootUi();
+		let fired = 0;
+		(editor as unknown as { onPaste?: () => void }).onPaste = () => {
+			fired++;
+		};
+		for (const ch of "just typing") editor.handleInput(ch);
+		assert.equal(fired, 0);
+	});
+});

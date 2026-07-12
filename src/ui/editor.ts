@@ -118,6 +118,23 @@ export class BrigadeEditor extends Editor {
 	 */
 	onTextChanged?: () => void;
 
+	/**
+	 * Fired on a PASTE gesture — a bracketed paste (`\x1b[200~…`), which is what the
+	 * terminal emits when the operator presses Ctrl+V (or Ctrl+Shift+V).
+	 *
+	 * This is how Ctrl+V attaches an image, and it is exactly how Claude Code does
+	 * it: you don't intercept the KEY (the terminal consumes it), you react to the
+	 * paste EVENT the terminal sends, and at that moment you check the clipboard for
+	 * an image. The real binary carries the same trio — `onPaste`, `isPasting`, and a
+	 * clipboard `GetImage()` on paste.
+	 *
+	 * The text portion of the paste (if any) still flows into the editor normally;
+	 * this fires ALONGSIDE that, so a text paste is unaffected and an image paste
+	 * gets attached. Fires even for an empty paste, because an image-only clipboard
+	 * pastes no text but still sends the bracketed markers.
+	 */
+	onPaste?: () => void;
+
 	override handleInput(data: string): void {
 		// `BRIGADE_DEBUG_INPUT=1` appends every raw input chunk to a trace file.
 		//
@@ -127,6 +144,11 @@ export class BrigadeEditor extends Editor {
 		// we find out what their terminal ACTUALLY sends instead of reasoning about
 		// what it ought to.
 		if (process.env.BRIGADE_DEBUG_INPUT) traceInput(data);
+
+		// A PASTE just arrived. Fire the paste hook (which checks the clipboard for an
+		// image) and STILL fall through so the base editor inserts any pasted text —
+		// the two are complementary: text lands in the editor, an image gets attached.
+		if (data.includes("\x1b[200~") && this.onPaste) this.onPaste();
 
 		// Ctrl+V (0x16) and Alt+V (ESC v) both mean "paste an image from the clipboard".
 		//

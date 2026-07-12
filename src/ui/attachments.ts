@@ -51,11 +51,8 @@ import {
 	clipboardSpoolDir,
 	startClipboardService,
 	type ClipboardService,
-	type ClipboardWatcher,
 } from "./clipboard.js";
 import type { PromptAttachment } from "../protocol.js";
-
-export type { ClipboardWatcher } from "./clipboard.js";
 
 /** A file staged for the next turn, plus the display facts the chip tray needs. */
 export interface StagedAttachment {
@@ -566,15 +563,12 @@ function spoolPath(): string {
  * pipe that is already open.
  */
 let service: ClipboardService | undefined;
-let serviceOnImage: ((att: StagedAttachment) => void) | undefined;
 
 function clipboard(): ClipboardService {
-	if (!service) {
-		service = startClipboardService((imagePath) => {
-			const att = stageAttachment(imagePath);
-			if (att) serviceOnImage?.(att);
-		});
-	}
+	// Started with NO on-image push callback: attachment is PASTE-triggered now (the
+	// `onPaste` hook reads the clipboard when the terminal reports a paste), so the
+	// worker only needs its fast request/response read channel, never the push loop.
+	if (!service) service = startClipboardService();
 	return service;
 }
 
@@ -629,34 +623,28 @@ export async function readClipboardAttachments(): Promise<{
 }
 
 /**
- * AUTO-ATTACH: hand back every image that lands on the clipboard from now on.
+ * Pre-boot the clipboard worker so the FIRST paste is fast.
  *
- * This is the answer to "I should just be able to paste, without a command", and
- * it exists because Ctrl+V CANNOT be made to work. Windows Terminal's own
- * settings.json binds `ctrl+v` to `Terminal.PasteFromClipboard`; the terminal
- * consumes the key, and its paste inserts the clipboard's TEXT — which a
- * screenshot does not have. Nothing is sent, so there is no keystroke to hook.
+ * Ctrl+V attaches an image via the PASTE-triggered path (`onPaste` →
+ * `readClipboardAttachments`), exactly like Claude Code: react to the paste event
+ * the terminal emits and read the clipboard then. That read goes through the
+ * persistent worker; warming it at startup means the first Ctrl+V pays no boot
+ * latency. No-op off a TTY, so tests and pipes never spawn a worker.
  *
- * The worker pushes the SAVED path, so an auto-attach costs Node nothing at all:
- * no spawn, no poll, no clipboard read on our side.
+ * Deliberately NO copy-watcher. Attaching on COPY (my earlier design) double-
+ * attaches with the paste path and surprises the operator with images they copied
+ * for unrelated reasons. Paste is the intent signal, and it is the one Claude Code
+ * uses.
  */
-export function watchClipboardImages(
-	onImage: (att: StagedAttachment) => void,
-): ClipboardWatcher {
-	// No terminal, no watcher. This is a convenience for a human sitting in front of
-	// a TUI; there is nobody to convenience in a test, a pipe or a cron run — and a
-	// never-exiting child process in those contexts is how you hang a suite (it did)
-	// or leak a process nobody knows to kill.
-	if (!process.stdout.isTTY) return { stop: () => {} };
-	serviceOnImage = onImage;
-	clipboard(); // starts the worker + its push channel
-	return {
-		stop: () => {
-			service?.stop();
-			service = undefined;
-			serviceOnImage = undefined;
-		},
-	};
+export function warmClipboard(): void {
+	if (!process.stdout.isTTY) return;
+	clipboard();
+}
+
+/** Stop the clipboard worker and reset the singleton. Idempotent. */
+export function stopClipboard(): void {
+	service?.stop();
+	service = undefined;
 }
 
 function stageAll(lines: string[]): StagedAttachment[] {

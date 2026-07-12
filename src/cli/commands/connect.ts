@@ -40,8 +40,9 @@ import {
 	MAX_STAGED_ATTACHMENTS,
 	readClipboardAttachments,
 	stageAttachment,
+	stopClipboard,
 	toPromptAttachments,
-	watchClipboardImages,
+	warmClipboard,
 	type StagedAttachment,
 } from "../../ui/attachments.js";
 import { PROVIDERS, findProvider } from "../../providers/catalog.js";
@@ -906,7 +907,7 @@ export async function wireConnectUi(
 	);
 	tui.addChild(
 		new Text(
-			brand.dim("  Enter to send · Ctrl+C abort · attach: drag a file · @path · paste a path · screenshot → /paste · /help"),
+			brand.dim("  Enter to send · Ctrl+C abort · attach: drag a file · @path · Ctrl+V an image · /help"),
 			0,
 			0,
 		),
@@ -2296,10 +2297,47 @@ export async function wireConnectUi(
 		tui.requestRender();
 	};
 
-	// Ctrl+V / Alt+V. Ctrl+V only reaches us in terminals that don't bind it to their
-	// own paste (Windows Terminal and VS Code both do). See `BrigadeEditor.onImagePaste`.
+	// Ctrl+V / Alt+V raw keystroke — reaches us only in terminals that DON'T bind
+	// Ctrl+V to their own paste. See `BrigadeEditor.onImagePaste`.
 	editor.onImagePaste = () => {
 		void pasteFromClipboard({ quiet: false });
+	};
+
+	/**
+	 * THE Ctrl+V image path, and the one that actually matters on Windows Terminal
+	 * and VS Code — where the terminal handles Ctrl+V itself but still emits a paste
+	 * EVENT (bracketed paste). This is precisely how Claude Code does it: react to the
+	 * paste, read the clipboard, attach any image found.
+	 *
+	 * IMAGE ONLY, quiet, non-blocking:
+	 *   • a plain TEXT paste already landed in the editor via the terminal — we must
+	 *     not also stage anything from it here (a pasted file PATH is handled by
+	 *     `onTextChanged`), so we look for an image and nothing else;
+	 *   • quiet, because most pastes are text and "nothing to attach" on every paste
+	 *     would be noise;
+	 *   • non-blocking, so a normal text paste is never slowed by a clipboard read.
+	 */
+	editor.onPaste = () => {
+		if (!gatewayIsLocal) return;
+		void (async () => {
+			try {
+				const { staged } = await readClipboardAttachments();
+				const img = staged.find((s) => s.kind === "image");
+				if (!img) return;
+				if (stagedAttachments.some((s) => s.path === img.path)) return;
+				if (stagePaths([img.path]) === 0) return;
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.amber("📋")} ${brand.dim("image attached from your paste —")} ${brand.amber("/detach")} ${brand.dim("if you didn't mean to.")}`,
+						0,
+						0,
+					),
+				);
+				tui.requestRender();
+			} catch {
+				/* a clipboard we can't read is not worth a word on a routine paste */
+			}
+		})();
 	};
 
 	/**
@@ -2319,52 +2357,10 @@ export async function wireConnectUi(
 	 * copied for some entirely unrelated reason must not sneak into your next
 	 * message without you noticing, and `/detach` is one word away.
 	 */
-	const clipboardWatcher = watchClipboardImages((att) => {
-		if (!gatewayIsLocal) return;
-		if (stagedAttachments.some((s) => s.path === att.path)) return;
-		if (stagePaths([att.path]) === 0) return;
-		insertBeforeEditor(
-			new Text(
-				`  ${brand.amber("📋")} ${brand.dim("image from your clipboard attached —")} ${brand.amber("/detach")} ${brand.dim("if you didn't mean to.")}`,
-				0,
-				0,
-			),
-		);
-		tui.requestRender();
-	});
-
-	/**
-	 * The image you copied BEFORE you opened Brigade.
-	 *
-	 * The watcher fires on clipboard CHANGE, which is right — silently attaching an
-	 * image that was already sitting there when the TUI opened would mean a picture
-	 * you copied an hour ago, for something else entirely, riding your first message.
-	 * But the natural order of events is "take a screenshot, THEN open the terminal",
-	 * and under a change-only rule that image is invisible and the operator concludes
-	 * the feature is broken.
-	 *
-	 * So: notice it, and OFFER it. Never attach it. Fire-and-forget — the TUI must
-	 * not wait on a clipboard read to become usable.
-	 */
-	if (gatewayIsLocal) {
-		void (async () => {
-			try {
-				const { staged } = await readClipboardAttachments();
-				const img = staged.find((s) => s.kind === "image");
-				if (!img || stagedAttachments.length > 0) return;
-				insertBeforeEditor(
-					new Text(
-						`  ${brand.dim("📋 there's an image on your clipboard —")} ${brand.amber("/paste")} ${brand.dim("to attach it.")}`,
-						0,
-						0,
-					),
-				);
-				tui.requestRender();
-			} catch {
-				/* a clipboard we can't read is not worth a word to the operator */
-			}
-		})();
-	}
+	// Pre-boot the clipboard worker so the FIRST Ctrl+V is instant. The paste itself
+	// does the attaching, via `editor.onPaste` above — this just means the worker is
+	// already warm when that first paste arrives.
+	if (gatewayIsLocal) warmClipboard();
 
 	/**
 	 * `/clipboard` — say exactly what Brigade sees, and which build is saying it.
@@ -2420,21 +2416,14 @@ export async function wireConnectUi(
 		}
 		insertBeforeEditor(
 			new Text(
-				`  ${brand.dim("note: Ctrl+V pastes TEXT and copied file paths fine (your terminal does that itself,")}`,
+				`  ${brand.dim("note: Ctrl+V works for images — Brigade reads the clipboard on the paste event your")}`,
 				0,
 				0,
 			),
 		);
 		insertBeforeEditor(
 			new Text(
-				`  ${brand.dim("and Brigade auto-attaches a pasted path). It can't carry a raw screenshot — an image")}`,
-				0,
-				0,
-			),
-		);
-		insertBeforeEditor(
-			new Text(
-				`  ${brand.dim("has no text form, so take a screenshot and it auto-attaches, or use")} ${brand.amber("/paste")}${brand.dim(".")}`,
+				`  ${brand.dim("terminal sends, so a copied image attaches and pasted text still types.")} ${brand.amber("/paste")} ${brand.dim("is the same.")}`,
 				0,
 				0,
 			),
@@ -2567,9 +2556,9 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/thinking <level>")} — set reasoning effort (off|minimal|low|medium|high|xhigh)\n` +
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
 					`- ${chalk.bold("/attach [<path>]")} — attach a file to the next turn (no arg = show staged files)\n` +
-					`- ${chalk.bold("/paste")} — attach the image or file on your clipboard (screenshot → /paste)\n` +
-					`  ${brand.dim("Ctrl+V pastes text and copied file paths normally (Brigade auto-attaches a pasted path);")}\n` +
-					`  ${brand.dim("it just can't carry a raw screenshot. For a screenshot: take it and it auto-attaches, or /paste.")}\n` +
+					`- ${chalk.bold("/paste")} — attach the image or file on your clipboard\n` +
+					`  ${brand.dim("Ctrl+V just works: paste an image and it attaches, paste text and it types. /paste is the same,")}\n` +
+					`  ${brand.dim("as a typed command.")}\n` +
 					`- ${chalk.bold("/detach [<n>|all]")} — unstage an attached file\n` +
 					`  ${brand.dim("…or just type")} ${chalk.bold("@path/to/file")} ${brand.dim("in your message, or drag a file onto the terminal.")}\n` +
 						`- ${chalk.bold("/update")} — install a newer Brigade (sessions, memory and config are untouched)\n` +
@@ -3813,11 +3802,10 @@ export async function wireConnectUi(
 			return true;
 		},
 		close: async () => {
-			// The clipboard watcher is a long-lived child process. Leaving one behind on
-			// every TUI exit would quietly accumulate PowerShell processes polling the
-			// clipboard forever, which is exactly the kind of thing nobody notices until
-			// there are forty of them.
-			clipboardWatcher.stop();
+			// The clipboard worker is a long-lived child process. Stop it on exit — a
+			// process.on("exit") reaper is the backstop, but tearing it down here is the
+			// clean path.
+			stopClipboard();
 			client.close();
 		},
 	};
