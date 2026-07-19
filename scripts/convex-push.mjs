@@ -23,7 +23,13 @@ import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const DATA_DIR = join(ROOT, ".convex-data");
+// Honor the data dir `brigade convex` resolves + exports — matching
+// convex-dev.mjs. A GLOBAL install mints the self-hosted admin key at
+// ~/.brigade/convex/data (via BRIGADE_CONVEX_DATA_DIR); without reading it here,
+// `brigade convex dev`'s auto-push looked at <pkg>/.convex-data, missed the
+// admin key, and died with "No Convex target" — so the backend booted with ZERO
+// functions deployed and onboarding later crashed at health:ping.
+const DATA_DIR = process.env.BRIGADE_CONVEX_DATA_DIR?.trim() || join(ROOT, ".convex-data");
 
 // Pre-clean: compiled .js/.js.map artifacts INSIDE convex/ make the bundler
 // fail with "Two output files share the same path" (it treats both the .ts

@@ -335,34 +335,42 @@ async function pickConvexBackend(tui: TUI): Promise<string> {
 		tui.requestRender();
 
 		const probe = await probeConvexBackend(url);
-		tui.removeChild(loader);
-
 		if (!probe.ok) {
+			tui.removeChild(loader);
 			lastError = probe.reason;
+			continue;
+		}
+
+		// Reachability is necessary but NOT sufficient. A backend can be UP with
+		// ZERO Brigade functions deployed — a fresh self-hosted backend, or a
+		// cloud deployment before its first `convex:push`. boot() verifies
+		// `health:ping`, so WITHOUT this check the wizard sails past here, takes
+		// the encryption key, and only THEN crashes at boot with "functions aren't
+		// deployed" (the confusing mid-onboard exit). Check the SAME function boot
+		// checks, right here, so the failure is early and actionable.
+		loader.setMessage(`Checking Brigade functions on ${url}…`);
+		tui.requestRender();
+		const fnState = await probeFunctionsDeployed(url);
+		tui.removeChild(loader);
+		const cloud = isConvexCloudUrl(url);
+		// Local: reachability just passed, so an unverifiable functions endpoint
+		// almost certainly means they're missing — block. Cloud: block only on a
+		// DEFINITIVE not-deployed, so a live deployment whose anonymous HTTP query
+		// we can't fully vouch for still proceeds (boot surfaces any real problem).
+		if (fnState === "not-deployed" || (!cloud && fnState === "unknown")) {
+			lastError = cloud
+				? "Reachable, but Brigade's functions aren't deployed. Set CONVEX_DEPLOY_KEY (Convex dashboard → deployment → Settings → Deploy key), run `npm run convex:push`, then press Enter to retry."
+				: "Reachable, but Brigade's functions aren't deployed. Deploy them — `npm run convex:dev` (auto-deploys) or `npm run convex:push` — then press Enter to retry.";
 			continue;
 		}
 
 		tui.addChild(
 			new Text(
-				`  ${brand.amber("✓")} Convex backend reachable · instance ${brand.white(probe.instanceName ?? "(unknown)")}`,
+				`  ${brand.amber("✓")} Convex backend ready · instance ${brand.white(probe.instanceName ?? "(unknown)")}`,
 				0,
 				0,
 			),
 		);
-		if (isConvexCloudUrl(url)) {
-			// A fresh cloud deployment has no functions yet — deploy them with a
-			// deploy key, otherwise boot fails with "functions aren't deployed".
-			tui.addChild(
-				new Text(`  ${brand.dim("Cloud deployment — deploy Brigade's functions with your deploy key:")}`, 0, 0),
-			);
-			tui.addChild(
-				new Text(
-					`  ${brand.dim("set CONVEX_DEPLOY_KEY (Convex dashboard → Settings → Deploy key), then run: npm run convex:push")}`,
-					0,
-					0,
-				),
-			);
-		}
 		tui.requestRender();
 		await delay(500);
 
@@ -442,6 +450,41 @@ async function probeConvexBackend(url: string): Promise<ProbeResult> {
 					? "  · check the deployment URL from your Convex dashboard."
 					: "";
 		return { ok: false, reason: `Couldn't reach ${cleaned}: ${msg}${localHint}` };
+	}
+}
+
+type FunctionsState = "deployed" | "not-deployed" | "unknown";
+
+/**
+ * Verify Brigade's Convex functions are deployed to `url` by calling the public
+ * `health:ping` query over HTTP — the SAME function boot() checks. A backend can
+ * be reachable (the connectivity probe passed) yet have ZERO functions deployed:
+ * a fresh self-hosted backend, or a cloud deployment before its first
+ * `convex:push`. Three outcomes so callers treat local vs cloud appropriately:
+ *   deployed     — health:ping returned success
+ *   not-deployed — the backend answered "Could not find public function …"
+ *   unknown      — anything else (network hiccup, unexpected shape); inconclusive
+ */
+async function probeFunctionsDeployed(url: string): Promise<FunctionsState> {
+	const cleaned = url.replace(/\/+$/, "");
+	try {
+		const controller = new AbortController();
+		const t = setTimeout(() => controller.abort(), 8_000);
+		const res = await fetch(`${cleaned}/api/query`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ path: "health:ping", args: {}, format: "json" }),
+			signal: controller.signal,
+		});
+		clearTimeout(t);
+		const body = (await res.json().catch(() => null)) as { status?: string; errorMessage?: string } | null;
+		if (body?.status === "success") return "deployed";
+		if (body && /could not find (a )?(public )?function|forget to run/i.test(body.errorMessage ?? "")) {
+			return "not-deployed";
+		}
+		return "unknown";
+	} catch {
+		return "unknown";
 	}
 }
 
