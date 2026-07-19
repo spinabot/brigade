@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.3](https://github.com/spinabot/brigade/compare/brigade-v1.29.2...brigade-v1.29.3) (2026-07-19)
+
+
+### Bug Fixes
+
+* **convex:** deploy functions on `brigade convex dev`, and verify them in onboard before proceeding ([ea9cdb1](https://github.com/spinabot/brigade/commit/ea9cdb1042687f955c15b280bfbac7fca6af5e5c))
+
 ## [1.29.2](https://github.com/spinabot/brigade/compare/brigade-v1.29.1...brigade-v1.29.2) (2026-07-19)
 
 
