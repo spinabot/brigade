@@ -10,7 +10,6 @@
 // where Brigade will read/write on next boot. `brigade store migrate` (a
 // later PR) handles the data copy.
 
-import * as fs from "node:fs";
 import readline from "node:readline/promises";
 
 import chalk from "chalk";
@@ -389,7 +388,9 @@ export async function runStoreReset(opts: StoreResetOptions = {}): Promise<numbe
 	let purgedLocal = false;
 	if (opts.purgeLocal) {
 		try {
-			fs.rmSync(resolveStateDir(), { recursive: true, force: true });
+			// Preserve the bundled runtime (Node + `brigade` binary can live under
+			// the state dir); a raw rm -rf ~/.brigade would uninstall the CLI.
+			wipeLocalBrigadeState();
 			purgedLocal = true;
 		} catch (err) {
 			return fail(`backend erased, but couldn't remove the local folder — ${(err as Error).message}`);

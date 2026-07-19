@@ -80,6 +80,29 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 	// stdin is still ours — decides animated vs static chrome. ≤150 ms once.
 	await probeTerminalAnimationSupport();
 
+	// Stop any running gateway BEFORE the wizard touches local state. The
+	// factory-reset primitive (behind a "Clear it" / "Start fresh" pick) requires
+	// it: a live daemon holds open handles under ~/.brigade, and on Windows
+	// deleting an open file throws EPERM and aborts the wizard mid-wipe (POSIX
+	// silently allows it — which is why this bit Windows and not macOS/Linux).
+	// Lazy-imported so onboard's boot stays light; best-effort + quiet when
+	// nothing is running. Onboard already tells the user to (re)start the gateway
+	// at the end, so stopping a stale one here changes nothing they didn't expect.
+	try {
+		const { readPid, isProcessAlive } = await import("../../core/gateway-probe.js");
+		const pid = await readPid();
+		if (pid && isProcessAlive(pid)) {
+			process.stdout.write(
+				chalk.dim("Stopping the running gateway so onboarding can reset state cleanly…\n"),
+			);
+			const { runGatewayStopCommand } = await import("./gateway.js");
+			await runGatewayStopCommand({ json: false });
+		}
+	} catch {
+		// If we can't stop it, continue anyway — the wipe now preserves the runtime
+		// + convex store, so a reset still can't uninstall the CLI or lose data.
+	}
+
 	const tui = new TUI(new ProcessTerminal());
 	tui.start();
 
