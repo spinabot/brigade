@@ -22,13 +22,53 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { resolveStateDir } from "../../config/paths.js";
+import { peekConvexMode, resolveOsConfigDir, resolveStateDir } from "../../config/paths.js";
 
-/** The dedicated config dir: `<stateDir>/claude-config`. Overridable for tests. */
+/**
+ * The dedicated Claude config dir. Filesystem mode: `<stateDir>/claude-config`.
+ *
+ * Convex mode: NOTHING may live under `~/.brigade` (the strict-zero invariant
+ * that keeps `rm -rf ~/.brigade` safe and lets convex be authoritative), so it
+ * resolves to the OS config dir instead. The `claude` CLI's login credential,
+ * sessions, and projects are machine-local by nature (the binary reads
+ * CLAUDE_CONFIG_DIR from disk — they can't live in convex), and leaving them
+ * under the state dir made every `fs.watch` on them trip the strict guard with
+ * "STRICT-ZERO VIOLATION" spam. The OS config dir (durable, NOT the reapable
+ * cache) survives a state wipe and keeps the login. Overridable via
+ * BRIGADE_CLAUDE_CONFIG_DIR (tests / exotic setups).
+ */
 export function resolveBrigadeClaudeConfigDir(): string {
 	const override = process.env.BRIGADE_CLAUDE_CONFIG_DIR?.trim();
 	if (override) return override;
+	if (peekConvexMode()) {
+		const dest = path.join(resolveOsConfigDir(), "claude-config");
+		migrateLegacyClaudeConfigOnce(dest);
+		return dest;
+	}
 	return path.join(resolveStateDir(), "claude-config");
+}
+
+// One-time relocation guard: convex mode moved this dir OUT of <stateDir> (see
+// above). Carry an existing login ACROSS so a returning operator who updates does
+// NOT silently have to re-login — the production cost of a bare relocation.
+// Idempotent + best-effort; copy+remove (not rename) so it survives a cross-
+// volume ~/.brigade-vs-OS-config split (rename would EXDEV). Removing the legacy
+// dir fires only "delete" watcher events, which the strict guard does not flag.
+let _claudeConfigMigrated = false;
+function migrateLegacyClaudeConfigOnce(dest: string): void {
+	if (_claudeConfigMigrated) return;
+	_claudeConfigMigrated = true;
+	try {
+		const legacy = path.join(resolveStateDir(), "claude-config");
+		if (path.resolve(legacy) === path.resolve(dest)) return; // same dir — nothing to do
+		if (fs.existsSync(dest) || !fs.existsSync(legacy)) return; // already moved / nothing to move
+		fs.mkdirSync(path.dirname(dest), { recursive: true });
+		fs.cpSync(legacy, dest, { recursive: true });
+		fs.rmSync(legacy, { recursive: true, force: true });
+	} catch {
+		// Perms / partial copy — leave the legacy dir in place; worst case the
+		// binary re-logins once. Never let a migration hiccup break resolution.
+	}
 }
 
 function credentialPath(): string {

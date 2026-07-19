@@ -20,6 +20,8 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
+import { resolveOsCacheDir } from "../../../config/paths.js";
+import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
 import { ensureDir, resolveChannelStateDir } from "../sdk.js";
 import { BLUEBUBBLES_CHANNEL_ID } from "./account-config.js";
 
@@ -50,7 +52,17 @@ export interface BlueBubblesCursorStore {
 /** Resolve the per-account cursor file path under the channel's state dir. */
 export function resolveCatchupCursorPath(accountId: string): string {
 	const safe = accountId.replace(/[^a-zA-Z0-9_-]/g, "_") || "default";
-	return path.join(resolveChannelStateDir(BLUEBUBBLES_CHANNEL_ID), "accounts", safe, "catchup-cursor.json");
+	return path.join(catchupBaseDir(), "accounts", safe, "catchup-cursor.json");
+}
+
+// Convex mode forbids writes under ~/.brigade (strict-zero). The cursor is
+// best-effort machine-local sync state — a lost cursor just re-scans the lookback
+// window (idempotent + deduped, per this file's header) — so the OS cache dir is
+// the right home, exactly like channel media. Filesystem mode unchanged.
+function catchupBaseDir(): string {
+	return tryGetRuntimeContext()?.mode === "convex"
+		? path.join(resolveOsCacheDir(), "channels", BLUEBUBBLES_CHANNEL_ID)
+		: resolveChannelStateDir(BLUEBUBBLES_CHANNEL_ID);
 }
 
 /** Drop non-positive / non-finite / non-string entries from a loaded retry map. */

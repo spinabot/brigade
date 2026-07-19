@@ -357,6 +357,13 @@ export function resolveExtensionsDir(): string {
 // and installs into the operator's HOME — which is exactly what happened, and the
 // package still wasn't resolvable afterwards.
 export function resolveEnginesDir(): string {
+  // Convex mode: NOTHING may live under ~/.brigade (strict-zero) — an `npm i`
+  // into ~/.brigade/engines would trip the guard the moment render_video runs.
+  // Engines are regenerable machine-local scratch (plain npm libs), so they go
+  // to the OS cache dir, exactly like managed skills. Filesystem mode unchanged.
+  if (peekConvexMode()) {
+    return path.join(resolveOsCacheDir(), "engines");
+  }
   return path.join(resolveStateDir(), "engines");
 }
 

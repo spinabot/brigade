@@ -49,6 +49,11 @@ function isAllowlisted(target: string): boolean {
 	if (parts[0] === "mode.sentinel") return true;
 	// Workspace stays local (incl. .git) — operator decision.
 	if (parts[0] === "workspace") return true;
+	// The self-hosted Convex backend a global install runs locally keeps its
+	// binary + sqlite database under `convex/`. That IS the authoritative store
+	// (factory-reset deliberately PRESERVES it), not leaked state, and its
+	// constant `*.sqlite3-journal` churn would otherwise flood the guard.
+	if (parts[0] === "convex") return true;
 	if (parts[0] === "agents") {
 		// agents/<id>/workspace/** stays local (operator decision).
 		if (parts[2] === "workspace") return true;
@@ -77,9 +82,15 @@ function recordViolation(method: string, target: string): void {
 			...(_mode !== "off" ? { stack: new Error().stack?.split("\n").slice(3, 7).join("\n") } : {}),
 		});
 	}
-	console.error(
-		`brigade: STRICT-ZERO VIOLATION — ${method} targeting ${target} (convex mode forbids writes under the state dir)`,
-	);
+	// Do NOT print to stderr by default: this process's stderr renders straight
+	// into the interactive TUI, and per-write spam (a chatty external binary, or
+	// churny sqlite journals) floods the conversation. The violation is COUNTED
+	// above for `brigade doctor`; opt into live logging with BRIGADE_STRICT_LOG=1.
+	if (process.env.BRIGADE_STRICT_LOG === "1") {
+		console.error(
+			`brigade: STRICT-ZERO VIOLATION — ${method} targeting ${target} (convex mode forbids writes under the state dir)`,
+		);
+	}
 }
 
 function guardTarget(method: string, target: unknown): void {
