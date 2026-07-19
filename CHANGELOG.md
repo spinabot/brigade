@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.2](https://github.com/spinabot/brigade/compare/brigade-v1.29.1...brigade-v1.29.2) (2026-07-19)
+
+
+### Bug Fixes
+
+* **storage:** factory-reset must not uninstall the CLI or erase the local Convex DB ([#87](https://github.com/spinabot/brigade/issues/87)) ([3268e35](https://github.com/spinabot/brigade/commit/3268e35bdde889ffc4f73fe659c201b2f39f7c1a))
+
 ## [1.29.1](https://github.com/spinabot/brigade/compare/brigade-v1.29.0...brigade-v1.29.1) (2026-07-12)
 
 
