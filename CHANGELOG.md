@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.4](https://github.com/spinabot/brigade/compare/brigade-v1.29.3...brigade-v1.29.4) (2026-07-19)
+
+
+### Bug Fixes
+
+* **convex:** keep ~/.brigade file-free in convex mode (no strict-zero TUI spam) ([241c643](https://github.com/spinabot/brigade/commit/241c643f7b5373be76f70f89b80117e261141934))
+
 ## [1.29.3](https://github.com/spinabot/brigade/compare/brigade-v1.29.2...brigade-v1.29.3) (2026-07-19)
 
 
