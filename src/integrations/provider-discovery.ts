@@ -342,6 +342,57 @@ export function getCachedSubscriptionModels(providerId: string): LiveCloudModel[
 }
 
 /**
+ * Per-model transport facts read straight off the ACCOUNT's own Copilot catalog
+ * — the authoritative source for what this seat can do, as opposed to Pi's
+ * bundled snapshot. Consumed by `agents/github-copilot-transport.ts` (endpoint
+ * selection) and the never-miss resolver (capabilities for a synthesized id).
+ */
+export interface CopilotModelHint {
+	id: string;
+	/** Endpoint the catalog says this model is served on, when it says at all. */
+	api?: "openai-responses" | "openai-completions";
+	contextWindow?: number;
+	maxTokens?: number;
+	vision?: boolean;
+	family?: string;
+}
+
+const copilotModelHints = new Map<string, CopilotModelHint>();
+
+/** Live transport facts for a Copilot model id (case-insensitive), if fetched. */
+export function getCopilotModelHint(modelId: string): CopilotModelHint | undefined {
+	return copilotModelHints.get(modelId.trim().toLowerCase());
+}
+
+/** Test seam — drop the live-hint cache. */
+export function resetCopilotModelHints(): void {
+	copilotModelHints.clear();
+}
+
+/**
+ * Read the endpoint a Copilot catalog entry advertises.
+ *
+ * GitHub ships NO endpoint metadata today (github/copilot-cli#4337 asks for
+ * exactly this), so today this returns `undefined` and the family rule decides.
+ * It is parsed defensively across the field names the API might grow into, so
+ * the moment GitHub does advertise it, Brigade routes by the account's own truth
+ * instead of a heuristic — with no code change. A model that advertises BOTH
+ * surfaces is left undecided on purpose: either works, so the family rule (which
+ * matches what GitHub's own clients pick) stays in charge.
+ */
+function copilotApiFromCatalogEntry(item: Record<string, unknown>, capabilities: Record<string, unknown> | undefined): CopilotModelHint["api"] {
+	const raw =
+		item.supported_endpoints ?? item.supported_apis ?? item.api_modes ?? capabilities?.supported_endpoints ?? capabilities?.api_modes;
+	const list = Array.isArray(raw) ? raw.map((v) => String(v)) : typeof raw === "string" ? [raw] : [];
+	if (list.length === 0) return undefined;
+	const responses = list.some((e) => /responses/i.test(e));
+	const chat = list.some((e) => /chat[/_]completions/i.test(e));
+	if (responses && !chat) return "openai-responses";
+	if (chat && !responses) return "openai-completions";
+	return undefined;
+}
+
+/**
  * GitHub Copilot's per-account model catalog. The token embeds the proxy host
  * (`proxy-ep=…`) which `getGitHubCopilotBaseUrl` rewrites to the api host; we GET
  * `${baseUrl}/models` with Copilot's required editor headers (a plain
@@ -387,7 +438,11 @@ export async function fetchGitHubCopilotModels(copilotToken: string): Promise<Li
 			// the response is untyped.
 			const policy = item.policy as { state?: unknown } | undefined;
 			const capabilities = item.capabilities as
-				| { supports?: { tool_calls?: unknown; vision?: unknown }; limits?: { max_context_window_tokens?: unknown } }
+				| {
+						family?: unknown;
+						supports?: { tool_calls?: unknown; vision?: unknown };
+						limits?: { max_context_window_tokens?: unknown; max_output_tokens?: unknown };
+				  }
 				| undefined;
 			const supports = capabilities?.supports;
 			if (item.model_picker_enabled !== true) continue;
@@ -395,8 +450,18 @@ export async function fetchGitHubCopilotModels(copilotToken: string): Promise<Li
 			if (supports?.tool_calls === false) continue;
 			const maxCtx = capabilities?.limits?.max_context_window_tokens;
 			const contextWindow = typeof maxCtx === "number" && maxCtx > 0 ? maxCtx : undefined;
+			const maxOut = capabilities?.limits?.max_output_tokens;
 			const name = typeof item.name === "string" && item.name.length > 0 ? item.name : id;
 			const input = supports?.vision ? ["text", "image"] : ["text"];
+			// Transport + capability facts for THIS seat, keyed for the resolver.
+			copilotModelHints.set(id.toLowerCase(), {
+				id,
+				api: copilotApiFromCatalogEntry(item, capabilities as Record<string, unknown> | undefined),
+				...(contextWindow !== undefined ? { contextWindow } : {}),
+				...(typeof maxOut === "number" && maxOut > 0 ? { maxTokens: maxOut } : {}),
+				vision: supports?.vision === true,
+				...(typeof capabilities?.family === "string" ? { family: capabilities.family } : {}),
+			});
 			out.push({
 				provider: "github-copilot",
 				id,

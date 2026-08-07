@@ -220,3 +220,37 @@ test("classifyErrorDetailed: 'out of extra usage' → subscription_limit, no sam
   assert.equal(r.class, "subscription_limit");
   assert.equal(r.retryableOnSameModel, false);
 });
+
+// ── 421 Misdirected Request (GitHub Copilot endpoint/host mismatch) ──────────
+// Pi surfaces this as a BARE `421 Misdirected Request` with no `status` field.
+// It used to fall through to `unknown`, which is transient — so the loop burned
+// three identical attempts and the TUI printed "last reason=unknown". The same
+// request can never succeed: it's a routing problem, not a blip.
+
+test("classifyError: bare '421 Misdirected Request' → model_not_found (not unknown)", () => {
+  assert.equal(classifyErrorReason(new Error("421 Misdirected Request")), "model_not_found");
+});
+
+test("classifyError: HTTP 421 with a status field → model_not_found", () => {
+  const err = Object.assign(new Error("Misdirected Request"), { status: 421 });
+  assert.equal(classifyErrorReason(err), "model_not_found");
+});
+
+test("classifyError: Copilot's chat-completions rejection → model_not_found", () => {
+  const err = new Error('400 model "gpt-5.6-luna" is not accessible via the /chat/completions endpoint');
+  assert.equal(classifyErrorReason(err), "model_not_found");
+});
+
+test("classifyErrorDetailed: 421 → model_not_found with an actionable endpoint message", () => {
+  const r = classifyErrorDetailed(new Error("421 Misdirected Request"));
+  assert.equal(r.class, "model_not_found");
+  assert.equal(r.retryableOnSameModel, false);
+  assert.match(r.message, /endpoint\/host/i);
+  assert.match(r.message, /\/responses/);
+});
+
+test("classifyError: a bare 421 inside an unrelated token count is not misread", () => {
+  // The status path only fires on a real status; "421 tokens" must not classify
+  // as a routing failure.
+  assert.equal(classifyErrorReason(new Error("prompt is too long: 421 tokens over the limit")), "context_overflow");
+});
