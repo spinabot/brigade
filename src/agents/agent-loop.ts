@@ -78,6 +78,11 @@ import { cleanProviderError } from "../core/model-caps.js";
 import { adoptNewerClaudeCliLogin, healDeadSubscriptionLogin } from "../auth/auth-health.js";
 import { persistentAuthBackend } from "../core/auth-bridge.js";
 import { billingSafeContextWindow, resolveModelNeverMiss } from "./model-resolution.js";
+import {
+  applyGitHubCopilotRouting,
+  GITHUB_COPILOT_PROVIDER,
+  wrapStreamFnWithCopilotEndpointHeal,
+} from "./github-copilot-transport.js";
 import { buildAutoRecallBlock, resolveAutoRecallOrigin } from "./memory/auto-recall.js";
 import { runPreCompactionExtraction } from "./memory/extract.js";
 import type { MemoryRecordOrigin } from "./memory/records.js";
@@ -488,6 +493,32 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
         `  • Verify your auth profile is configured: ` +
         `\`cat ${resolveAuthProfilesPath(args.agentId)}\``,
     );
+  }
+
+  // GitHub Copilot transport correction — the ONE choke point both the
+  // catalogued and the synthesized model pass through before Pi opens the
+  // session. A Copilot seat's endpoint (`/responses` vs `/chat/completions`)
+  // and API host (individual vs business vs enterprise) are account- and
+  // model-family-specific; getting either wrong is the `421 Misdirected
+  // Request` every turn on a Copilot Business/Enterprise login. See
+  // `applyGitHubCopilotRouting`.
+  if (args.provider === GITHUB_COPILOT_PROVIDER) {
+    const copilotToken = await (authStorage as { getApiKey?: (p: string) => Promise<string | undefined> })
+      .getApiKey?.(args.provider)
+      .catch(() => undefined);
+    const routed = applyGitHubCopilotRouting(model, args.modelId, copilotToken);
+    if (routed !== model) {
+      const before = model as { api?: string; baseUrl?: string };
+      const after = routed as { api?: string; baseUrl?: string };
+      if (before.api !== after.api || before.baseUrl !== after.baseUrl) {
+        log.debug("github-copilot routing corrected", {
+          model: args.modelId,
+          api: `${before.api ?? "?"} → ${after.api ?? "?"}`,
+          baseUrl: `${before.baseUrl ?? "?"} → ${after.baseUrl ?? "?"}`,
+        });
+      }
+      model = routed;
+    }
   }
 
   // Cross-process lock to prevent two `brigade agent` runs from interleaving
@@ -1116,7 +1147,21 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     const dispatchStreamFn = makeTransportDispatch(baseStreamFn);
     const wrappedStreamFn = wrapStreamFnWithIdleTimeout(
       wrapStreamFnWithStopReasonRecovery(
-        wrapStreamFnWithToolCallRepair(dispatchStreamFn),
+        // Copilot endpoint self-heal wraps the dispatch layer directly, so the
+        // re-issued request still goes through tool-call repair and stays under
+        // the idle timeout, while the outer wrappers never observe the
+        // healed-away failure at all. A Copilot model whose endpoint we guessed
+        // wrong (a family GitHub ships after this release) corrects itself on the
+        // first request, and every later turn starts on the right one.
+        wrapStreamFnWithCopilotEndpointHeal(
+          wrapStreamFnWithToolCallRepair(dispatchStreamFn),
+          (info) =>
+            log.warn("github-copilot endpoint corrected mid-request", {
+              model: info.modelId,
+              from: info.from,
+              to: info.to,
+            }),
+        ),
       ),
       { timeoutMs: idleTimeoutMs },
     );

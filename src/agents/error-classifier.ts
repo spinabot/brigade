@@ -210,11 +210,29 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
   /truncating\s+input.*too\s+long/i, // Ollama native /api/chat overflow phrasing
 ];
 
+// Endpoint mismatch — the model exists, but not on the API surface we asked
+// for. GitHub Copilot is the loud case: it serves GPT-5+ / codex ONLY on
+// `/responses` and answers `421 Misdirected Request` (or a 400 "not accessible
+// via the /chat/completions endpoint") for a chat-completions request, and it
+// answers 421 just the same when a business/enterprise token is pointed at the
+// individual API host. Retrying the identical request is guaranteed to re-fail,
+// so this must NOT collapse into `unknown` (2 pointless retries, "last
+// reason=unknown" in the TUI) — it's a model-routing problem, so it rides the
+// `model_not_found` policy: fail fast, advance to the fallback chain.
+// (The bare status code is deliberately NOT matched here — `421` can appear in
+// an unrelated message as a token count. The status path below catches it.)
+export const ENDPOINT_MISMATCH_PATTERNS: RegExp[] = [
+  /misdirected request/i,
+  /not accessible via the \/\S+ endpoint/i,
+  /not supported (?:on|by) (?:the )?\/\S+ endpoint/i,
+];
+
 const MODEL_NOT_FOUND_PATTERNS: RegExp[] = [
   /model[_ ]?not[_ ]?found/i,
   /unknown model/i,
   /model .*?(?:does not exist|is not available)/i,
   /no such model/i,
+  ...ENDPOINT_MISMATCH_PATTERNS,
 ];
 
 const SESSION_EXPIRED_PATTERNS: RegExp[] = [
@@ -247,6 +265,12 @@ function classifyByStatus(status: number, message: string): RetryReason | null {
       return "timeout";
     case 410:
       return matchAny(message, SESSION_EXPIRED_PATTERNS) ? "session_expired" : "timeout";
+    case 421:
+      // Misdirected Request — the request reached a host/endpoint that won't
+      // serve this model (GitHub Copilot: GPT-5+ is `/responses`-only; a
+      // business/enterprise token must use its own API host). Same request,
+      // same result — fail fast and let the model-fallback chain move on.
+      return "model_not_found";
     case 422:
       return matchAny(message, FORMAT_PATTERNS) ? "format" : null;
     case 429:
@@ -627,6 +651,11 @@ export function classifyErrorDetailed(err: unknown): ClassifiedError {
     if (status === 404) {
       return { class: "model_not_found", message, retryableOnSameModel: false };
     }
+    if (status === 421) {
+      // Misdirected Request — right credential, wrong endpoint/host for this
+      // model. Retrying the identical request re-fails; advance to fallback.
+      return { class: "model_not_found", message: endpointMismatchMessage(message), retryableOnSameModel: false };
+    }
   }
 
   if (CONTEXT_OVERFLOW_PATTERNS_DETAILED.some((p) => p.test(message))) {
@@ -649,11 +678,33 @@ export function classifyErrorDetailed(err: unknown): ClassifiedError {
   if (CONTENT_FILTER_PATTERNS_DETAILED.some((p) => p.test(message))) {
     return { class: "content_filter", message, retryableOnSameModel: false };
   }
+  if (ENDPOINT_MISMATCH_PATTERNS.some((p) => p.test(message))) {
+    return {
+      class: "model_not_found",
+      message: endpointMismatchMessage(message),
+      retryableOnSameModel: false,
+    };
+  }
   if (MODEL_NOT_FOUND_PATTERNS_DETAILED.some((p) => p.test(message))) {
     return { class: "model_not_found", message, retryableOnSameModel: false };
   }
 
   return { class: "unknown", message, retryableOnSameModel: false };
+}
+
+/**
+ * Operator-facing text for an endpoint/host mismatch. A bare "421 Misdirected
+ * Request" tells the user nothing and reads like a network blip they should
+ * retry; this names the actual cause and the two things that fix it.
+ */
+function endpointMismatchMessage(message: string): string {
+  return (
+    `${message} — the provider won't serve this model on the endpoint/host the request used. ` +
+    `On GitHub Copilot this means the model is served only on a different API surface ` +
+    `(GPT-5+/codex are \`/responses\`-only) or your Copilot seat is on a business/enterprise ` +
+    `host. Pick another model with /model, or re-run \`brigade login copilot\` to refresh the ` +
+    `account's endpoint.`
+  );
 }
 
 /* ─────────────────────────── retry policy ─────────────────────────── */
@@ -757,7 +808,9 @@ function extractStatusDetailed(err: unknown): number | undefined {
   const bareMatch = msg.match(/\b([45]\d{2})\b/);
   if (bareMatch) {
     const n = Number(bareMatch[1]);
-    if ([401, 403, 404, 429, 500, 502, 503, 504].includes(n)) return n;
+    // 421 included: Pi surfaces a Copilot endpoint/host mismatch as a bare
+    // `421 Misdirected Request` with no `status` field to read.
+    if ([401, 403, 404, 421, 429, 500, 502, 503, 504].includes(n)) return n;
   }
   return undefined;
 }
