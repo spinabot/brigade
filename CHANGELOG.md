@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.5](https://github.com/spinabot/brigade/compare/brigade-v1.29.4...brigade-v1.29.5) (2026-08-07)
+
+
+### Bug Fixes
+
+* **copilot:** route enterprise Copilot seats to the right endpoint and host ([#93](https://github.com/spinabot/brigade/issues/93)) ([289ee1d](https://github.com/spinabot/brigade/commit/289ee1deb1eefd2d4584b2730ff811f1ee76de80))
+
 ## [1.29.4](https://github.com/spinabot/brigade/compare/brigade-v1.29.3...brigade-v1.29.4) (2026-07-19)
 
 
