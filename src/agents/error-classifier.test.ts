@@ -254,3 +254,27 @@ test("classifyError: a bare 421 inside an unrelated token count is not misread",
   // as a routing failure.
   assert.equal(classifyErrorReason(new Error("prompt is too long: 421 tokens over the limit")), "context_overflow");
 });
+
+// ── Copilot plan entitlement vs endpoint routing (both are HTTP 400) ─────────
+// Verified live on a free_limited_copilot seat: two different 400s that need
+// two different responses. Neither should retry three times as `unknown`.
+
+test("classifyError: Copilot plan rejection → model_not_found, not unknown", () => {
+  const err = new Error("OpenAI API error (400): 400 The requested model is not supported.");
+  assert.equal(classifyErrorReason(err), "model_not_found");
+});
+
+test("classifyErrorDetailed: plan rejection explains it's the subscription, not the endpoint", () => {
+  const r = classifyErrorDetailed(new Error("400 The requested model is not supported."));
+  assert.equal(r.class, "model_not_found");
+  assert.equal(r.retryableOnSameModel, false);
+  assert.match(r.message, /subscription doesn't include this model/i);
+  assert.doesNotMatch(r.message, /\/responses/, "must not send them chasing an endpoint problem");
+});
+
+test("classifyError: the real 'via Responses API' wording is an endpoint mismatch", () => {
+  const err = new Error("model gpt-4.1 is not supported via Responses API.");
+  assert.equal(classifyErrorReason(err), "model_not_found");
+  const r = classifyErrorDetailed(err);
+  assert.match(r.message, /endpoint\/host/i);
+});

@@ -221,10 +221,26 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
 // `model_not_found` policy: fail fast, advance to the fallback chain.
 // (The bare status code is deliberately NOT matched here — `421` can appear in
 // an unrelated message as a token count. The status path below catches it.)
+//
+// The "via <surface>" wordings are the ones GitHub actually returns — verified
+// against the live API: `model gpt-4.1 is not supported via Responses API.`
+// The `/chat/completions endpoint` phrasing (from github/copilot-cli#4337) is
+// real too, so both stay.
 export const ENDPOINT_MISMATCH_PATTERNS: RegExp[] = [
   /misdirected request/i,
+  /not (?:accessible|supported) via (?:the )?\/?\S+(?: api| endpoint)?\./i,
   /not accessible via the \/\S+ endpoint/i,
   /not supported (?:on|by) (?:the )?\/\S+ endpoint/i,
+];
+
+// Plan entitlement — the seat cannot run this model on ANY surface. Verified on
+// a `free_limited_copilot` Copilot seat, where `gpt-5-mini` and
+// `claude-haiku-4.5` both fail this way despite `/models` advertising them for
+// every plan. Retrying is useless and switching endpoints is useless; the only
+// move is a different model, so say that.
+const PLAN_ENTITLEMENT_PATTERNS: RegExp[] = [
+  /the requested model is not supported/i,
+  /model is not (?:supported|available) (?:for|on) (?:your|this) (?:plan|subscription|account)/i,
 ];
 
 const MODEL_NOT_FOUND_PATTERNS: RegExp[] = [
@@ -233,6 +249,7 @@ const MODEL_NOT_FOUND_PATTERNS: RegExp[] = [
   /model .*?(?:does not exist|is not available)/i,
   /no such model/i,
   ...ENDPOINT_MISMATCH_PATTERNS,
+  ...PLAN_ENTITLEMENT_PATTERNS,
 ];
 
 const SESSION_EXPIRED_PATTERNS: RegExp[] = [
@@ -678,6 +695,15 @@ export function classifyErrorDetailed(err: unknown): ClassifiedError {
   if (CONTENT_FILTER_PATTERNS_DETAILED.some((p) => p.test(message))) {
     return { class: "content_filter", message, retryableOnSameModel: false };
   }
+  // Entitlement BEFORE endpoint: a plan rejection names no surface, so it must
+  // not be mistaken for a routing problem the loop could retry around.
+  if (PLAN_ENTITLEMENT_PATTERNS.some((p) => p.test(message))) {
+    return {
+      class: "model_not_found",
+      message: planEntitlementMessage(message),
+      retryableOnSameModel: false,
+    };
+  }
   if (ENDPOINT_MISMATCH_PATTERNS.some((p) => p.test(message))) {
     return {
       class: "model_not_found",
@@ -697,6 +723,20 @@ export function classifyErrorDetailed(err: unknown): ClassifiedError {
  * Request" tells the user nothing and reads like a network blip they should
  * retry; this names the actual cause and the two things that fix it.
  */
+/**
+ * Operator-facing text for a plan-entitlement rejection. The raw provider line
+ * ("The requested model is not supported.") reads like a bug in the client, so
+ * it sends people looking in the wrong place — name the real cause and the one
+ * action that resolves it.
+ */
+function planEntitlementMessage(message: string): string {
+  return (
+    `${message} — your subscription doesn't include this model, so no retry or endpoint change ` +
+    `will help. Pick a different one with /model. (On GitHub Copilot, the plan's model list is ` +
+    `narrower than what \`/models\` advertises — a Free seat typically has gpt-4.1 and gpt-4o only.)`
+  );
+}
+
 function endpointMismatchMessage(message: string): string {
   return (
     `${message} — the provider won't serve this model on the endpoint/host the request used. ` +
