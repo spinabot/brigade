@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.29.6](https://github.com/spinabot/brigade/compare/brigade-v1.29.5...brigade-v1.29.6) (2026-08-08)
+
+
+### Bug Fixes
+
+* **copilot:** route by what the API says, and refuse un-renewable logins ([04d2f85](https://github.com/spinabot/brigade/commit/04d2f857f425e87e2c992b51f19013e0ceda0b05))
+* **copilot:** route by what the API says, and refuse un-renewable logins ([09a9b6e](https://github.com/spinabot/brigade/commit/09a9b6ecba88fe67f88967876cab441dd554c23f))
+
 ## [1.29.5](https://github.com/spinabot/brigade/compare/brigade-v1.29.4...brigade-v1.29.5) (2026-08-07)
 
 
