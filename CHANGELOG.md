@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.30.0](https://github.com/spinabot/brigade/compare/brigade-v1.29.6...brigade-v1.30.0) (2026-08-08)
+
+
+### Features
+
+* **copilot:** plan-aware model list with Auto, and human error copy ([1ff9208](https://github.com/spinabot/brigade/commit/1ff920851eedd489e5d9edb493da598416784643))
+* **copilot:** plan-aware model list with Auto, and human error copy ([f467681](https://github.com/spinabot/brigade/commit/f46768174aec8c709a017972e8b5cfe1f0083921))
+
 ## [1.29.6](https://github.com/spinabot/brigade/compare/brigade-v1.29.5...brigade-v1.29.6) (2026-08-08)
 
 
