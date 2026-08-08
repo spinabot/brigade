@@ -32,7 +32,7 @@
  * between tiers (or a fresh login) routes correctly with no code change.
  */
 
-import { fetchGitHubCopilotModels, getCopilotModelHint } from "../integrations/provider-discovery.js";
+import { fetchGitHubCopilotModels, getCopilotModelHint, listCopilotModelHints } from "../integrations/provider-discovery.js";
 
 /** Pi's provider id for the Copilot subscription backend. */
 export const GITHUB_COPILOT_PROVIDER = "github-copilot";
@@ -208,6 +208,123 @@ export function applyGitHubCopilotRouting(model: unknown, modelId: string, copil
 			: { ...COPILOT_EDITOR_HEADERS };
 
 	return next;
+}
+
+/* ───────────────────────────── plan + auto model ───────────────────────────── */
+
+/** The synthetic model id that means "let Brigade choose for this seat". */
+export const COPILOT_AUTO_MODEL_ID = "auto";
+
+export interface CopilotPlan {
+	/** Raw `sku` from the token, e.g. `free_limited_copilot`, `copilot_for_business`. */
+	sku?: string;
+	/** Human label for onboarding / the picker. */
+	label: string;
+	/** A Free (or Student-equivalent) seat. */
+	isFree: boolean;
+	/**
+	 * Whether the seat may choose its own model. GitHub removed manual model
+	 * selection from Copilot Free in June 2026, and reports it per model as
+	 * `model_picker_enabled: false` — on a Free seat that is false for EVERY
+	 * entry, which is the signal we read rather than hardcoding plan names.
+	 */
+	canPickModels: boolean;
+}
+
+/**
+ * What plan is this seat on? Read from the token's own `sku`, cross-checked
+ * against the catalog's picker flags — so a plan GitHub invents next quarter is
+ * classified by behaviour ("nothing is pickable") rather than by a name we'd
+ * have to keep updating.
+ */
+export function copilotPlanFromToken(token: string | undefined): CopilotPlan {
+	const sku = token ? /(?:^|;)\s*sku=([^;]+)/.exec(token)?.[1] : undefined;
+	const isFree = !!sku && /free|student/i.test(sku);
+	const hints = listCopilotModelHints();
+	// Only trust the catalog when we actually have one; an empty cache must not
+	// be read as "nothing is pickable".
+	const catalogSaysNoPicking = hints.length > 0 && hints.every((h) => h.pickerEnabled !== true);
+	const label = sku ? sku.replace(/_/g, " ").replace(/\bcopilot\b/gi, "Copilot").trim() : "GitHub Copilot";
+	return { sku, label, isFree, canPickModels: !(isFree || catalogSaysNoPicking) };
+}
+
+/**
+ * Resolve `auto` to a concrete model this seat can actually run.
+ *
+ * Ranked from the account's own catalog, never a hardcoded list:
+ *   1. drop anything the API has already refused (learned at runtime)
+ *   2. drop policy-disabled and non-tool-calling models — Brigade needs tools
+ *   3. drop models whose `restricted_to` excludes this seat's sku (advisory:
+ *      the field over-promises, so it only ever narrows, never confirms)
+ *   4. prefer the seat's own `is_chat_default`, then vision, then the largest
+ *      context window
+ *
+ * Returns `undefined` when the catalog isn't loaded or nothing survives, and the
+ * caller falls back to its configured model. Entitlement mistakes are
+ * self-correcting: a plan rejection marks the model unsupported, so the next
+ * resolution picks the next candidate.
+ */
+export function resolveCopilotAutoModel(token: string | undefined): string | undefined {
+	const plan = copilotPlanFromToken(token);
+	const candidates = listCopilotModelHints().filter((h) => {
+		if (isCopilotModelKnownUnsupported(h.id)) return false;
+		if (h.policyState === "disabled") return false;
+		if (h.toolCalls === false) return false;
+		// GitHub's auto-routing pseudo-models only resolve inside a `/models/session`
+		// (see the Auto design notes) — they 400 on a direct call, so exclude them.
+		if (/-free-auto$|^copilot-search-|^exec-agent-|^trajectory-/.test(h.id)) return false;
+		if (plan.sku && h.restrictedTo && h.restrictedTo.length > 0) {
+			const skuFamily = plan.isFree ? "free" : plan.sku;
+			if (!h.restrictedTo.some((r) => r === skuFamily || plan.sku?.includes(r))) return false;
+		}
+		return true;
+	});
+	if (candidates.length === 0) return undefined;
+	candidates.sort((a, b) => {
+		if (!!a.isChatDefault !== !!b.isChatDefault) return a.isChatDefault ? -1 : 1;
+		if (!!a.vision !== !!b.vision) return a.vision ? -1 : 1;
+		return (b.contextWindow ?? 0) - (a.contextWindow ?? 0);
+	});
+	return candidates[0]?.id;
+}
+
+/** True when the requested id is the synthetic auto entry. */
+export function isCopilotAutoModelId(modelId: string): boolean {
+	return modelId.trim().toLowerCase() === COPILOT_AUTO_MODEL_ID;
+}
+
+/**
+ * Build a usable Model for a Copilot id from the ACCOUNT's catalog alone, with
+ * no catalogued template to clone.
+ *
+ * Needed because Pi filters the registry down to the ids the login reported
+ * (`availableModelIds`). When a seat's real ids don't intersect Pi's bundled
+ * snapshot — routine on enterprise seats, and on any seat once GitHub ships a
+ * new family — EVERY Copilot entry is filtered out, the never-miss resolver
+ * finds no template to clone, and the turn dies with "isn't available on
+ * github-copilot" for a model the picker just listed.
+ *
+ * Everything here comes from the live catalog or the live token, so it stays
+ * correct for models that don't exist yet.
+ */
+export function buildCopilotModelFromCatalog(modelId: string, token: string | undefined): unknown | undefined {
+	const hint = getCopilotModelHint(modelId);
+	if (!hint) return undefined;
+	return applyGitHubCopilotRouting(
+		{
+			provider: GITHUB_COPILOT_PROVIDER,
+			id: hint.id,
+			name: hint.name ?? hint.id,
+			api: resolveGitHubCopilotApi(hint.id),
+			input: hint.vision ? ["text", "image"] : ["text"],
+			reasoning: false,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: hint.contextWindow ?? 128_000,
+			maxTokens: hint.maxTokens ?? 8192,
+		},
+		hint.id,
+		token,
+	);
 }
 
 /* ─────────────────────────── credential health ─────────────────────────── */

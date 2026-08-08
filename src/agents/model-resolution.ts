@@ -25,7 +25,12 @@
 import * as fs from "node:fs";
 
 import { isClaudeCliProvider, synthClaudeCliModel } from "./claude-cli/register.js";
-import { applyGitHubCopilotRouting, GITHUB_COPILOT_PROVIDER, githubCopilotApiForModelId } from "./github-copilot-transport.js";
+import {
+	applyGitHubCopilotRouting,
+	buildCopilotModelFromCatalog,
+	GITHUB_COPILOT_PROVIDER,
+	githubCopilotApiForModelId,
+} from "./github-copilot-transport.js";
 import { isLikelyReasoningModelId } from "../core/model-caps.js";
 import { rediscoverOllamaModel } from "../integrations/ollama.js";
 import {
@@ -175,18 +180,22 @@ export async function resolveModelNeverMiss(args: ResolveModelArgs): Promise<unk
 	// provider's first-listed model, or it inherits the wrong endpoint.
 	const template = findProviderTemplate(registry, provider, modelId);
 
-	// 3. Live cloud discovery for accurate metadata (best-effort).
+	// 3. Live discovery for accurate metadata (best-effort).
 	const apiKey = await readApiKey(args.authStorage, provider);
-	const discovery = await discoverCloudModelMeta(provider, modelId, {
-		baseUrl: typeof template?.baseUrl === "string" ? template.baseUrl : undefined,
-		apiKey,
-	});
-	// 3b. GitHub Copilot has a per-ACCOUNT live catalog, and reaching this line
-	// means the id is one Pi's bundled snapshot doesn't carry — exactly the case
-	// where the account's own list is the only accurate source (context window,
-	// vision, and any endpoint it advertises). Cached for 5 min and never throws,
-	// so at most one extra request per model generation.
-	const copilotMeta = provider === GITHUB_COPILOT_PROVIDER ? await readCopilotLiveMeta(modelId, apiKey) : undefined;
+	const isCopilot = provider === GITHUB_COPILOT_PROVIDER;
+	// Copilot has a per-ACCOUNT live catalog, and reaching this line means the id
+	// is one Pi's bundled snapshot doesn't carry — exactly when the account's own
+	// list is the only accurate source (context window, vision, and any endpoint
+	// it advertises). It needs Copilot's editor headers, which the generic probe
+	// doesn't send (that request 400s), so route to the purpose-built reader
+	// instead of the generic one. Cached for 5 min and never throws.
+	const copilotMeta = isCopilot ? await readCopilotLiveMeta(modelId, apiKey) : undefined;
+	const discovery = isCopilot
+		? { exists: false, meta: {} as DiscoveredModelMeta }
+		: await discoverCloudModelMeta(provider, modelId, {
+				baseUrl: typeof template?.baseUrl === "string" ? template.baseUrl : undefined,
+				apiKey,
+			});
 
 	// 4. Synthesize from the provider template (clone routing, override the
 	// per-model fields). We synthesize even when discovery couldn't confirm
@@ -197,7 +206,17 @@ export async function resolveModelNeverMiss(args: ResolveModelArgs): Promise<unk
 		const synth = synthFromTemplate(template, modelId, { ...discovery.meta, ...copilotMeta });
 		// Copilot: route to the endpoint/host THIS account needs. The template
 		// only gets us close (see applyGitHubCopilotRouting).
-		return provider === GITHUB_COPILOT_PROVIDER ? applyGitHubCopilotRouting(synth, modelId, apiKey) : synth;
+		return isCopilot ? applyGitHubCopilotRouting(synth, modelId, apiKey) : synth;
+	}
+
+	// 4b. GitHub Copilot with NO template to clone. Pi filters the registry to the
+	// ids the login reported, so a seat whose real ids don't intersect the bundled
+	// snapshot has every Copilot entry filtered out — leaving a model the picker
+	// just listed unresolvable. The account's own catalog carries everything
+	// needed to build it outright.
+	if (isCopilot) {
+		const fromCatalog = buildCopilotModelFromCatalog(modelId, apiKey);
+		if (fromCatalog) return fromCatalog;
 	}
 
 	// 5. Synthesize from a configured `custom`/OpenAI-compatible provider in

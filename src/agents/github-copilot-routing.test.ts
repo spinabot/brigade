@@ -23,7 +23,9 @@ import {
 	flipCopilotApi,
 	githubCopilotApiForModelId,
 	githubCopilotBaseUrlFromToken,
+	copilotPlanFromToken,
 	copilotRejectedApi,
+	isCopilotAutoModelId,
 	describeCopilotCredentialProblem,
 	inspectCopilotCredential,
 	isCopilotEndpointMismatch,
@@ -440,5 +442,41 @@ describe("inspectCopilotCredential", () => {
 		const msg = describeCopilotCredentialProblem(h);
 		assert.match(String(msg), /brigade login copilot/);
 		assert.match(String(msg), /already/);
+	});
+});
+
+// ── Plan detection + Auto ────────────────────────────────────────────────────
+// GitHub removed manual model selection from Copilot Free in June 2026, and
+// reports it per model as `model_picker_enabled: false`. Detection reads the
+// seat's own sku and catalog rather than a plan table we'd have to maintain.
+
+describe("copilotPlanFromToken", () => {
+	const tok = (sku: string) => `tid=abc;exp=9999999999;sku=${sku};proxy-ep=proxy.individual.githubcopilot.com`;
+
+	it("recognises a free seat and marks it unable to pick models", () => {
+		const plan = copilotPlanFromToken(tok("free_limited_copilot"));
+		assert.equal(plan.isFree, true);
+		assert.equal(plan.canPickModels, false);
+		assert.match(plan.label, /free/i);
+	});
+
+	it("leaves a paid seat free to choose", () => {
+		const plan = copilotPlanFromToken(tok("copilot_for_business"));
+		assert.equal(plan.isFree, false);
+		assert.equal(plan.canPickModels, true);
+	});
+
+	it("degrades gracefully with no token", () => {
+		const plan = copilotPlanFromToken(undefined);
+		assert.equal(plan.isFree, false);
+		assert.equal(plan.canPickModels, true, "an unknown seat must not be locked out of picking");
+	});
+});
+
+describe("isCopilotAutoModelId", () => {
+	it("matches the synthetic id, case and space tolerant", () => {
+		assert.equal(isCopilotAutoModelId("auto"), true);
+		assert.equal(isCopilotAutoModelId(" Auto "), true);
+		assert.equal(isCopilotAutoModelId("gpt-4.1"), false);
 	});
 });

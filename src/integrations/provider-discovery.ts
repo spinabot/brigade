@@ -349,12 +349,26 @@ export function getCachedSubscriptionModels(providerId: string): LiveCloudModel[
  */
 export interface CopilotModelHint {
 	id: string;
+	name?: string;
 	/** Endpoint the catalog says this model is served on, when it says at all. */
 	api?: "openai-responses" | "openai-completions";
 	contextWindow?: number;
 	maxTokens?: number;
 	vision?: boolean;
+	toolCalls?: boolean;
 	family?: string;
+	/** Plans the catalog claims may use this model. Advisory only — a free seat's
+	 *  listing says `all` for models the API then refuses, so this narrows the
+	 *  candidate set but never proves entitlement. */
+	restrictedTo?: string[];
+	/** `disabled` means the account must accept the model's terms first. */
+	policyState?: string;
+	/** The seat's own default pick — the closest thing to "what Auto would use". */
+	isChatDefault?: boolean;
+	/** GitHub's per-seat "can this user choose models at all" flag. False across
+	 *  the board on Copilot Free since June 2026, when manual selection was
+	 *  removed from that plan. */
+	pickerEnabled?: boolean;
 }
 
 const copilotModelHints = new Map<string, CopilotModelHint>();
@@ -380,6 +394,39 @@ export function resetCopilotModelHints(): void {
  * surfaces is left undecided on purpose: either works, so the family rule (which
  * matches what GitHub's own clients pick) stays in charge.
  */
+/** Every model the seat's catalog listed, pickable or not. Drives `auto`. */
+export function listCopilotModelHints(): CopilotModelHint[] {
+	return [...copilotModelHints.values()];
+}
+
+/** Record one `/models` entry verbatim — the selectability gate comes later. */
+function recordCopilotHint(
+	item: Record<string, unknown>,
+	capabilities: { family?: unknown; supports?: { tool_calls?: unknown; vision?: unknown }; limits?: { max_context_window_tokens?: unknown; max_output_tokens?: unknown } } | undefined,
+	policy: { state?: unknown } | undefined,
+	supports: { tool_calls?: unknown; vision?: unknown } | undefined,
+): void {
+	const id = typeof item.id === "string" ? item.id : "";
+	if (!id) return;
+	const ctx = capabilities?.limits?.max_context_window_tokens;
+	const maxOut = capabilities?.limits?.max_output_tokens;
+	const billing = item.billing as { restricted_to?: unknown } | undefined;
+	copilotModelHints.set(id.toLowerCase(), {
+		id,
+		...(typeof item.name === "string" && item.name ? { name: item.name } : {}),
+		api: copilotApiFromCatalogEntry(item, capabilities as Record<string, unknown> | undefined),
+		...(typeof ctx === "number" && ctx > 0 ? { contextWindow: ctx } : {}),
+		...(typeof maxOut === "number" && maxOut > 0 ? { maxTokens: maxOut } : {}),
+		vision: supports?.vision === true,
+		toolCalls: supports?.tool_calls !== false,
+		...(typeof capabilities?.family === "string" ? { family: capabilities.family } : {}),
+		...(Array.isArray(billing?.restricted_to) ? { restrictedTo: billing.restricted_to.map((v) => String(v)) } : {}),
+		...(typeof policy?.state === "string" ? { policyState: policy.state } : {}),
+		isChatDefault: item.is_chat_default === true,
+		pickerEnabled: item.model_picker_enabled === true,
+	});
+}
+
 function copilotApiFromCatalogEntry(item: Record<string, unknown>, capabilities: Record<string, unknown> | undefined): CopilotModelHint["api"] {
 	const raw =
 		item.supported_endpoints ?? item.supported_apis ?? item.api_modes ?? capabilities?.supported_endpoints ?? capabilities?.api_modes;
@@ -445,6 +492,11 @@ export async function fetchGitHubCopilotModels(copilotToken: string): Promise<Li
 				  }
 				| undefined;
 			const supports = capabilities?.supports;
+			// Hints are recorded for EVERY entry, before the selectability gate —
+			// a Copilot Free seat reports `model_picker_enabled: false` on all of
+			// them, and the picker still has to know what those models are in order
+			// to resolve `auto` and to explain why the list is short.
+			recordCopilotHint(item, capabilities, policy, supports);
 			if (item.model_picker_enabled !== true) continue;
 			if (policy?.state === "disabled") continue;
 			if (supports?.tool_calls === false) continue;
@@ -453,15 +505,7 @@ export async function fetchGitHubCopilotModels(copilotToken: string): Promise<Li
 			const maxOut = capabilities?.limits?.max_output_tokens;
 			const name = typeof item.name === "string" && item.name.length > 0 ? item.name : id;
 			const input = supports?.vision ? ["text", "image"] : ["text"];
-			// Transport + capability facts for THIS seat, keyed for the resolver.
-			copilotModelHints.set(id.toLowerCase(), {
-				id,
-				api: copilotApiFromCatalogEntry(item, capabilities as Record<string, unknown> | undefined),
-				...(contextWindow !== undefined ? { contextWindow } : {}),
-				...(typeof maxOut === "number" && maxOut > 0 ? { maxTokens: maxOut } : {}),
-				vision: supports?.vision === true,
-				...(typeof capabilities?.family === "string" ? { family: capabilities.family } : {}),
-			});
+			void maxOut;
 			out.push({
 				provider: "github-copilot",
 				id,
