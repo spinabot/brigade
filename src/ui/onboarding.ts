@@ -29,6 +29,7 @@ import { CancellableLoader, Input, type SelectItem, SelectList, Text, TUI } from
 import {
 	upsertApiKeyProfile,
 	upsertApiKeyRefProfile,
+	readProfiles,
 	upsertOAuthProfile,
 	upsertTokenProfile,
 } from "../auth/profiles.js";
@@ -62,6 +63,13 @@ import {
 	prefetchSubscriptionModels,
 	probeModelReachable,
 } from "../integrations/provider-discovery.js";
+import {
+	COPILOT_AUTO_MODEL_ID,
+	copilotPlanFromToken,
+	GITHUB_COPILOT_PROVIDER,
+	isCopilotModelKnownUnsupported,
+	resolveCopilotAutoModel,
+} from "../agents/github-copilot-transport.js";
 
 export interface OnboardingResult {
 	provider: string;
@@ -1217,10 +1225,37 @@ export async function ensureSubscriptionLogin(
 
 		tui.addChild(new Text("", 0, 0));
 		tui.addChild(new Text(`  ${brand.amber("✓")} ${provider.name} connected.`, 0, 0));
+		// Say what the seat can actually do, HERE, rather than letting the operator
+		// discover it as a 400 three screens later. A Copilot Free seat cannot
+		// choose its own model at all (GitHub removed manual selection from that
+		// plan in June 2026), so the honest thing is to name the plan and point at
+		// Auto before they reach the picker.
+		if (providerId === GITHUB_COPILOT_PROVIDER) {
+			for (const line of describeCopilotPlanForOnboarding(creds.access)) {
+				tui.addChild(new Text(line, 0, 0));
+			}
+		}
 		tui.requestRender();
 		await delay(600);
 		return "ok";
 	}
+}
+
+/**
+ * Plain-language summary of what a Copilot seat may do, shown right after login.
+ * Reads the plan off the token and the account's own catalog — no plan table to
+ * keep in sync.
+ */
+function describeCopilotPlanForOnboarding(token: string): string[] {
+	const plan = copilotPlanFromToken(token);
+	const lines: string[] = [`  ${brand.dim("Plan:")} ${brand.white(plan.label)}`];
+	if (plan.canPickModels) return lines;
+	const auto = resolveCopilotAutoModel(token);
+	lines.push(
+		brand.dim("  This plan doesn't allow choosing your own model — GitHub decides for you."),
+		brand.dim(`  Pick ${brand.amber("Auto")} on the next screen and Brigade will use one your plan allows${auto ? ` (currently ${auto})` : ""}.`),
+	);
+	return lines;
 }
 
 /** True when EITHER the operator's own `claude` login OR Brigade's managed
@@ -1863,11 +1898,14 @@ async function pickModel(tui: TUI, modelRegistry: ModelRegistry, providerId: str
 		}
 	}
 
-	const items: SelectItem[] = models.map((m) => ({
-		value: m.id,
-		label: m.id,
-		description: describeModel(m),
-	}));
+	const items: SelectItem[] = models
+		// Models this account has already been refused are noise, not choices.
+		.filter((m) => !(providerId === GITHUB_COPILOT_PROVIDER && isCopilotModelKnownUnsupported(m.id)))
+		.map((m) => ({
+			value: m.id,
+			label: m.id,
+			description: describeModel(m),
+		}));
 
 	// Default-first ordering: reasoning > non-reasoning, then larger context first.
 	items.sort((a, b) => {
@@ -1877,6 +1915,24 @@ async function pickModel(tui: TUI, modelRegistry: ModelRegistry, providerId: str
 		if (!!ma.reasoning !== !!mb.reasoning) return ma.reasoning ? -1 : 1;
 		return (mb.contextWindow ?? 0) - (ma.contextWindow ?? 0);
 	});
+
+	// GitHub Copilot: offer Auto first. On a plan that can't choose its own model
+	// it's the only choice that reliably works, so it leads and says why; on a
+	// paid seat it's a convenience. The rule below it is decorative — SelectItem
+	// has no separator primitive, so it's a row we refuse to select.
+	if (providerId === GITHUB_COPILOT_PROVIDER) {
+		const plan = copilotPlanFromToken(readCopilotTokenForPicker());
+		items.unshift(
+			{
+				value: COPILOT_AUTO_MODEL_ID,
+				label: "Auto",
+				description: plan.canPickModels
+					? "Brigade picks a model your plan allows"
+					: `recommended — ${plan.label} can't choose models; Brigade picks one that works`,
+			},
+			{ value: PICKER_SEPARATOR, label: "─".repeat(18), description: "" },
+		);
+	}
 
 	// Searchable picker — providers like OpenRouter expose 270+ models, so a
 	// type-to-filter box on top of the list is the difference between usable
@@ -1899,13 +1955,37 @@ async function pickModel(tui: TUI, modelRegistry: ModelRegistry, providerId: str
 
 	try {
 		const chosen = await new Promise<SelectItem>((resolve, reject) => {
-			list.onSelect = (item) => resolve(item);
+			// Swallow the separator: not resolving leaves the picker open and focused,
+			// so the row reads as a divider even though the list has no concept of one.
+			list.onSelect = (item) => {
+				if (item.value === PICKER_SEPARATOR) return;
+				resolve(item);
+			};
 			list.onCancel = () => reject(new Error("back"));
 		});
 		return { modelId: chosen.value };
 	} catch {
 		return "back";
 	}
+}
+
+/** Sentinel value for the decorative divider row in a model picker. */
+const PICKER_SEPARATOR = "__brigade_separator__";
+
+/** The live Copilot bearer, for plan-aware picker copy. Best-effort: the picker
+ *  must render even when the credential can't be read. */
+function readCopilotTokenForPicker(): string | undefined {
+	try {
+		const profiles = readProfiles(DEFAULT_AGENT_ID) as {
+			profiles?: Record<string, { provider?: string; key?: string; access?: string; token?: string }>;
+		};
+		for (const p of Object.values(profiles.profiles ?? {})) {
+			if (p?.provider === GITHUB_COPILOT_PROVIDER) return p.access || p.key || p.token;
+		}
+	} catch {
+		/* no credential readable — Auto still renders, just without the plan name */
+	}
+	return undefined;
 }
 
 /** Model picker for the claude-cli backend — its models are synthesized (not in

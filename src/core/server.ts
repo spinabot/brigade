@@ -133,7 +133,12 @@ import { clearChannelMetaRegistry, registerChannelMeta } from "../agents/channel
 import type { GroupToolPolicyConfig } from "../agents/channels/access-control/index.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
-import { inspectCopilotCredential } from "../agents/github-copilot-transport.js";
+import {
+	COPILOT_AUTO_MODEL_ID,
+	GITHUB_COPILOT_PROVIDER,
+	inspectCopilotCredential,
+	isCopilotModelKnownUnsupported,
+} from "../agents/github-copilot-transport.js";
 import { isClaudeCliAvailable } from "../agents/claude-cli/availability.js";
 import { listClaudeCliModels, listClaudeCliModelsLive } from "../agents/claude-cli/register.js";
 import {
@@ -3556,6 +3561,24 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					for (const cm of cliModels) {
 						if (!seenCli.has(`${cm.provider}/${cm.id}`)) merged.push(cm as unknown as Model<any>);
 					}
+				}
+				// GitHub Copilot: lead with `auto`, and drop models this seat has
+				// already been refused. On a plan that can't choose its own model
+				// (Copilot Free, since GitHub removed manual selection) `auto` is the
+				// only reliable pick, and listing 20 models the account will reject is
+				// how an operator ends up debugging a 400 instead of chatting.
+				if (merged.some((m) => m.provider === GITHUB_COPILOT_PROVIDER)) {
+					merged = merged.filter(
+						(m) => m.provider !== GITHUB_COPILOT_PROVIDER || !isCopilotModelKnownUnsupported(m.id),
+					);
+					const copilotIndex = merged.findIndex((m) => m.provider === GITHUB_COPILOT_PROVIDER);
+					const template = merged[copilotIndex] as Model<any> | undefined;
+					merged.splice(copilotIndex < 0 ? merged.length : copilotIndex, 0, {
+						...(template ?? {}),
+						provider: GITHUB_COPILOT_PROVIDER,
+						id: COPILOT_AUTO_MODEL_ID,
+						name: "Auto — Brigade picks a model your plan allows",
+					} as Model<any>);
 				}
 				const models = merged.map((m: Model<any>) => modelToSummary(m));
 				return models as ResponseFor[M];

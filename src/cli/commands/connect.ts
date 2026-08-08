@@ -19,6 +19,7 @@
  * Ollama, BYO-endpoint) still need the full `brigade onboard` wizard.
  */
 
+import { COPILOT_AUTO_MODEL_ID } from "../../agents/github-copilot-transport.js";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
 import * as nodePath from "node:path";
@@ -3650,7 +3651,16 @@ export async function wireConnectUi(
 				const head = current
 					? `${brand.amber(current)} ${brand.dim("(current)")}`
 					: brand.dim("models");
-				const body = currentModels.map((m) => `    ${brand.white(m.id)}`).join("\n");
+				// `auto` (GitHub Copilot) leads the list and is ruled off from the
+				// concrete ids below it — it's a different KIND of choice, and on a
+				// plan that can't pick its own model it's the one that works.
+				const body = currentModels
+					.map((m) =>
+						m.id === COPILOT_AUTO_MODEL_ID
+							? `    ${brand.amber(m.id)}  ${brand.dim("— picks a model your plan allows")}\n    ${brand.dim("─".repeat(24))}`
+							: `    ${brand.white(m.id)}`,
+					)
+					.join("\n");
 				insertBeforeEditor(
 					new Markdown(
 						`${brand.dim("models on your current provider:")}\n\n  ${head}\n${body}\n\n${brand.dim("usage: /model <id>  ·  switch provider with /provider")}`,

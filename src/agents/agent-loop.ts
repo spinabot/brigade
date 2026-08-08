@@ -83,6 +83,8 @@ import {
   describeCopilotCredentialProblem,
   GITHUB_COPILOT_PROVIDER,
   inspectCopilotCredential,
+  isCopilotAutoModelId,
+  resolveCopilotAutoModel,
   warmGitHubCopilotHints,
   wrapStreamFnWithCopilotEndpointHeal,
 } from "./github-copilot-transport.js";
@@ -478,10 +480,9 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   const registryAsFinder = modelRegistry as { find?: (p: string, m: string) => unknown };
   if (typeof registryAsFinder.find !== "function") {
     throw new Error(
-      "Pi ModelRegistry.find is not a function — likely a Pi SDK version drift. " +
-        "Brigade was built against the 0.70.x ModelRegistry surface. " +
-        "Pin `@earendil-works/pi-coding-agent` to a known-compatible version, or " +
-        "update brigade's agent-loop to match the new Pi API.",
+      "Brigade's model engine is a version we don't recognise — this build can't " +
+        "start a turn. Update Brigade (`npm i -g @spinabot/brigade@latest`); if it " +
+        "persists, report it at https://github.com/spinabot/brigade/issues.",
     );
   }
   let model = registryAsFinder.find(args.provider, args.modelId);
@@ -500,15 +501,24 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     });
   }
   if (!model) {
-    throw new Error(
-      `Model not registered: provider=${args.provider} model=${args.modelId}.\n` +
-        `  • Pi's built-in catalog covers known Anthropic/OpenAI/Google/Ollama models;\n` +
-        `    if yours isn't listed, append an entry to ${modelsFile}\n` +
-        `    (one object under .providers.<provider>.models[]).\n` +
-        `  • For local Ollama: run \`ollama pull <model>\` first.\n` +
-        `  • Verify your auth profile is configured: ` +
-        `\`cat ${resolveAuthProfilesPath(args.agentId)}\``,
-    );
+    // Operator-facing: name the model, say the one thing that fixes it, stop.
+    // The old copy named our internal engine, quoted a models.json schema and a
+    // `cat` of the auth file — four lines of implementation detail for what is
+    // almost always "that model isn't on your plan, pick another". The
+    // diagnostics still exist, one debug log away.
+    log.debug("model resolution missed", {
+      provider: args.provider,
+      model: args.modelId,
+      modelsFile,
+      authProfiles: resolveAuthProfilesPath(args.agentId),
+    });
+    const nextStep =
+      args.provider === "ollama"
+        ? `Pull it first: \`ollama pull ${args.modelId}\``
+        : args.provider === GITHUB_COPILOT_PROVIDER
+          ? "Your Copilot plan may not include it — /model to see what this account can use."
+          : "Use /model to pick another, or /provider to switch provider.";
+    throw new Error(`${args.modelId} isn't available on ${args.provider}. ${nextStep}`);
   }
 
   // GitHub Copilot transport correction — the ONE choke point both the
@@ -546,13 +556,44 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     // our id heuristic and is the only thing that routes a family the heuristic
     // has never seen (e.g. `mai-code-1-flash`, which is /responses-only).
     await warmGitHubCopilotHints(args.modelId, copilotToken);
-    const routed = applyGitHubCopilotRouting(model, args.modelId, copilotToken);
+    // `auto` — the only selection a Copilot Free seat is allowed to make since
+    // GitHub removed manual model choice from that plan. Resolve it against the
+    // account's live catalog, minus anything the API has already refused, so the
+    // pick self-corrects instead of needing a plan table we'd have to maintain.
+    let copilotEffectiveModelId = args.modelId;
+    if (isCopilotAutoModelId(args.modelId)) {
+      const picked = resolveCopilotAutoModel(copilotToken);
+      if (picked) {
+        log.debug("github-copilot auto resolved", { model: picked });
+        copilotEffectiveModelId = picked;
+        model =
+          registryAsFinder.find(args.provider, picked) ??
+          (await resolveModelNeverMiss({
+            modelRegistry,
+            provider: args.provider,
+            modelId: picked,
+            modelsFile,
+            authStorage,
+          }));
+      }
+      if (!model) {
+        throw new BrigadeRetryError({
+          message:
+            "Couldn't work out which GitHub Copilot model your plan allows — the account's model list " +
+            "was unreachable. Pick one explicitly with /model, or try again in a moment.",
+          reason: "model_not_found",
+          provider: args.provider,
+          model: args.modelId,
+        });
+      }
+    }
+    const routed = applyGitHubCopilotRouting(model, copilotEffectiveModelId, copilotToken);
     if (routed !== model) {
       const before = model as { api?: string; baseUrl?: string };
       const after = routed as { api?: string; baseUrl?: string };
       if (before.api !== after.api || before.baseUrl !== after.baseUrl) {
         log.debug("github-copilot routing corrected", {
-          model: args.modelId,
+          model: copilotEffectiveModelId,
           api: `${before.api ?? "?"} → ${after.api ?? "?"}`,
           baseUrl: `${before.baseUrl ?? "?"} → ${after.baseUrl ?? "?"}`,
         });
@@ -1087,7 +1128,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   } as never);
 
   if (!session) {
-    throw new Error("Pi createAgentSession returned no session.");
+    throw new Error("Couldn't start a session with the model engine. Try again, or update Brigade if it persists.");
   }
 
   // H4 — install the payload-level streamFn wrap so every outbound LLM
