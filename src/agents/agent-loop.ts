@@ -73,16 +73,32 @@ import {
 } from "../sessions/bootstrap-marker.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { runWithRetry } from "./retry-policy.js";
-import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
+import { BrigadeRetryError, scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { cleanProviderError } from "../core/model-caps.js";
 import { adoptNewerClaudeCliLogin, healDeadSubscriptionLogin } from "../auth/auth-health.js";
 import { persistentAuthBackend } from "../core/auth-bridge.js";
 import { billingSafeContextWindow, resolveModelNeverMiss } from "./model-resolution.js";
 import {
   applyGitHubCopilotRouting,
+  describeCopilotCredentialProblem,
   GITHUB_COPILOT_PROVIDER,
+  inspectCopilotCredential,
+  warmGitHubCopilotHints,
   wrapStreamFnWithCopilotEndpointHeal,
 } from "./github-copilot-transport.js";
+
+/** Agents already told their Copilot login can't renew — warn once, not every turn. */
+const copilotCredentialWarned = new Set<string>();
+
+function warnCopilotCredentialOnce(
+  agentId: string,
+  problem: string,
+  logger: { warn: (msg: string, fields?: Record<string, unknown>) => void },
+): void {
+  if (copilotCredentialWarned.has(agentId)) return;
+  copilotCredentialWarned.add(agentId);
+  logger.warn(problem, { agentId });
+}
 import { buildAutoRecallBlock, resolveAutoRecallOrigin } from "./memory/auto-recall.js";
 import { runPreCompactionExtraction } from "./memory/extract.js";
 import type { MemoryRecordOrigin } from "./memory/records.js";
@@ -506,6 +522,30 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     const copilotToken = await (authStorage as { getApiKey?: (p: string) => Promise<string | undefined> })
       .getApiKey?.(args.provider)
       .catch(() => undefined);
+    // A Copilot bearer held as a plain api_key cannot renew itself (see
+    // `inspectCopilotCredential`). Say so BEFORE the request: once expired it
+    // only ever produces 401s, and the honest fix is one `brigade login copilot`
+    // — not something the operator can guess from a bare auth error.
+    const copilotCredType = (authStorage as { get?: (p: string) => { type?: string } | undefined }).get?.(
+      args.provider,
+    )?.type;
+    const copilotHealth = inspectCopilotCredential(copilotToken, copilotCredType);
+    const copilotProblem = describeCopilotCredentialProblem(copilotHealth);
+    if (copilotProblem) {
+      if (copilotHealth.expired) {
+        throw new BrigadeRetryError({
+          message: copilotProblem,
+          reason: "auth_permanent", // no refresh path — a retry or profile rotation cannot fix it
+          provider: args.provider,
+          model: args.modelId,
+        });
+      }
+      warnCopilotCredentialOnce(agentId, copilotProblem, log);
+    }
+    // Load the account's own catalog first — its `supported_endpoints` outranks
+    // our id heuristic and is the only thing that routes a family the heuristic
+    // has never seen (e.g. `mai-code-1-flash`, which is /responses-only).
+    await warmGitHubCopilotHints(args.modelId, copilotToken);
     const routed = applyGitHubCopilotRouting(model, args.modelId, copilotToken);
     if (routed !== model) {
       const before = model as { api?: string; baseUrl?: string };

@@ -23,7 +23,14 @@ import {
 	flipCopilotApi,
 	githubCopilotApiForModelId,
 	githubCopilotBaseUrlFromToken,
+	copilotRejectedApi,
+	describeCopilotCredentialProblem,
+	inspectCopilotCredential,
 	isCopilotEndpointMismatch,
+	isCopilotModelKnownUnsupported,
+	isCopilotPlanRejection,
+	listCopilotUnsupportedModels,
+	resetCopilotEntitlementMemory,
 	resetLearnedGitHubCopilotApis,
 	wrapStreamFnWithCopilotEndpointHeal,
 } from "./github-copilot-transport.js";
@@ -295,5 +302,143 @@ describe("wrapStreamFnWithCopilotEndpointHeal", () => {
 		});
 		await wrapped({ provider: "openai", id: "gpt-5.5", api: "openai-responses" }, {}, {});
 		assert.equal(calls, 1);
+	});
+});
+
+// ── Wordings captured from the LIVE Copilot API (free_limited_copilot seat) ──
+// The first fix shipped with patterns taken from a GitHub issue; probing the
+// real API showed the common rejection is phrased differently, and that a
+// second, unrelated 400 (plan entitlement) must NOT be treated as routing.
+
+describe("copilotRejectedApi — read the surface out of the error", () => {
+	it("names /responses as the wrong surface", () => {
+		assert.equal(copilotRejectedApi(new Error("model gpt-4.1 is not supported via Responses API.")), "openai-responses");
+	});
+
+	it("names /chat/completions as the wrong surface", () => {
+		assert.equal(
+			copilotRejectedApi(new Error('model "gpt-5.6-luna" is not accessible via the /chat/completions endpoint')),
+			"openai-completions",
+		);
+	});
+
+	it("returns undefined when no surface is named (bare 421)", () => {
+		assert.equal(copilotRejectedApi(new Error("421 Misdirected Request")), undefined);
+	});
+});
+
+describe("plan entitlement vs endpoint mismatch", () => {
+	it("treats the bare 'not supported' 400 as entitlement, never as routing", () => {
+		const err = new Error("OpenAI API error (400): 400 The requested model is not supported.");
+		assert.equal(isCopilotPlanRejection(err), true);
+		assert.equal(isCopilotEndpointMismatch(err), false, "must not trigger an endpoint flip");
+	});
+
+	it("treats the 'via Responses API' 400 as routing, never as entitlement", () => {
+		const err = new Error("model gpt-4.1 is not supported via Responses API.");
+		assert.equal(isCopilotEndpointMismatch(err), true);
+		assert.equal(isCopilotPlanRejection(err), false);
+	});
+});
+
+describe("self-heal targeting", () => {
+	function eventStream(events: unknown[], result: unknown = "ok") {
+		return {
+			[Symbol.asyncIterator]: async function* () {
+				for (const e of events) yield e;
+			},
+			result: async () => result,
+		};
+	}
+	function failingStream(err: Error) {
+		return {
+			[Symbol.asyncIterator]: async function* () {
+				throw err;
+			},
+			result: async () => {
+				throw err;
+			},
+		};
+	}
+
+	it("retries on the surface the server did NOT name", async () => {
+		resetLearnedGitHubCopilotApis();
+		resetCopilotEntitlementMemory();
+		const calls: string[] = [];
+		const wrapped = wrapStreamFnWithCopilotEndpointHeal((model: unknown) => {
+			const api = String((model as { api?: string }).api);
+			calls.push(api);
+			// Server rejects /responses by name — the retry must go to completions.
+			return api === "openai-responses"
+				? failingStream(new Error("model gpt-4.1 is not supported via Responses API."))
+				: eventStream(["ok"]);
+		});
+		const stream = (await wrapped({ provider: "github-copilot", id: "gpt-4.1", api: "openai-responses" }, {}, {})) as {
+			result(): Promise<unknown>;
+		};
+		assert.equal(await stream.result(), "ok");
+		assert.deepEqual(calls, ["openai-responses", "openai-completions"]);
+		resetLearnedGitHubCopilotApis();
+	});
+
+	it("does not re-issue a plan rejection, and remembers the model is unusable", async () => {
+		resetLearnedGitHubCopilotApis();
+		resetCopilotEntitlementMemory();
+		let calls = 0;
+		const wrapped = wrapStreamFnWithCopilotEndpointHeal(() => {
+			calls++;
+			return failingStream(new Error("400 The requested model is not supported."));
+		});
+		const stream = (await wrapped({ provider: "github-copilot", id: "gpt-5-mini", api: "openai-responses" }, {}, {})) as {
+			result(): Promise<unknown>;
+		};
+		await assert.rejects(() => stream.result(), /not supported/);
+		assert.equal(calls, 1, "the other surface refuses it identically — don't spend a request finding out");
+		assert.equal(isCopilotModelKnownUnsupported("gpt-5-mini"), true);
+		assert.deepEqual(listCopilotUnsupportedModels(), ["gpt-5-mini"]);
+		resetCopilotEntitlementMemory();
+	});
+});
+
+// ── Credential health: a Copilot bearer stored as a plain API key ────────────
+// GitHub Copilot has no durable API key. A `tid=…;exp=…` bearer held under any
+// credential type other than `oauth` has no refresh path, so it dies within the
+// half hour. Verified against a real profile that had exactly this shape.
+
+describe("inspectCopilotCredential", () => {
+	const NOW = 1_786_230_000_000;
+	const bearer = (expSeconds: number) => `tid=abc;exp=${expSeconds};proxy-ep=proxy.individual.githubcopilot.com;st=dotcom`;
+
+	it("flags a bearer held as an api_key as degraded (no refresh path)", () => {
+		const h = inspectCopilotCredential(bearer(Math.floor(NOW / 1000) + 1800), "api_key", NOW);
+		assert.equal(h.isBearer, true);
+		assert.equal(h.degraded, true);
+		assert.equal(h.expired, false);
+		assert.equal(Math.round((h.msRemaining ?? 0) / 60000), 30);
+	});
+
+	it("does not flag the same bearer under an oauth credential", () => {
+		const h = inspectCopilotCredential(bearer(Math.floor(NOW / 1000) + 1800), "oauth", NOW);
+		assert.equal(h.isBearer, true);
+		assert.equal(h.degraded, false, "oauth carries the GitHub grant and renews itself");
+	});
+
+	it("treats an about-to-expire token as expired (clock-skew allowance)", () => {
+		const h = inspectCopilotCredential(bearer(Math.floor(NOW / 1000) + 30), "api_key", NOW);
+		assert.equal(h.expired, true, "a request in flight at exp still fails");
+	});
+
+	it("ignores a real API key from any other provider", () => {
+		const h = inspectCopilotCredential("sk-ant-api03-abcdef", "api_key", NOW);
+		assert.equal(h.isBearer, false);
+		assert.equal(h.degraded, false);
+		assert.equal(describeCopilotCredentialProblem(h), undefined);
+	});
+
+	it("explains the fix in the operator message", () => {
+		const h = inspectCopilotCredential(bearer(Math.floor(NOW / 1000) - 60), "api_key", NOW);
+		const msg = describeCopilotCredentialProblem(h);
+		assert.match(String(msg), /brigade login copilot/);
+		assert.match(String(msg), /already/);
 	});
 });

@@ -32,7 +32,7 @@
  * between tiers (or a fresh login) routes correctly with no code change.
  */
 
-import { getCopilotModelHint } from "../integrations/provider-discovery.js";
+import { fetchGitHubCopilotModels, getCopilotModelHint } from "../integrations/provider-discovery.js";
 
 /** Pi's provider id for the Copilot subscription backend. */
 export const GITHUB_COPILOT_PROVIDER = "github-copilot";
@@ -116,6 +116,30 @@ export function resolveGitHubCopilotApi(modelId: string): CopilotApi {
 	return githubCopilotApiForModelId(modelId);
 }
 
+/**
+ * Make sure the account's live catalog is loaded before routing decisions.
+ *
+ * The advertised layer is only useful if the hints are actually in memory, and
+ * `/models` DOES carry `supported_endpoints` today (verified live: 35 of 53
+ * entries, and it is the only thing that gets a family like `mai-code-1-flash`
+ * — `/responses`-only, matching no id heuristic — right). So warm it on the turn
+ * path too, not just when synthesizing an unknown id.
+ *
+ * Cost-shaped: awaited only when we have nothing for this model (first turn on a
+ * cold cache); otherwise the cached hint is used immediately and the refresh
+ * runs detached. `fetchGitHubCopilotModels` is 5-minute cached, timeout-bounded
+ * and swallows its own errors, so the worst case is that we fall through to the
+ * family rule exactly as before.
+ */
+export async function warmGitHubCopilotHints(modelId: string, token: string | undefined): Promise<void> {
+	if (!token) return;
+	if (getCopilotModelHint(modelId)) {
+		void fetchGitHubCopilotModels(token).catch(() => {}); // keep it fresh for the next turn
+		return;
+	}
+	await fetchGitHubCopilotModels(token).catch(() => {});
+}
+
 /* ─────────────────────────────── host selection ─────────────────────────────── */
 
 /**
@@ -186,22 +210,162 @@ export function applyGitHubCopilotRouting(model: unknown, modelId: string, copil
 	return next;
 }
 
+/* ─────────────────────────── credential health ─────────────────────────── */
+
+/**
+ * GitHub Copilot has NO durable API key. The only bearer the API accepts is the
+ * short-lived token exchanged from a GitHub OAuth grant — `tid=…;exp=…;proxy-ep=…`,
+ * good for ~30 minutes. Renewing it requires the GitHub grant, which lives in the
+ * `refresh` field of an OAuth credential.
+ *
+ * So a Copilot bearer stored as `type: "api_key"` is a login with a countdown on
+ * it: Pi's refresh path only runs for `type: "oauth"`, so when `exp` passes there
+ * is nothing to renew from and every turn 401s. Observed in the wild — the
+ * gateway's `add-provider` RPC accepts a key for any provider id, and a Copilot
+ * bearer pasted there looks durable but dies within the half hour.
+ *
+ * This inspection lets the loop say so precisely, instead of surfacing a bare 401
+ * half an hour after a login that appeared to work.
+ */
+export interface CopilotCredentialHealth {
+	/** The value is an exchanged Copilot bearer, not a durable key. */
+	isBearer: boolean;
+	/** Epoch ms from the token's own `exp`, when present. */
+	expiresAt?: number;
+	/** Already past `exp` (with a small clock-skew allowance). */
+	expired: boolean;
+	/** Milliseconds left; negative once expired. */
+	msRemaining?: number;
+	/** Cannot renew itself: a bearer held under a non-OAuth credential type. */
+	degraded: boolean;
+}
+
+/** Treat a token as spent slightly early — a request in flight at `exp` still fails. */
+const COPILOT_EXPIRY_SKEW_MS = 60_000;
+
+export function inspectCopilotCredential(
+	token: string | undefined,
+	credentialType?: string,
+	now: number = Date.now(),
+): CopilotCredentialHealth {
+	if (!token || !/(?:^|;)\s*tid=/.test(token)) {
+		return { isBearer: false, expired: false, degraded: false };
+	}
+	const exp = /(?:^|;)\s*exp=(\d{1,12})/.exec(token)?.[1];
+	const expiresAt = exp ? Number(exp) * 1000 : undefined;
+	const msRemaining = expiresAt === undefined ? undefined : expiresAt - now;
+	const expired = msRemaining !== undefined && msRemaining <= COPILOT_EXPIRY_SKEW_MS;
+	// `oauth` credentials carry the GitHub grant and renew themselves; anything
+	// else holding a bearer has no way back once it lapses.
+	const degraded = credentialType !== undefined && credentialType !== "oauth";
+	return { isBearer: true, expiresAt, expired, msRemaining, degraded };
+}
+
+/** Operator-facing explanation for a Copilot login that cannot renew itself. */
+export function describeCopilotCredentialProblem(health: CopilotCredentialHealth): string | undefined {
+	if (!health.isBearer || !health.degraded) return undefined;
+	const when =
+		health.expiresAt === undefined
+			? "shortly"
+			: health.expired
+				? "already"
+				: `in ~${Math.max(1, Math.round((health.msRemaining ?? 0) / 60_000))} min`;
+	return (
+		`Your GitHub Copilot credential is a short-lived access token stored as a plain API key, ` +
+		`so it cannot refresh itself — it expires ${when}. GitHub Copilot has no durable API key; ` +
+		`run \`brigade login copilot\` and complete the device-code sign-in to store a credential ` +
+		`that renews automatically.`
+	);
+}
+
 /* ──────────────────────────── self-healing stream ───────────────────────────── */
+
+/**
+ * Which API surface did Copilot say was the WRONG one? Verified against the live
+ * API, it names the surface in the rejection rather than the model's real home:
+ *
+ *   "model gpt-4.1 is not supported via Responses API."                 → /responses was wrong
+ *   "model gpt-5.6-luna is not accessible via the /chat/completions endpoint"
+ *                                                                       → /chat/completions was wrong
+ *
+ * Reading the surface out of the message is strictly better than flipping
+ * blindly: the retry targets what the server implied instead of guessing, and a
+ * future third surface can't send us to the wrong place. Returns `undefined`
+ * when the error names no surface (e.g. a bare 421 from the edge), which leaves
+ * the caller to flip.
+ */
+export function copilotRejectedApi(err: unknown): CopilotApi | undefined {
+	const text = endpointErrorText(err);
+	if (!text) return undefined;
+	if (/(?:via|on|by)\s+(?:the\s+)?(?:\/)?responses(?:\s+api|\s+endpoint)?\b/i.test(text)) return "openai-responses";
+	if (/(?:via|on|by)\s+(?:the\s+)?(?:\/)?chat[\s/_-]?completions(?:\s+api|\s+endpoint)?\b/i.test(text)) {
+		return "openai-completions";
+	}
+	return undefined;
+}
 
 /**
  * Does this failure mean "right credential, wrong endpoint"? Copilot says so two
  * ways: a bare `421 Misdirected Request` from the edge, or a 400 naming the
- * endpoint the model isn't served on.
+ * surface the model isn't served on (see `copilotRejectedApi` for the wordings
+ * observed live — the earlier pattern set only covered the `/chat/completions
+ * endpoint` phrasing and missed the far more common "via Responses API" one).
  */
 export function isCopilotEndpointMismatch(err: unknown): boolean {
 	const text = endpointErrorText(err);
 	if (!text) return false;
-	return (
-		/misdirected request/i.test(text) ||
-		/\b421\b/.test(text) ||
-		/not accessible via the \/\S+ endpoint/i.test(text) ||
-		/not supported (?:on|by) (?:the )?\/\S+ endpoint/i.test(text)
-	);
+	if (isCopilotPlanRejection(err)) return false; // entitlement, not routing
+	return /misdirected request/i.test(text) || /\b421\b/.test(text) || copilotRejectedApi(err) !== undefined;
+}
+
+/**
+ * The OTHER 400 — the seat isn't entitled to this model at all:
+ *
+ *   "The requested model is not supported."
+ *
+ * Verified on a `free_limited_copilot` seat, where `gpt-5-mini` and
+ * `claude-haiku-4.5` both fail this way even though `/models` advertises them as
+ * available on every plan. It is NOT an endpoint problem, so re-issuing on the
+ * other surface is guaranteed to fail the same way — the heal must sit this one
+ * out and let the error surface with a "pick another model" message.
+ *
+ * Distinguished from the endpoint case by the absence of a named surface: the
+ * entitlement rejection never says "via …".
+ */
+export function isCopilotPlanRejection(err: unknown): boolean {
+	const text = endpointErrorText(err);
+	if (!text) return false;
+	if (copilotRejectedApi(err) !== undefined) return false;
+	return /requested model is not supported/i.test(text) || /model is not supported\b/i.test(text);
+}
+
+/**
+ * Models this seat has been told it cannot use, learned from live rejections.
+ * `/models` cannot be trusted for entitlement (a free seat's listing claims
+ * `restricted_to: all` for models the API then refuses), so the only reliable
+ * source is what the API actually answered. Process-scoped, same rationale as
+ * the learned-endpoint map above.
+ */
+const unsupportedCopilotModels = new Set<string>();
+
+/** Record that this seat cannot run `modelId` (learned from a live rejection). */
+export function rememberCopilotModelUnsupported(modelId: string): void {
+	if (modelId) unsupportedCopilotModels.add(modelId.trim().toLowerCase());
+}
+
+/** Has this seat already been refused `modelId`? */
+export function isCopilotModelKnownUnsupported(modelId: string): boolean {
+	return unsupportedCopilotModels.has(modelId.trim().toLowerCase());
+}
+
+/** Every model this seat has been refused so far — for an actionable error. */
+export function listCopilotUnsupportedModels(): string[] {
+	return [...unsupportedCopilotModels].sort();
+}
+
+/** Test seam — drop everything learned about entitlement this process. */
+export function resetCopilotEntitlementMemory(): void {
+	unsupportedCopilotModels.clear();
 }
 
 function endpointErrorText(err: unknown): string {
@@ -257,9 +421,20 @@ export function wrapStreamFnWithCopilotEndpointHeal(
 
 		/** Re-issue the call on the other endpoint, or rethrow the original error. */
 		const reissue = async (err: unknown): Promise<EventStreamLike> => {
+			// Entitlement rejections are terminal for this model — the other surface
+			// refuses it identically. Learn it so the next turn fails instantly with
+			// an actionable message instead of probing again.
+			if (modelId && isCopilotPlanRejection(err)) {
+				rememberCopilotModelUnsupported(modelId);
+				throw err;
+			}
 			if (healed || eventsSeen > 0 || !modelId || !isCopilotEndpointMismatch(err)) throw err;
 			healed = true;
-			const to = flipCopilotApi(typeof model.api === "string" ? model.api : undefined);
+			// Prefer the surface the server NAMED as wrong (retry the other one); fall
+			// back to flipping whatever we sent when the error names none (bare 421).
+			const rejected = copilotRejectedApi(err);
+			const to = rejected ? flipCopilotApi(rejected) : flipCopilotApi(typeof model.api === "string" ? model.api : undefined);
+			if (to === model.api) throw err; // nothing left to try — don't repeat the same call
 			const flipped: LooseModel = { ...model, api: to };
 			delete flipped.compat;
 			delete flipped.thinkingLevelMap;

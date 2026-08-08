@@ -133,6 +133,7 @@ import { clearChannelMetaRegistry, registerChannelMeta } from "../agents/channel
 import type { GroupToolPolicyConfig } from "../agents/channels/access-control/index.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
+import { inspectCopilotCredential } from "../agents/github-copilot-transport.js";
 import { isClaudeCliAvailable } from "../agents/claude-cli/availability.js";
 import { listClaudeCliModels, listClaudeCliModelsLive } from "../agents/claude-cli/register.js";
 import {
@@ -3582,6 +3583,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const apiKey = p.apiKey?.trim();
 				if (!providerId) throw new Error("providerId is required");
 				if (!apiKey) throw new Error("apiKey is required");
+				// GitHub Copilot has no durable API key — the only accepted bearer is
+				// the ~30-minute token exchanged from a GitHub OAuth grant. Storing one
+				// here produces a login that looks fine and then 401s within the half
+				// hour with nothing to refresh from, because Pi only renews
+				// `type: "oauth"` credentials. Refuse it and point at the flow that
+				// stores a renewable credential.
+				const copilotHealth = inspectCopilotCredential(apiKey, "api_key");
+				if (copilotHealth.isBearer) {
+					throw new Error(
+						"That's a short-lived GitHub Copilot access token, not a durable API key — it " +
+							"expires within the hour and can't refresh itself. Run `brigade login copilot` " +
+							"and complete the device-code sign-in instead.",
+					);
+				}
 				// Live validation against the provider's models endpoint (8s timeout):
 				// 401/403 hard-reject; rate-limit / outage soft-accept with a warning.
 				let warning: string | undefined;
