@@ -3,13 +3,20 @@
 
 version: 2
 
+# Version updates are OFF; security updates are ON.
+#
+# `open-pull-requests-limit: 0` disables routine version-bump PRs for an
+# ecosystem. It has no effect on Dependabot SECURITY updates, which have their
+# own internal limit — so a real advisory still opens a PR, while "bump X from
+# 1.2.3 to 1.2.4" churn does not. Routine upgrades are done deliberately
+# instead, in batches, when someone is actually free to test them.
 updates:
   # npm dependencies
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0
     groups:
       production:
         dependency-type: production
@@ -36,7 +43,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       actions:
         patterns:
