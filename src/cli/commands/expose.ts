@@ -11,6 +11,7 @@
  *   brigade expose                 — start a cloudflare quick tunnel (token auto-gen)
  *   brigade expose --provider bore — self-hostable OSS tunnel
  *   brigade expose --insecure      — NO token gate (loud warning; explicit opt-in)
+ *   brigade expose --show-qr       — also print a scannable QR to pair the app
  *   brigade expose status          — show the active tunnel
  *   brigade expose stop            — tear down the active tunnel
  *
@@ -44,6 +45,10 @@ export interface ExposeCommandOptions {
   port?: number;
   verbose?: boolean;
   json?: boolean;
+  /** `--show-qr` — render a scannable QR of the public link right after the
+   *  tunnel comes up, so the Brigade app pairs in one command. This is the only
+   *  place a QR is rendered; there is no `status` variant. */
+  showQr?: boolean;
 }
 
 const LOOPBACK_HOST = "127.0.0.1";
@@ -140,7 +145,7 @@ export async function runExposeCommand(opts: ExposeCommandOptions): Promise<void
     process.exit(EXIT_FAILURE);
   }
 
-  printBanner(tunnel, provider);
+  printBanner(tunnel, provider, opts.showQr === true);
 
   // Tear down on Ctrl-C / SIGTERM so we never leave an orphaned public URL.
   let shuttingDown = false;
@@ -156,7 +161,7 @@ export async function runExposeCommand(opts: ExposeCommandOptions): Promise<void
   // The build-program action holds the process open after we return.
 }
 
-function printBanner(tunnel: RunningTunnel, provider: string): void {
+function printBanner(tunnel: RunningTunnel, provider: string, showQr: boolean): void {
   const line = chalk.dim("─".repeat(68));
   console.error("");
   console.error(line);
@@ -166,6 +171,14 @@ function printBanner(tunnel: RunningTunnel, provider: string): void {
   // generated + stored automatically; the operator never sees or types it.
   console.error(`  ${chalk.bold("Public URL →")}  ${chalk.green.bold(tunnel.url)}`);
   console.error("");
+  // `--show-qr` renders the scannable link right under the URL it encodes, so
+  // the app pairs in ONE command. `urlWithToken` IS the clean url when the
+  // tunnel is open (manager.ts only appends `?token=` when secured), so one
+  // field covers both modes.
+  if (showQr) {
+    printQr(tunnel.urlWithToken, tunnel.secured);
+    console.error("");
+  }
   if (tunnel.secured) {
     console.error(`  ${chalk.green("🔒 Secured automatically")} ${chalk.dim("— a private access key is saved to your config.")}`);
     console.error(`  ${chalk.dim("You never type it. Need the full link for another device? ")}${chalk.cyan("brigade expose status --show-link")}`);
@@ -173,13 +186,58 @@ function printBanner(tunnel: RunningTunnel, provider: string): void {
     console.error(`  ${chalk.red.bold("⚠ OPEN MODE: no key — ANYONE who finds this URL controls your crew.")}`);
     console.error(`  ${chalk.dim("Drop --open to secure it automatically instead.")}`);
   }
+  // Keep pairing discoverable for anyone who didn't pass the flag.
+  if (!showQr) {
+    console.error(`  ${chalk.dim("📱 Pairing the Brigade app? Re-run with")} ${chalk.cyan("--show-qr")} ${chalk.dim("for a scannable code.")}`);
+  }
   console.error("");
   console.error(`  ${chalk.dim("Stop anytime: brigade expose stop  ·  or press Ctrl-C")}`);
   console.error(line);
   console.error("");
 }
 
-export async function runExposeStatusCommand(opts: { json?: boolean; showLink?: boolean; showQr?: boolean }): Promise<number> {
+/**
+ * Render `link` as a scannable QR on stderr, inline in the expose banner
+ * (stdout stays clean for piping). The caller owns the surrounding blank
+ * lines. `qrcode-terminal` is synchronous despite the callback shape, so the
+ * rows land in order between the lines printed either side of this call.
+ *
+ * Two things this does that a bare `generate()` doesn't, both of which decide
+ * whether a phone actually locks onto the code:
+ *
+ *  1. **Forces the polarity.** In `small` mode the library draws a LIGHT module
+ *     as a block glyph (`█`) and a DARK module as a space — i.e. the code is
+ *     carried by the foreground colour. Left to the terminal's own palette that
+ *     renders correctly on a dark theme and *inverted* on a light one, where
+ *     many scanners simply give up. Pinning bright-white-on-black makes it
+ *     scan the same in either theme.
+ *  2. **Widens the quiet zone.** The library emits a 1-module border; the spec
+ *     wants 4. We pad with light modules — spaces would read as DARK and eat
+ *     the margin rather than extend it.
+ */
+function printQr(link: string, secured: boolean): void {
+  const LIGHT = "█"; // a light module — and therefore the quiet-zone fill
+  console.error(`  ${chalk.bold("📱 Scan to connect")} ${chalk.dim("(open the Brigade app and scan this):")}`);
+  qrcodeTerminal.generate(link, { small: true }, (qr: string) => {
+    const rows = qr.replace(/\n+$/, "").split("\n");
+    // Drop the library's own 1-module border rows (all `▄` on top / all `▀` on
+    // the bottom). Half of each of those cells is the terminal background —
+    // dark — so keeping them would lay a dark stripe *inside* the light margin
+    // below, i.e. a ring around the code. Our own full-block rows replace them.
+    if (rows.length > 1 && /^▄+$/.test(rows[0] ?? "")) rows.shift();
+    if (rows.length > 1 && /^▀+$/.test(rows[rows.length - 1] ?? "")) rows.pop();
+    const width = Math.max(...rows.map((r) => r.length));
+    const side = LIGHT.repeat(3);
+    const margin = LIGHT.repeat(width + 6);
+    // One printed row is TWO modules tall (half-block encoding), so two margin
+    // rows top and bottom clear the 4-module quiet zone the spec asks for.
+    const framed = [margin, margin, ...rows.map((r) => `${side}${r.padEnd(width, LIGHT)}${side}`), margin, margin];
+    for (const row of framed) console.error(`  ${chalk.bgBlack.whiteBright(row)}`);
+  });
+  console.error(`  ${chalk.dim(secured ? "Encodes the full link incl. the access key — keep it on-screen only." : "Open mode — no key in the link.")}`);
+}
+
+export async function runExposeStatusCommand(opts: { json?: boolean; showLink?: boolean }): Promise<number> {
   const state = readTunnelState();
   if (!state || !isProcessAlive(state.pid)) {
     if (state) await clearTunnelState().catch(() => {});
@@ -204,16 +262,6 @@ export async function runExposeStatusCommand(opts: { json?: boolean; showLink?: 
   console.log(`  secured    ${state.secured ? chalk.green("yes (key handled automatically)") : chalk.red("NO (open mode)")}`);
   if (state.secured && !opts.showLink) {
     console.log(`  ${chalk.dim("(run with --show-link to reveal the full access link for another device)")}`);
-  }
-  if (opts.showQr) {
-    // Encode the FULL link (key included) so a phone scans once and connects.
-    const link = state.secured ? state.urlWithToken : state.url;
-    console.log("");
-    console.log(`  ${chalk.bold("Scan to connect")} ${chalk.dim("(open the Brigade app and scan this):")}`);
-    qrcodeTerminal.generate(link, { small: true }, (qr: string) => {
-      console.log(qr.replace(/^/gm, "  "));
-    });
-    console.log(`  ${chalk.dim(state.secured ? "Encodes the full link incl. the access key — keep it on-screen only." : "Open mode — no key in the link.")}`);
   }
   console.log(`  pid        ${state.pid}`);
   console.log(`  uptime     ${uptimeS}s`);
