@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 
 import { _resetApprovalsCacheForTests } from "./exec-approvals.js";
+import { CATASTROPHIC_TRIO, nestedQuantifier } from "./exec-pattern-fixtures.js";
 import {
 	handleExecAllow,
 	handleExecAllowPattern,
@@ -74,7 +75,7 @@ test("empty command / pattern → ok:false", () => {
 /* ─────────────── pattern guard over the RPC (remote-reachable) ─────────────── */
 
 test("allow-pattern refuses a catastrophically backtracking regex", () => {
-	for (const pattern of ["^git (a+)+$", "^(a|a)*$", "^([a-z]+)+#$"]) {
+	for (const pattern of CATASTROPHIC_TRIO) {
 		const started = Date.now();
 		const r = handleExecAllowPattern({ pattern });
 		const elapsed = Date.now() - started;
@@ -109,7 +110,7 @@ test("allow-pattern refuses a pattern past the length cap", () => {
 });
 
 test("allow-pattern reasons carry the remediation hint for remote clients", () => {
-	const r = handleExecAllowPattern({ pattern: "^(a+)+$" });
+	const r = handleExecAllowPattern({ pattern: nestedQuantifier("a") });
 	assert.equal(r.ok, false);
 	assert.match(r.reason ?? "", /write `a\+` instead of `\(a\+\)\+`/);
 });

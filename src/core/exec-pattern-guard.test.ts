@@ -13,6 +13,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+	ambiguousAlternation,
+	CATASTROPHIC_PATTERNS,
+	chainedNestedQuantifiers,
+	nestedQuantifier,
+} from "./exec-pattern-fixtures.js";
+import {
 	describeApprovalPatternRefusal,
 	MAX_APPROVAL_PATTERN_LENGTH,
 	validateApprovalPattern,
@@ -31,7 +37,7 @@ const REALISTIC = [
 ];
 
 /** Doubly-nested / alternation-ambiguous quantifiers — the ReDoS shapes. */
-const CATASTROPHIC = ["^git (a+)+$", "^(a|a)*$", "^([a-z]+)+#$", "(a+)+$", "^(a*)*$"];
+const CATASTROPHIC = CATASTROPHIC_PATTERNS;
 
 test("realistic allowlist patterns are accepted and compiled", () => {
 	for (const pattern of REALISTIC) {
@@ -53,7 +59,7 @@ test("catastrophically backtracking patterns are refused as pattern-too-slow", (
 test("the literal head of an anchored pattern is carried into the probes", () => {
 	// Without the literal prefix the probes fail at `^git ` and never reach the
 	// ambiguous tail, so this pattern would look fast and slip through.
-	const checked = validateApprovalPattern("^git (a+)+$");
+	const checked = validateApprovalPattern(nestedQuantifier("a", { head: "git " }));
 	assert.equal(checked.ok, false);
 });
 
@@ -79,7 +85,7 @@ test("a pattern past the length cap is refused before it is compiled", () => {
 
 test("the check stays bounded even on a pattern designed to hang", () => {
 	const started = Date.now();
-	validateApprovalPattern("^(a+)+(b+)+(c+)+$");
+	validateApprovalPattern(chainedNestedQuantifiers(["a", "b", "c"]));
 	const elapsed = Date.now() - started;
 	assert.ok(elapsed < 2000, `guard took ${elapsed}ms — the budget should have cut it short`);
 });
@@ -98,7 +104,7 @@ test("input is trimmed so every surface agrees on what the pattern is", () => {
 });
 
 test("describeApprovalPatternRefusal folds the hint lines into one sentence", () => {
-	const checked = validateApprovalPattern("^(a|a)*$");
+	const checked = validateApprovalPattern(ambiguousAlternation("a"));
 	assert.equal(checked.ok, false);
 	if (checked.ok) return;
 	const described = describeApprovalPatternRefusal(checked.refusal);

@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { _resetApprovalsCacheForTests, listApprovals } from "../core/exec-approvals.js";
+import { ambiguousAlternation, nestedQuantifier } from "../core/exec-pattern-fixtures.js";
 import {
 	applyApprovalDecision,
 	type ApprovalDecisionKind,
@@ -247,7 +248,7 @@ describe("applyApprovalDecision — allow-pattern", () => {
 		const refusals: string[] = [];
 		const outcome = applyApprovalDecision({
 			command: "git aaaa",
-			decision: { kind: "allow-pattern", pattern: "^git (a+)+$" },
+			decision: { kind: "allow-pattern", pattern: nestedQuantifier("a", { head: "git " }) },
 			onRefused: (message) => refusals.push(message),
 		});
 		// The operator picked an "allow" disposition — blocking the call they
@@ -272,7 +273,7 @@ describe("applyApprovalDecision — allow-pattern", () => {
 	it("a listener that throws doesn't break the call", () => {
 		const outcome = applyApprovalDecision({
 			command: "echo hi",
-			decision: { kind: "allow-pattern", pattern: "^(a|a)*$" },
+			decision: { kind: "allow-pattern", pattern: ambiguousAlternation("a") },
 			onRefused: () => {
 				throw new Error("transport is gone");
 			},

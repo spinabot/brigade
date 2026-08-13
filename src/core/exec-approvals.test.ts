@@ -28,6 +28,7 @@ process.env.BRIGADE_STATE_DIR = path.join(tmpHome, ".brigade");
 
 // Static import works now that HOME is set.
 const mod = await import("./exec-approvals.js");
+const { CATASTROPHIC_TRIO, nestedQuantifier } = await import("./exec-pattern-fixtures.js");
 
 before(() => {
 	process.on("exit", () => {
@@ -195,7 +196,7 @@ describe("decideApproval — allowlist", () => {
 /* ─────────────── pattern guard (write + read side) ─────────────── */
 
 describe("approval-pattern guard", () => {
-	const CATASTROPHIC = ["^git (a+)+$", "^(a|a)*$", "^([a-z]+)+#$"];
+	const CATASTROPHIC = CATASTROPHIC_TRIO;
 	const REALISTIC = [
 		"^git (status|diff|log)( |$)",
 		"^cat package\\.json$",
@@ -233,14 +234,15 @@ describe("approval-pattern guard", () => {
 
 	it("quarantines a catastrophic pattern already on disk instead of hanging the gate", () => {
 		// Pre-guard files exist in the wild — the gate has to survive them.
-		writeApprovalsFile({ commands: ["ls"], patterns: ["^git (a+)+$", "^git status$"] });
+		const planted = [nestedQuantifier("a", { head: "git " }), "^git status$"];
+		writeApprovalsFile({ commands: ["ls"], patterns: planted });
 		const started = Date.now();
 		assert.equal(mod.decideApproval("git aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"), "prompt");
 		assert.equal(mod.decideApproval("git status"), "allow", "healthy siblings keep working");
 		assert.equal(mod.decideApproval("ls"), "allow");
 		assert.ok(Date.now() - started < 1000, "gate stayed bounded");
 		// Quarantine is in-memory only — the operator's file is left alone.
-		assert.deepEqual(mod.listApprovals().patterns, ["^git (a+)+$", "^git status$"]);
+		assert.deepEqual(mod.listApprovals().patterns, planted);
 	});
 });
 
