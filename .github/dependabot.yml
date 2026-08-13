@@ -1,5 +1,25 @@
 # Dependabot configuration
-# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+# https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference
+#
+# Goal: dependencies stay current WITHOUT anyone shepherding pull requests, and
+# without routine bumps crowding out genuine contributions.
+#
+# How that works here:
+#   - grouped        one PR per group, not one per package (13 open PRs became
+#                    the norm before this; several sat stale for two months)
+#   - monthly        a cadence a person can actually absorb
+#   - cooldown       a release must age before Dependabot proposes it, so a
+#                    compromised or immediately-yanked version is caught by the
+#                    ecosystem before it can be auto-merged here
+#   - auto-merged    patch/minor land on their own once CI is green
+#                    (see .github/workflows/dependabot-auto-merge.yml)
+#
+# Majors deliberately still open a PR and wait for a human — auto-merging
+# zod 3 -> 4 or TypeScript 5 -> 6 would break the build, and that is a decision,
+# not a chore. The 30-day major cooldown keeps them rare.
+#
+# Security updates are a separate channel and are NOT affected by any of this:
+# a real advisory opens a PR immediately, ignoring cadence and cooldown.
 
 version: 2
 
@@ -8,8 +28,13 @@ updates:
   - package-ecosystem: npm
     directory: /
     schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
+      interval: monthly
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-patch-days: 3
+      semver-minor-days: 7
+      semver-major-days: 30
     groups:
       production:
         dependency-type: production
@@ -35,8 +60,10 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns:
