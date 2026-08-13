@@ -9,7 +9,9 @@
  *   1. `"menu"`    — four-letter shortcut row (Y/A/P/N) for the four
  *                    operator decisions.
  *   2. `"pattern"` — operator picked "P" (Allow pattern); we collect a
- *                    regex string with Pi-TUI's `Input` then resolve.
+ *                    regex string with Pi-TUI's `Input` then resolve. A regex
+ *                    the gate would refuse to store is reported inline and the
+ *                    operator stays here to fix it.
  *
  * Visual style mirrors the user's mock:
  *
@@ -38,6 +40,10 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 
+import {
+	describeApprovalPatternRefusal,
+	validateApprovalPattern,
+} from "../core/exec-pattern-guard.js";
 import { brand } from "../ui/theme.js";
 
 export type ApprovalDecisionKind =
@@ -119,6 +125,8 @@ function deriveTitle(request: ApprovalRenderRequest): string {
 export class ApprovalPrompt implements Component {
 	private state: "menu" | "pattern" = "menu";
 	private patternInput: Input | null = null;
+	/** Refusal text for the last pattern the operator submitted, if any. */
+	private patternError: string | null = null;
 	private resolved = false;
 	/** Last rendered width — captured so `pattern` mode can re-frame the input. */
 	private lastWidth = 80;
@@ -183,7 +191,10 @@ export class ApprovalPrompt implements Component {
 			const pad = " ".repeat(Math.max(0, inner - visibleWidth(fitted)));
 			return `${brand.dim("│ ")}${fitted}${pad}${brand.dim(" │")}`;
 		});
-		return [titleLine, helpLine, helpLine2, ...framedInput, bottom];
+		const errorLines = this.patternError
+			? [boxLine(inner, brand.error(truncateForBox(this.patternError, inner)))]
+			: [];
+		return [titleLine, helpLine, helpLine2, ...errorLines, ...framedInput, bottom];
 	}
 
 	handleInput(keyData: string): void {
@@ -243,6 +254,7 @@ export class ApprovalPrompt implements Component {
 
 	private enterPatternMode(): void {
 		this.state = "pattern";
+		this.patternError = null;
 		const input = new Input();
 		input.onSubmit = (value: string): void => {
 			const pattern = value.trim();
@@ -252,6 +264,18 @@ export class ApprovalPrompt implements Component {
 				this.resolve({ decision: "allow-once" });
 				return;
 			}
+			// The gate refuses to store a malformed or catastrophically slow
+			// regex, so say so HERE — where the operator can fix the typo —
+			// rather than accepting the keystroke and dropping the pattern
+			// server-side. Stay in pattern mode with the text still in the
+			// input; Esc is always the way out.
+			const checked = validateApprovalPattern(pattern);
+			if (!checked.ok) {
+				this.patternError = describeApprovalPatternRefusal(checked.refusal);
+				this.opts.tui.requestRender();
+				return;
+			}
+			this.patternError = null;
 			this.resolve({ decision: "allow-pattern", pattern });
 		};
 		input.onEscape = (): void => {

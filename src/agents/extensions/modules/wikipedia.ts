@@ -16,6 +16,7 @@ import type {
 	WebProviderToolDefinition,
 	WebSearchProvider,
 } from "../types.js";
+import { stripHtmlTags } from "../../tools/web-fetch-utils.js";
 import { DEFAULT_TIMEOUT_SECONDS, readResponseText } from "../../tools/web-shared.js";
 import {
 	readProviderConfigSlot,
@@ -41,7 +42,6 @@ interface MwSearchResponse {
 	query?: { search?: MwSearchHit[] };
 }
 
-const MW_TAG_RE = /<[^>]*>/g;
 const MW_ENTITY_RE = /&(?:quot|amp|lt|gt|nbsp);/g;
 const MW_ENTITY_MAP: Record<string, string> = {
 	"&quot;": '"',
@@ -53,13 +53,13 @@ const MW_ENTITY_MAP: Record<string, string> = {
 
 function stripMwMarkup(html: string): string {
 	// MediaWiki returns snippets with `<span class="searchmatch">…</span>`
-	// wrappers around hit terms. Strip every `<…>` span first (one pass over
-	// a regex that can't leave a reconstructable tag behind), THEN decode the
-	// entities in a single map-driven pass. Doing the decode last — and as one
-	// pass rather than chained replaces — avoids double-unescaping (`&amp;lt;`
-	// must stay `&lt;`, not become `<`).
-	return html
-		.replace(MW_TAG_RE, "")
+	// wrappers around hit terms. Strip the markup with the shared scanner in
+	// `web-fetch-utils` — a `/<[^>]*>/g` replace walks the string once, so
+	// overlapping angle brackets from a hostile article revision can close back
+	// up into a tag behind it. THEN decode the entities in a single map-driven
+	// pass. Doing the decode last — and as one pass rather than chained
+	// replaces — avoids double-unescaping (`&amp;lt;` must stay `&lt;`).
+	return stripHtmlTags(html)
 		.replace(MW_ENTITY_RE, (m) => MW_ENTITY_MAP[m] ?? m)
 		.trim();
 }

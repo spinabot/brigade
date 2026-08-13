@@ -130,13 +130,30 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 		(hasToolPlane ? CLAUDE_CLI_TOOL_PLANE_OVERALL_TIMEOUT_MS : CLAUDE_CLI_OVERALL_TIMEOUT_MS);
 	const doSpawn = args.spawnFn ?? spawn;
 
-	// Isolated, empty working dir — the tool-containment boundary.
+	// Isolated, empty working dir — the tool-containment boundary. `mkdtempSync`
+	// gives it a random suffix nobody can pre-claim, at mode 0700: what lands in
+	// here is the composed system prompt and the tool-plane config (which carries
+	// this turn's MCP token), and a fixed name under a world-writable /tmp (mode
+	// 1777) is a path any local user can create or symlink ahead of us.
+	//
+	// There is deliberately NO fallback to the bare temp dir. That would hand both
+	// files a predictable path AND drop the containment boundary itself, pointing a
+	// `bypassPermissions` binary at everyone's /tmp. A machine that cannot make a
+	// temp dir cannot run this turn safely, so say so.
 	let cwd: string;
 	try {
 		cwd = mkdtempSync(path.join(tmpdir(), "brigade-claude-cli-"));
-	} catch {
-		cwd = tmpdir();
+	} catch (err) {
+		throw new Error(`claude-cli: could not create an isolated working dir under ${tmpdir()}: ${String(err)}`);
 	}
+	// Every exit from here on — thrown or spawned — goes through this.
+	const removeCwd = () => {
+		try {
+			rmSync(cwd, { recursive: true, force: true });
+		} catch {
+			/* leave it for the OS temp reaper */
+		}
+	};
 
 	// Prefer Brigade's OWN Claude login (dedicated grant in its managed config
 	// dir) when present — the binary auths + refreshes there, isolated from the
@@ -152,7 +169,7 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 	if (sys && sys.length > 0) {
 		try {
 			const sysFile = path.join(cwd, "system-prompt.txt");
-			writeFileSync(sysFile, sys, "utf8");
+			writeFileSync(sysFile, sys, { encoding: "utf8", mode: 0o600 });
 			finalArgs.push(CLAUDE_CLI_SYSTEM_PROMPT_FILE_FLAG, sysFile);
 		} catch {
 			/* couldn't write the file — proceed without the appended prompt rather
@@ -167,7 +184,7 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 	if (mcpJson && mcpJson.length > 0) {
 		try {
 			const mcpFile = path.join(cwd, "mcp-config.json");
-			writeFileSync(mcpFile, mcpJson, "utf8");
+			writeFileSync(mcpFile, mcpJson, { encoding: "utf8", mode: 0o600 });
 			finalArgs.push(CLAUDE_CLI_MCP_CONFIG_FLAG, mcpFile, CLAUDE_CLI_STRICT_MCP_FLAG);
 		} catch (err) {
 			// Fail-open is only safe when the binary keeps its own tools. On a FULL-PLANE
@@ -176,6 +193,9 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 			// promises a filesystem — it would confidently report work it cannot do.
 			// Fail LOUD instead: the retry layer respawns, and the operator sees why.
 			if (args.requireMcpConfig === true) {
+				// Nothing will ever start here, so nothing will ever run `finish` — take the
+				// system prompt we just wrote with us.
+				removeCwd();
 				throw new Error(
 					`claude-cli: could not write the tool-plane config; refusing to spawn a tool-less agent: ${String(err)}`,
 				);
@@ -184,13 +204,21 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 		}
 	}
 
-	const child: ChildProcessWithoutNullStreams = doSpawn(command, finalArgs, {
-		cwd,
-		env: buildClaudeCliEnv(process.env, { configDir }),
-		stdio: ["pipe", "pipe", "pipe"],
-		// No shell — argv is passed verbatim so nothing is word-split or expanded.
-		shell: false,
-	}) as ChildProcessWithoutNullStreams;
+	let child: ChildProcessWithoutNullStreams;
+	try {
+		child = doSpawn(command, finalArgs, {
+			cwd,
+			env: buildClaudeCliEnv(process.env, { configDir }),
+			stdio: ["pipe", "pipe", "pipe"],
+			// No shell — argv is passed verbatim so nothing is word-split or expanded.
+			shell: false,
+		}) as ChildProcessWithoutNullStreams;
+	} catch (err) {
+		// A synchronous spawn failure (bad argv, EPERM) never reaches the 'error'
+		// handler below, so this is the only place the prompt file can be removed.
+		removeCwd();
+		throw err;
+	}
 
 	let killReason: SpawnKillReason | undefined;
 	let settled = false;
@@ -332,11 +360,7 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 				closed = true;
 				pump();
 				// Best-effort cleanup of the throwaway cwd.
-				try {
-					rmSync(cwd, { recursive: true, force: true });
-				} catch {
-					/* leave it for the OS temp reaper */
-				}
+				removeCwd();
 				resolve({ code, killReason, stderr });
 			};
 			child.on("close", (code) => finish(code));

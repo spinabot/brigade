@@ -70,3 +70,46 @@ test("empty command / pattern → ok:false", () => {
 	assert.equal(handleExecAllow({ command: "   " }).ok, false);
 	assert.equal(handleExecAllowPattern({ pattern: "" }).ok, false);
 });
+
+/* ─────────────── pattern guard over the RPC (remote-reachable) ─────────────── */
+
+test("allow-pattern refuses a catastrophically backtracking regex", () => {
+	for (const pattern of ["^git (a+)+$", "^(a|a)*$", "^([a-z]+)+#$"]) {
+		const started = Date.now();
+		const r = handleExecAllowPattern({ pattern });
+		const elapsed = Date.now() - started;
+		assert.equal(r.ok, false, `stored a catastrophic pattern: ${pattern}`);
+		assert.match(r.reason ?? "", /backtracks catastrophically/);
+		assert.ok(elapsed < 2000, `${pattern} took ${elapsed}ms — the guard should bail early`);
+	}
+	assert.deepEqual(handleExecList({}).patterns, [], "nothing reached the store");
+});
+
+test("allow-pattern still accepts realistic allowlist patterns", () => {
+	const patterns = [
+		"^git (status|diff|log)( |$)",
+		"^cat package\\.json$",
+		"^npm (run|ci|test)\\b.*",
+		"^ls( -[a-zA-Z]+)*( |$)",
+	];
+	for (const pattern of patterns) {
+		assert.equal(handleExecAllowPattern({ pattern }).ok, true, `refused: ${pattern}`);
+	}
+	assert.deepEqual(handleExecList({}).patterns, patterns);
+	assert.equal(handleExecDenyTest({ command: "git log --oneline" }).decision, "allow");
+	assert.equal(handleExecDenyTest({ command: "npm run build" }).decision, "allow");
+	assert.equal(handleExecDenyTest({ command: "git push --force" }).decision, "prompt");
+});
+
+test("allow-pattern refuses a pattern past the length cap", () => {
+	const r = handleExecAllowPattern({ pattern: `^${"a".repeat(600)}$` });
+	assert.equal(r.ok, false);
+	assert.match(r.reason ?? "", /too long/);
+	assert.deepEqual(handleExecList({}).patterns, []);
+});
+
+test("allow-pattern reasons carry the remediation hint for remote clients", () => {
+	const r = handleExecAllowPattern({ pattern: "^(a+)+$" });
+	assert.equal(r.ok, false);
+	assert.match(r.reason ?? "", /write `a\+` instead of `\(a\+\)\+`/);
+});

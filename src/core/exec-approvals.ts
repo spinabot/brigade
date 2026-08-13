@@ -11,6 +11,9 @@
  *     a TUI prompt and writes the decision back via `recordApproval`.
  *   - Hard-deny patterns (rm -rf /, dd to /dev/sda, etc.) return `"deny"` and
  *     are NEVER stored. Caller rejects without prompting the operator.
+ *   - Regex approvals clear `exec-pattern-guard.ts` before they're written, and
+ *     again when they're loaded — a pattern the gate re-runs on every bash call
+ *     has to be bounded, and a file written before the guard existed isn't.
  *
  * Per-agent layout:
  *   - Each agent gets its own allowlist at `<agentDir>/exec-approvals.json`,
@@ -68,6 +71,8 @@ import * as path from "node:path";
 import { DEFAULT_AGENT_ID, resolveAgentDir, resolveStateDir } from "../config/paths.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
+import { describeApprovalPatternRefusal, validateApprovalPattern } from "./exec-pattern-guard.js";
+
 const SUPPORTED_SCHEMA_VERSION = 1 as const;
 
 export type ApprovalDecision = "allow" | "deny" | "prompt";
@@ -112,11 +117,21 @@ interface CacheEntry {
 	contents: ApprovalsFile;
 	/** mtime ms at load time. -1 sentinel = file was missing when loaded. */
 	mtimeMs: number;
+	/**
+	 * Compiled matchers for `contents.patterns`, minus any entry that fails the
+	 * write-time guard. Built once per load so `decideApproval` neither
+	 * recompiles nor re-measures a pattern on the tool-call hot path.
+	 */
+	matchers: RegExp[];
 }
 
 // Per-agentId cache. Keyed on normalised agentId so two callers passing
 // "main" / " main " resolve to the same slot.
 const cache = new Map<string, CacheEntry>();
+
+// Patterns we've already complained about, so a quarantined entry produces one
+// line per process rather than one per reload. Keyed `agentId pattern`.
+const quarantinedPatterns = new Set<string>();
 
 // Track per-agent migration-from-legacy status so we only attempt the rename
 // once per process start.
@@ -244,11 +259,67 @@ function emptyApprovals(): ApprovalsFile {
 }
 
 /**
+ * Compile the agent's patterns once, dropping any that the write-time guard
+ * refuses. Entries written before the guard existed (or copied in by hand)
+ * are the reason this runs on the READ path too: an allowlist file is
+ * long-lived, and a catastrophic pattern already on disk would otherwise wedge
+ * every future bash call with nothing to grep for.
+ *
+ * Quarantine, never delete — the operator's file is theirs. The entry stays on
+ * disk (and in `brigade exec list`) with a one-off line telling them how to
+ * remove it; the gate simply stops evaluating it, which downgrades an affected
+ * command from "allow" to "prompt" rather than to "hang".
+ *
+ * Cost lands here and not in `decideApproval` on purpose: this runs on a cache
+ * miss or an mtime change, while `decideApproval` runs on every bash tool call.
+ * A healthy pattern clears the guard in microseconds and the gate then reuses
+ * the compiled regex instead of rebuilding it per call.
+ */
+function compileSafePatterns(agentId: string, patterns: readonly string[]): RegExp[] {
+	const out: RegExp[] = [];
+	for (const pat of patterns) {
+		const checked = validateApprovalPattern(pat);
+		if (checked.ok) {
+			out.push(checked.regex);
+			continue;
+		}
+		const key = `${agentId} ${pat}`;
+		if (!quarantinedPatterns.has(key)) {
+			quarantinedPatterns.add(key);
+			// The guard's own wording addresses an operator ADDING a pattern.
+			// Reframe the slow case for someone reading back a file they wrote
+			// months ago — the entry is already stored, the news is that the
+			// gate has stopped honouring it.
+			const why =
+				checked.refusal.code === "pattern-too-slow"
+					? "it backtracks catastrophically and would hang the gate on every bash call"
+					: checked.refusal.message;
+			console.error(
+				`brigade: ignoring exec-approval pattern /${pat}/ (agent ${agentId}) — ${why}. ` +
+					`Remove it with \`brigade exec remove ${JSON.stringify(pat)} --agent ${agentId}\`.`,
+			);
+		}
+	}
+	return out;
+}
+
+/** Install a cache slot, compiling + guarding its patterns in one place. */
+function putCacheEntry(agentId: string, contents: ApprovalsFile, mtimeMs: number): CacheEntry {
+	const entry: CacheEntry = {
+		contents,
+		mtimeMs,
+		matchers: compileSafePatterns(agentId, contents.patterns),
+	};
+	cache.set(agentId, entry);
+	return entry;
+}
+
+/**
  * Load the cache slot for `agentId` if absent OR if the on-disk file's mtime
  * moved since we captured it. Triggers the lazy legacy migration the first
  * time we look up the default agent.
  */
-function loadApprovals(agentId: string): ApprovalsFile {
+function loadApprovalsEntry(agentId: string): CacheEntry {
 	const id = normaliseAgentId(agentId);
 
 	// Convex mode — serve from the in-process cache. Boot hydration
@@ -259,10 +330,8 @@ function loadApprovals(agentId: string): ApprovalsFile {
 	const rctx = tryGetRuntimeContext();
 	if (rctx?.mode === "convex") {
 		const existing = cache.get(id);
-		if (existing) return existing.contents;
-		const empty = emptyApprovals();
-		cache.set(id, { contents: empty, mtimeMs: -1 });
-		return empty;
+		if (existing) return existing;
+		return putCacheEntry(id, emptyApprovals(), -1);
 	}
 
 	maybeMigrateLegacyApprovals(id);
@@ -270,11 +339,14 @@ function loadApprovals(agentId: string): ApprovalsFile {
 	const existing = cache.get(id);
 	const observed = currentMtimeMs(filePath, existing?.mtimeMs ?? -1);
 	if (existing && existing.mtimeMs === observed) {
-		return existing.contents;
+		return existing;
 	}
-	const contents = loadApprovalsFromDisk(filePath);
-	cache.set(id, { contents, mtimeMs: observed });
-	return contents;
+	return putCacheEntry(id, loadApprovalsFromDisk(filePath), observed);
+}
+
+/** Contents-only view of the cache slot — the shape most callers want. */
+function loadApprovals(agentId: string): ApprovalsFile {
+	return loadApprovalsEntry(agentId).contents;
 }
 
 /** Convex-mode boot hydration — install the agent's allowlist into the
@@ -285,14 +357,15 @@ export function primeApprovalsCache(
 	contents: { commands: string[]; patterns: string[] },
 ): void {
 	const id = normaliseAgentId(agentId);
-	cache.set(id, {
-		contents: {
+	putCacheEntry(
+		id,
+		{
 			version: SUPPORTED_SCHEMA_VERSION,
 			commands: [...contents.commands],
 			patterns: [...contents.patterns],
 		},
-		mtimeMs: -1,
-	});
+		-1,
+	);
 }
 
 // Serialises convex-mode approval mutations; errors are surfaced loudly but
@@ -365,12 +438,13 @@ function writeApprovalsFileAtomic(filePath: string, contents: ApprovalsFile): vo
  */
 function pinCacheAfterWrite(agentId: string, filePath: string, contents: ApprovalsFile): void {
 	const id = normaliseAgentId(agentId);
+	let mtimeMs = -1;
 	try {
-		const mtimeMs = fs.statSync(filePath).mtimeMs;
-		cache.set(id, { contents, mtimeMs });
+		mtimeMs = fs.statSync(filePath).mtimeMs;
 	} catch {
-		cache.set(id, { contents, mtimeMs: -1 });
+		// Stat raced the rename — leave the sentinel so the next call reloads.
 	}
+	putCacheEntry(id, contents, mtimeMs);
 }
 
 /**
@@ -403,20 +477,18 @@ export function decideApproval(
 
 	if (isHardDenied(cmd)) return "deny";
 
-	const approvals = loadApprovals(agentId ?? DEFAULT_AGENT_ID);
+	const entry = loadApprovalsEntry(agentId ?? DEFAULT_AGENT_ID);
 
 	const normalisedCmd = normalizeForExactMatch(cmd);
-	for (const entry of approvals.commands) {
-		if (normalizeForExactMatch(entry) === normalisedCmd) return "allow";
+	for (const approved of entry.contents.commands) {
+		if (normalizeForExactMatch(approved) === normalisedCmd) return "allow";
 	}
 
-	for (const pat of approvals.patterns) {
-		try {
-			const re = new RegExp(pat);
-			if (re.test(cmd)) return "allow";
-		} catch {
-			// Skip malformed pattern.
-		}
+	// Matchers are compiled + guarded at load time, so this loop is a plain
+	// `test` per pattern — no recompilation, and a malformed or catastrophic
+	// entry never reaches it.
+	for (const re of entry.matchers) {
+		if (re.test(cmd)) return "allow";
 	}
 
 	return "prompt";
@@ -499,6 +571,19 @@ export function recordApproval(
 				`refused by the gate and cannot be allowlisted — pick a safer command.`,
 		);
 	}
+	// Guard the regex BEFORE anything else runs it — `patternMatchesHardDeny`
+	// below compiles and executes the pattern itself, and a catastrophic one
+	// must never be handed to the probe sweep (or to the gate) in the first
+	// place. Every writer — CLI, `exec.allow-pattern` RPC, approval bridge, TUI
+	// prompt — funnels through here, so the bar is the same on all four.
+	if (kind === "pattern") {
+		const checked = validateApprovalPattern(value);
+		if (!checked.ok) {
+			throw new BrigadeApprovalRefusedError(
+				`refused to record approval: ${describeApprovalPatternRefusal(checked.refusal)}`,
+			);
+		}
+	}
 	if (kind === "pattern" && patternMatchesHardDeny(value)) {
 		throw new BrigadeApprovalRefusedError(
 			`refused to record approval: pattern /${value}/ matches at least one hard-deny ` +
@@ -528,7 +613,7 @@ export function recordApproval(
 			if (next.patterns.includes(value)) return;
 			next.patterns.push(value);
 		}
-		cache.set(id, { contents: next, mtimeMs: -1 });
+		putCacheEntry(id, next, -1);
 		const store = rctx.store;
 		approvalsFlushChain = approvalsFlushChain
 			.then(() => store.execApprovals.recordApproval({ agentId: id, value, kind }))
@@ -579,7 +664,7 @@ export function removeApproval(
 		if (removedCommands === 0 && removedPatterns === 0) {
 			return { removedCommands: 0, removedPatterns: 0 };
 		}
-		cache.set(id, { contents: next, mtimeMs: -1 });
+		putCacheEntry(id, next, -1);
 		const store = rctx.store;
 		approvalsFlushChain = approvalsFlushChain
 			.then(() => store.execApprovals.removeApproval(id, v))
@@ -637,6 +722,7 @@ export class BrigadeApprovalFileVersionError extends Error {
 export function _resetApprovalsCacheForTests(): void {
 	cache.clear();
 	migrationAttempted.clear();
+	quarantinedPatterns.clear();
 }
 
 /**

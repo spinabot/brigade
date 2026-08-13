@@ -61,6 +61,18 @@ afterEach(() => {
 	mod._resetApprovalsCacheForTests();
 });
 
+/**
+ * Plant an allowlist file directly, bypassing `recordApproval`. Stands in for
+ * a file written by an older Brigade (or edited by hand) so the read path can
+ * be tested against entries the writers would refuse today.
+ */
+function writeApprovalsFile(contents: { commands: string[]; patterns: string[] }): void {
+	const filePath = mod.getApprovalsFilePath();
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, JSON.stringify({ version: 1, ...contents }, null, 2), "utf8");
+	mod._resetApprovalsCacheForTests();
+}
+
 describe("per-agent allowlist isolation", () => {
 	it("default agent + non-default agent see independent allowlists", () => {
 		mod.recordApproval("ls -la", "exact"); // default = "main"
@@ -167,9 +179,68 @@ describe("decideApproval — allowlist", () => {
 		assert.equal(mod.decideApproval("rm -rf /"), "deny");
 	});
 
-	it("malformed regex pattern is skipped, not crashed", () => {
-		mod.recordApproval("[unclosed", "pattern");
+	it("malformed regex pattern is REFUSED at recordApproval", () => {
+		assert.throws(
+			() => mod.recordApproval("[unclosed", "pattern"),
+			(err: unknown) => err instanceof mod.BrigadeApprovalRefusedError,
+		);
+	});
+
+	it("malformed regex already on disk is skipped, not crashed", () => {
+		writeApprovalsFile({ commands: [], patterns: ["[unclosed"] });
 		assert.equal(mod.decideApproval("foo"), "prompt");
+	});
+});
+
+/* ─────────────── pattern guard (write + read side) ─────────────── */
+
+describe("approval-pattern guard", () => {
+	const CATASTROPHIC = ["^git (a+)+$", "^(a|a)*$", "^([a-z]+)+#$"];
+	const REALISTIC = [
+		"^git (status|diff|log)( |$)",
+		"^cat package\\.json$",
+		"^npm (run|ci|test)\\b.*",
+		"^ls( -[a-zA-Z]+)*( |$)",
+	];
+
+	it("refuses a catastrophically backtracking pattern from every writer", () => {
+		for (const pattern of CATASTROPHIC) {
+			assert.throws(
+				() => mod.recordApproval(pattern, "pattern"),
+				(err: unknown) => err instanceof mod.BrigadeApprovalRefusedError,
+				`expected ${pattern} to be refused`,
+			);
+		}
+		assert.deepEqual(mod.listApprovals().patterns, []);
+	});
+
+	it("refuses a pattern past the length cap", () => {
+		assert.throws(
+			() => mod.recordApproval(`^${"a".repeat(600)}$`, "pattern"),
+			(err: unknown) =>
+				err instanceof mod.BrigadeApprovalRefusedError && /too long/.test((err as Error).message),
+		);
+	});
+
+	it("still stores realistic allowlist patterns", () => {
+		for (const pattern of REALISTIC) mod.recordApproval(pattern, "pattern");
+		assert.deepEqual(mod.listApprovals().patterns, REALISTIC);
+		assert.equal(mod.decideApproval("git status"), "allow");
+		assert.equal(mod.decideApproval("npm run build"), "allow");
+		assert.equal(mod.decideApproval("ls -la"), "allow");
+		assert.equal(mod.decideApproval("curl example.com"), "prompt");
+	});
+
+	it("quarantines a catastrophic pattern already on disk instead of hanging the gate", () => {
+		// Pre-guard files exist in the wild — the gate has to survive them.
+		writeApprovalsFile({ commands: ["ls"], patterns: ["^git (a+)+$", "^git status$"] });
+		const started = Date.now();
+		assert.equal(mod.decideApproval("git aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"), "prompt");
+		assert.equal(mod.decideApproval("git status"), "allow", "healthy siblings keep working");
+		assert.equal(mod.decideApproval("ls"), "allow");
+		assert.ok(Date.now() - started < 1000, "gate stayed bounded");
+		// Quarantine is in-memory only — the operator's file is left alone.
+		assert.deepEqual(mod.listApprovals().patterns, ["^git (a+)+$", "^git status$"]);
 	});
 });
 

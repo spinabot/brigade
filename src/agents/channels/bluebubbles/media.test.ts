@@ -119,6 +119,21 @@ describe("downloadInboundAttachments", () => {
 		assert.equal(out.length, 0);
 	});
 
+	it("keeps a traversal-shaped guid/transferName inside cacheDir", async () => {
+		const cacheDir = mkdtempSync(path.join(os.tmpdir(), "bb-media-"));
+		const out = await downloadInboundAttachments(
+			[
+				{ guid: "../../etc", transferName: "../../../passwd.png" },
+				{ guid: "..\\..\\win", transferName: "..\\evil.png" },
+			],
+			{ serverUrl: SERVER, password: PASSWORD, cacheDir, maxBytes: 1024, fetchImpl: bytesFetch(new Uint8Array([1])) },
+		);
+		assert.equal(out.length, 2);
+		for (const att of out) {
+			assert.equal(path.dirname(path.resolve(att.path)), path.resolve(cacheDir));
+		}
+	});
+
 	it("returns [] when a download fails (non-2xx)", async () => {
 		const cacheDir = mkdtempSync(path.join(os.tmpdir(), "bb-media-"));
 		const out = await downloadInboundAttachments([{ guid: "ATT-2", transferName: "p.png" }], {

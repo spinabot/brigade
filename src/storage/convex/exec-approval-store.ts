@@ -5,6 +5,7 @@ import { api } from "../../../convex/_generated/api.js";
 
 import { getReactiveConvexClient } from "./client.js";
 
+import { validateApprovalPattern } from "../../core/exec-pattern-guard.js";
 import { NotImplementedYet } from "../store.js";
 import type { ApprovalsSnapshot, ExecApprovalStore } from "../store.js";
 
@@ -20,6 +21,29 @@ function cacheKey(ownerId: string, agentId: string): string {
 
 function normaliseCommand(cmd: string): string {
 	return cmd.trim().replace(/\s+/g, " ");
+}
+
+/**
+ * Fold approval rows into the sync-gate's lookup shape. Patterns are compiled
+ * ONCE here — `decideSync` runs on every bash tool call and must not pay for a
+ * recompile — and a pattern the write-time guard refuses (malformed, or slow
+ * enough to hang the gate) is cached as `re: null` so it's simply never
+ * evaluated. Rows predate the guard, so the check belongs on the read path too.
+ */
+function toCachedRows(
+	rows: ReadonlyArray<{ kind: "exact" | "pattern"; valueNormalised: string; value: string }>,
+): CachedRows {
+	const commands = new Set<string>();
+	const patterns: CachedRows["patterns"] = [];
+	for (const r of rows) {
+		if (r.kind === "exact") {
+			commands.add(r.valueNormalised);
+			continue;
+		}
+		const checked = validateApprovalPattern(r.value);
+		patterns.push({ raw: r.value, re: checked.ok ? checked.regex : null });
+	}
+	return { commands, patterns };
 }
 
 export class ConvexExecApprovalStore implements ExecApprovalStore {
@@ -108,23 +132,12 @@ export class ConvexExecApprovalStore implements ExecApprovalStore {
 			{ ownerId: this.deps.ownerId, agentId },
 			(rows) => {
 				const list = rows as Array<{ kind: "exact" | "pattern"; valueNormalised: string; value: string }>;
-				const commands = new Set<string>();
-				const patterns: CachedRows["patterns"] = [];
-				for (const r of list) {
-					if (r.kind === "exact") commands.add(r.valueNormalised);
-					else {
-						try {
-							patterns.push({ raw: r.value, re: new RegExp(r.value) });
-						} catch {
-							patterns.push({ raw: r.value, re: null });
-						}
-					}
-				}
-				cache.set(cacheKey(this.deps.ownerId, agentId), { commands, patterns });
+				const cached = toCachedRows(list);
+				cache.set(cacheKey(this.deps.ownerId, agentId), cached);
 				try {
 					onChange({
-						commandCount: commands.size,
-						patternCount: patterns.length,
+						commandCount: cached.commands.size,
+						patternCount: cached.patterns.length,
 					} as ApprovalsSnapshot);
 				} catch {
 					// Subscriber threw — stay alive.
@@ -145,19 +158,7 @@ export class ConvexExecApprovalStore implements ExecApprovalStore {
 			ownerId: this.deps.ownerId,
 			agentId,
 		})) as Array<{ kind: "exact" | "pattern"; valueNormalised: string; value: string }>;
-		const commands = new Set<string>();
-		const patterns: CachedRows["patterns"] = [];
-		for (const r of rows) {
-			if (r.kind === "exact") commands.add(r.valueNormalised);
-			else {
-				try {
-					patterns.push({ raw: r.value, re: new RegExp(r.value) });
-				} catch {
-					patterns.push({ raw: r.value, re: null });
-				}
-			}
-		}
-		cache.set(cacheKey(this.deps.ownerId, agentId), { commands, patterns });
+		cache.set(cacheKey(this.deps.ownerId, agentId), toCachedRows(rows));
 	}
 
 	__unused = NotImplementedYet;

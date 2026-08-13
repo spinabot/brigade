@@ -270,12 +270,39 @@ export function markdownToTelegramHtml(markdown: string): string {
  */
 export function telegramHtmlIsEmpty(html: string): boolean {
 	if (!html) return true;
-	// Drop tags (allowing quoted attribute values that themselves contain `>`),
-	// then decode the handful of entities we emit, then trim.
-	const withoutTags = html.replace(/<(?:"[^"]*"|'[^']*'|[^'">])*>/g, "");
+	// Scan the tags out rather than `replace`-ing them: a single-pass strip lets
+	// the text on either side of a removed match close up into a tag the pass has
+	// already walked by (`<<b>b>` leaves `<b>`), so the "is anything visible"
+	// answer would depend on markup the scan never re-examined. Walking left to
+	// right never re-emits a `<` it consumed, so it settles in one pass.
+	let text = "";
+	let i = 0;
+	while (i < html.length) {
+		const lt = html.indexOf("<", i);
+		if (lt === -1) {
+			text += html.slice(i);
+			break;
+		}
+		text += html.slice(i, lt);
+		// Walk to the tag's `>`; quoted attribute values may hold a literal `>`.
+		let quote = "";
+		let j = lt + 1;
+		for (; j < html.length; j += 1) {
+			const ch = html[j] as string;
+			if (quote) {
+				if (ch === quote) quote = "";
+			} else if (ch === '"' || ch === "'") {
+				quote = ch;
+			} else if (ch === ">") {
+				break;
+			}
+		}
+		if (j >= html.length) break; // unterminated tag — nothing visible follows
+		i = j + 1;
+	}
 	// Decode `&amp;` LAST so an already-decoded entity sequence is never
 	// re-expanded into a second decode pass (e.g. `&amp;lt;` → `&lt;`, not `<`).
-	const decoded = withoutTags
+	const decoded = text
 		.replace(/&lt;/g, "<")
 		.replace(/&gt;/g, ">")
 		.replace(/&quot;/g, '"')

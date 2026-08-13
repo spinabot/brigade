@@ -23,7 +23,7 @@
 
 import * as crypto from "node:crypto";
 
-import { recordApproval } from "../core/exec-approvals.js";
+import { BrigadeApprovalRefusedError, recordApproval } from "../core/exec-approvals.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
@@ -285,17 +285,31 @@ export function getActiveApprovalBridge(): ApprovalBridge | null {
  *                          falls back to "allow-once" semantics otherwise
  *   - `"deny"`           → no write
  *
- * Persistence errors (hard-deny conflict, symlink at the file path) bubble
+ * Persistence errors (symlink at the file path, unwritable state dir) bubble
  * up — the caller decides whether to refuse the tool call or treat the
  * decision as allow-once.
+ *
+ * A REFUSED pattern is not one of those. The operator typed a regex the gate
+ * won't store (hard-deny shaped, malformed, or catastrophically slow); they
+ * still picked an "allow" disposition for the command in front of them, so
+ * this call proceeds as allow-once and the refusal is reported through
+ * `onRefused` — the caller's own transport, which for a channel-routed turn is
+ * a message back in the conversation. Throwing here would block a call the
+ * operator explicitly approved.
  */
 export function applyApprovalDecision(args: {
 	command: string;
 	decision: ApprovalDecision;
 	/** Per-agent allowlist scope — defaults to the canonical agent. */
 	agentId?: string;
+	/**
+	 * Called with an operator-readable sentence when a pattern was refused and
+	 * therefore NOT persisted. Optional: without it the refusal is still logged,
+	 * it just isn't echoed to whoever answered the prompt.
+	 */
+	onRefused?: (message: string) => void;
 }): "allow" | "deny" {
-	const { command, decision, agentId } = args;
+	const { command, decision, agentId, onRefused } = args;
 	switch (decision.kind) {
 		case "deny":
 			return "deny";
@@ -311,7 +325,23 @@ export function applyApprovalDecision(args: {
 		case "allow-pattern": {
 			const pattern = decision.pattern?.trim();
 			if (pattern) {
-				recordApproval(pattern, "pattern", agentId);
+				try {
+					recordApproval(pattern, "pattern", agentId);
+				} catch (err) {
+					if (!(err instanceof BrigadeApprovalRefusedError)) throw err;
+					const message =
+						`Ran the command, but didn't save the pattern /${pattern}/: ${err.message.replace(/^refused to record approval: /, "")}`;
+					log.warn("approval pattern refused — not persisted", {
+						agentId: agentId ?? "",
+						pattern,
+						reason: err.message,
+					});
+					try {
+						onRefused?.(message);
+					} catch {
+						// A transport that can't deliver the note must not fail the call.
+					}
+				}
 			}
 			// Even if no pattern was provided, this call IS allowed — the
 			// operator picked an "allow" disposition. Future calls miss the

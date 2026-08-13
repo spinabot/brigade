@@ -19,7 +19,7 @@ import type {
 	WebSearchProvider,
 } from "../types.js";
 import { guardedFetch } from "../../../infra/net/fetch-guard.js";
-import { decodeHtmlEntities } from "../../tools/web-fetch-utils.js";
+import { decodeHtmlEntities, stripHtmlTags } from "../../tools/web-fetch-utils.js";
 import { DEFAULT_TIMEOUT_SECONDS, readResponseText } from "../../tools/web-shared.js";
 import { resolveSiteName, wrapSearchHit } from "./web-provider-helpers.js";
 
@@ -51,21 +51,15 @@ function unwrapDdgUrl(rawHref: string): string {
 	}
 }
 
-/** Strip ALL HTML tags from a fragment + decode entities. */
+/**
+ * Strip ALL HTML tags from a fragment + decode entities. Tag removal runs
+ * through the shared scanner in `web-fetch-utils` — a one-shot `<[^>]*>`
+ * replace lets overlapping angle brackets (`<<a>script>`) close back up into a
+ * live tag after the pass has moved on, and DDG's title/snippet HTML comes
+ * straight off whatever page ranked.
+ */
 function stripHtmlToText(html: string): string {
-	// Strip tags repeatedly until the string stabilises. A single
-	// `<[^>]+>` pass is incomplete: overlapping/nested angle brackets
-	// (e.g. `<a<b>`) can leave a residual `<…>` that the one-shot replace
-	// never sees, which — after entity decoding — could smuggle markup
-	// back into the title/snippet text. Looping to a fixed point closes
-	// that gap and is a no-op for well-formed fragments.
-	let prev = html;
-	let stripped = html.replace(/<[^>]*>/g, "");
-	while (stripped !== prev) {
-		prev = stripped;
-		stripped = stripped.replace(/<[^>]*>/g, "");
-	}
-	return decodeHtmlEntities(stripped).replace(/\s+/g, " ").trim();
+	return decodeHtmlEntities(stripHtmlTags(html)).replace(/\s+/g, " ").trim();
 }
 
 /** Parse the DDG HTML response into normalized hit objects. */

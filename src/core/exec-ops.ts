@@ -12,7 +12,8 @@
  * All structured returns (no console I/O) so the gateway can hand them straight
  * back to a WS client. The underlying primitives in `exec-approvals.ts` are the
  * SAME ones the CLI calls, so `brigade exec allow` and `exec.allow` over the
- * wire behave identically — including the hard-deny safety net.
+ * wire behave identically — including the hard-deny safety net and the
+ * approval-pattern guard.
  */
 
 import { DEFAULT_AGENT_ID } from "../config/paths.js";
@@ -25,6 +26,7 @@ import {
 	recordApproval,
 	removeApproval,
 } from "./exec-approvals.js";
+import { describeApprovalPatternRefusal, validateApprovalPattern } from "./exec-pattern-guard.js";
 
 function resolveAgentId(agentId?: string): string {
 	const t = (agentId ?? "").trim();
@@ -73,10 +75,13 @@ export function handleExecAllowPattern(params: unknown): ExecMutateResult {
 	const agentId = resolveAgentId(p.agentId);
 	const pat = (p.pattern ?? "").trim();
 	if (!pat) return { ok: false, agentId, reason: "pattern is empty" };
-	try {
-		new RegExp(pat);
-	} catch (err) {
-		return { ok: false, agentId, value: pat, reason: `invalid regex: ${(err as Error).message}` };
+	// Remote-reachable writer, so the guard matters most here: syntax, length,
+	// and backtracking cost are all checked before the pattern can reach the
+	// store. `recordApproval` enforces the same bar — running it first just lets
+	// the RPC answer with the actionable text instead of a thrown error.
+	const checked = validateApprovalPattern(pat);
+	if (!checked.ok) {
+		return { ok: false, agentId, value: pat, reason: describeApprovalPatternRefusal(checked.refusal) };
 	}
 	try {
 		recordApproval(pat, "pattern", agentId);

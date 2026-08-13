@@ -18,8 +18,8 @@ import { spawn } from "node:child_process";
 import { mkdirSync, existsSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { readFile, stat } from "node:fs/promises";
-import { extname, join, dirname, resolve, sep } from "node:path";
+import { readFile } from "node:fs/promises";
+import { extname, join, dirname, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -237,44 +237,58 @@ const MIME = {
 
 // Confine a request-derived file path under DASHBOARD_DIR. `req.url` is
 // attacker-controllable (any local process can hit 127.0.0.1:6791), so a
-// decoded `..` segment must never let `join` escape the served root. Resolve
-// to an absolute path and reject anything outside DASHBOARD_DIR.
+// decoded `..` segment — or an absolute path — must never let `join` escape
+// the served root. Resolve the candidate, then ask `relative()` whether the
+// result is still *inside* the root: a bare `resolved.startsWith(root)` is
+// not a containment test (a sibling `<root>-evil` passes it). Returns the
+// safe absolute path, or null for anything that walks out.
 const DASHBOARD_ROOT = resolve(DASHBOARD_DIR);
 function confineToDashboard(candidate) {
-  const resolved = resolve(candidate);
-  if (resolved === DASHBOARD_ROOT || resolved.startsWith(DASHBOARD_ROOT + sep)) {
-    return resolved;
-  }
-  return null;
+  const rel = relative(DASHBOARD_ROOT, resolve(DASHBOARD_ROOT, candidate));
+  if (rel === "") return DASHBOARD_ROOT;
+  if (rel.startsWith("..") || isAbsolute(rel)) return null;
+  return join(DASHBOARD_ROOT, rel);
 }
 
 const dashboardServer = createServer(async (req, res) => {
   try {
     let urlPath = decodeURIComponent((req.url ?? "/").split("?")[0]);
     if (urlPath === "/") urlPath = "/index.html";
+    // No decoded segment may be a parent-directory hop. The containment check
+    // below is the real defence; this just rejects the obvious probe early,
+    // before any of it reaches the filesystem.
+    if (urlPath.split(/[/\\]/).includes("..")) { res.writeHead(404); res.end("Not Found"); return; }
 
-    let filePath = confineToDashboard(join(DASHBOARD_DIR, urlPath));
-    if (!filePath) { res.writeHead(404); res.end("Not Found"); return; }
+    const requested = confineToDashboard(join(DASHBOARD_ROOT, urlPath));
+    if (!requested) { res.writeHead(404); res.end("Not Found"); return; }
 
-    // SPA fallback — if the requested path has no extension and doesn't exist,
-    // try $path.html, then fall back to index.html.
-    let st;
-    try { st = await stat(filePath); } catch {}
-    if (!st || st.isDirectory()) {
-      const candidates = [
-        confineToDashboard(filePath + ".html"),
-        confineToDashboard(join(filePath, "index.html")),
-        join(DASHBOARD_ROOT, "index.html"),
-      ];
-      for (const c of candidates) {
-        if (!c) continue;
-        try {
-          const s = await stat(c);
-          if (s.isFile()) { filePath = c; st = s; break; }
-        } catch {}
+    // SPA fallback — the requested path, then $path.html, then $path/index.html,
+    // then the app shell. Read each candidate outright rather than stat-ing it
+    // first: a stat/read pair can straddle a rename and end up describing one
+    // file while serving another, and the read has to handle "not there" anyway.
+    // EISDIR/EACCES/EPERM are how the platforms variously report "that's a
+    // directory" — all of them just mean "try the next candidate".
+    const candidates = [
+      requested,
+      confineToDashboard(requested + ".html"),
+      confineToDashboard(join(requested, "index.html")),
+      join(DASHBOARD_ROOT, "index.html"),
+    ];
+    let filePath = null;
+    let body = null;
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      try {
+        body = await readFile(candidate);
+        filePath = candidate;
+        break;
+      } catch (err) {
+        const code = err?.code;
+        if (code === "ENOENT" || code === "ENOTDIR" || code === "EISDIR" || code === "EACCES" || code === "EPERM") continue;
+        throw err;
       }
     }
-    if (!st || !st.isFile()) { res.writeHead(404); res.end("Not Found"); return; }
+    if (!filePath) { res.writeHead(404); res.end("Not Found"); return; }
 
     const ext = extname(filePath).toLowerCase();
     const mime = MIME[ext] ?? "application/octet-stream";
@@ -296,7 +310,7 @@ const dashboardServer = createServer(async (req, res) => {
         `{type:"dashboard-credentials",adminKey:${JSON.stringify(adminKey)},` +
         `deploymentUrl:${JSON.stringify(`http://${BACKEND_HOST}:${BACKEND_PORT}`)},` +
         `deploymentName:${JSON.stringify(identity.instanceName)}}`;
-      const html = (await readFile(filePath, "utf8")).replace(
+      const html = body.toString("utf8").replace(
         /<head>/i,
         `<head><script>(function(){try{` +
           `window.addEventListener("message",function(ev){` +
@@ -307,7 +321,7 @@ const dashboardServer = createServer(async (req, res) => {
       res.end(html);
       return;
     }
-    res.end(await readFile(filePath));
+    res.end(body);
   } catch (err) {
     // Log the detail locally; never echo the raw error (path/stack) to the
     // HTTP response.

@@ -13,6 +13,7 @@ import {
 	markdownToText,
 	sanitizeHtml,
 	stripEnvelopeMarkers,
+	stripHtmlTags,
 	stripInvisibleUnicode,
 } from "./web-fetch-utils.js";
 
@@ -177,6 +178,15 @@ describe("htmlToMarkdown", () => {
 		assert.ok(!/alert/.test(md));
 	});
 
+	it("does not re-form a tag from entity-encoded angle brackets", () => {
+		// Entities decode BEFORE the tag strip, so a page that writes
+		// `&lt;&lt;a&gt;script&gt;` gets `<<a>script>` handed to the stripper.
+		const html = `<p>&lt;&lt;a&gt;script&gt;alert(1)&lt;&lt;/a&gt;/script&gt;</p>`;
+		const md = htmlToMarkdown(html);
+		assert.equal(md.trim(), "alert(1)");
+		assert.ok(!/<\/?[a-z]/i.test(md));
+	});
+
 	it("preserves bold + italic", () => {
 		const html = `<strong>bold</strong> <em>italic</em>`;
 		const md = htmlToMarkdown(html);
@@ -203,16 +213,53 @@ describe("extractBasicHtmlContent (fallback extractor)", () => {
 	});
 });
 
+describe("stripHtmlTags", () => {
+	it("does not let nested angle brackets re-form a tag", () => {
+		// A single-pass `/<\/?[a-z][^>]*>/g` strip removes `<a>` and `</a>` here and
+		// hands back a working `<script>alert(1)</script>`.
+		const out = stripHtmlTags("<<a>script>alert(1)<</a>/script>");
+		assert.equal(out, "alert(1)");
+		assert.ok(!/</.test(out));
+	});
+
+	it("settles on deeply overlapped brackets", () => {
+		// Leftover bare `<` is fine — what must never survive is a complete tag.
+		const TAG_RE = /<\/?[a-z]/i;
+		assert.ok(!TAG_RE.test(stripHtmlTags("<<<a>b>script>x<<</a>b>/script>")));
+		assert.ok(!TAG_RE.test(stripHtmlTags(`${"<".repeat(64)}a>script>x`)));
+	});
+
+	it("keeps a `<` that isn't a tag", () => {
+		assert.equal(stripHtmlTags("if a < b and b > c then <b>go</b>"), "if a < b and b > c then go");
+	});
+
+	it("honours a literal `>` inside a quoted attribute value", () => {
+		assert.equal(stripHtmlTags(`<a title="x > y">hi</a>`), "hi");
+		assert.equal(stripHtmlTags(`<a title='x > y'>hi</a>`), "hi");
+	});
+
+	it("falls back to the raw `>` when the quoting is unbalanced", () => {
+		assert.equal(stripHtmlTags(`<a href=x" >text</a>`), "text");
+	});
+
+	it("drops a tag that never closes instead of emitting the fragment", () => {
+		assert.equal(stripHtmlTags(`ok <div class="x`), "ok ");
+		assert.equal(stripHtmlTags("ok <script"), "ok ");
+	});
+
+	it("handles empty + tag-free input", () => {
+		assert.equal(stripHtmlTags(""), "");
+		assert.equal(stripHtmlTags("plain text"), "plain text");
+	});
+});
+
 describe("markdownToText", () => {
 	it("strips markdown markers, keeps text", () => {
 		const md = `# Title\n\nBody with [link](https://example.com) and **bold** and *italic*.\n\n- item one\n- item two`;
 		const t = markdownToText(md);
-		assert.ok(!/[#*]/.test(t));
-		assert.ok(/Title/.test(t));
-		assert.ok(/link/.test(t));
-		assert.ok(!t.includes("https://example.com"));
-		assert.ok(/bold/.test(t));
-		assert.ok(/item one/.test(t));
+		// Exact output — a substring check for the dropped URL would also pass on
+		// a link target that merely *contains* the expected host.
+		assert.equal(t, "Title\n\nBody with link and bold and italic.\nitem one\nitem two");
 	});
 
 	it("preserves fenced code body but drops fences", () => {

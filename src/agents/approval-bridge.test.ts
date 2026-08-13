@@ -2,15 +2,21 @@
  * Tests for the approval bridge — pure unit-level coverage of the
  * in-memory request/resolve/timeout behaviour.
  *
- * Persistence behaviour (`applyApprovalDecision` calling `recordApproval`)
- * is tested in exec-approvals.test.ts; here we mock the broadcaster and
- * verify the bridge's own state machine.
+ * The allowlist-file mechanics behind `recordApproval` are tested in
+ * exec-approvals.test.ts; here we mock the broadcaster, verify the bridge's
+ * own state machine, and cover how `applyApprovalDecision` reports a pattern
+ * the allowlist refuses to store.
  */
 
 import { strict as assert } from "node:assert";
-import { afterEach, describe, it } from "node:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, it } from "node:test";
 
+import { _resetApprovalsCacheForTests, listApprovals } from "../core/exec-approvals.js";
 import {
+	applyApprovalDecision,
 	type ApprovalDecisionKind,
 	type ApprovalRequest,
 	getActiveApprovalBridge,
@@ -209,5 +215,68 @@ describe("requestApproval — abort cancels the prompt", () => {
 		assert.equal(bridge.listPending().length, 0, "all drained");
 		// every settle detached its listener; aborting now must not throw or resolve anything
 		assert.doesNotThrow(() => ac.abort());
+	});
+});
+
+/* ─────────────── applyApprovalDecision — pattern persistence ─────────────── */
+
+describe("applyApprovalDecision — allow-pattern", () => {
+	let prevStateDir: string | undefined;
+
+	beforeEach(() => {
+		prevStateDir = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = mkdtempSync(join(tmpdir(), "brigade-approval-bridge-"));
+		_resetApprovalsCacheForTests();
+	});
+	afterEach(() => {
+		if (prevStateDir === undefined) delete process.env.BRIGADE_STATE_DIR;
+		else process.env.BRIGADE_STATE_DIR = prevStateDir;
+		_resetApprovalsCacheForTests();
+	});
+
+	it("persists a healthy pattern and allows the call", () => {
+		const outcome = applyApprovalDecision({
+			command: "git status",
+			decision: { kind: "allow-pattern", pattern: "^git (status|diff)( |$)" },
+		});
+		assert.equal(outcome, "allow");
+		assert.deepEqual(listApprovals().patterns, ["^git (status|diff)( |$)"]);
+	});
+
+	it("a refused pattern still allows THIS call, reports why, and stores nothing", () => {
+		const refusals: string[] = [];
+		const outcome = applyApprovalDecision({
+			command: "git aaaa",
+			decision: { kind: "allow-pattern", pattern: "^git (a+)+$" },
+			onRefused: (message) => refusals.push(message),
+		});
+		// The operator picked an "allow" disposition — blocking the call they
+		// just approved would be the wrong failure mode.
+		assert.equal(outcome, "allow");
+		assert.deepEqual(listApprovals().patterns, []);
+		assert.equal(refusals.length, 1);
+		assert.match(refusals[0] ?? "", /didn't save the pattern/);
+		assert.match(refusals[0] ?? "", /backtracks catastrophically/);
+	});
+
+	it("a refused pattern never throws, even with no listener attached", () => {
+		assert.doesNotThrow(() => {
+			applyApprovalDecision({
+				command: "echo hi",
+				decision: { kind: "allow-pattern", pattern: "[unclosed" },
+			});
+		});
+		assert.deepEqual(listApprovals().patterns, []);
+	});
+
+	it("a listener that throws doesn't break the call", () => {
+		const outcome = applyApprovalDecision({
+			command: "echo hi",
+			decision: { kind: "allow-pattern", pattern: "^(a|a)*$" },
+			onRefused: () => {
+				throw new Error("transport is gone");
+			},
+		});
+		assert.equal(outcome, "allow");
 	});
 });

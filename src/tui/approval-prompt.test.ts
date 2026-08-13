@@ -172,3 +172,51 @@ test("pattern state stays within width (regex help line used to overflow narrow 
 		assert.ok(widest <= width, `width ${width}: widest line is ${widest}`);
 	}
 });
+
+test("a pattern the gate would refuse is reported inline instead of resolving", () => {
+	let resolution: { decision: string; pattern?: string } | null = null;
+	const prompt = new ApprovalPrompt({
+		tui: fakeTui(),
+		request: makeRequest(),
+		onResolve: (r) => {
+			resolution = r;
+		},
+	});
+	const internals = prompt as unknown as {
+		enterPatternMode: () => void;
+		patternInput: { onSubmit: (value: string) => void } | null;
+	};
+	internals.enterPatternMode();
+	// Catastrophic backtracker — the allowlist won't store it, so the operator
+	// has to hear about it here, where they can still fix the typo.
+	internals.patternInput?.onSubmit("^git (a+)+$");
+	assert.equal(resolution, null, "stayed in pattern mode");
+	const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+	const rendered = prompt.render(100).map(stripAnsi).join("\n");
+	assert.match(rendered, /backtracks catastrophically/);
+	// A malformed regex gets the same treatment.
+	internals.patternInput?.onSubmit("[unclosed");
+	assert.equal(resolution, null);
+	assert.match(prompt.render(100).map(stripAnsi).join("\n"), /invalid regex pattern/);
+	// Fixing it resolves normally.
+	internals.patternInput?.onSubmit("^git status$");
+	assert.deepEqual(resolution, { decision: "allow-pattern", pattern: "^git status$" });
+});
+
+test("the inline pattern error never overflows a narrow terminal", () => {
+	const prompt = new ApprovalPrompt({
+		tui: fakeTui(),
+		request: makeRequest(),
+		onResolve: () => {},
+	});
+	const internals = prompt as unknown as {
+		enterPatternMode: () => void;
+		patternInput: { onSubmit: (value: string) => void } | null;
+	};
+	internals.enterPatternMode();
+	internals.patternInput?.onSubmit("^(a|a)*$");
+	for (const width of [83, 50, 30, 12]) {
+		const widest = maxLineWidth(prompt.render(width));
+		assert.ok(widest <= width, `width ${width}: widest line is ${widest}`);
+	}
+});
