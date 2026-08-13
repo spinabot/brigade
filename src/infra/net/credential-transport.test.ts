@@ -76,9 +76,12 @@ describe("checkCredentialTransport — https anywhere, http only to this machine
 		const res = checkCredentialTransport("http://remote.example.com/v1");
 		assert.equal(res.ok, false);
 		const reason = (res as { reason: string }).reason;
-		assert.match(reason, /remote\.example\.com/);
-		assert.match(reason, /https:\/\//);
-		assert.match(reason, /localhost:11434/);
+		// Plain substring checks: this is a human-readable message, so what matters
+		// is that it names the host, the scheme to switch to, and a concrete local
+		// example — not where in the sentence each lands.
+		assert.ok(reason.includes("remote.example.com"), reason);
+		assert.ok(reason.includes("https://"), reason);
+		assert.ok(reason.includes("localhost:11434"), reason);
 	});
 
 	it("refuses the loopback-lookalike hosts", () => {
@@ -96,8 +99,9 @@ describe("checkCredentialTransport — https anywhere, http only to this machine
 		process.env[LAN_ENV] = "1";
 		const res = checkCredentialTransport("http://192.168.1.50:11434/v1");
 		assert.equal(res.ok, true);
-		assert.match((res as { warning?: string }).warning ?? "", /192\.168\.1\.50/);
-		assert.match((res as { warning?: string }).warning ?? "", new RegExp(LAN_ENV));
+		const warning = (res as { warning?: string }).warning ?? "";
+		assert.ok(warning.includes("192.168.1.50"), warning);
+		assert.ok(warning.includes(LAN_ENV), warning);
 		// A public host is still refused — the opt-in is about the LAN, not http.
 		assert.equal(ok("http://remote.example.com/v1"), false);
 		// And cloud metadata never counts as a LAN host.
