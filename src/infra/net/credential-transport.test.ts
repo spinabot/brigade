@@ -75,13 +75,18 @@ describe("checkCredentialTransport — https anywhere, http only to this machine
 	it("refuses http to a remote host, with an actionable line", () => {
 		const res = checkCredentialTransport("http://remote.example.com/v1");
 		assert.equal(res.ok, false);
-		const reason = (res as { reason: string }).reason;
-		// Plain substring checks: this is a human-readable message, so what matters
-		// is that it names the host, the scheme to switch to, and a concrete local
-		// example — not where in the sentence each lands.
-		assert.ok(reason.includes("remote.example.com"), reason);
-		assert.ok(reason.includes("https://"), reason);
-		assert.ok(reason.includes("localhost:11434"), reason);
+		if (res.ok) return;
+		// The refused host is structured data, so assert it exactly rather than
+		// fishing it back out of the sentence — a caller wanting the host should
+		// read the field, not parse the prose.
+		assert.equal(res.host, "remote.example.com");
+		// The line still has to be actionable, so pin it whole. Rewording the copy
+		// should require updating this deliberately.
+		assert.equal(
+			res.reason,
+			"Refusing to send your API key unencrypted to remote.example.com — over http:// anyone on the network can read it. " +
+				"Use https:// for a remote endpoint, or point Brigade at a server on this machine (Ollama runs on http://localhost:11434).",
+		);
 	});
 
 	it("refuses the loopback-lookalike hosts", () => {

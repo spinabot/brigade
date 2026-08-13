@@ -95,7 +95,9 @@ function isPrivateNetworkHostname(hostname: string): boolean {
  * sites that can talk to the operator should surface it. `reason` is a
  * finished, printable line in the CLI's voice.
  */
-export type CredentialTransportCheck = { ok: true; warning?: string } | { ok: false; reason: string };
+export type CredentialTransportCheck =
+	| { ok: true; warning?: string }
+	| { ok: false; reason: string; host?: string };
 
 /**
  * May a provider API key be sent to `rawUrl`?
@@ -134,6 +136,7 @@ export function checkCredentialTransport(rawUrl: string): CredentialTransportChe
 	}
 	return {
 		ok: false,
+		host: parsed.host,
 		reason:
 			`Refusing to send your API key unencrypted to ${parsed.host} — over http:// anyone on the network can read it. ` +
 			`Use https:// for a remote endpoint, or point Brigade at a server on this machine (Ollama runs on http://localhost:11434).`,
