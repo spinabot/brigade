@@ -209,7 +209,7 @@
     "exceljs": "^4.4.0",
     "fflate": "^0.8.3",
     "grammy": "^1.42.0",
-    "https-proxy-agent": "^7.0.6",
+    "https-proxy-agent": "^9.1.0",
     "jimp": "^1.6.1",
     "jiti": "^2.6.1",
     "json5": "^2.2.3",
