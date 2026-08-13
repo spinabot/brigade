@@ -51,6 +51,14 @@ updates:
     # nothing, so the pin was unprotected. Three of the four are also held by
     # `overrides` in package.json — a Dependabot bump here would fight that.
     ignore:
+      # Major bumps are a decision, not a chore — TypeScript 5 -> 7, zod 3 -> 4 or
+      # @slack/web-api 7 -> 8 need code changes and land when someone plans them,
+      # not because a bot opened a PR that then sits failing CI for two months.
+      # `update-types` ignore conditions do NOT apply to Dependabot SECURITY
+      # updates, so if an advisory can only be fixed by a major, the PR is still
+      # raised. This suppresses routine churn, not vulnerability coverage.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
       - dependency-name: "@earendil-works/pi-ai"
       - dependency-name: "@earendil-works/pi-agent-core"
       - dependency-name: "@earendil-works/pi-coding-agent"
@@ -64,6 +72,11 @@ updates:
     open-pull-requests-limit: 5
     cooldown:
       default-days: 7
+    ignore:
+      # Same policy as npm: action majors (checkout 4 -> 7, codeql-action 3 -> 4)
+      # change behaviour and are upgraded deliberately, not by a standing PR.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       actions:
         patterns:
