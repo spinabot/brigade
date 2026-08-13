@@ -1,0 +1,48 @@
+name: Dependabot auto-merge
+
+# Lets grouped patch/minor updates land without a person shepherding them, so
+# dependencies stay current instead of rotting into one painful upgrade later.
+#
+# `--auto` does NOT bypass anything: the merge only happens once every required
+# check passes. This repo runs the full suite on two Node versions plus CodeQL,
+# OSV and the supply-chain audit, and dependabot.yml makes a release age before
+# it is even proposed. A bad version has to get past all of that.
+#
+# Majors are excluded on purpose — auto-merging zod 3 -> 4 would break the build.
+# They stay open for a human.
+#
+# `pull_request_target` is required because a workflow triggered BY Dependabot
+# receives a read-only GITHUB_TOKEN and could not merge. It is safe here for one
+# specific reason: this workflow never checks out or executes the PR's code. It
+# only reads metadata and calls the API. Do not add a checkout step.
+
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Approve and enable auto-merge for patch/minor
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: |
+          gh pr review --approve "$PR_URL"
+          gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Leave majors for a human
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        run: |
+          echo "::notice::${{ steps.meta.outputs.dependency-names }} is a major update — left open for review."
