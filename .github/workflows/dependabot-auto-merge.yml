@@ -33,11 +33,17 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Approve and enable auto-merge for patch/minor
+      # Ask Dependabot to do the merge rather than merging via `gh pr merge --auto`.
+      # Both wait for CI, but the merge ACTOR differs, and that is what decides
+      # whether the branch ruleset lets it through: the review rule requires a
+      # code-owner approval, github-actions[bot] is not a code owner, and GitHub
+      # refuses to add that app as a repo-level bypass actor ("must be part of the
+      # ruleset source or owner organization"). Dependabot IS a bypass actor here,
+      # so a Dependabot-performed merge satisfies review while still being gated
+      # by the Required CI ruleset, which has no bypass at all.
+      - name: Ask Dependabot to merge patch/minor once CI is green
         if: steps.meta.outputs.update-type != 'version-update:semver-major'
-        run: |
-          gh pr review --approve "$PR_URL"
-          gh pr merge --auto --squash "$PR_URL"
+        run: gh pr comment "$PR_URL" --body "@dependabot merge"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
