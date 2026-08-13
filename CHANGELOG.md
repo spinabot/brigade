@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.31.0](https://github.com/spinabot/brigade/compare/brigade-v1.30.0...brigade-v1.31.0) (2026-08-13)
+
+
+### Features
+
+* **expose:** print a scannable QR at tunnel startup with --show-qr ([9c9ad3d](https://github.com/spinabot/brigade/commit/9c9ad3db1368eb6a001cf9e1eb46239262772ff6))
+
+
+### Bug Fixes
+
+* **ci:** point the Dependabot pin-protection at the packages we actually use ([a1e604d](https://github.com/spinabot/brigade/commit/a1e604df06f32e4b0958549ea49313065a5673fe))
+* **deps:** patch tar, brace-expansion, undici, ip-address and protobufjs advisories ([9416b79](https://github.com/spinabot/brigade/commit/9416b794b4438b1e49bb4994c3d351c0dd9e832f))
+* **security:** block system files whose root is itself a symlink ([34d1c21](https://github.com/spinabot/brigade/commit/34d1c212dca60f3e20efda4b09c4447a6bc91c57))
+* **security:** close CodeQL findings across sanitization, temp files and exec approvals ([9015a98](https://github.com/spinabot/brigade/commit/9015a983a4d8eca616578e97be4e361210b42706))
+* **security:** patch dependency advisories and close CodeQL findings ([14e2f9e](https://github.com/spinabot/brigade/commit/14e2f9e561e5e8c6e14a0ab7ca21601eb7dab1e1))
+* **security:** refuse to send a provider API key over cleartext to a non-loopback host ([58dbbc6](https://github.com/spinabot/brigade/commit/58dbbc62cc541adb11096c95b349dfd5711f472b))
+* **test:** derive the symlinked system root from the platform, not a literal ([5d9a4f4](https://github.com/spinabot/brigade/commit/5d9a4f402a6ae96f322254520d29b35babecd153))
+* **test:** stop the hot-reload watcher tests hanging the entire suite ([088e08c](https://github.com/spinabot/brigade/commit/088e08c279a86f4db829c8c9853ac08bb9473de3))
+
 ## [1.30.0](https://github.com/spinabot/brigade/compare/brigade-v1.29.6...brigade-v1.30.0) (2026-08-08)
 
 
