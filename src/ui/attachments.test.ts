@@ -271,10 +271,22 @@ describe("extractAttachmentPaths — the disambiguation rule", () => {
 	it("captures a backslash-escaped path — what macOS/iTerm pastes on drag-drop", () => {
 		// Regression: the alternation used to try `[^\s"']` first, which ate the lone
 		// backslash and truncated the path at `…/my\`.
-		const escaped = spaced.replace(/ /g, "\\ ");
+		const escaped = spaced.replace(/([\\ ])/g, "\\$1");
 		const r = extractAttachmentPaths(`${escaped} read it`);
 		assert.equal(r.staged.length, 1);
 		assert.equal(r.staged[0]?.path, spaced);
+	});
+
+	it("captures a path whose NAME contains a backslash — the escape a terminal doubles", () => {
+		// `\` is a legal filename character on POSIX and an illegal one on Windows,
+		// so this paste shape only exists off Windows.
+		if (process.platform === "win32") return;
+		const weird = path.join(dir, "back\\slash report.pdf");
+		fs.writeFileSync(weird, "%PDF-1.4 weird");
+		const escaped = weird.replace(/([\\ ])/g, "\\$1");
+		const r = extractAttachmentPaths(`${escaped} read it`);
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.staged[0]?.path, weird);
 	});
 
 	it("captures a file:// URI — what GNOME/Wayland pastes on drag-drop", () => {

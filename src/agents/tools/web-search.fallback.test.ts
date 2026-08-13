@@ -136,7 +136,13 @@ describe("web_search — error-time fallback chain", () => {
 		assert.match(out.message ?? "", /dead-4b: network down/);
 		assert.match(out.message ?? "", /all search providers failed/);
 		assert.match(out.message ?? "", /browser tool/);
-		assert.match(out.message ?? "", /https:\/\/www\.bing\.com\/search/);
+		// Every URL in the playbook, in full and in order — a substring check would
+		// still pass if the SERP host were wrapped in some other host.
+		const urls = (out.message ?? "").match(/https?:\/\/[^\s,)]+/g) ?? [];
+		assert.deepEqual(urls, [
+			"https://www.bing.com/search?q=<query>",
+			"https://duckduckgo.com/html/?q=<query>",
+		]);
 	});
 
 	it("an explicit per-call override never falls back to other providers", async () => {

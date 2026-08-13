@@ -10,9 +10,11 @@
  *      regex (NOT Turndown — Turndown is heavy + opinionated, the regex
  *      pipeline below is ~80 LOC and good-enough for the LLM consumer).
  *
- *   2. **Fallback** — `extractBasicHtmlContent`: pure-regex visible-text
+ *   2. **Fallback** — `extractBasicHtmlContent`: dependency-free visible-text
  *      extraction used when Readability returns nothing (very-small pages,
- *      single-page apps with no semantic markup, malformed HTML).
+ *      single-page apps with no semantic markup, malformed HTML). Tag removal
+ *      goes through `stripHtmlTags`, a scanner rather than a `replace` — see
+ *      its doc comment for why a one-shot regex strip is unsound here.
  *
  * `sanitizeHtml` runs BEFORE either extractor to strip hidden content,
  * scripts/styles, and invisible-Unicode prompt-injection vectors. The
@@ -344,7 +346,7 @@ export function htmlToMarkdown(html: string): string {
 	for (let i = 6; i >= 1; i -= 1) {
 		const hashes = "#".repeat(i);
 		const re = new RegExp(`<h${i}\\b[^>]*>([\\s\\S]*?)<\\/h${i}>`, "gi");
-		out = out.replace(re, (_m, body: string) => `\n\n${hashes} ${stripTags(body).trim()}\n\n`);
+		out = out.replace(re, (_m, body: string) => `\n\n${hashes} ${stripHtmlTags(body).trim()}\n\n`);
 	}
 	// Code blocks — `<pre><code>…</code></pre>` → fenced block.
 	out = out.replace(/<pre\b[^>]*><code\b[^>]*>([\s\S]*?)<\/code><\/pre>/gi, (_m, body: string) => {
@@ -356,7 +358,7 @@ export function htmlToMarkdown(html: string): string {
 	});
 	// Blockquotes.
 	out = out.replace(/<blockquote\b[^>]*>([\s\S]*?)<\/blockquote>/gi, (_m, body: string) => {
-		const inner = stripTags(body).trim();
+		const inner = stripHtmlTags(body).trim();
 		return `\n\n${inner
 			.split("\n")
 			.map((line) => `> ${line}`)
@@ -366,7 +368,7 @@ export function htmlToMarkdown(html: string): string {
 	out = out.replace(
 		/<a\b[^>]*\bhref=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi,
 		(_m, href: string, body: string) => {
-			const label = stripTags(body).trim();
+			const label = stripHtmlTags(body).trim();
 			if (!label) return "";
 			if (!href || href.startsWith("#") || hasDangerousScheme(href)) return label;
 			return `[${label}](${href})`;
@@ -382,11 +384,11 @@ export function htmlToMarkdown(html: string): string {
 		return `![${alt}](${src})`;
 	});
 	// Lists. Convert `<li>` → `- ` then drop the surrounding `<ul>/<ol>`.
-	out = out.replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, (_m, body: string) => `\n- ${stripTags(body).trim()}`);
+	out = out.replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, (_m, body: string) => `\n- ${stripHtmlTags(body).trim()}`);
 	out = out.replace(/<\/?(ul|ol)\b[^>]*>/gi, "");
 	// Emphasis + strong + bold + italic.
-	out = out.replace(/<(?:strong|b)\b[^>]*>([\s\S]*?)<\/(?:strong|b)>/gi, (_m, body: string) => `**${stripTags(body)}**`);
-	out = out.replace(/<(?:em|i)\b[^>]*>([\s\S]*?)<\/(?:em|i)>/gi, (_m, body: string) => `*${stripTags(body)}*`);
+	out = out.replace(/<(?:strong|b)\b[^>]*>([\s\S]*?)<\/(?:strong|b)>/gi, (_m, body: string) => `**${stripHtmlTags(body)}**`);
+	out = out.replace(/<(?:em|i)\b[^>]*>([\s\S]*?)<\/(?:em|i)>/gi, (_m, body: string) => `*${stripHtmlTags(body)}*`);
 	// Line break + horizontal rule.
 	out = out.replace(/<br\s*\/?>/gi, "\n");
 	out = out.replace(/<hr\s*\/?>/gi, "\n\n---\n\n");
@@ -394,7 +396,7 @@ export function htmlToMarkdown(html: string): string {
 	out = out.replace(/<\/p\s*>/gi, "\n\n");
 	out = out.replace(/<\/div\s*>/gi, "\n");
 	// Strip everything else.
-	out = stripTags(out);
+	out = stripHtmlTags(out);
 	// Normalize whitespace.
 	out = normalizeWhitespace(out);
 	// Strip invisible Unicode (prompt-injection defense).
@@ -417,12 +419,82 @@ function hasDangerousScheme(href: string): boolean {
 	return /^(?:javascript|data|vbscript):/.test(normalized);
 }
 
-/** Strip ALL remaining HTML tags from a string. */
-function stripTags(input: string): string {
-	// `(?:"[^"]*"|'[^']*'|[^'">])*` lets quoted attribute values carry a literal
-	// `>` without prematurely ending the tag match (which would leave a dangling
-	// fragment behind).
-	return input.replace(/<\/?[a-z][a-z0-9-]*\b(?:"[^"]*"|'[^']*'|[^'">])*>/gi, "");
+/**
+ * Strip ALL HTML tags from a string, leaving the visible text.
+ *
+ * A one-shot `replace` can't do this soundly. Removing an inner match lets the
+ * text on either side close up into a tag the pass has already walked past, so
+ * `<<a>script>alert(1)<</a>/script>` survives a `/<\/?[a-z][^>]*>/g` strip as a
+ * working `<script>` block. This scans left to right and repeats the scan until
+ * the string stops changing; every pass that changes anything deletes at least
+ * one character, so the loop always terminates.
+ *
+ * A `<` that isn't followed by a tag name (`a < b`, `x <- y`, `<3`) is TEXT and
+ * is kept — an HTML tokenizer reads it the same way, and dropping it would eat
+ * operators out of scraped code samples. An unterminated `<tag …` with no `>`
+ * anywhere after it takes the rest of the input with it: the page was truncated
+ * mid-tag, and emitting the fragment would let it fuse with a `>` downstream.
+ *
+ * Shared by the web-search providers (`duckduckgo`, `wikipedia`) so there's one
+ * implementation of this to get right rather than one per scraper.
+ */
+export function stripHtmlTags(html: string): string {
+	let out = html;
+	// Angle brackets nested k deep need k passes. The bound keeps hostile input
+	// from turning this quadratic; anything past it gets the blunt scrub below.
+	for (let pass = 0; pass < 16; pass += 1) {
+		const next = stripHtmlTagsOnce(out);
+		if (next === out) return out;
+		out = next;
+	}
+	// Bound exhausted — drop every remaining `<` so no tag can survive.
+	return out.replace(/</g, "");
+}
+
+/** One left-to-right tag-stripping pass. See {@link stripHtmlTags}. */
+function stripHtmlTagsOnce(html: string): string {
+	let out = "";
+	let i = 0;
+	const n = html.length;
+	while (i < n) {
+		const lt = html.indexOf("<", i);
+		if (lt === -1) return out + html.slice(i);
+		// `<` followed by anything but a name start / `!` / `?` / `/` is literal.
+		if (!/[a-z!?/]/i.test(html[lt + 1] ?? "")) {
+			out += html.slice(i, lt + 1);
+			i = lt + 1;
+			continue;
+		}
+		out += html.slice(i, lt);
+		const end = findTagEnd(html, lt);
+		if (end === -1) return out; // unterminated tag — the rest is inside it
+		i = end;
+	}
+	return out;
+}
+
+/**
+ * Index just past the `>` closing the tag that opens at `lt`, or -1 when the
+ * tag never closes. Quoted attribute values are skipped so a literal `>` inside
+ * `title="a > b"` doesn't end the tag early; when the quoting turns out to be
+ * unbalanced (malformed markup) we fall back to the first raw `>` instead of
+ * swallowing the rest of the document.
+ */
+function findTagEnd(html: string, lt: number): number {
+	const rawGt = html.indexOf(">", lt + 1);
+	if (rawGt === -1) return -1;
+	let quote = "";
+	for (let j = lt + 1; j < html.length; j += 1) {
+		const ch = html[j] as string;
+		if (quote) {
+			if (ch === quote) quote = "";
+		} else if (ch === '"' || ch === "'") {
+			quote = ch;
+		} else if (ch === ">") {
+			return j + 1;
+		}
+	}
+	return rawGt + 1;
 }
 
 /** Collapse runs of whitespace; keep paragraph breaks (double newlines). */
@@ -563,11 +635,11 @@ export function extractBasicHtmlContent(html: string): ExtractedContent {
 	const sanitized = sanitizeHtml(html);
 	const titleMatch = sanitized.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
 	const rawTitle = titleMatch
-		? decodeHtmlEntities(stripTags(titleMatch[1] as string)).trim()
+		? decodeHtmlEntities(stripHtmlTags(titleMatch[1] as string)).trim()
 		: undefined;
 	const title = rawTitle ? stripEnvelopeMarkers(stripInvisibleUnicode(rawTitle)) : undefined;
 	const text = stripEnvelopeMarkers(
-		stripInvisibleUnicode(normalizeWhitespace(decodeHtmlEntities(stripTags(sanitized)))),
+		stripInvisibleUnicode(normalizeWhitespace(decodeHtmlEntities(stripHtmlTags(sanitized)))),
 	).trim();
 	return { title: title || undefined, text, extractor: "basic-html" };
 }

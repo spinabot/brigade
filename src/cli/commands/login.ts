@@ -63,10 +63,10 @@ function resolveSubscriptionProvider(arg: string): ProviderInfo | undefined {
 	const direct = findProvider(a);
 	if (direct?.subscription) return direct;
 	// 2. A subscription provider whose underlying OAuth id matches (anthropic → claude-code).
-	const byOauth = PROVIDERS.find(
+	const byUnderlyingId = PROVIDERS.find(
 		(p) => p.subscription && p.subscription.oauthProviderId.toLowerCase() === a,
 	);
-	if (byOauth) return byOauth;
+	if (byUnderlyingId) return byUnderlyingId;
 	// 3. A friendly alias.
 	const aliased = SUBSCRIPTION_LOGIN_ALIASES[a];
 	if (aliased) {

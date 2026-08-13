@@ -10,7 +10,8 @@
  * v1 shape (per-agent, file-backed):
  *   - exact-command approvals: the literal command string must match (after
  *     trim) for the gate to allow.
- *   - pattern approvals: operator-supplied regex; gate skips malformed
+ *   - pattern approvals: operator-supplied regex, checked against
+ *     `core/exec-pattern-guard.ts` before it's stored; gate skips malformed
  *     regexes rather than crashing.
  *   - hard-deny patterns (rm -rf /, dd to raw disk, fork bomb, etc.) are
  *     coded into `exec-approvals.ts` and CANNOT be allowlisted. Operators
@@ -26,6 +27,10 @@ import {
 	recordApproval,
 	removeApproval,
 } from "../../core/exec-approvals.js";
+import {
+	MAX_APPROVAL_PATTERN_LENGTH,
+	validateApprovalPattern,
+} from "../../core/exec-pattern-guard.js";
 import { DEFAULT_AGENT_ID } from "../../config/paths.js";
 import * as fs from "node:fs";
 
@@ -195,14 +200,20 @@ export async function runExecAllowPattern(
 		writeError(opts.json, "brigade exec: pattern is empty", { code: "empty" });
 		return 1;
 	}
-	try {
-		// eslint-disable-next-line no-new
-		new RegExp(pat);
-	} catch (err) {
-		writeError(opts.json, `brigade exec: invalid regex pattern: ${(err as Error).message}`, {
-			code: "invalid-regex",
-			pattern: pat,
-		});
+	// Same guard `recordApproval` enforces for every writer — run here first so
+	// the operator gets the CLI's wording and hint lines instead of a bare
+	// refusal bubbling out of core.
+	const checked = validateApprovalPattern(pat);
+	if (!checked.ok) {
+		const { refusal } = checked;
+		writeError(
+			opts.json,
+			`brigade exec: ${refusal.message}`,
+			refusal.code === "pattern-too-long"
+				? { code: refusal.code, length: pat.length, maxLength: MAX_APPROVAL_PATTERN_LENGTH }
+				: { code: refusal.code, pattern: pat },
+		);
+		for (const hint of refusal.hint) process.stderr.write(`${chalk.dim(`  ${hint}`)}\n`);
 		return 1;
 	}
 	try {

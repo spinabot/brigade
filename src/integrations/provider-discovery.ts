@@ -17,6 +17,8 @@
 
 import { getModels, type KnownProvider } from "@earendil-works/pi-ai";
 
+import { checkCredentialTransport } from "../infra/net/credential-transport.js";
+
 const TIMEOUT_MS = 5000;
 
 export interface DiscoveredModelMeta {
@@ -38,6 +40,12 @@ const EMPTY: DiscoveryResult = { exists: false, meta: {} };
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 
 async function fetchJson(url: string, apiKey?: string): Promise<unknown | null> {
+	// Backstop for the cleartext-credential gate: a `baseUrl` can arrive from a
+	// hand-edited models.json or a config/RPC write, not just the wizard, so the
+	// check lives HERE — where the key is attached — as well as at the entry
+	// points. Callers that can talk to the operator run the same check first so
+	// they can print the reason; this one just refuses to leak.
+	if (apiKey && !checkCredentialTransport(url).ok) return null;
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 	try {
@@ -206,29 +214,41 @@ export async function listOpenRouterModels(): Promise<LiveCloudModel[]> {
 }
 
 /**
+ * Outcome of a live model-list fetch. `insecure_transport` means the key was
+ * never sent — the endpoint would have carried it in the clear (see
+ * `infra/net/credential-transport.ts`); `unavailable` is the ordinary
+ * bad-key/unreachable/empty-list case. `detail` is a finished operator-facing
+ * line when we have one.
+ */
+export type ModelIdsResult =
+	| { ok: true; ids: string[] }
+	| { ok: false; reason: "insecure_transport" | "unavailable"; detail?: string };
+
+/**
  * List an OpenAI-compatible endpoint's served models via `GET {baseUrl}/models`
  * (Bearer auth). Used for LIVE model discovery on catalog providers flagged
  * `liveModels` — e.g. NVIDIA NIM (https://integrate.api.nvidia.com/v1), whose
  * served set changes over time and isn't in Pi's bundled catalog. Doubles as an
- * online key check (a bad key → the request fails → null). Filters out obvious
- * non-chat models (embedding / reranking). Returns model ids, or `null` on any
- * failure so the caller can surface an actionable error rather than persisting a
+ * online key check (a bad key → the request fails → not-ok). Filters out obvious
+ * non-chat models (embedding / reranking). Returns a typed failure on any
+ * problem so the caller can surface an actionable error rather than persisting a
  * dead provider. Never throws.
  */
-export async function fetchOpenAICompatibleModelIds(
-	baseUrl: string,
-	apiKey: string,
-): Promise<string[] | null> {
+export async function fetchOpenAICompatibleModelIds(baseUrl: string, apiKey: string): Promise<ModelIdsResult> {
 	const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+	// Refuse BEFORE the key is attached, and hand the caller the reason so the
+	// operator sees "http:// to a remote host" rather than "key rejected".
+	const transport = checkCredentialTransport(url);
+	if (!transport.ok) return { ok: false, reason: "insecure_transport", detail: transport.reason };
 	const body = (await fetchJson(url, apiKey)) as { data?: Array<{ id?: unknown }> } | null;
-	if (!body || !Array.isArray(body.data)) return null;
+	if (!body || !Array.isArray(body.data)) return { ok: false, reason: "unavailable" };
 	const ids = body.data
 		.map((m) => (typeof m?.id === "string" ? m.id.trim() : ""))
 		// Substring (not word-bounded) — NVIDIA fuses the type into the id, e.g.
 		// `nv-embedqa-e5-v5`, `llama-3.2-nv-rerankqa-1b-v2`, where a `\b` after
 		// "embed"/"rerank" wouldn't match.
 		.filter((id) => id.length > 0 && !/(embed|rerank)/i.test(id));
-	return ids.length > 0 ? ids : null;
+	return ids.length > 0 ? { ok: true, ids } : { ok: false, reason: "unavailable" };
 }
 
 /* ──────────────────── model reachability probe ──────────────────── */
@@ -237,20 +257,30 @@ export async function fetchOpenAICompatibleModelIds(
  * Result of probing whether a model actually RESPONDS — not just whether it's
  * listed. `model_unavailable`: the endpoint is up but the model returns nothing
  * (the NVIDIA-lists-dead-models case). `provider_unreachable`: the whole endpoint
- * is down/blocked. `auth`: the key was rejected. `error`: an HTTP error with detail.
+ * is down/blocked. `auth`: the key was rejected. `insecure_transport`: the endpoint
+ * would have carried the key in the clear, so nothing was sent. `error`: an HTTP
+ * error with detail.
  */
 export type ModelProbeResult =
 	| { ok: true }
-	| { ok: false; reason: "model_unavailable" | "provider_unreachable" | "auth" | "error"; detail?: string };
+	| {
+			ok: false;
+			reason: "model_unavailable" | "provider_unreachable" | "auth" | "insecure_transport" | "error";
+			detail?: string;
+	  };
 
 /** Is the OpenAI-compatible endpoint reachable at all? (`/models`, incl. a 401 —
  *  an auth rejection still proves the host is up.) Used to tell a dead MODEL apart
  *  from an unreachable PROVIDER. Never throws. */
 async function isEndpointReachable(baseUrl: string, apiKey: string): Promise<boolean> {
+	const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+	// Same cleartext-credential gate as the probe itself — a fallback check must
+	// not become the hole the main check closed.
+	if (apiKey && !checkCredentialTransport(url).ok) return false;
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 6000);
 	try {
-		const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
+		const res = await fetch(url, {
 			signal: controller.signal,
 			headers: { Accept: "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
 		});
@@ -277,10 +307,17 @@ export async function probeModelReachable(
 	opts?: { timeoutMs?: number },
 ): Promise<ModelProbeResult> {
 	const timeoutMs = opts?.timeoutMs ?? 12_000;
+	const url = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
+	// Refuse before the key is attached. A models.json can name an http:// host
+	// the wizard never saw, and this is the path that reaches it with a key.
+	const transport = checkCredentialTransport(url);
+	if (apiKey && !transport.ok) {
+		return { ok: false, reason: "insecure_transport", detail: transport.reason };
+	}
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
 	try {
-		const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+		const res = await fetch(url, {
 			method: "POST",
 			signal: controller.signal,
 			headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
@@ -317,6 +354,9 @@ export function describeModelProbe(result: ModelProbeResult, providerName: strin
 			return `Can't reach ${providerName} right now — check your connection or the service status.`;
 		case "auth":
 			return `${providerName} rejected the API key.`;
+		case "insecure_transport":
+			// Already a finished, actionable line from the transport gate.
+			return result.detail ?? `${providerName} is configured on http:// — Brigade won't send your API key in the clear.`;
 		default:
 			return `${providerName} returned an error${result.detail ? ` (${result.detail})` : ""}.`;
 	}
@@ -459,7 +499,13 @@ export async function fetchGitHubCopilotModels(copilotToken: string): Promise<Li
 	try {
 		const { getGitHubCopilotBaseUrl } = await import("@earendil-works/pi-ai/oauth");
 		const baseUrl = getGitHubCopilotBaseUrl(copilotToken);
-		const res = await fetch(`${baseUrl}/models`, {
+		const url = `${baseUrl}/models`;
+		// The host here is read out of the token's own `proxy-ep=` claim, so it is
+		// only as trustworthy as the token. Same cleartext gate as everywhere else:
+		// a Copilot token is a credential, and GitHub serves this over https —
+		// anything else falls back to Pi's bundled catalog rather than leaking.
+		if (!checkCredentialTransport(url).ok) return cached?.models ?? [];
+		const res = await fetch(url, {
 			signal: controller.signal,
 			headers: {
 				Accept: "application/json",

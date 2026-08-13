@@ -511,6 +511,7 @@ export function buildProgram(): Command {
     port?: number;
     verbose?: boolean;
     json?: boolean;
+    showQr?: boolean;
   };
 
   // Shared option set so `expose` and `bloody benchmark` stay identical.
@@ -523,6 +524,7 @@ export function buildProgram(): Command {
       .option("--relay <addr>", "self-hosted relay address (bore/custom providers)")
       .option("--command <cmd>", "custom provider command template; {port} is replaced with the proxy port")
       .option("-p, --port <port>", "gateway port to expose (default: config gateway.port or 7777)", (v) => parseInt(v, 10))
+      .option("--show-qr", "print a scannable QR of the public link at startup (pair the Brigade app in one command)", false)
       .option("-V, --verbose", "stream tunnel provider logs", false);
 
   const runExpose = async (opts: ExposeOpts): Promise<void> => {
@@ -540,8 +542,7 @@ export function buildProgram(): Command {
     .description("Show the active tunnel (URL, provider, uptime)")
     .option("--json", "emit JSON instead of human-readable text", false)
     .option("--show-link", "reveal the full access link (includes the private key)", false)
-    .option("--show-qr", "render the full access link as a scannable QR code (for the app)", false)
-    .action(async (opts: { json?: boolean; showLink?: boolean; showQr?: boolean }) => {
+    .action(async (opts: { json?: boolean; showLink?: boolean }) => {
       const { runExposeStatusCommand } = await import("../commands/expose.js");
       await exitAfterFlush(await runExposeStatusCommand(opts));
     });
@@ -567,8 +568,7 @@ export function buildProgram(): Command {
     .description("Show the active tunnel")
     .option("--json", "emit JSON instead of human-readable text", false)
     .option("--show-link", "reveal the full access link (includes the private key)", false)
-    .option("--show-qr", "render the full access link as a scannable QR code (for the app)", false)
-    .action(async (opts: { json?: boolean; showLink?: boolean; showQr?: boolean }) => {
+    .action(async (opts: { json?: boolean; showLink?: boolean }) => {
       const { runExposeStatusCommand } = await import("../commands/expose.js");
       await exitAfterFlush(await runExposeStatusCommand(opts));
     });

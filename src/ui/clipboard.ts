@@ -340,7 +340,7 @@ const LINUX: ClipboardBackend = {
 				});
 				const buf = stdout as unknown as Buffer;
 				if (buf?.length > 0) {
-					fs.writeFileSync(dest, buf);
+					fs.writeFileSync(dest, buf, { mode: 0o600 });
 					return true;
 				}
 			} catch {
@@ -548,16 +548,59 @@ export function startClipboardService(onImage?: (imagePath: string) => void): Cl
 	};
 }
 
+/** How long a spooled bitmap survives. Long enough to re-open a session's images,
+ *  short enough that screenshots don't pile up in temp forever. */
+const SPOOL_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** This process's spool dir, created once. */
+let spoolDir: string | undefined;
+
+/**
+ * Spool dirs abandoned by earlier runs — and the fixed-name one older Brigades
+ * used. Each run now gets its own dir, so without this pass a crashed session's
+ * screenshots would have nobody left to sweep them.
+ */
+function sweepAbandonedSpools(keep: string): void {
+	try {
+		const cutoff = Date.now() - SPOOL_TTL_MS;
+		const root = os.tmpdir();
+		for (const name of fs.readdirSync(root)) {
+			if (!name.startsWith("brigade-attachments")) continue;
+			const p = path.join(root, name);
+			if (p === keep) continue;
+			try {
+				// lstat, so a symlink someone planted under that name is measured — and
+				// removed — as the link it is, never followed.
+				if (fs.lstatSync(p).mtimeMs < cutoff) fs.rmSync(p, { recursive: true, force: true });
+			} catch {
+				/* another user's, in use, or gone */
+			}
+		}
+	} catch {
+		/* unreadable temp root — sweeping is best-effort */
+	}
+}
+
 /** Where clipboard bitmaps are materialised. OS temp — never `~/.brigade`, which
  *  the convex-mode strict-zero guard requires to stay clean. Sweeps its own
  *  leavings, or every screenshot ever pasted would live on disk forever. */
 export function clipboardSpoolDir(): string {
-	const dir = path.join(os.tmpdir(), "brigade-attachments");
-	fs.mkdirSync(dir, { recursive: true });
+	if (spoolDir === undefined) {
+		// A FIXED name in a world-writable /tmp (mode 1777) is a path any local user
+		// can pre-create or symlink — the sticky bit stops deletion but NOT creation —
+		// and what we then write into it is whatever the operator just screenshotted.
+		// `mkdtempSync` takes a name with a random suffix, at mode 0700, so there is
+		// nothing to pre-claim and nothing for another account to read.
+		spoolDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-attachments-"));
+		sweepAbandonedSpools(spoolDir);
+	}
+	// Re-assert rather than test-then-create: a long-idle session's dir can be taken
+	// by the OS temp reaper (or another run's sweep) between two pastes.
+	fs.mkdirSync(spoolDir, { recursive: true, mode: 0o700 });
 	try {
-		const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-		for (const name of fs.readdirSync(dir)) {
-			const p = path.join(dir, name);
+		const cutoff = Date.now() - SPOOL_TTL_MS;
+		for (const name of fs.readdirSync(spoolDir)) {
+			const p = path.join(spoolDir, name);
 			try {
 				if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
 			} catch {
@@ -567,5 +610,5 @@ export function clipboardSpoolDir(): string {
 	} catch {
 		/* unreadable spool dir — pasting still works, we just don't sweep */
 	}
-	return dir;
+	return spoolDir;
 }

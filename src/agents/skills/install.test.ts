@@ -126,6 +126,25 @@ describe("installSkill", () => {
 		assert.equal(fs.readFileSync(res.downloadedTo!, "utf8"), "hi");
 	});
 
+	it("kind=download confines the write to targetDir for a traversal-shaped URL", async () => {
+		const dest = path.join(tmpRoot, "out");
+		const stubFetch = (async () =>
+			new Response(new Uint8Array([0x68, 0x69]), { status: 200 })) as typeof fetch;
+		for (const url of [
+			"https://example.test/a/../../../etc/passwd",
+			"https://example.test/..%2f..%2fetc%2fpasswd",
+			"https://example.test/",
+			"https://example.test/..",
+		]) {
+			const res = await installSkill({ kind: "download", url, targetDir: dest }, { fetchImpl: stubFetch });
+			assert.equal(res.ok, true, url);
+			const written = path.resolve(res.downloadedTo!);
+			assert.equal(path.dirname(written), path.resolve(dest), url);
+			const rel = path.relative(path.resolve(dest), written);
+			assert.ok(rel.length > 0 && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel), url);
+		}
+	});
+
 	it("kind=download surfaces non-2xx HTTP as ok=false", async () => {
 		const stubFetch = (async () =>
 			new Response("nope", { status: 404 })) as typeof fetch;

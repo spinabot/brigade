@@ -16,7 +16,15 @@ import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-const REPO = process.env.BRIGADIERS_REPO || "spinabot/brigade";
+// `owner/repo`, nothing else. BRIGADIERS_REPO is spliced straight into the API
+// path, so an unvalidated value (`../../gists/…`, a query string, an encoded
+// slash) would aim this script at a different endpoint than the contributor
+// graph it is written to read.
+const REPO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const REPO = process.env.BRIGADIERS_REPO?.trim() || "spinabot/brigade";
+if (!REPO_PATTERN.test(REPO)) {
+	throw new Error(`BRIGADIERS_REPO must be "owner/repo" — got: ${REPO}`);
+}
 // Linked HTML avatars with EXPLICIT width/height so every avatar renders at a
 // uniform 48px. Markdown `![](…&s=48)` can't enforce a display size — GitHub only
 // honors the `s=` param for users with a real photo; for identicon (no-photo)
@@ -25,6 +33,7 @@ const REPO = process.env.BRIGADIERS_REPO || "spinabot/brigade";
 // rows separated by a blank line.
 const AVATAR_SIZE = 48;
 const PER_LINE = 10;
+const LOGIN_PATTERN = /^[A-Za-z0-9-]{1,39}$/;
 const START = "<!-- brigadiers:start -->";
 const END = "<!-- brigadiers:end -->";
 const README = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "README.md");
@@ -46,6 +55,10 @@ async function fetchContributors() {
 		if (!res.ok) {
 			throw new Error(`GitHub contributors API ${res.status}: ${await res.text().catch(() => "")}`);
 		}
+		const contentType = res.headers.get("content-type") ?? "";
+		if (!contentType.toLowerCase().startsWith("application/json")) {
+			throw new Error(`GitHub contributors API returned ${contentType || "no content-type"}, expected JSON.`);
+		}
 		const batch = await res.json();
 		if (!Array.isArray(batch) || batch.length === 0) break;
 		all.push(...batch);
@@ -53,7 +66,18 @@ async function fetchContributors() {
 	}
 	// Drop bots (github-actions, dependabot, …). The API already sorts humans by
 	// contribution count, so the wall leads with the most active.
-	return all.filter((c) => c && c.type !== "Bot" && !String(c.login).endsWith("[bot]"));
+	const humans = all.filter((c) => c && c.type !== "Bot" && !String(c.login).endsWith("[bot]"));
+	// Every remaining login and id goes into HTML attributes in a committed
+	// file, so take only the two fields the wall needs and only in the shape
+	// GitHub guarantees — a login is 1–39 of [A-Za-z0-9-], an id a positive
+	// integer. Anything else means the response isn't the contributor graph;
+	// stop rather than splice unknown markup into README.md.
+	return humans.map((c) => {
+		if (typeof c.login !== "string" || !LOGIN_PATTERN.test(c.login) || !Number.isInteger(c.id) || c.id <= 0) {
+			throw new Error(`Unexpected contributor entry from GitHub: ${JSON.stringify(c).slice(0, 200)}`);
+		}
+		return { login: c.login, id: c.id };
+	});
 }
 
 function renderWall(contributors) {

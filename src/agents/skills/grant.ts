@@ -26,6 +26,7 @@ import {
 	recordApproval,
 	removeApproval,
 } from "../../core/exec-approvals.js";
+import { validateApprovalPattern } from "../../core/exec-pattern-guard.js";
 import { discoverEligibleSkills } from "./index.js";
 import { readSkillCommandManifest, type SkillCommandManifest } from "./skill-manifest.js";
 
@@ -101,6 +102,13 @@ export function grantSkill(args: {
 	});
 	const grantablePatterns = manifest.patterns.filter((p) => {
 		if (patternMatchesHardDeny(p)) {
+			base.refused.push(p);
+			return false;
+		}
+		// A manifest is just a file — it can carry a regex the gate won't store.
+		// Report it as refused alongside the hard-deny hits instead of letting
+		// `recordApproval` throw halfway through a partially applied grant.
+		if (!validateApprovalPattern(p).ok) {
 			base.refused.push(p);
 			return false;
 		}

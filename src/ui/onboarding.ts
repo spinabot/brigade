@@ -63,6 +63,7 @@ import {
 	prefetchSubscriptionModels,
 	probeModelReachable,
 } from "../integrations/provider-discovery.js";
+import { checkCredentialTransport } from "../infra/net/credential-transport.js";
 import {
 	COPILOT_AUTO_MODEL_ID,
 	copilotPlanFromToken,
@@ -1680,6 +1681,9 @@ async function ensureCustomProvider(
 	modelRegistry: ModelRegistry,
 	provider: ProviderInfo,
 ): Promise<"ok" | "back"> {
+	// Set when the operator's base URL was only accepted because they opted into
+	// insecure LAN endpoints — surfaced on every screen that then asks for a key.
+	let urlWarning: string | null = null;
 	// Generic custom provider — the catalog entry has `custom: true` but no
 	// pre-set `baseUrl` (it varies per user). Prompt for the URL before the
 	// key-entry loop, then attach it to a shallow copy so the downstream
@@ -1698,6 +1702,9 @@ async function ensureCustomProvider(
 			}
 			tui.addChild(new Text(`  Enter your OpenAI-compatible base URL.`, 0, 0));
 			tui.addChild(new Text(brand.dim("  Example: https://api.example.com/v1"), 0, 0));
+			// State the rule before they can trip over it: remote endpoints need TLS
+			// because the API key rides along; a server on this machine doesn't.
+			tui.addChild(new Text(brand.dim("  Remote endpoints must be https://  ·  http:// is fine for a server on this machine"), 0, 0));
 			tui.addChild(new Text(brand.dim("  Enter to continue  ·  Esc to go back"), 0, 0));
 			tui.addChild(new Text("", 0, 0));
 			const urlInput = new Input();
@@ -1722,11 +1729,27 @@ async function ensureCustomProvider(
 				urlError = "URL must start with http:// or https://";
 				continue;
 			}
+			// Cleartext-credential gate, at configure time: a key typed on the NEXT
+			// screen would be sent to this URL, so an http:// remote host is caught
+			// here rather than at the first request. http:// to a local server
+			// (Ollama, LM Studio, llama.cpp) still passes — the bytes never leave
+			// the machine.
+			const transport = checkCredentialTransport(rawUrl);
+			if (!transport.ok) {
+				urlError = transport.reason;
+				continue;
+			}
+			if (transport.warning) urlWarning = transport.warning;
 			provider = { ...provider, baseUrl: rawUrl, api: provider.api ?? "openai-completions" };
 			break;
 		}
 	}
 	let lastError: string | null = null;
+	const renderUrlWarning = (): void => {
+		if (!urlWarning) return;
+		tui.addChild(new Text(`  ${brand.amber("⚠")} ${brand.amber(urlWarning)}`, 0, 0));
+		tui.addChild(new Text("", 0, 0));
+	};
 	// If the operator already has this provider's key in their environment (e.g.
 	// NVIDIA_API_KEY), OFFER it — confirm-then-validate, never silent-adopt. A
 	// present env var isn't proof it works, and the operator may want to paste a
@@ -1742,6 +1765,7 @@ async function ensureCustomProvider(
 			const candidate = pendingEnvKey;
 			pendingEnvKey = null; // offer once; on decline/failure fall through to paste
 			renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
+			renderUrlWarning();
 			tui.addChild(
 				new Text(
 					`  ${brand.amber("?")} We found a saved ${provider.name} key on this computer (${formatApiKeyPreview(candidate)}). Use it?`,
@@ -1778,6 +1802,7 @@ async function ensureCustomProvider(
 			key = candidate;
 		} else {
 			renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
+			renderUrlWarning();
 
 			if (lastError) {
 				tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
@@ -1828,14 +1853,17 @@ async function ensureCustomProvider(
 		if (provider.liveModels && provider.baseUrl) {
 			tui.addChild(new Text(brand.dim(`  Fetching ${provider.name} models…`), 0, 0));
 			tui.requestRender();
-			const ids = await fetchOpenAICompatibleModelIds(provider.baseUrl, key);
-			if (!ids || ids.length === 0) {
-				// A null/empty result means either a rejected key OR an unreachable
-				// endpoint (firewall/proxy/offline) — don't accuse the key outright.
-				lastError = `Couldn't reach ${provider.name}, or the key was rejected. Check your connection and the key, then try again.`;
+			const listed = await fetchOpenAICompatibleModelIds(provider.baseUrl, key);
+			if (!listed.ok) {
+				// `unavailable` means either a rejected key OR an unreachable endpoint
+				// (firewall/proxy/offline) — don't accuse the key outright. A transport
+				// refusal already carries its own precise line.
+				lastError =
+					listed.detail ??
+					`Couldn't reach ${provider.name}, or the key was rejected. Check your connection and the key, then try again.`;
 				continue;
 			}
-			models = ids;
+			models = listed.ids;
 		}
 
 		upsertApiKeyProfile(DEFAULT_AGENT_ID, { provider: provider.id, key });

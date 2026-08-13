@@ -10,7 +10,7 @@
 // place `resolveProducerEntry()` will never resolve. That is not hypothetical: it is
 // what our own error message told an agent to do, and it did.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { resolveEnginesDir } from "../../../config/paths.js";
@@ -42,14 +42,15 @@ export interface InstallEngineResult {
 function ensureEnginesManifest(dir: string): void {
 	mkdirSync(dir, { recursive: true });
 	const manifest = path.join(dir, "package.json");
-	if (existsSync(manifest)) {
-		// Repair only if it stopped being valid JSON — never clobber a real one.
-		try {
-			JSON.parse(readFileSync(manifest, "utf8"));
-			return;
-		} catch {
-			/* fall through and rewrite */
-		}
+	// Read it and see, rather than asking whether it exists first: the answer to
+	// "does it exist?" is already stale by the time we act on it, and the read tells
+	// us the thing we actually need to know. Repair only what stopped being valid
+	// JSON — never clobber a real one.
+	try {
+		JSON.parse(readFileSync(manifest, "utf8"));
+		return;
+	} catch {
+		/* absent, unreadable, or no longer JSON — write ours */
 	}
 	writeFileSync(
 		manifest,

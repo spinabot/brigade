@@ -515,7 +515,13 @@ function tryStage(candidate: string, tier: Tier): StagedAttachment | null {
 /** Undo the escaping a terminal applies when it pastes a dropped path. */
 function decodeCandidate(raw: string): string {
 	let s = raw.trim();
-	s = s.replace(/\\ /g, " "); // macOS/iTerm escape spaces
+	// macOS/iTerm escape EVERY meta-character in a dropped path, not just the
+	// spaces: a file called `back\slash report.pdf` pastes as
+	// `back\\slash\ report.pdf`, and undoing only the spaces leaves a path that
+	// names nothing. One pass over the pairs, so a decoded backslash can never
+	// re-form an escape. A leading `\\` is a Windows UNC root, not an escape.
+	const uncRoot = s.startsWith("\\\\") ? "\\\\" : "";
+	s = uncRoot + s.slice(uncRoot.length).replace(/\\([\\ ])/g, "$1");
 	if (s.startsWith("file://")) s = s.slice("file://".length);
 	// A file:// URI is percent-encoded; a plain Windows path is not, and decoding
 	// one is harmless (no % in a normal path). Guard anyway — a malformed escape

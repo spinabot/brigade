@@ -33,11 +33,11 @@ export declare const getChart: import("convex/server").RegisteredQuery<"public",
     _creationTime: number;
     transient: boolean;
     mtimeMs: number;
+    mimeType: "image/png";
     width: number;
     height: number;
     themeId: string;
     themeName: string;
-    mimeType: "image/png";
     hash: string;
     ownerId: string;
     pngBytes: ArrayBuffer;
@@ -63,11 +63,11 @@ export declare const listCharts: import("convex/server").RegisteredQuery<"public
     _creationTime: number;
     transient: boolean;
     mtimeMs: number;
+    mimeType: "image/png";
     width: number;
     height: number;
     themeId: string;
     themeName: string;
-    mimeType: "image/png";
     hash: string;
     ownerId: string;
     pngBytes: ArrayBuffer;
