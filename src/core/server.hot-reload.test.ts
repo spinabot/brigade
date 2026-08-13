@@ -119,38 +119,70 @@ describe("H1 hot-reload: computeSeedDiff (pure shape)", () => {
  * Returns a `stop()` plus an `awaitNext()` so callers can wait
  * deterministically for one reload to complete.
  */
-function startMirroredWatcher(
+async function startMirroredWatcher(
 	configPath: string,
 	onReload: (raw: string) => void,
 	debounceMs = 100,
-): { stop: () => void; awaitNext: () => Promise<void> } {
+): Promise<{ stop: () => void; awaitNext: (timeoutMs?: number) => Promise<void> }> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	let resolveNext: (() => void) | undefined;
-	let nextPromise: Promise<void> = new Promise<void>((r) => {
-		resolveNext = r;
-	});
+	// Reloads that have already completed but not yet been awaited. Without this
+	// latch the helper races the filesystem: on macOS the watch event lands and
+	// the debounce settles BEFORE the caller reaches `await awaitNext()`, so the
+	// caller would wait on a promise created after the only resolution — forever,
+	// since node:test has no default per-test timeout. Counting instead of
+	// swapping promises makes "fired already" and "fires next" the same case.
+	let banked = 0;
+	let waiter: { resolve: () => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> } | undefined;
+
 	const watcher = fsWatch(configPath, { persistent: false }, () => {
 		if (timer) clearTimeout(timer);
 		timer = setTimeout(() => {
 			timer = undefined;
 			try {
-				const raw = readFileSync(configPath, "utf8");
-				onReload(raw);
+				onReload(readFileSync(configPath, "utf8"));
 			} finally {
-				const r = resolveNext;
-				nextPromise = new Promise<void>((rs) => {
-					resolveNext = rs;
-				});
-				r?.();
+				if (waiter) {
+					const w = waiter;
+					waiter = undefined;
+					clearTimeout(w.timer);
+					w.resolve();
+				} else {
+					banked += 1;
+				}
 			}
 		}, debounceMs);
 	});
+
+	// `fs.watch()` returns before the kernel watch is armed. On macOS a write in
+	// the SAME TICK is silently dropped (measured: 0 events same-tick, 1 event
+	// after a 1ms yield), so every caller would have to remember to yield first.
+	// Arming here instead makes that impossible to get wrong — and is why these
+	// round-trip tests never actually exercised the watcher on macOS before.
+	await new Promise((r) => setTimeout(r, 25));
+
 	return {
 		stop: () => {
 			if (timer) clearTimeout(timer);
+			if (waiter) clearTimeout(waiter.timer);
+			waiter = undefined;
 			watcher.close();
 		},
-		awaitNext: () => nextPromise,
+		// Rejects rather than hanging: a watcher that goes deaf is a real failure
+		// mode (see the atomic-rename test), and it should fail the test that
+		// depends on it rather than stall the whole run.
+		awaitNext: (timeoutMs = 5000) =>
+			new Promise<void>((resolve, reject) => {
+				if (banked > 0) {
+					banked -= 1;
+					resolve();
+					return;
+				}
+				const t = setTimeout(() => {
+					waiter = undefined;
+					reject(new Error(`watcher did not fire within ${timeoutMs}ms`));
+				}, timeoutMs);
+				waiter = { resolve, reject, timer: t };
+			}),
 	};
 }
 
@@ -227,7 +259,7 @@ describe("H1 hot-reload: real fs.watch round-trip", () => {
 
 		let reloadCount = 0;
 		let lastRaw = "";
-		const watcher = startMirroredWatcher(configPath, (raw) => {
+		const watcher = await startMirroredWatcher(configPath, (raw) => {
 			reloadCount += 1;
 			lastRaw = raw;
 		});
@@ -255,7 +287,7 @@ describe("H1 hot-reload: real fs.watch round-trip", () => {
 		const addedSeen: string[] = [];
 		const removedSeen: string[] = [];
 
-		const watcher = startMirroredWatcher(configPath, (raw) => {
+		const watcher = await startMirroredWatcher(configPath, (raw) => {
 			const parsed = JSON.parse(raw) as { agents?: Record<string, unknown> };
 			const diff = computeSeedDiff(seededIds, "main", parsed.agents);
 			for (const id of diff.addedCandidates) {
@@ -295,7 +327,7 @@ describe("H1 hot-reload: real fs.watch round-trip", () => {
 		const seededIds = new Set<string>(["main", "scout"]);
 		const removedSeen: string[] = [];
 
-		const watcher = startMirroredWatcher(configPath, (raw) => {
+		const watcher = await startMirroredWatcher(configPath, (raw) => {
 			const parsed = JSON.parse(raw) as { agents?: Record<string, unknown> };
 			const diff = computeSeedDiff(seededIds, "main", parsed.agents);
 			for (const id of diff.removed) {
@@ -328,7 +360,7 @@ describe("H1 hot-reload: real fs.watch round-trip", () => {
 		writeFileSync(configPath, JSON.stringify({ agents: { main: {} } }), "utf8");
 
 		let reloadCount = 0;
-		const watcher = startMirroredWatcher(configPath, () => {
+		const watcher = await startMirroredWatcher(configPath, () => {
 			reloadCount += 1;
 		});
 
