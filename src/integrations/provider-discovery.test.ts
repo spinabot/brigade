@@ -86,22 +86,27 @@ describe("fetchOpenAICompatibleModelIds — live model discovery (NVIDIA NIM etc
 				{ id: "qwen/qwen2.5-coder-32b-instruct" },
 			],
 		});
-		const ids = await fetchOpenAICompatibleModelIds("https://integrate.api.nvidia.com/v1", "nvapi-xxx");
-		assert.deepEqual(ids, [
-			"meta/llama-3.3-70b-instruct",
-			"deepseek-ai/deepseek-r1",
-			"qwen/qwen2.5-coder-32b-instruct",
-		]);
+		const listed = await fetchOpenAICompatibleModelIds("https://integrate.api.nvidia.com/v1", "nvapi-xxx");
+		assert.deepEqual(listed, {
+			ok: true,
+			ids: ["meta/llama-3.3-70b-instruct", "deepseek-ai/deepseek-r1", "qwen/qwen2.5-coder-32b-instruct"],
+		});
 	});
 
-	it("returns null on a failed request (bad key / unreachable) — never throws", async () => {
+	it("reports unavailable on a failed request (bad key / unreachable) — never throws", async () => {
 		mockFetch({ error: "unauthorized" }, false);
-		assert.equal(await fetchOpenAICompatibleModelIds("https://integrate.api.nvidia.com/v1", "bad"), null);
+		assert.deepEqual(await fetchOpenAICompatibleModelIds("https://integrate.api.nvidia.com/v1", "bad"), {
+			ok: false,
+			reason: "unavailable",
+		});
 	});
 
-	it("returns null when the endpoint yields no usable ids", async () => {
+	it("reports unavailable when the endpoint yields no usable ids", async () => {
 		mockFetch({ data: [] });
-		assert.equal(await fetchOpenAICompatibleModelIds("https://integrate.api.nvidia.com/v1", "nvapi-xxx"), null);
+		assert.deepEqual(await fetchOpenAICompatibleModelIds("https://integrate.api.nvidia.com/v1", "nvapi-xxx"), {
+			ok: false,
+			reason: "unavailable",
+		});
 	});
 });
 
@@ -165,5 +170,71 @@ describe("describeModelProbe — actionable, jargon-free copy", () => {
 
 	it("distinguishes an unreachable provider from a dead model", () => {
 		assert.match(describeModelProbe({ ok: false, reason: "provider_unreachable" }, "NVIDIA NIM", "m")!, /reach/i);
+	});
+
+	it("passes the transport gate's own line through verbatim", () => {
+		const msg = describeModelProbe(
+			{ ok: false, reason: "insecure_transport", detail: "Refusing to send your API key unencrypted to evil.tld." },
+			"Custom",
+			"m",
+		);
+		assert.equal(msg, "Refusing to send your API key unencrypted to evil.tld.");
+	});
+});
+
+/**
+ * The credential never leaves the machine in the clear. These assert on the
+ * REQUESTS ACTUALLY MADE (not just the return value) — a refusal that still
+ * fired the request would be no refusal at all.
+ */
+describe("cleartext-credential gate — API keys never cross a plaintext hop", () => {
+	function recordingFetch(payload: unknown): { urls: string[]; authed: string[] } {
+		const seen = { urls: [] as string[], authed: [] as string[] };
+		globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+			seen.urls.push(String(url));
+			const headers = (init?.headers ?? {}) as Record<string, string>;
+			if (headers.Authorization) seen.authed.push(String(url));
+			return { ok: true, status: 200, json: async () => payload } as unknown as Response;
+		}) as typeof fetch;
+		return seen;
+	}
+
+	it("allows an https remote endpoint", async () => {
+		recordingFetch({ data: [{ id: "m" }] });
+		const listed = await fetchOpenAICompatibleModelIds("https://api.example.com/v1", "k");
+		assert.deepEqual(listed, { ok: true, ids: ["m"] });
+	});
+
+	for (const local of ["http://localhost:11434/v1", "http://127.0.0.1:1234/v1", "http://127.0.0.2/v1", "http://[::1]:8080/v1"]) {
+		it(`allows the local inference endpoint ${local}`, async () => {
+			const seen = recordingFetch({ data: [{ id: "m" }] });
+			const listed = await fetchOpenAICompatibleModelIds(local, "k");
+			assert.deepEqual(listed, { ok: true, ids: ["m"] });
+			assert.equal(seen.authed.length, 1, "the key IS sent to a local server");
+		});
+	}
+
+	for (const remote of ["http://remote.example.com/v1", "http://localhost.evil.tld/v1", "http://127.0.0.1.evil.tld/v1"]) {
+		it(`refuses the cleartext remote endpoint ${remote}`, async () => {
+			const seen = recordingFetch({ data: [{ id: "m" }] });
+			const listed = await fetchOpenAICompatibleModelIds(remote, "k");
+			assert.equal(listed.ok, false);
+			assert.equal((listed as { reason?: string }).reason, "insecure_transport");
+			assert.match((listed as { detail?: string }).detail ?? "", /https:\/\//);
+			assert.deepEqual(seen.urls, [], "no request at all — not a stripped-header request");
+		});
+	}
+
+	it("probeModelReachable refuses cleartext to a remote host without probing", async () => {
+		const seen = recordingFetch({});
+		const res = await probeModelReachable("http://remote.example.com/v1", "k", "m");
+		assert.equal(res.ok, false);
+		assert.equal((res as { reason?: string }).reason, "insecure_transport");
+		assert.deepEqual(seen.urls, []);
+	});
+
+	it("probeModelReachable still probes a local server over http", async () => {
+		globalThis.fetch = (async () => ({ ok: true, status: 200 }) as unknown as Response) as typeof fetch;
+		assert.deepEqual(await probeModelReachable("http://localhost:11434/v1", "k", "m"), { ok: true });
 	});
 });
