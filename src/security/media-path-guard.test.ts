@@ -71,6 +71,16 @@ describe("validateOutboundMediaPath", () => {
 		assert.equal(validateOutboundMediaPath(target).ok, false);
 	});
 
+	it("blocks a system file through the platform's own symlinked root", () => {
+		// macOS symlinks /etc -> /private/etc, so realpathSync turns /etc/passwd
+		// into /private/etc/passwd and the literal "/etc" prefix never matched.
+		// Both spellings must be refused, whichever one the caller hands us.
+		if (process.platform === "win32") return;
+		assert.equal(validateOutboundMediaPath("/etc/passwd").ok, false);
+		assert.equal(validateOutboundMediaPath("/private/etc/passwd").ok, false);
+		assert.equal(validateOutboundMediaPath("/etc/ssh/sshd_config").ok, false);
+	});
+
 	it("resolves symlinks before checking (innocent name → denied target)", () => {
 		const secret = path.join(dir, "brigade.json");
 		fs.writeFileSync(secret, "secret");

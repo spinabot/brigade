@@ -49,15 +49,41 @@ const SENSITIVE_BASENAMES = new Set([
 /** Path fragments that mark a credentials directory (platform-normalized separators). */
 const SENSITIVE_DIR_NAMES = [".ssh", ".aws", ".gnupg", ".kube", ".docker", "gcloud", ".convex-data"];
 
-/** Resolved-prefix roots that are off-limits regardless of filename. */
+let cachedSystemRoots: string[] | undefined;
+
+/**
+ * Resolved-prefix roots that are off-limits regardless of filename.
+ *
+ * Both spellings of each root are returned, because the caller compares against
+ * a `realpathSync`'d path and some platforms symlink their own system dirs:
+ * on macOS `/etc` IS a symlink to `/private/etc`, so `/etc/passwd` resolves to
+ * `/private/etc/passwd` and never matches the literal `/etc` prefix. The
+ * symlink resolution that stops a `photo.jpg -> /etc/shadow` trick is exactly
+ * what defeated this check.
+ */
 function systemRoots(): string[] {
+	if (cachedSystemRoots) return cachedSystemRoots;
+	let roots: string[];
 	if (process.platform === "win32") {
-		const roots: string[] = [];
-		if (process.env.SystemRoot) roots.push(process.env.SystemRoot);
-		else roots.push("C:\\Windows");
-		return roots;
+		roots = [process.env.SystemRoot || "C:\\Windows"];
+	} else {
+		roots = ["/etc", "/proc", "/sys", "/dev", "/boot", "/root"];
 	}
-	return ["/etc", "/proc", "/sys", "/dev", "/boot", "/root"];
+	const all = new Set(roots);
+	for (const r of roots) {
+		try {
+			all.add(fs.realpathSync(r));
+		} catch {
+			/* root absent on this platform — the literal spelling still stands */
+		}
+	}
+	cachedSystemRoots = [...all];
+	return cachedSystemRoots;
+}
+
+/** Test seam: the root set is process-lifetime cached. */
+export function __resetSystemRootsCacheForTests(): void {
+	cachedSystemRoots = undefined;
 }
 
 /**
