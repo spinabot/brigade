@@ -22,9 +22,14 @@ updates:
           - minor
           - patch
     # Pi SDK is pinned exact on purpose — bump it deliberately, not via Dependabot.
+    # These moved from @mariozechner/* to @earendil-works/*; the old names matched
+    # nothing, so the pin was unprotected. Three of the four are also held by
+    # `overrides` in package.json — a Dependabot bump here would fight that.
     ignore:
-      - dependency-name: "@mariozechner/pi-coding-agent"
-      - dependency-name: "@mariozechner/pi-tui"
+      - dependency-name: "@earendil-works/pi-ai"
+      - dependency-name: "@earendil-works/pi-agent-core"
+      - dependency-name: "@earendil-works/pi-coding-agent"
+      - dependency-name: "@earendil-works/pi-tui"
 
   # GitHub Actions used by our workflows
   - package-ecosystem: github-actions
