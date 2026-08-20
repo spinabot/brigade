@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.31.1](https://github.com/spinabot/brigade/compare/brigade-v1.31.0...brigade-v1.31.1) (2026-08-20)
+
+
+### Bug Fixes
+
+* **tui:** deliver Ctrl+C to the exit path ([#121](https://github.com/spinabot/brigade/issues/121)) ([a6ccc8e](https://github.com/spinabot/brigade/commit/a6ccc8e77fec5683455531abe4e9ff0086ccdd3e))
+
 ## [1.31.0](https://github.com/spinabot/brigade/compare/brigade-v1.30.0...brigade-v1.31.0) (2026-08-13)
 
 
