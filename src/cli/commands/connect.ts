@@ -197,7 +197,10 @@ export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promi
 		if (chatHandle) {
 			const wasRunning = chatHandle.abort();
 			if (!wasRunning) {
-				void chatHandle.close().then(() => {
+				// `.finally`, not `.then`: this listener is a `once` and is already
+				// consumed here, so a rejected close() would leave the TUI with Ctrl+C
+				// permanently dead and no way out but another terminal. Exit either way.
+				void chatHandle.close().finally(() => {
 					tui.stop();
 					// tui.stop() already runs Pi-TUI's cleanup (kitty pop on
 					// the happy path); restoreTerminal() is the broader safety
@@ -2296,6 +2299,17 @@ export async function wireConnectUi(
 			editor.insertTextAtCursor(a.kind === "image" ? `[image #${i + 1}] ` : `[${a.fileName}] `);
 		}
 		tui.requestRender();
+	};
+
+	// In raw mode Ctrl+C (and Ctrl+D on an empty line) arrive as keypresses, never as
+	// signals, so raise the signal ourselves and let `runConnectCommand`'s `onSigint`
+	// do the rest: abort a running turn, or close and exit when the agent is idle.
+	//
+	// `process.emit`, not `process.kill(process.pid, "SIGINT")`: on Windows the latter
+	// terminates instead of running the handler, turning "abort this turn" into "kill
+	// the client mid-stream".
+	editor.onInterrupt = () => {
+		process.emit("SIGINT", "SIGINT");
 	};
 
 	// Ctrl+V / Alt+V raw keystroke — reaches us only in terminals that DON'T bind

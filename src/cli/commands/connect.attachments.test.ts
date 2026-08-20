@@ -318,3 +318,25 @@ describe("TUI attachments — Ctrl+V fires the paste hook", () => {
 		assert.equal(fired, 0);
 	});
 });
+
+/**
+ * Ctrl+C has to travel from the terminal, through the focused editor, to the SIGINT
+ * handler in `runConnectCommand`. `src/ui/editor.test.ts` covers the editor end of
+ * that trip; this covers whether `wireConnectUi` connects it to the process at all.
+ */
+describe("TUI interrupt — end to end, real editor + real wiring", () => {
+	it("a bare Ctrl+C raises the SIGINT that runConnectCommand's handler owns", async () => {
+		const { editor } = await bootUi();
+		let raised = 0;
+		const listener = (): void => {
+			raised += 1;
+		};
+		process.on("SIGINT", listener);
+		try {
+			editor.handleInput("\x03");
+		} finally {
+			process.off("SIGINT", listener);
+		}
+		assert.equal(raised, 1);
+	});
+});

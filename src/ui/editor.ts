@@ -28,7 +28,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { Editor } from "@earendil-works/pi-tui";
+import { Editor, matchesKey } from "@earendil-works/pi-tui";
 
 /** Where `BRIGADE_DEBUG_INPUT=1` writes the raw input trace. */
 export const INPUT_TRACE_PATH = path.join(os.tmpdir(), "brigade-input-trace.log");
@@ -135,6 +135,22 @@ export class BrigadeEditor extends Editor {
 	 */
 	onPaste?: () => void;
 
+	/**
+	 * Fired when the operator presses Ctrl+C, or Ctrl+D on an empty line. What
+	 * "interrupt" should DO is the host's choice: `connect.ts` raises SIGINT, and its
+	 * handler aborts the turn or exits.
+	 *
+	 * Without this hook the keypress is simply lost. The terminal is in raw mode, so
+	 * the kernel never turns Ctrl+C into SIGINT, and Pi's own `Editor` ignores the
+	 * byte on purpose ("Ctrl+C - let parent handle (exit/clear)") to leave the
+	 * decision to the application. This editor IS the application's, so the key
+	 * travels no further unless it is forwarded from here.
+	 *
+	 * Hook the EDITOR, not the whole TUI: `ctrl+c` is also `tui.select.cancel`, so a
+	 * global interceptor would quit the app where `/model` just closes its list.
+	 */
+	onInterrupt?: () => void;
+
 	override handleInput(data: string): void {
 		// `BRIGADE_DEBUG_INPUT=1` appends every raw input chunk to a trace file.
 		//
@@ -149,6 +165,21 @@ export class BrigadeEditor extends Editor {
 		// image) and STILL fall through so the base editor inserts any pasted text —
 		// the two are complementary: text lands in the editor, an image gets attached.
 		if (data.includes("\x1b[200~") && this.onPaste) this.onPaste();
+
+		// Ctrl+C — see `onInterrupt`. `matchesKey` covers the bare `0x03` byte and the
+		// Kitty encoding (`ESC[99;5u`) alike.
+		if (this.onInterrupt && matchesKey(data, "ctrl+c")) {
+			this.onInterrupt();
+			return;
+		}
+
+		// Ctrl+D quits only on an EMPTY line; with text it stays Pi's delete-forward.
+		// Matched by key, not by the `tui.editor.deleteCharForward` binding — that
+		// binding also covers Delete, and Delete on an empty line must not quit.
+		if (this.onInterrupt && matchesKey(data, "ctrl+d") && this.getText() === "") {
+			this.onInterrupt();
+			return;
+		}
 
 		// Ctrl+V (0x16) and Alt+V (ESC v) both mean "paste an image from the clipboard".
 		//
