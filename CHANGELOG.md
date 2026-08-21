@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.31.2](https://github.com/spinabot/brigade/compare/brigade-v1.31.1...brigade-v1.31.2) (2026-08-21)
+
+
+### Bug Fixes
+
+* **claude-cli:** stop a stale macOS keychain entry masking Brigade's login ([19a0f2a](https://github.com/spinabot/brigade/commit/19a0f2a0dc2e07bd8dd335010ad4e5b4ca3a539d))
+* **claude-cli:** stop a stale macOS keychain entry masking Brigade's login ([efc7a27](https://github.com/spinabot/brigade/commit/efc7a2733144f219b2831889b4fa40d60aae6307))
+
 ## [1.31.1](https://github.com/spinabot/brigade/compare/brigade-v1.31.0...brigade-v1.31.1) (2026-08-20)
 
 
