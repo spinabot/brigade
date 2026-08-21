@@ -30,6 +30,8 @@ import {
 	CLAUDE_CLI_API,
 	CLAUDE_CLI_PROVIDER,
 } from "./catalog.js";
+import { BrigadeRetryError } from "../error-classifier.js";
+import { hasBrigadeClaudeLogin, healClaudeKeychainShadow, readBrigadeClaudeCredential } from "./claude-config.js";
 import { buildClaudeCliHttpMcpConfig, buildClaudeCliMcpConfig, readClaudeCliToolPlane } from "./tool-plane.js";
 import { registerHarnessWatchdog, unregisterHarnessWatchdog } from "../harness/watchdog.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
@@ -216,6 +218,68 @@ const SUBSCRIPTION_LIMIT_MESSAGE =
  *  the exact fix. */
 const CLAUDE_CLI_REAUTH_MESSAGE =
 	"Claude sign-in expired or was revoked — the CLI backend can't authenticate. Run `brigade login claude-cli` to sign in again.";
+
+/** A stale keychain shadow was masking a VALID Brigade login — now cleared. */
+const CLAUDE_CLI_SHADOW_REPAIRED_MESSAGE =
+	"A stale macOS keychain entry was shadowing Brigade's Claude login — cleared it and retried. No re-login needed.";
+
+/**
+ * Brigade's own credential is present and NOT expired, yet the binary refused
+ * to authenticate. Re-running the login would rewrite the same good file and
+ * change nothing, so do not send the operator down that path — say what we
+ * actually know. On macOS this is the keychain shadow (already reconciled
+ * above, so reaching here means something else owns the login); elsewhere the
+ * binary is resolving a credential from somewhere other than our config dir.
+ */
+const CLAUDE_CLI_CREDENTIAL_IGNORED_MESSAGE =
+	"Brigade's Claude credential is still valid, but the CLI rejected it — the binary is authenticating from somewhere other than Brigade's config dir. Re-running `brigade login claude-cli` will not help; check for another Claude login on this machine (`brigade doctor`).";
+
+/**
+ * A dead-login failure is not always a dead login. On macOS the binary reads its
+ * credential from the login keychain, which OUTRANKS Brigade's managed
+ * `.credentials.json`; a shadow the binary tombstoned on a failed refresh
+ * (empty accessToken) makes every turn report "expired" while our credential is
+ * still valid — and `brigade login claude-cli` cannot fix it, because it
+ * rewrites the file the binary never reads.
+ *
+ * So before telling the operator to re-authenticate, reconcile the two stores.
+ * Runs ONLY on the failure path (zero cost on a healthy turn). If we cleared a
+ * tombstone, the credential we already hold is good and the next spawn will
+ * bootstrap from it — say so instead of sending them through a pointless login.
+ */
+function claudeCliAuthFailure(): Error {
+	try {
+		if (hasBrigadeClaudeLogin() && healClaudeKeychainShadow() === "cleared") {
+			// We repaired the actual cause, so this turn is recoverable: hand the
+			// loop a classified retry rather than an error the operator must act on.
+			// `auth_recovered` retries ONCE, in place, without rotating profile or
+			// model — rotating would abandon the path we just fixed.
+			return new BrigadeRetryError({
+				message: CLAUDE_CLI_SHADOW_REPAIRED_MESSAGE,
+				reason: "auth_recovered",
+				provider: CLAUDE_CLI_PROVIDER,
+			});
+		}
+	} catch {
+		/* reconciliation is best-effort — fall through to the diagnosis below */
+	}
+	// Nothing to repair. Distinguish "the credential really is dead" (re-login
+	// fixes it) from "the credential is fine and something else is answering"
+	// (re-login is a dead end). Platform-agnostic on purpose: it holds wherever
+	// the binary sources a login we did not write.
+	try {
+		const ours = readBrigadeClaudeCredential();
+		const live =
+			typeof ours?.accessToken === "string" &&
+			ours.accessToken.length > 0 &&
+			typeof ours.expiresAt === "number" &&
+			ours.expiresAt > Date.now();
+		if (live) return new Error(CLAUDE_CLI_CREDENTIAL_IGNORED_MESSAGE);
+	} catch {
+		/* fall through */
+	}
+	return new Error(CLAUDE_CLI_REAUTH_MESSAGE);
+}
 
 /** Auth-shaped stderr from a non-zero exit (the binary couldn't authenticate). */
 function isAuthShapedText(text: string): boolean {
@@ -620,7 +684,7 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				// Dead login — from a result frame OR an auth-shaped non-zero exit.
 				// Actionable: tell the operator the exact re-auth command.
 				if (authHit || (code !== 0 && code !== null && isAuthShapedText(stderr))) {
-					throw new Error(CLAUDE_CLI_REAUTH_MESSAGE);
+					throw claudeCliAuthFailure();
 				}
 				if (errorText) {
 					throw new Error(`claude-cli error: ${errorText}`);
@@ -629,7 +693,7 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 					// No terminal frame — spawn failure (binary missing) or a crash.
 					// An auth-shaped stderr here is a dead login, not a missing binary.
 					if (isAuthShapedText(stderr)) {
-						throw new Error(CLAUDE_CLI_REAUTH_MESSAGE);
+						throw claudeCliAuthFailure();
 					}
 					const hint =
 						code === null
