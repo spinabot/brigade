@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { BrigadeRetryError } from "./error-classifier.js";
+import { BrigadeRetryError, classifyErrorReason } from "./error-classifier.js";
 import {
   RetryExhaustedError,
   computeBackoffMs,
@@ -302,4 +302,23 @@ test("runWithRetry: subscription_limit fails fast — exactly one attempt, no ba
     (e: unknown) => isRetryExhaustedError(e) && e.lastReason === "subscription_limit",
   );
   assert.equal(calls, 1);
+});
+
+test("getRetryPolicy: auth_recovered → retries ONCE in place, never rotates", () => {
+  const p = getRetryPolicy("auth_recovered");
+  assert.equal(p.transient, true);
+  assert.equal(p.maxRetries, 1);
+  assert.equal(p.baseBackoffMs, 0);
+  // Rotating would abandon the exact path we just repaired.
+  assert.equal(p.rotateAuthProfile, false);
+  assert.equal(p.rotateModel, false);
+  // Not a provider-health signal — must not burn a transient probe slot.
+  assert.equal(p.consumesProbeSlot, false);
+});
+
+test("classifyErrorReason: a BrigadeRetryError('auth_recovered') is not re-classified as auth", () => {
+  const err = new BrigadeRetryError({ message: "cleared a stale keychain shadow", reason: "auth_recovered" });
+  // The message mentions a credential problem; the explicit reason must win, or
+  // the heuristics would demote it to `auth` (0 retries) and lose the recovery.
+  assert.equal(classifyErrorReason(err), "auth_recovered");
 });

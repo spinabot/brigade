@@ -721,6 +721,25 @@ export async function runGatewayCommand(opts: GatewayCommandOptions = {}): Promi
 		// while the gateway was down) is repaired here — refresh-probe, then adopt
 		// the CLI's live login. Without this the first turns after boot fail with
 		// "No API key for provider: anthropic".
+		// macOS: the `claude` binary reads its credential from the LOGIN KEYCHAIN,
+		// which outranks Brigade's `<claude-config>/.credentials.json`. A shadow the
+		// binary tombstoned on a failed refresh (empty accessToken) makes every turn
+		// report "OAuth session expired and could not be refreshed" while our valid
+		// credential sits unread — and re-login cannot fix it, because we rewrite the
+		// file the binary never reads. Clear ONLY an unusable shadow; a healthy one
+		// belongs to the binary.
+		try {
+			const { hasBrigadeClaudeLogin, healClaudeKeychainShadow } = await import(
+				"../../agents/claude-cli/claude-config.js"
+			);
+			if (hasBrigadeClaudeLogin() && healClaudeKeychainShadow() === "cleared") {
+				process.stderr.write(
+					"brigade-gateway: cleared a stale Claude keychain entry that was shadowing Brigade's login (no action needed).\n",
+				);
+			}
+		} catch {
+			/* keychain heal is best-effort — never block boot */
+		}
 		const deadHeal = await healDeadSubscriptionLogin();
 		if (deadHeal !== "none") {
 			process.stderr.write(

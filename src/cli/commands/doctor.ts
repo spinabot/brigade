@@ -31,6 +31,7 @@ import { detectUnrefreshableSubscriptions } from "../../auth/auth-health.js";
 import { isClaudeCliAvailable } from "../../agents/claude-cli/availability.js";
 import { hasBrigadeClaudeLogin } from "../../agents/claude-cli/claude-config.js";
 import { readClaudeCliLogin } from "../../integrations/cli-login.js";
+import { inspectClaudeKeychainShadow } from "../../agents/claude-cli/claude-config.js";
 import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { FactStore } from "../../agents/memory/records.js";
 import { discoverEligibleSkills } from "../../agents/skills/index.js";
@@ -471,6 +472,21 @@ function checkClaudeCliBackend(): CheckResult {
 			status: "warn",
 			message: "`claude` is installed but no login was detected",
 			hint: "run `brigade onboard` and pick 'Claude (via Claude Code CLI)' to sign in via browser (no key)",
+		};
+	}
+	// macOS keeps the binary's credential in the login keychain, and that entry
+	// OUTRANKS the `.credentials.json` Brigade writes. A tombstoned one (emptied
+	// by a failed refresh) masks a perfectly good Brigade login and makes every
+	// turn report "OAuth session expired" — and re-running the login cannot fix
+	// it, because it rewrites the file the binary never reads. Brigade now
+	// repairs this automatically, so surfacing it here matters most when the
+	// operator is looking at a turn that already failed.
+	if (viaBrigade && inspectClaudeKeychainShadow() === "tombstoned") {
+		return {
+			name: "claude-cli backend",
+			status: "warn",
+			message: "signed in, but a stale macOS keychain entry is shadowing Brigade's Claude login",
+			hint: "Brigade clears this automatically on the next turn or gateway start — do NOT re-run `brigade login claude-cli`, it rewrites a file the binary does not read",
 		};
 	}
 	return {

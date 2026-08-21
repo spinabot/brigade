@@ -28,6 +28,9 @@ export type RetryReason =
   | "context_overflow" // input + output exceeds context — compact then retry, don't burn fallbacks
   | "model_not_found"  // provider doesn't know this model — rotate to fallback
   | "session_expired"  // upstream session/conversation expired — fail fast or refresh
+  | "auth_recovered"   // an auth failure we REPAIRED in place (e.g. cleared a stale
+                       // macOS keychain shadow) — the credential is known-good now,
+                       // so retry the SAME path immediately; never rotate away
   | "unknown";         // catch-all; treated as transient at the policy layer
 
 export interface ClassificationContext {

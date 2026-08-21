@@ -20,6 +20,7 @@
 //   auth               no         0        n/a          yes             try other profile
 //   auth_permanent     no         0        n/a          n/a             surface to user
 //   session_expired    no         0        n/a          n/a             upstream needs re-auth
+//   auth_recovered     yes        1        0            no              we fixed it; retry in place
 
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -46,6 +47,22 @@ export interface RetryPolicy {
 
 export function getRetryPolicy(reason: RetryReason): RetryPolicy {
   switch (reason) {
+    case "auth_recovered":
+      // We already repaired the cause (e.g. deleted a tombstoned keychain entry
+      // that was shadowing a valid credential), so the very next attempt should
+      // succeed. Retry ONCE, immediately, on the SAME profile and model —
+      // rotating would abandon the path we just fixed. Self-limiting: the
+      // repair only reports success while there is something to repair, so a
+      // genuinely dead login cannot loop here.
+      return {
+        reason,
+        transient: true,
+        maxRetries: 1,
+        baseBackoffMs: 0,
+        rotateAuthProfile: false,
+        rotateModel: false,
+        consumesProbeSlot: false,
+      };
     case "rate_limit":
       return {
         reason,
