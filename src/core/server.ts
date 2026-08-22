@@ -211,7 +211,9 @@ import type { SkillInstallSpec } from "../agents/skills/install-spec.js";
 import { applySkillUpdate } from "../agents/skills/update-config.js";
 import {
 	handleSessionsHistory,
+	handleSessionsDelete,
 	handleSessionsList,
+	handleSessionsRename,
 	handleSessionsPatch,
 	handleSessionsSend,
 	handleSessionsSpawn,
@@ -4418,6 +4420,22 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		registerGatewayHandler("sessions.list", (params: unknown) =>
 			handleSessionsList(
 				params as Parameters<typeof handleSessionsList>[0],
+				{ accessCheck: sessionsAccessCheck },
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("sessions.rename", (params: unknown) =>
+			handleSessionsRename(
+				params as Parameters<typeof handleSessionsRename>[0],
+				{ accessCheck: sessionsAccessCheck },
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("sessions.delete", (params: unknown) =>
+			handleSessionsDelete(
+				params as Parameters<typeof handleSessionsDelete>[0],
 				{ accessCheck: sessionsAccessCheck },
 			),
 		),

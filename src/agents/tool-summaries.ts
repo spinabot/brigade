@@ -47,6 +47,7 @@ export const BRIGADE_TOOL_SUMMARIES: Record<string, string> = {
   sessions_send: "Send a message to another session/sub-agent",
   sessions_history: "Fetch history for another session/sub-agent",
   sessions_spawn: "Spawn an isolated sub-agent session",
+  sessions_rename: "Name the conversation you are in, so it is recognisable in the thread list",
   subagents: "List, steer, or kill sub-agent runs for this requester session",
   spawn_agent: "Spawn a one-shot sub-agent for an independent, parallelisable subtask. Returns its final reply synchronously.",
   spawn_agents: "Spawn multiple independent sub-agents in parallel (one task each); returns their replies.",

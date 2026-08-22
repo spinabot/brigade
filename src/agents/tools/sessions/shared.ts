@@ -390,6 +390,7 @@ export const SESSIONS_HISTORY_TOOL_DISPLAY_SUMMARY =
 export const SESSIONS_SEND_TOOL_DISPLAY_SUMMARY =
 	"Send a message to another visible session.";
 export const SESSIONS_SPAWN_TOOL_DISPLAY_SUMMARY = "Spawn a sub-agent session.";
+export const SESSIONS_RENAME_TOOL_DISPLAY_SUMMARY = "Name the current conversation.";
 
 export function describeSessionsListTool(): string {
 	return [
