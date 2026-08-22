@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.31.4](https://github.com/spinabot/brigade/compare/brigade-v1.31.3...brigade-v1.31.4) (2026-08-22)
+
+
+### Bug Fixes
+
+* **claude-cli:** bound and shape-check discovered model ids ([#129](https://github.com/spinabot/brigade/issues/129)) ([8285308](https://github.com/spinabot/brigade/commit/8285308f72fe4d236b5845200961a718fad0d4ec))
+
 ## [1.31.3](https://github.com/spinabot/brigade/compare/brigade-v1.31.2...brigade-v1.31.3) (2026-08-22)
 
 
