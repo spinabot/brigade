@@ -41,3 +41,48 @@ test("fetchClaudeCliModelIds: serves the DISCOVERED list when no token is availa
 		rmSync(credDir, { recursive: true, force: true });
 	}
 });
+
+test("fetchClaudeCliModelIds: a tampered cache file cannot inject malformed ids", async () => {
+	const cacheDir = mkdtempSync(path.join(tmpdir(), "brigade-mcache-"));
+	const credDir = mkdtempSync(path.join(tmpdir(), "brigade-nocred-"));
+	const prevCache = process.env.BRIGADE_CACHE_DIR;
+	const prevCred = process.env.BRIGADE_CLAUDE_CONFIG_DIR;
+	process.env.BRIGADE_CACHE_DIR = cacheDir;
+	process.env.BRIGADE_CLAUDE_CONFIG_DIR = credDir;
+	__resetClaudeCliModelsCache();
+	try {
+		// These ids reach the picker, `brigade.json`, and the binary's `--model`
+		// argv, so the cache is a trust boundary even though it is local.
+		fs.writeFileSync(
+			path.join(cacheDir, "claude-cli-models.json"),
+			JSON.stringify({
+				atMs: Date.now(),
+				ids: [
+					"../../etc/passwd",
+					"claude- rm -rf /",
+					"claude-a\nb",
+					"gpt-4",
+					`claude-${"x".repeat(200)}`,
+					POST_RELEASE_MODEL, // the one legitimate entry
+				],
+			}),
+		);
+		const ids = await fetchClaudeCliModelIds({ force: true });
+		assert.ok(ids.includes(POST_RELEASE_MODEL), "the well-formed id must survive");
+		for (const bad of ["../../etc/passwd", "claude- rm -rf /", "claude-a\nb", "gpt-4"]) {
+			assert.ok(!ids.includes(bad), `malformed id leaked: ${bad}`);
+		}
+		assert.ok(
+			ids.every((id) => id.length <= 128),
+			"an oversized id leaked",
+		);
+	} finally {
+		if (prevCache === undefined) delete process.env.BRIGADE_CACHE_DIR;
+		else process.env.BRIGADE_CACHE_DIR = prevCache;
+		if (prevCred === undefined) delete process.env.BRIGADE_CLAUDE_CONFIG_DIR;
+		else process.env.BRIGADE_CLAUDE_CONFIG_DIR = prevCred;
+		__resetClaudeCliModelsCache();
+		rmSync(cacheDir, { recursive: true, force: true });
+		rmSync(credDir, { recursive: true, force: true });
+	}
+});
