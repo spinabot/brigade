@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.32.1](https://github.com/spinabot/brigade/compare/brigade-v1.32.0...brigade-v1.32.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* **sessions:** /delete accepts the short key form /sessions shows ([b7abf9e](https://github.com/spinabot/brigade/commit/b7abf9e202f1708682e29a84bf0290ba5e428a95))
+* **sessions:** /delete accepts the short key form /sessions shows ([dba8c6c](https://github.com/spinabot/brigade/commit/dba8c6cdc7a4a58ca4ea46a146a2d6dde1c4346b))
+
 ## [1.32.0](https://github.com/spinabot/brigade/compare/brigade-v1.31.4...brigade-v1.32.0) (2026-08-22)
 
 
