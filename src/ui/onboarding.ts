@@ -33,7 +33,8 @@ import {
 	upsertOAuthProfile,
 	upsertTokenProfile,
 } from "../auth/profiles.js";
-import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveModelsPath } from "../config/paths.js";
+import { DEFAULT_AGENT_ID, resolveModelsPath } from "../config/paths.js";
+import { readStoredProviderKey } from "../core/auth-bridge.js";
 import { BRIGADE_DIR, saveConfig } from "../core/config.js";
 import { readClaudeCliLogin, readCodexCliLogin } from "../integrations/cli-login.js";
 import { isClaudeCliAvailable } from "../agents/claude-cli/availability.js";
@@ -43,6 +44,7 @@ import { writeCustomProviderToModelsJson } from "../integrations/custom-provider
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
 import {
 	findProvider,
+	findSharedKeySibling,
 	PROVIDERS,
 	readProviderEnvKey,
 	resolveProviderEnvVarSource,
@@ -648,7 +650,23 @@ export async function ensureApiKey(
 	// rejected because it removes that choice.
 	//
 	// `noEnvDetect` short-circuits env entirely (CI / typed-only operators).
-	const envKey = opts.noEnvDetect ? undefined : readProviderEnvKey(provider);
+	// A `sharedKeyWith` sibling may already hold this credential (OpenCode Zen and
+	// Go share one key). Folded in here so it takes the SAME confirm-then-validate
+	// path below — the key authenticates both catalogs, but the entitlement isn't
+	// shared. Skipped in `ref` mode, which needs an env var name to point at.
+	const envKeyFromEnv = opts.noEnvDetect ? undefined : readProviderEnvKey(provider);
+	const sibling =
+		envKeyFromEnv === undefined && !opts.noEnvDetect && opts.secretInputMode !== "ref"
+			? findSharedKeySibling(provider, readKeyRefFromProfilesFile)
+			: undefined;
+	const envKey = envKeyFromEnv ?? sibling?.value;
+	// Whose credential the offer is actually about. When it came from a sibling
+	// catalog, the prompt must NOT claim we found a key for the provider being
+	// onboarded — no such key exists, and because entitlement is NOT shared the
+	// validation below may well reject it. Naming "OpenCode Go" for a key the
+	// operator only ever pasted for Zen sends them looking for a key they never
+	// created.
+	const keyOwnerName = sibling?.name ?? provider.name;
 	if (envKey) {
 		// Env-supplied key: confirm with the user before adopting it. The
 		// canonical form is `Use existing OPENROUTER_API_KEY (env:
@@ -658,7 +676,7 @@ export async function ensureApiKey(
 		renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
 		tui.addChild(
 			new Text(
-				`  ${brand.amber("?")} We found a saved ${provider.name} key on this computer (${formatApiKeyPreview(envKey)}). Use it?`,
+				`  ${brand.amber("?")} We found a saved ${keyOwnerName} key on this computer (${formatApiKeyPreview(envKey)}). Use it?`,
 				0,
 				0,
 			),
@@ -769,7 +787,12 @@ export async function ensureApiKey(
 				});
 				authStorage.set(providerId, { type: "api_key", key: envKey });
 			}
-			const pinShape = mode === "ref" ? "the key already on this computer" : "your saved key";
+			const pinShape =
+				mode === "ref"
+					? "the key already on this computer"
+					: sibling
+						? `your saved ${sibling.name} key`
+						: "your saved key";
 			tui.addChild(
 				new Text(
 					`  ${brand.amber("✓")} ${provider.name} is already connected (using ${brand.white(pinShape)}).`,
@@ -786,7 +809,7 @@ export async function ensureApiKey(
 		// skip — drop into the typed-key path with the failure seeded so the
 		// user immediately sees WHY their env key didn't work and can paste a
 		// fresh one.
-		const staleReason = `That saved ${provider.name} key didn't work: ${envCheck.reason}`;
+		const staleReason = `That saved ${keyOwnerName} key didn't work: ${envCheck.reason}`;
 		return await promptTypedKey(tui, authStorage, provider, providerId, staleReason);
 	}
 
@@ -2107,55 +2130,23 @@ export function formatApiKeyPreview(raw: string, opts: { head?: number; tail?: n
  */
 
 /**
- * Read auth-profiles.json synchronously and return the resolved API key for
- * `providerId` if a profile exists, or "" otherwise.
+ * Resolved API key stored for `providerId` in the default agent's auth
+ * profiles, or "" when there is none.
  *
- * Mirrors `core/auth-bridge.ts:resolveProfileKey` so the wizard's
- * fast-accept path treats keyRef profiles the same as plaintext ones —
- * without this, ref-stored profiles look "missing" because Pi's authStorage
- * (which reads ~/.brigade/auth.json) doesn't see them and the operator
- * gets re-prompted on every onboard run.
+ * Delegates to `auth-bridge.readStoredProviderKey` rather than re-parsing the
+ * file here. One implementation means the wizard's fast-accept decision cannot
+ * disagree with what the runtime will actually resolve — the copy this replaced
+ * differed on a legacy string `keyRef`, reporting "no key stored" for a
+ * credential `readBrigadeCredentials` uses happily. It is also testable without
+ * importing this TUI module.
  *
- * Sync read is fine here: the file is at most a few KB, the wizard has
- * already opened a TUI session (so we're past hot-cold-start), and async
- * would force the caller into a chain of awaits in tight UI logic.
+ * (That copy had no callers, and did `require("node:fs")` inside this ESM module
+ * — a latent ReferenceError its own catch would have swallowed. The
+ * shared-key-sibling path is the first caller, so the defect never fired in a
+ * shipped build.)
  */
 function readKeyRefFromProfilesFile(providerId: string): string {
-	try {
-		const profilesPath = resolveAuthProfilesPath(DEFAULT_AGENT_ID);
-		const fsSync = require("node:fs") as typeof import("node:fs");
-		if (!fsSync.existsSync(profilesPath)) return "";
-		const raw = fsSync.readFileSync(profilesPath, "utf8");
-		const parsed = JSON.parse(raw) as {
-			profiles?: Record<
-				string,
-				{
-					provider?: string;
-					key?: string;
-					keyRef?: { source?: string; id?: string } | string;
-				}
-			>;
-		};
-		const profile = Object.values(parsed.profiles ?? {}).find(
-			(p) => p?.provider === providerId,
-		);
-		if (!profile) return "";
-		// Plaintext wins if both shapes are somehow present (shouldn't happen).
-		if (typeof profile.key === "string" && profile.key.length > 0) return profile.key;
-		const ref = profile.keyRef;
-		if (!ref) return "";
-		if (typeof ref === "string") {
-			const m = /^\$\{([A-Z_][A-Z0-9_]*)\}$/.exec(ref);
-			if (m && m[1]) return process.env[m[1]] ?? "";
-			return "";
-		}
-		if (ref.source === "env" && ref.id) {
-			return process.env[ref.id] ?? "";
-		}
-		return "";
-	} catch {
-		return "";
-	}
+	return readStoredProviderKey(providerId, DEFAULT_AGENT_ID);
 }
 
 function clear(tui: TUI): void {

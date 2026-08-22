@@ -251,9 +251,37 @@ const MODEL_NOT_FOUND_PATTERNS: RegExp[] = [
   /unknown model/i,
   /model .*?(?:does not exist|is not available)/i,
   /no such model/i,
+  /\bmodel \S+ is not supported\b/i, // OpenCode's wording; PLAN_ENTITLEMENT needs "the requested"
   ...ENDPOINT_MISMATCH_PATTERNS,
   ...PLAN_ENTITLEMENT_PATTERNS,
 ];
+
+// OpenCode answers 401 for every gateway refusal — bad key, unknown model, spent
+// credits, blocked region — and resolves the model before checking auth, so the
+// status says nothing. The discriminator is the `error.type` in the body:
+//   {"type":"error","error":{"type":"CreditsError","message":"…"}}
+// Left unread, all of them land in `auth` and the loop rotates auth profiles
+// instead of advancing the fallback chain. Matched on the quoted type token so no
+// other provider's 401 can move.
+// `cls` is carried alongside `reason` because ErrorClass has no `billing` bucket;
+// the detailed ladder already routes a 402 to auth_permanent, so credits match.
+const OPENCODE_ERRORS: ReadonlyArray<{ re: RegExp; reason: RetryReason; cls: ErrorClass }> = [
+  { re: /"type"\s*:\s*"ModelError"/, reason: "model_not_found", cls: "model_not_found" },
+  { re: /"type"\s*:\s*"CreditsError"/, reason: "billing", cls: "auth_permanent" },
+  { re: /"type"\s*:\s*"RateLimitError"/, reason: "rate_limit", cls: "rate_limit" },
+  {
+    re: /"type"\s*:\s*"(?:MonthlyLimitError|UserLimitError|FreeUsageLimitError|GoUsageLimitError|BlackUsageLimitError)"/,
+    reason: "subscription_limit",
+    cls: "subscription_limit",
+  },
+  { re: /"type"\s*:\s*"(?:RegionError|DataPolicyError)"/, reason: "auth_permanent", cls: "auth_permanent" },
+];
+
+function matchOpenCodeError(message: string): (typeof OPENCODE_ERRORS)[number] | null {
+  // Cheap bail so every other provider's message costs one indexOf, not five regexes.
+  if (!message.includes('"type"')) return null;
+  return OPENCODE_ERRORS.find((entry) => entry.re.test(message)) ?? null;
+}
 
 const SESSION_EXPIRED_PATTERNS: RegExp[] = [
   /session not found/i,
@@ -272,7 +300,10 @@ function classifyByStatus(status: number, message: string): RetryReason | null {
   switch (status) {
     case 401:
     case 403:
-      return matchAny(message, AUTH_PERMANENT_PATTERNS) ? "auth_permanent" : "auth";
+      return (
+        matchOpenCodeError(message)?.reason ??
+        (matchAny(message, AUTH_PERMANENT_PATTERNS) ? "auth_permanent" : "auth")
+      );
     case 402:
       // 402 is overloaded with meanings — providers use it for both "you owe
       // money" and "you've hit the daily cap, try again". Inspect the body.
@@ -409,6 +440,8 @@ export function classifyErrorReason(value: unknown, _ctx?: ClassificationContext
 
 function classifyByMessage(message: string): RetryReason | null {
   if (!message) return null;
+  const openCode = matchOpenCodeError(message);
+  if (openCode) return openCode.reason;
   if (matchAny(message, AUTH_PERMANENT_PATTERNS)) return "auth_permanent";
   // Subscription-window exhaustion MUST be checked before billing and
   // rate_limit: its phrasings ("out of extra usage", "usage limit reached")
@@ -600,6 +633,9 @@ const MODEL_NOT_FOUND_PATTERNS_DETAILED = [
   /no\s+such\s+model/i,
   /unknown\s+model/i,
   /\b404\b.*model/i,
+  // Entitlement + endpoint patterns are tested EARLIER in classifyErrorDetailed,
+  // so this can't steal Copilot's plan message or the Responses-API wording.
+  /\bmodel\b[^.\n]{0,80}is\s+not\s+supported/i,
 ];
 
 /**
@@ -633,6 +669,20 @@ export function classifyErrorDetailed(err: unknown): ClassifiedError {
   // useless (the window resets on wall clock); advance to fallback.
   if (SUBSCRIPTION_LIMIT_PATTERNS.some((p) => p.test(message))) {
     return { class: "subscription_limit", message, retryableOnSameModel: false };
+  }
+
+  // Also BEFORE the status block: OpenCode's envelope is self-describing, and Pi
+  // does not always surface a parseable status alongside it. Left inside the
+  // 401/403 arm, a CreditsError with no status fell through to `unknown` and the
+  // loop burned the whole fallback chain instead of reporting the balance.
+  const openCodeEarly = matchOpenCodeError(message);
+  if (openCodeEarly) {
+    return {
+      class: openCodeEarly.cls,
+      message,
+      // Only a transient rate spike is worth re-trying the same model.
+      retryableOnSameModel: openCodeEarly.reason === "rate_limit",
+    };
   }
 
   if (code && NETWORK_ERROR_CODES_DETAILED.has(code)) {

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 import {
 	findProvider,
+	findSharedKeySibling,
 	PROVIDERS,
 	readProviderEnvKey,
 	resolveProviderEnvVarSource,
@@ -21,6 +22,8 @@ const ENV_KEYS_TO_GUARD = [
 	"XAI_API_KEY",
 	"DEEPSEEK_API_KEY",
 	"MISTRAL_API_KEY",
+	"OPENCODE_API_KEY",
+	"OPENCODE_ZEN_API_KEY",
 ];
 
 const originalEnv: Record<string, string | undefined> = {};
@@ -52,6 +55,8 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 		{ id: "xai", envVar: "XAI_API_KEY" },
 		{ id: "deepseek", envVar: "DEEPSEEK_API_KEY" },
 		{ id: "mistral", envVar: "MISTRAL_API_KEY" },
+		{ id: "opencode", envVar: "OPENCODE_API_KEY" },
+		{ id: "opencode-go", envVar: "OPENCODE_API_KEY" },
 	];
 
 	for (const { id, envVar } of CLOUD_PROVIDERS_WITH_ENV) {
@@ -100,6 +105,56 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 		});
 	});
 
+	it("OpenCode falls back to OPENCODE_ZEN_API_KEY when OPENCODE_API_KEY is unset", () => {
+		// `--secret-input-mode ref` persists keyRef.id from this, so a user keyed via
+		// the alias must get OPENCODE_ZEN_API_KEY on disk, not the primary.
+		for (const id of ["opencode", "opencode-go"]) {
+			const provider = findProvider(id)!;
+			assert.deepEqual(provider.envVarFallbacks, ["OPENCODE_ZEN_API_KEY"]);
+			process.env.OPENCODE_ZEN_API_KEY = "sk-zen-fallback";
+			assert.equal(readProviderEnvKey(provider), "sk-zen-fallback");
+			assert.deepEqual(resolveProviderEnvVarSource(provider), {
+				name: "OPENCODE_ZEN_API_KEY",
+				value: "sk-zen-fallback",
+			});
+		}
+	});
+
+	it("findSharedKeySibling pairs the two OpenCode catalogs in both directions", () => {
+		const zen = findProvider("opencode")!;
+		const go = findProvider("opencode-go")!;
+		assert.deepEqual(zen.sharedKeyWith, ["opencode-go"]);
+		assert.deepEqual(go.sharedKeyWith, ["opencode"]);
+
+		const onlyGo = (id: string) => (id === "opencode-go" ? "sk-go-stored" : "");
+		assert.deepEqual(findSharedKeySibling(zen, onlyGo), {
+			providerId: "opencode-go",
+			name: "OpenCode Go",
+			value: "sk-go-stored",
+		});
+		const onlyZen = (id: string) => (id === "opencode" ? "sk-zen-stored" : "");
+		assert.deepEqual(findSharedKeySibling(go, onlyZen), {
+			providerId: "opencode",
+			name: "OpenCode Zen",
+			value: "sk-zen-stored",
+		});
+	});
+
+	it("findSharedKeySibling ignores blank keys and providers with no siblings", () => {
+		const zen = findProvider("opencode")!;
+		assert.equal(findSharedKeySibling(zen, () => ""), undefined);
+		assert.equal(findSharedKeySibling(zen, () => "   "), undefined);
+		// A provider with no siblings must not consult the store at all.
+		const openai = findProvider("openai")!;
+		assert.equal(openai.sharedKeyWith, undefined);
+		assert.equal(
+			findSharedKeySibling(openai, () => {
+				throw new Error("must not be called");
+			}),
+			undefined,
+		);
+	});
+
 	it("Ollama has no envVar (noAuth, local)", () => {
 		const ollama = findProvider("ollama")!;
 		assert.equal(ollama.envVar, "");
@@ -144,6 +199,8 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 			"ollama",
 			"openai",
 			"openai-codex",
+			"opencode",
+			"opencode-go",
 			"openrouter",
 			"qwen",
 			"xai",

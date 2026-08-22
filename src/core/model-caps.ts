@@ -188,6 +188,8 @@ export function pickStreamIdleMs(model: Model<any>): number {
 		"mistral",
 		"github-copilot",
 		"vercel-ai-gateway",
+		"opencode",
+		"opencode-go",
 	]);
 	const isCloud = KNOWN_CLOUD_PROVIDERS.has(provider);
 
