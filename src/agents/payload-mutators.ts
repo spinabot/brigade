@@ -623,12 +623,13 @@ export function decodeXaiToolCallArgs<T>(args: T): T {
   return args;
 }
 
-/** Whether the active model is xAI / Grok (or routed via OpenRouter to Grok). */
+/** Whether the active model is xAI / Grok (or routed via OpenRouter or OpenCode to Grok). */
 export function isXaiModel(model: Model<any> | undefined): boolean {
   if (!model) return false;
   const provider = (model.provider ?? "").toLowerCase();
   if (provider === "xai" || provider === "x-ai") return true;
   if (provider === "openrouter" && /grok|xai|x-ai/i.test(model.id ?? "")) return true;
+  if (provider === "opencode" && /grok|xai|x-ai/i.test(model.id ?? "")) return true;
   return false;
 }
 

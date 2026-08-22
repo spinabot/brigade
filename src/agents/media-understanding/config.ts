@@ -69,6 +69,7 @@ export const MEDIA_ONLY_KEY_PROVIDER_IDS: readonly string[] = ["elevenlabs", "mi
 const PI_PROVIDER_PREFERENCE = [
 	"openai",
 	"openrouter",
+	"opencode",
 	"groq",
 	"xai",
 	"mistral",

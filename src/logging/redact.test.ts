@@ -30,6 +30,21 @@ describe("redact.ts (cron summariser) — Google keys", () => {
 	});
 });
 
+// An OpenCode key: "sk-" + 64 [A-Za-z0-9]. Synthetic. No dedicated pattern exists
+// for it — these pin that the generic `sk-` rules cover it in both redactors.
+const OPENCODE_KEY = `sk-${"Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3Wx4Yz5Ab6Cd7Ef8Gh9Ij0Kl1Mn2Op3"}`;
+
+describe("both redactors — OpenCode keys are covered by the existing sk- rules", () => {
+	it("redacts an OpenCode key from a cron summary", () => {
+		assert.match(redactLog(`OPENCODE_API_KEY=${OPENCODE_KEY}`), /<redacted:/);
+		assert.doesNotMatch(redactLog(OPENCODE_KEY), /Ab3Cd4/);
+	});
+	it("redacts an OpenCode key from transcript history", () => {
+		assert.match(redactSession(`key: ${OPENCODE_KEY}`), /\[redacted\]/);
+		assert.doesNotMatch(redactSession(`key: ${OPENCODE_KEY}`), /Ab3Cd4/);
+	});
+});
+
 describe("sessions/shared.ts (history redactor) — Google keys now caught (#65)", () => {
 	it("redacts an AQ. key in transcript text — the leak the fix targeted", () => {
 		assert.match(redactSession(`answer: ${AQ_KEY}`), /\[redacted\]/);
