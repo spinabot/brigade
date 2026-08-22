@@ -39,6 +39,31 @@ function staticModelIds(): string[] {
 // disappear from the picker on any restart that raced a stale token. Lives in
 // the OS cache dir: reapable by design, and writable in convex mode where
 // `~/.brigade` must stay file-free.
+// Model ids arrive from the network and from a cache file on disk, then flow
+// into the picker, into `brigade.json`, and onto the spawned binary's `--model`
+// argv. Neither source is trusted: bound and shape-check at BOTH boundaries so
+// nothing unbounded or malformed is ever persisted or propagated. (CodeQL:
+// "network data written to file system".)
+const MAX_MODEL_IDS = 200;
+const MAX_MODEL_ID_LEN = 128;
+/** Every Claude model id is `claude-` + printable id chars. No spaces, no
+ *  control characters, no path separators. */
+const MODEL_ID_RE = /^claude-[A-Za-z0-9._[\]-]{1,120}$/;
+
+/** Bound, shape-check and de-duplicate ids from any untrusted source. */
+function sanitizeModelIds(raw: readonly unknown[]): string[] {
+	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const value of raw) {
+		if (out.length >= MAX_MODEL_IDS) break;
+		if (typeof value !== "string" || value.length > MAX_MODEL_ID_LEN) continue;
+		if (!MODEL_ID_RE.test(value) || seen.has(value)) continue;
+		seen.add(value);
+		out.push(value);
+	}
+	return out;
+}
+
 function discoveredCachePath(): string {
 	return path.join(resolveOsCacheDir(), "claude-cli-models.json");
 }
@@ -46,7 +71,7 @@ function discoveredCachePath(): string {
 function readDiscoveredModelIds(): string[] | undefined {
 	try {
 		const raw = JSON.parse(fs.readFileSync(discoveredCachePath(), "utf8")) as { ids?: unknown };
-		const ids = Array.isArray(raw.ids) ? raw.ids.filter((i): i is string => typeof i === "string") : [];
+		const ids = sanitizeModelIds(Array.isArray(raw.ids) ? raw.ids : []);
 		return ids.length > 0 ? ids : undefined;
 	} catch {
 		return undefined;
@@ -112,9 +137,7 @@ export async function fetchClaudeCliModelIds(opts: { force?: boolean; nowMs?: nu
 		});
 		if (!res.ok) return fallbackModelIds();
 		const body = (await res.json()) as { data?: Array<{ id?: unknown }> };
-		const ids = (body.data ?? [])
-			.map((m) => (typeof m.id === "string" ? m.id : ""))
-			.filter((id): id is string => id.startsWith("claude-"));
+		const ids = sanitizeModelIds((body.data ?? []).map((m) => m.id));
 		if (ids.length === 0) return fallbackModelIds();
 		// Merge: live ids first (current), then any static id the API omitted, so a
 		// catalogued default never vanishes from the picker.
