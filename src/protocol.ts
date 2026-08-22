@@ -217,6 +217,18 @@ export type RequestMethod =
 	 * sessions. Used by the connect TUI's `/sessions` slash command.
 	 */
 	| "sessions.list"
+	/**
+	 * Set or clear a session's display name. Naming is metadata about a
+	 * conversation, not activity in it, so this deliberately does NOT touch
+	 * `lastUsedAt` — a rename must not reorder a recency-sorted history.
+	 */
+	| "sessions.rename"
+	/**
+	 * Delete a session and its transcript. OPERATOR-ONLY — there is deliberately
+	 * no agent tool for this: deletion is irreversible and the sessions tool
+	 * bundle has no owner gate. Refuses while a turn is running.
+	 */
+	| "sessions.delete"
 	/* ─── Cron methods (Wave N6 — full reference parity) ────────── */
 	/** Service-level snapshot — job count, next wake, running. */
 	| "cron.status"
@@ -311,6 +323,8 @@ export const REQUEST_METHODS = [
 	"unsubscribe",
 	"agents.list",
 	"sessions.list",
+	"sessions.rename",
+	"sessions.delete",
 	"cron.status",
 	"cron.list",
 	"cron.add",
@@ -621,6 +635,20 @@ export interface RequestParams {
 		/** When true, ignore `agentId` and return every agent's live sessions. */
 		all?: boolean;
 	} | void;
+	"sessions.delete": {
+		/** The session to delete. The owning agent is derived from it. */
+		sessionKey: string;
+	};
+	"sessions.rename": {
+		/** The session to rename. */
+		sessionKey: string;
+		/**
+		 * New display name. Empty / whitespace-only CLEARS the name, so
+		 * `/rename` with no argument is a natural "remove it" rather than a
+		 * second command. Sanitised and length-capped server-side.
+		 */
+		name?: string;
+	};
 	/* ─── Cron methods (Wave N6) — wire shapes owned by the handler module. */
 	"cron.status": CronStatusParamsV2 | void;
 	"cron.list": CronListParamsV2 | void;
@@ -675,6 +703,8 @@ export interface ResponseFor {
 	unsubscribe: void;
 	"agents.list": AgentSummary[];
 	"sessions.list": SessionSummary[];
+	"sessions.rename": SessionRenameResult;
+	"sessions.delete": SessionDeleteResult;
 	/* ─── Cron methods (Wave N6) ─────────────────────────────── */
 	"cron.status": CronStatusResultV2;
 	"cron.list": CronListResultV2;
@@ -944,6 +974,40 @@ export interface AgentSummary {
 export interface SessionSummary {
 	sessionKey: string;
 	agentId: string;
+	/**
+	 * Operator-chosen display name, sanitised. Absent means unnamed — render the
+	 * derived label or the key, as every surface did before names existed.
+	 */
+	displayName?: string;
+}
+
+export interface SessionDeleteResult {
+	/** False on a miss, a bad key, or a session with a turn still running. */
+	ok: boolean;
+	sessionKey: string;
+	agentId: string;
+	/** Why it was refused. Absent on success. */
+	reason?: string;
+	/**
+	 * False when the index entry went but the JSONL could not be removed — an
+	 * orphaned file nothing references. Surfaced rather than hidden so the
+	 * operator knows the bytes are still on disk.
+	 */
+	transcriptRemoved?: boolean;
+}
+
+export interface SessionRenameResult {
+	/**
+	 * False when the session does not exist — a clean miss rather than an error,
+	 * since the caller may be racing a deletion and a rename is never worth
+	 * failing a turn over. Typed clients MUST branch on this: without it a
+	 * successful rename and an unknown-session miss are indistinguishable.
+	 */
+	ok: boolean;
+	sessionKey: string;
+	agentId: string;
+	/** The stored name AFTER sanitising. Absent when the name was cleared. */
+	name?: string;
 }
 
 export function modelToSummary(model: Model<any>): ModelSummary {

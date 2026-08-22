@@ -261,7 +261,63 @@ export interface SessionEntry {
   thinkingLevel?: string;
   /** Primitive #6 — see `SubagentSessionMetadata`. Unset on top-level sessions. */
   subagent?: SubagentSessionMetadata;
+  /**
+   * Operator-chosen display name. Absent means "unnamed" — callers fall back to
+   * the session key, which is what every surface did before names existed.
+   * Sanitised on write (see `sanitizeSessionName`); never trusted on read,
+   * since the store is a plain JSON file an operator can hand-edit.
+   */
+  name?: string;
   [key: string]: unknown;
+}
+
+/** Upper bound on a session name. Long enough for a sentence, short enough that
+ *  a list stays readable and a single entry can't bloat the store. */
+export const MAX_SESSION_NAME_LENGTH = 120;
+
+/**
+ * Normalise an operator-supplied session name.
+ *
+ * Returns `undefined` for anything that should CLEAR the name (empty, or
+ * whitespace/control characters only), so `/rename` with no argument is a
+ * natural "remove the name" rather than a separate command.
+ *
+ * Control characters are stripped rather than rejected: these names are printed
+ * into a TUI, and a stray \r or ANSI escape would corrupt the rendering of every
+ * row around it.
+ */
+export function sanitizeSessionName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  // C0 + DEL + C1 (U+0080-U+009F) — C1 still carries escape semantics in some
+  // terminals — plus the bidi overrides, which can visually reverse a name so it
+  // reads as something else entirely in a list.
+  // eslint-disable-next-line no-control-regex
+  const stripped = raw.replace(
+    // C0 + DEL + C1, ZWSP, and the bidi marks/overrides/isolates (incl. U+061C).
+    //
+    // ZWJ (U+200D) and ZWNJ (U+200C) are deliberately NOT here. They are text,
+    // not formatting: stripping them tore "👨‍👩‍👧" into three separate people,
+    // broke the pride flag into two glyphs, and split Devanagari conjuncts.
+    // Emptiness is handled below by testing for VISIBLE content instead, which
+    // is the property we actually cared about.
+    /[\u0000-\u001f\u007f-\u009f\u061c\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,
+    " ",
+  );
+  const collapsed = stripped.replace(/\s+/g, " ").trim();
+  if (collapsed.length === 0) return undefined;
+  // A name made only of joiners and spaces renders as nothing and cannot be
+  // distinguished from an unnamed thread, so treat it as a clear. Checking for
+  // visible content lets ZWJ/ZWNJ live inside a real name while still rejecting
+  // a name that is entirely invisible.
+  if (!/[^\s\u200c\u200d]/u.test(collapsed)) return undefined;
+  // Slice by CODE POINT, not UTF-16 unit: a raw slice can cut a surrogate pair
+  // and persist a lone surrogate that becomes U+FFFD on any UTF-8 round-trip.
+  // This also matches the agent tool's JSON-Schema `maxLength`, which JSON
+  // Schema defines in code points.
+  const points = [...collapsed];
+  return points.length > MAX_SESSION_NAME_LENGTH
+    ? points.slice(0, MAX_SESSION_NAME_LENGTH).join("")
+    : collapsed;
 }
 
 export interface SessionStoreFile {
@@ -478,7 +534,10 @@ function buildBrigadeMainSessionKeyLazy(agentId: string): string {
 export function deleteSessionEntry(agentId: string, sessionKey: string): boolean {
   return withSyncStoreLock(agentId, () => {
     const store = readSessionStore(agentId);
-    if (!(sessionKey in store.sessions)) return false;
+    // `in` walks the prototype chain: `"toString" in {}` is true, so a
+    // caller-supplied key like `toString` or `constructor` reported a
+    // successful delete for a session that never existed.
+    if (!Object.hasOwn(store.sessions, sessionKey)) return false;
     delete store.sessions[sessionKey];
     writeSessionStore(agentId, store);
     return true;
@@ -513,6 +572,35 @@ export function updateSessionEntry(
       ...rest,
       lastUsedAt: new Date().toISOString(),
     };
+    store.sessions[sessionKey] = next;
+    writeSessionStore(agentId, store);
+    return next;
+  });
+}
+
+/**
+ * Set or clear a session's display name.
+ *
+ * Deliberately NOT `updateSessionEntry`: that stamps `lastUsedAt`, and renaming
+ * is not *using* a session — it would jump the row to the top of every
+ * recency-sorted list and make the history reorder itself under the operator's
+ * cursor. Naming is metadata about a conversation, not activity in it.
+ *
+ * Returns the updated entry, or null when the session does not exist.
+ */
+export function renameSessionEntry(agentId: string, sessionKey: string, name: unknown): SessionEntry | null {
+  const clean = sanitizeSessionName(name);
+  return withSyncStoreLock(agentId, () => {
+    const store = readSessionStore(agentId);
+    // Own-property only. A bare index hits Object.prototype, so `constructor`
+    // was truthy and got spread into a brand-new entry that was then PERSISTED
+    // and listed in `/sessions` — the opposite of "never conjure one".
+    if (!Object.hasOwn(store.sessions, sessionKey)) return null;
+    const entry = store.sessions[sessionKey];
+    if (!entry) return null;
+    const next: SessionEntry = { ...entry };
+    if (clean === undefined) delete next.name;
+    else next.name = clean;
     store.sessions[sessionKey] = next;
     writeSessionStore(agentId, store);
     return next;

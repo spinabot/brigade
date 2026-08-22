@@ -22,6 +22,8 @@
 import { COPILOT_AUTO_MODEL_ID } from "../../agents/github-copilot-transport.js";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
+
+import { sanitizeSessionName } from "../../sessions/session-store.js";
 import * as nodePath from "node:path";
 
 import {
@@ -69,7 +71,16 @@ import { asstKey, clipOneLine, extractUserText } from "./connect-transcript.js";
 import { UPDATE_PRESERVES_MESSAGE } from "../../core/update-check.js";
 import { runUpdateCommand } from "./update.js";
 import { ApprovalPrompt, type ApprovalResolution } from "../../tui/approval-prompt.js";
-import type { AgentSummary, EventPayload, ModelSummary, PromptAttachment, SessionStateSnapshot, SessionSummary } from "../../protocol.js";
+import type {
+	AgentSummary,
+	EventPayload,
+	ModelSummary,
+	PromptAttachment,
+	SessionDeleteResult,
+	SessionRenameResult,
+	SessionStateSnapshot,
+	SessionSummary,
+} from "../../protocol.js";
 import {
 	computeExplain,
 	filterGraphToSubtree,
@@ -409,6 +420,23 @@ export async function wireConnectUi(
 	// Seeded by `--session <key>` (already resolved + verified against sessions.list).
 	// Left undefined, the first `state` snapshot seeds it with the agent's main thread.
 	let boundSessionKey: string | undefined = initialSessionKey;
+	// A name typed before the thread exists on the gateway. `/new` mints a key
+	// CLIENT-side and no store entry is written until the first turn, so
+	// "start a thread and name it" — the most natural order — had nothing to
+	// rename. Hold the name and apply it once the turn creates the entry.
+	//
+	// Bound to a SPECIFIC key, and re-checked at apply time: if the operator
+	// moves to another thread first, this must never land on the wrong one.
+	let pendingRename: { sessionKey: string; name: string } | undefined;
+	// Key awaiting a confirming repeat of `/delete`. Cleared on any other
+	// `/delete` form so a stale confirmation can never execute later.
+	let pendingDeleteKey: string | undefined;
+	/** Disarm a `/delete` confirmation. Called on EVERY other submitted line, so
+	 *  an armed key cannot survive unrelated work and fire on a later repeat that
+	 *  the operator expected to re-arm rather than execute. */
+	const disarmPendingDelete = (): void => {
+		pendingDeleteKey = undefined;
+	};
 	// Residual P0 (post-Wave K integration audit) — the WS broadcast filter
 	// at server.ts:903 keys on per-connection subscription Sets populated by
 	// the `subscribe` RPC. Without an explicit subscribe, the filter falls
@@ -886,6 +914,16 @@ export async function wireConnectUi(
 			argumentHint: "[--all]",
 		},
 		{
+			name: "rename",
+			description: "name this thread (no argument clears the name)",
+			argumentHint: "[<name>]",
+		},
+		{
+			name: "delete",
+			description: "permanently delete a thread and its transcript (confirm by repeating)",
+			argumentHint: "<session-key>",
+		},
+		{
 			name: "mute",
 			description: "unsubscribe from an agent id or session key",
 			argumentHint: "<agent-id|session-key>",
@@ -904,7 +942,7 @@ export async function wireConnectUi(
 	// providers still need `brigade onboard` on the gateway machine.
 	tui.addChild(
 		new Text(
-			brand.dim("  connect-mode: /new /agent /agents /session /sessions · /model /provider /thinking /reasoning · /abort /steer /compact · /usage /help"),
+			brand.dim("  connect-mode: /new /agent /agents /session /sessions /rename /delete · /model /provider /thinking /reasoning · /abort /steer /compact · /usage /help"),
 			0,
 			0,
 		),
@@ -1849,6 +1887,35 @@ export async function wireConnectUi(
 				agentStartedAt = null;
 				editor.disableSubmit = false;
 				activeAssistants.clear();
+				// The turn just created the store entry a pre-turn `/rename` had
+				// nothing to write to. Apply it now — but only if we are STILL on the
+				// thread the name was typed for; the operator may have moved on.
+				// Cleared either way: a queued name must not retry forever.
+				if (pendingRename && pendingRename.sessionKey === (boundSessionKey ?? lastSnapshot?.sessionKey)) {
+					const queued = pendingRename;
+					pendingRename = undefined;
+					void client
+						.request("sessions.rename", { sessionKey: queued.sessionKey, name: queued.name })
+						.then((r) => {
+							const res = r as SessionRenameResult | undefined;
+							if (res?.ok && res.name) {
+								insertBeforeEditor(new Text(`  ${brand.amber("✓")} renamed to ${brand.white(scrubRenderable(res.name))}`, 0, 0));
+							} else {
+								// We PROMISED this name would land. Silence here left the
+								// operator believing a rename happened that never did.
+								insertBeforeEditor(
+									new Text(`  ${brand.dim("could not name this thread — try /rename again")}`, 0, 0),
+								);
+							}
+							tui.requestRender();
+						})
+						.catch(() => {
+							insertBeforeEditor(
+								new Text(`  ${brand.dim("could not name this thread — try /rename again")}`, 0, 0),
+							);
+							tui.requestRender();
+						});
+				}
 				// Turn-end is the definitive flush point — even if every other
 				// path missed flushing, this guarantees the last paint of the
 				// turn lands before the editor re-enables for the operator.
@@ -2494,6 +2561,11 @@ export async function wireConnectUi(
 		// from a malicious page) can otherwise corrupt the terminal or smuggle control
 		// bytes into the transcript. The single submit chokepoint covers every path.
 		const trimmed = sanitizeTerminalInput(value).trim();
+		// Any line that is not a `/delete` disarms a pending confirmation. Without
+		// this the armed key survived arbitrary intervening work, so repeating the
+		// command an hour later — expecting the warning again — deleted on the
+		// first Enter. Irreversible operations must not stay armed in the dark.
+		if (!trimmed.startsWith("/delete")) disarmPendingDelete();
 		// An empty line normally does nothing. The ONE exception is a wordless send of
 		// staged files — "drop an image, press Enter" is a legitimate turn (the media
 		// note alone is a valid prompt, and the agent describes what it sees).
@@ -2588,6 +2660,8 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/session [<key>]")} — show/bind the connection's active session\n` +
 						`- ${chalk.bold("/agents")} — list every agent the gateway knows about\n` +
 						`- ${chalk.bold("/sessions [--all]")} — list live sessions (bound agent or all)\n` +
+						`- ${chalk.bold("/rename [<name>]")} — name this thread (no argument clears the name)\n` +
+						`- ${chalk.bold("/delete <session-key>")} — permanently delete a thread + transcript (repeat to confirm)\n` +
 						`- ${chalk.bold("/mute <id|key>")} — unsubscribe from an agent id or session key\n` +
 						`- ${chalk.bold("/memory")} — list recent memories\n` +
 						`- ${chalk.bold("/memory search <q>")} — search memories by keyword\n` +
@@ -2750,6 +2824,153 @@ export async function wireConnectUi(
 			return;
 		}
 
+		// /delete <session-key> — delete a thread and its transcript.
+		//
+		// Requires an EXPLICIT key and a confirming repeat. Deletion is
+		// irreversible and there is no agent tool for it, so the two frictions
+		// are deliberate: no argument means the operator cannot fat-finger away
+		// the thread they are sitting in, and the repeat means a key pasted from
+		// `/sessions` is not executed on the first Enter.
+		if (trimmed === "/delete" || trimmed.startsWith("/delete ")) {
+			editor.setText("");
+			const key = trimmed === "/delete" ? "" : trimmed.slice("/delete ".length).trim();
+			if (!key) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim("usage: /delete <session-key> — deletes the thread AND its transcript, permanently")}\n  ${brand.dim("(`/sessions` lists the keys)")}`,
+						0,
+						0,
+					),
+				);
+				pendingDeleteKey = undefined;
+				return;
+			}
+			if (pendingDeleteKey !== key) {
+				pendingDeleteKey = key;
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error("!")} ${brand.dim("this permanently deletes")} ${brand.white(key)} ${brand.dim("and its transcript.")}\n  ${brand.dim("run the same command again to confirm")}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
+			pendingDeleteKey = undefined;
+			try {
+				const res = (await client.request("sessions.delete", { sessionKey: key })) as SessionDeleteResult;
+				if (!res?.ok) {
+					insertBeforeEditor(
+						new Text(`  ${brand.error("✗")} ${brand.error(res?.reason ?? "could not delete that session")}`, 0, 0),
+					);
+					return;
+				}
+				// An orphaned transcript is a disk leak the operator should hear about
+				// — "deleted" must not quietly mean "mostly deleted".
+				const note =
+					res.transcriptRemoved === false
+						? ` ${brand.dim("(entry removed; its transcript may still be on disk)")}`
+						: "";
+				const wasBound = (boundSessionKey ?? lastSnapshot?.sessionKey) === key;
+				// The notice MUST come after any `clearTranscriptRegion()` below, which
+				// removes every child between the divider and the editor — printing it
+				// first wiped the "transcript may still be on disk" warning before it
+				// painted. `/new` carries the same warning about this exact ordering.
+				if (!wasBound) {
+					insertBeforeEditor(new Text(`  ${brand.amber("✓")} deleted ${brand.white(key)}${note}`, 0, 0));
+				}
+				if (wasBound) {
+					// Do NOT simply unbind: with no bound key the prompt handler falls
+					// back to the BOOT session, so the next message would land in
+					// `agent:main:main` with all its history — the opposite of what
+					// deleting the thread you were in should do. Mint a fresh key, as
+					// `/new` does.
+					const agentForNext = boundAgentId ?? lastSnapshot?.agentId ?? DEFAULT_AGENT_ID;
+					boundSessionKey = `agent:${agentForNext}:t-${randomUUID().slice(0, 8)}`;
+					clearTranscriptRegion();
+					insertBeforeEditor(new Text(`  ${brand.amber("✓")} deleted ${brand.white(key)}${note}`, 0, 0));
+					insertBeforeEditor(
+						new Text(`  ${brand.dim("moved to a new thread")} ${brand.amber(boundSessionKey)}`, 0, 0),
+					);
+					// The full context switch, matching `/new` / `/session` / `/agent`.
+					// Omitting these left files staged for the DELETED thread armed to
+					// upload into the new one, and the connection still subscribed to a
+					// key that no longer exists — so the next turn streamed nothing.
+					clearTrayForContextSwitch("the new thread");
+					updateHeader();
+					void applySubscription();
+				}
+				// A queued name for the deleted thread is dead regardless of whether we
+				// were sitting in it — otherwise it lingers and can later retitle a
+				// recreated thread with the same key.
+				if (pendingRename?.sessionKey === key) pendingRename = undefined;
+			} catch (err) {
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`, 0, 0),
+				);
+			}
+			return;
+		}
+
+		// /rename [name] — name the thread you are in. No argument CLEARS the
+		// name, so removing one is the same verb rather than a second command.
+		// Naming is metadata, not activity: the gateway deliberately does not
+		// touch `lastUsedAt`, so renaming never reorders the history.
+		if (trimmed === "/rename" || trimmed.startsWith("/rename ")) {
+			editor.setText("");
+			// `String.trim()` does not strip C0 controls, so `/rename <ctrl>` looked
+			// like a name here while the server's sanitizer reduced it to nothing and
+			// CLEARED the existing name. Normalise with the same rules the server
+			// applies so the branch below and the preview both match what is stored.
+			const raw = sanitizeSessionName(trimmed === "/rename" ? "" : trimmed.slice("/rename ".length)) ?? "";
+			const targetKey = boundSessionKey ?? lastSnapshot?.sessionKey;
+			if (!targetKey) {
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("no session bound yet — send a message first, or /session <key>")}`, 0, 0),
+				);
+				return;
+			}
+			try {
+				const res = (await client.request("sessions.rename", {
+					sessionKey: targetKey,
+					name: raw,
+				})) as SessionRenameResult;
+				if (!res?.ok) {
+					// The thread has no store entry yet — almost always a `/new` key.
+					// Hold the name rather than dead-ending; the first turn creates the
+					// entry and `agent_end` flushes it. Clearing (empty argument) has
+					// nothing to hold: there is no name on a thread that does not exist.
+					if (!raw) {
+						pendingRename = undefined;
+						insertBeforeEditor(new Text(`  ${brand.dim("nothing to clear — this thread has no name yet")}`, 0, 0));
+						return;
+					}
+					pendingRename = { sessionKey: targetKey, name: raw };
+					insertBeforeEditor(
+						new Text(`  ${brand.amber("✓")} ${brand.dim("will name this thread")} ${brand.white(raw)} ${brand.dim("once you send a message")}`, 0, 0),
+					);
+					return;
+				}
+				// Supersede only a queue for THIS thread — a name waiting on a
+				// different, not-yet-persisted thread was promised and must survive.
+				if (pendingRename?.sessionKey === targetKey) pendingRename = undefined;
+				insertBeforeEditor(
+					new Text(
+						res.name
+							? `  ${brand.amber("✓")} renamed to ${brand.white(scrubRenderable(res.name))}`
+							: `  ${brand.amber("✓")} ${brand.dim("name cleared")}`,
+						0,
+						0,
+					),
+				);
+			} catch (err) {
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`, 0, 0),
+				);
+			}
+			return;
+		}
+
 		// /sessions [--all] — list live (in-flight Pi) sessions. Defaults to
 		// the bound agent's sessions; `--all` returns every agent's. Wave N5
 		// (bug #9). Combine with /session <key> to bind to one of them.
@@ -2792,7 +3013,21 @@ export async function wireConnectUi(
 			}
 			const boundKey = boundSessionKey ?? lastSnapshot?.sessionKey;
 			const lines = sessions.map((s) => {
-				const friendly = formatSessionLabel(s.sessionKey) ?? brand.dim("(home)");
+				// Show the name ALONGSIDE the derived label, never instead of it, and
+				// quote it so it reads as operator-supplied data. `sessions_rename`
+				// has no owner gate, so an untrusted channel peer can name their own
+				// thread — replacing the label would let them make it render as e.g.
+				// `Mom` in this picker. Scrubbed like every other gateway-pushed
+				// string before it reaches the screen.
+				const label = formatSessionLabel(s.sessionKey) ?? brand.dim("(home)");
+				// This row is rendered through `Markdown`, and the name is operator- OR
+				// channel-peer-supplied (`sessions_rename` has no owner gate). Escape
+				// the metacharacters and the quote, or a name can style itself, emit a
+				// link, or close the quoting and spoof the key / `← bound` marker.
+				const named = s.displayName
+					? scrubRenderable(s.displayName).replace(/[\\`*_[\]()"~|]/g, "\\$&")
+					: undefined;
+				const friendly = named ? `${label} ${brand.white(`"${named}"`)}` : label;
 				const here = s.sessionKey === boundKey ? " " + brand.amber("← bound") : "";
 				return `  ${brand.white(s.agentId)}  ${friendly}  ${brand.dim(s.sessionKey)}${here}`;
 			});
@@ -2801,7 +3036,7 @@ export async function wireConnectUi(
 				: `live sessions for agent ${boundAgentId ?? lastSnapshot?.agentId ?? "main"}:`;
 			insertBeforeEditor(
 				new Markdown(
-					`${brand.dim(scopeLine)}\n${lines.join("\n")}\n\n${brand.dim("usage: /session <key> to bind · /mute <id|key> to unsubscribe")}`,
+					`${brand.dim(scopeLine)}\n${lines.join("\n")}\n\n${brand.dim("usage: /session <key> to bind · /rename <name> to name this thread · /mute <id|key> to unsubscribe")}`,
 					1,
 					0,
 					markdownTheme,

@@ -72,10 +72,7 @@ test("fetchClaudeCliModelIds: a tampered cache file cannot inject malformed ids"
 		for (const bad of ["../../etc/passwd", "claude- rm -rf /", "claude-a\nb", "gpt-4"]) {
 			assert.ok(!ids.includes(bad), `malformed id leaked: ${bad}`);
 		}
-		assert.ok(
-			ids.every((id) => id.length <= 128),
-			"an oversized id leaked",
-		);
+		assert.ok(ids.every((id) => id.length <= 127), "an oversized id leaked");
 	} finally {
 		if (prevCache === undefined) delete process.env.BRIGADE_CACHE_DIR;
 		else process.env.BRIGADE_CACHE_DIR = prevCache;

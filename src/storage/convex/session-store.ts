@@ -44,6 +44,11 @@ const KNOWN_FIELDS = new Set([
 	"authProfile",
 	"thinkingLevel",
 	"subagent",
+	// NOTE: `name` is deliberately ABSENT. Listing a field here excludes it from
+	// the sealed `extra` blob, and there is no `name` column on the sessions
+	// table — allowlisting it would make a rename look like it worked (served
+	// from the in-process cache) and vanish on the next gateway restart. The
+	// `extra` path already persists and restores it correctly.
 ]);
 
 function isoToMs(value: unknown): number | undefined {
