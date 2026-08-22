@@ -2833,7 +2833,15 @@ export async function wireConnectUi(
 		// `/sessions` is not executed on the first Enter.
 		if (trimmed === "/delete" || trimmed.startsWith("/delete ")) {
 			editor.setText("");
-			const key = trimmed === "/delete" ? "" : trimmed.slice("/delete ".length).trim();
+			// `/sessions` shows the short form (`t-c701aba6`) in its prominent column,
+			// and `/session` accepts it — so `/delete` must too. Without this the
+			// server's canonical-key guard rejected exactly the string the UI teaches,
+			// after the operator had already confirmed twice.
+			const deleteArg = trimmed === "/delete" ? "" : trimmed.slice("/delete ".length).trim();
+			const agentForDelete = boundAgentId ?? lastSnapshot?.agentId ?? DEFAULT_AGENT_ID;
+			const key = deleteArg && !deleteArg.startsWith("agent:")
+				? `agent:${agentForDelete}:${deleteArg}`
+				: deleteArg;
 			if (!key) {
 				insertBeforeEditor(
 					new Text(
@@ -3036,7 +3044,7 @@ export async function wireConnectUi(
 				: `live sessions for agent ${boundAgentId ?? lastSnapshot?.agentId ?? "main"}:`;
 			insertBeforeEditor(
 				new Markdown(
-					`${brand.dim(scopeLine)}\n${lines.join("\n")}\n\n${brand.dim("usage: /session <key> to bind · /rename <name> to name this thread · /mute <id|key> to unsubscribe")}`,
+					`${brand.dim(scopeLine)}\n${lines.join("\n")}\n\n${brand.dim("usage: /session <key> to bind · /rename <name> to name this thread · /delete <key> to remove one · /mute <id|key> to unsubscribe")}`,
 					1,
 					0,
 					markdownTheme,
