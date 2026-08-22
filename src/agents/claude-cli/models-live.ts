@@ -9,9 +9,13 @@
 // back to the static catalog, so discovery is a pure upgrade — never a
 // regression.
 
+import fs from "node:fs";
+import path from "node:path";
+
+import { resolveOsCacheDir } from "../../config/paths.js";
 import { readClaudeCliLogin } from "../../integrations/cli-login.js";
 import { CLAUDE_CLI_MODELS } from "./catalog.js";
-import { readBrigadeClaudeCredential } from "./claude-config.js";
+import { readEffectiveClaudeCredential } from "./claude-config.js";
 
 const MODELS_URL = "https://api.anthropic.com/v1/models?limit=100";
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -23,9 +27,45 @@ interface ModelsCache {
 }
 let cache: ModelsCache | undefined;
 
-/** The static fallback ids (the catalog snapshot). */
+/** Last-resort seed. Frozen at release, so it is the WORST source — used only
+ *  when we have never once discovered the live list on this machine. */
 function staticModelIds(): string[] {
 	return CLAUDE_CLI_MODELS.map((m) => m.id);
+}
+
+// A discovered list, persisted across restarts. The in-memory cache alone meant
+// every gateway restart fell back to the frozen catalog until the next
+// successful fetch — so a model Anthropic shipped after this release would
+// disappear from the picker on any restart that raced a stale token. Lives in
+// the OS cache dir: reapable by design, and writable in convex mode where
+// `~/.brigade` must stay file-free.
+function discoveredCachePath(): string {
+	return path.join(resolveOsCacheDir(), "claude-cli-models.json");
+}
+
+function readDiscoveredModelIds(): string[] | undefined {
+	try {
+		const raw = JSON.parse(fs.readFileSync(discoveredCachePath(), "utf8")) as { ids?: unknown };
+		const ids = Array.isArray(raw.ids) ? raw.ids.filter((i): i is string => typeof i === "string") : [];
+		return ids.length > 0 ? ids : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function writeDiscoveredModelIds(ids: string[]): void {
+	try {
+		const target = discoveredCachePath();
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.writeFileSync(target, JSON.stringify({ atMs: Date.now(), ids }), "utf8");
+	} catch {
+		/* a cache we cannot persist is still usable in memory — never throw */
+	}
+}
+
+/** Best list available WITHOUT a network call: last discovered, else the seed. */
+function fallbackModelIds(): string[] {
+	return readDiscoveredModelIds() ?? staticModelIds();
 }
 
 /**
@@ -34,7 +74,10 @@ function staticModelIds(): string[] {
  * when neither is present (→ caller uses the static list).
  */
 function readAccessToken(): string | undefined {
-	const managed = readBrigadeClaudeCredential();
+	// The EFFECTIVE credential, not the file: on macOS the binary rotates into
+	// the keychain and leaves `.credentials.json` stale, which 401s this call
+	// and silently froze the picker to the release-time catalog.
+	const managed = readEffectiveClaudeCredential();
 	if (managed?.accessToken) return managed.accessToken;
 	const own = readClaudeCliLogin();
 	if (own?.type === "oauth" && own.access) return own.access;
@@ -53,7 +96,7 @@ export async function fetchClaudeCliModelIds(opts: { force?: boolean; nowMs?: nu
 	if (!opts.force && cache && now - cache.atMs < CACHE_TTL_MS) return cache.ids;
 
 	const token = readAccessToken();
-	if (!token) return staticModelIds();
+	if (!token) return fallbackModelIds();
 
 	try {
 		const res = await fetch(MODELS_URL, {
@@ -67,20 +110,21 @@ export async function fetchClaudeCliModelIds(opts: { force?: boolean; nowMs?: nu
 			},
 			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 		});
-		if (!res.ok) return staticModelIds();
+		if (!res.ok) return fallbackModelIds();
 		const body = (await res.json()) as { data?: Array<{ id?: unknown }> };
 		const ids = (body.data ?? [])
 			.map((m) => (typeof m.id === "string" ? m.id : ""))
 			.filter((id): id is string => id.startsWith("claude-"));
-		if (ids.length === 0) return staticModelIds();
+		if (ids.length === 0) return fallbackModelIds();
 		// Merge: live ids first (current), then any static id the API omitted, so a
 		// catalogued default never vanishes from the picker.
 		const seen = new Set(ids);
 		for (const s of staticModelIds()) if (!seen.has(s)) ids.push(s);
 		cache = { atMs: now, ids };
+		writeDiscoveredModelIds(ids);
 		return ids;
 	} catch {
-		return staticModelIds();
+		return fallbackModelIds();
 	}
 }
 
