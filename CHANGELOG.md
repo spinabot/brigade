@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.32.0](https://github.com/spinabot/brigade/compare/brigade-v1.31.4...brigade-v1.32.0) (2026-08-22)
+
+
+### Features
+
+* **sessions:** name and delete threads from the TUI, gateway and agent ([65c8cac](https://github.com/spinabot/brigade/commit/65c8cac24b8f01456f5cb91767db01654e21cd6a))
+* **sessions:** name and delete threads from the TUI, gateway and agent ([15b072c](https://github.com/spinabot/brigade/commit/15b072c85b20f74b30428868e06d6dde52f98ca6))
+
 ## [1.31.4](https://github.com/spinabot/brigade/compare/brigade-v1.31.3...brigade-v1.31.4) (2026-08-22)
 
 
