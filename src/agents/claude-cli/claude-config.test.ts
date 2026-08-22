@@ -11,6 +11,7 @@ import {
 	clearClaudeKeychainShadow,
 	healClaudeKeychainShadow,
 	inspectClaudeKeychainShadow,
+	readEffectiveClaudeCredential,
 	hasBrigadeClaudeLogin,
 	readBrigadeClaudeCredential,
 	resolveBrigadeClaudeConfigDir,
@@ -145,5 +146,33 @@ test("healClaudeKeychainShadow: refuses to clear when OUR credential is unusable
 			JSON.stringify({ claudeAiOauth: { accessToken: "", refreshToken: "", expiresAt: 0 } }),
 		);
 		assert.equal(healClaudeKeychainShadow(), "none");
+	});
+});
+
+test("readEffectiveClaudeCredential: returns the file credential when no keychain shadow", () => {
+	withTempConfigDir(() => {
+		const exp = Date.now() + 3_600_000;
+		writeBrigadeClaudeCredential({ access: "acc-file", refresh: "ref-file", expires: exp });
+		const eff = readEffectiveClaudeCredential();
+		assert.equal(eff?.accessToken, "acc-file");
+		assert.equal(eff?.expiresAt, exp);
+	});
+});
+
+test("readEffectiveClaudeCredential: null when neither store has a usable credential", () => {
+	withTempConfigDir(() => {
+		assert.equal(readEffectiveClaudeCredential(), null);
+	});
+});
+
+test("readEffectiveClaudeCredential: an empty access token is not usable", () => {
+	withTempConfigDir((dir) => {
+		fs.writeFileSync(
+			path.join(dir, ".credentials.json"),
+			JSON.stringify({ claudeAiOauth: { accessToken: "", refreshToken: "r", expiresAt: Date.now() + 1000 } }),
+		);
+		// An empty token must never be handed to a caller as "the credential" —
+		// it would 401 and be misread as a dead login.
+		assert.equal(readEffectiveClaudeCredential(), null);
 	});
 });

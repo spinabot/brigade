@@ -148,10 +148,8 @@ export type ClaudeKeychainShadowState =
  * operator's back — a doctor that silently changes state is a doctor you
  * cannot use to reproduce a bug.
  */
-export function inspectClaudeKeychainShadow(
-	dir: string = resolveBrigadeClaudeConfigDir(),
-): ClaudeKeychainShadowState {
-	if (os.platform() !== "darwin") return "unsupported";
+function readClaudeKeychainCredential(dir: string): ClaudeCodeCredentialFile["claudeAiOauth"] | undefined {
+	if (os.platform() !== "darwin") return undefined;
 	let raw: string;
 	try {
 		raw = execFileSync("security", ["find-generic-password", "-s", claudeKeychainService(dir), "-w"], {
@@ -160,15 +158,61 @@ export function inspectClaudeKeychainShadow(
 			timeout: KEYCHAIN_CMD_TIMEOUT_MS,
 		});
 	} catch {
-		return "none"; // no entry — the file is already authoritative
+		return undefined; // no entry
 	}
-	let token: unknown;
 	try {
-		token = (JSON.parse(raw.trim()) as { claudeAiOauth?: { accessToken?: unknown } }).claudeAiOauth?.accessToken;
+		return (JSON.parse(raw.trim()) as ClaudeCodeCredentialFile).claudeAiOauth;
 	} catch {
-		token = undefined; // unparseable shadow is by definition unusable
+		return undefined; // unparseable
 	}
+}
+
+export function inspectClaudeKeychainShadow(
+	dir: string = resolveBrigadeClaudeConfigDir(),
+): ClaudeKeychainShadowState {
+	if (os.platform() !== "darwin") return "unsupported";
+	const shadow = readClaudeKeychainCredential(dir);
+	if (!shadow) return "none"; // no entry — the file is already authoritative
+	const token = shadow.accessToken;
 	return typeof token === "string" && token.length > 0 ? "healthy" : "tombstoned";
+}
+
+/**
+ * The credential the `claude` binary is ACTUALLY using — the freshest of the
+ * two stores, never a refresh.
+ *
+ * Brigade writes `.credentials.json`, but the binary owns the grant from then
+ * on: on macOS it rotates into the keychain and leaves our file behind. So the
+ * file goes stale within hours of a healthy install, and anything of Brigade's
+ * that authenticates with it (live model discovery) starts getting 401s and
+ * silently degrades.
+ *
+ * Read, do not refresh. Refreshing here would make Brigade a SECOND refresher
+ * of one grant, and since refresh tokens rotate the two would invalidate each
+ * other — the split-brain the managed-config design exists to prevent. The
+ * binary refreshes on every turn, so simply looking in the right place keeps us
+ * current with no re-auth ever asked of the operator.
+ */
+export function readEffectiveClaudeCredential(
+	dir: string = resolveBrigadeClaudeConfigDir(),
+): ClaudeCodeCredentialFile["claudeAiOauth"] | null {
+	let file: ClaudeCodeCredentialFile["claudeAiOauth"] | undefined;
+	try {
+		file = (JSON.parse(fs.readFileSync(path.join(dir, ".credentials.json"), "utf8")) as ClaudeCodeCredentialFile)
+			.claudeAiOauth;
+	} catch {
+		file = undefined;
+	}
+	const shadow = readClaudeKeychainCredential(dir);
+	const usable = (c: ClaudeCodeCredentialFile["claudeAiOauth"] | undefined): boolean =>
+		!!c && typeof c.accessToken === "string" && c.accessToken.length > 0;
+	if (!usable(shadow)) return usable(file) ? (file as ClaudeCodeCredentialFile["claudeAiOauth"]) : null;
+	if (!usable(file)) return shadow as ClaudeCodeCredentialFile["claudeAiOauth"];
+	// Both usable — the later expiry is the one the binary rotated into most
+	// recently, whichever store it lives in.
+	const fileExp = typeof file?.expiresAt === "number" ? file.expiresAt : 0;
+	const shadowExp = typeof shadow?.expiresAt === "number" ? shadow.expiresAt : 0;
+	return (shadowExp >= fileExp ? shadow : file) as ClaudeCodeCredentialFile["claudeAiOauth"];
 }
 
 export function healClaudeKeychainShadow(dir: string = resolveBrigadeClaudeConfigDir()): "none" | "cleared" {
