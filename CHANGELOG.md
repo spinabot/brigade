@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.31.3](https://github.com/spinabot/brigade/compare/brigade-v1.31.2...brigade-v1.31.3) (2026-08-22)
+
+
+### Bug Fixes
+
+* **claude-cli:** keep model discovery live instead of freezing to the catalog ([d89cc24](https://github.com/spinabot/brigade/commit/d89cc24a89446d2b6b07e23ec82b37dee53e6b44))
+* **claude-cli:** keep model discovery live instead of freezing to the catalog ([4c77212](https://github.com/spinabot/brigade/commit/4c77212a74d7eb72a538a72c6dc8132f0a474639))
+
 ## [1.31.2](https://github.com/spinabot/brigade/compare/brigade-v1.31.1...brigade-v1.31.2) (2026-08-21)
 
 
