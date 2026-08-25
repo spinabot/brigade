@@ -180,6 +180,72 @@ export function snapshotSessionSeedable(
 	return typeof snapAgentId === "string" && snapAgentId === boundAgentId;
 }
 
+/** Cumulative usage figures, in the shape `/new` snapshots as a baseline. */
+export interface UsageBaseline {
+	in: number;
+	out: number;
+	cost: number;
+}
+
+/**
+ * Usage since a baseline was captured — what the header/`/usage` show after
+ * `/new` instead of the raw cumulative snapshot.
+ *
+ * `totalTokensIn/Out/CostUsd` on `SessionStateSnapshot` are cumulative for the
+ * whole gateway PROCESS (server.ts accumulates them across every turn on
+ * every session, never reset) — not per-thread. `/new` mints a genuinely
+ * fresh session key with no prior turns, so its true usage is zero, but the
+ * gateway has no per-thread counter to ask for. Rather than plumb session-
+ * scoped accounting through the (already carefully-audited) multi-agent
+ * broadcast/subscribe filter, `/new` snapshots the CURRENT cumulative totals
+ * as a baseline and this function reports the delta — "usage since this
+ * thread started" — with zero server changes. Exported for regression
+ * testing (issue #136: `/new` didn't clear the token count).
+ *
+ * Known trade-off: because the underlying totals are process-wide, a turn on
+ * a DIFFERENT session finishing while this one is idle (a WhatsApp reply, a
+ * cron run, a spawned sub-agent under another lane) still nudges this
+ * thread's displayed delta. That's the accepted cost of a client-only fix —
+ * a true per-thread counter needs server-side per-session accounting (see
+ * server.ts's `totalIn`/`totalOut`/`totalCost`), which is a materially
+ * larger change than this bug warrants on its own.
+ */
+export function usageSinceBaseline(
+	snapshot: { totalTokensIn: number; totalTokensOut: number; totalCostUsd: number } | null,
+	baseline: UsageBaseline | null,
+): UsageBaseline {
+	if (!snapshot) return { in: 0, out: 0, cost: 0 };
+	const base = baseline ?? { in: 0, out: 0, cost: 0 };
+	return {
+		in: Math.max(0, snapshot.totalTokensIn - base.in),
+		out: Math.max(0, snapshot.totalTokensOut - base.out),
+		cost: Math.max(0, snapshot.totalCostUsd - base.cost),
+	};
+}
+
+/**
+ * Re-anchor a captured usage baseline against a gateway restart.
+ *
+ * The process-wide totals `captureUsageBaseline` snapshots reset to 0 when
+ * the gateway process restarts mid-connection. Without this, a stale
+ * (higher) baseline would make `usageSinceBaseline` clamp to zero and mask
+ * ALL real usage in the current thread until the counters organically climb
+ * back past it. Called on every incoming state snapshot; a no-op unless a
+ * rollback is actually observed. Exported for regression testing.
+ */
+export function reanchorBaselineOnRollback(
+	snapshot: { totalTokensIn: number; totalTokensOut: number; totalCostUsd: number },
+	baseline: UsageBaseline | null,
+): UsageBaseline | null {
+	if (!baseline) return baseline;
+	const rolledBack =
+		snapshot.totalTokensIn < baseline.in ||
+		snapshot.totalTokensOut < baseline.out ||
+		snapshot.totalCostUsd < baseline.cost;
+	if (!rolledBack) return baseline;
+	return { in: snapshot.totalTokensIn, out: snapshot.totalTokensOut, cost: snapshot.totalCostUsd };
+}
+
 /**
  * Boot the connect TUI. Establishes the WebSocket connection FIRST so the
  * user gets a clear "couldn't reach gateway" error instead of a blank chat.
@@ -389,6 +455,34 @@ export async function wireConnectUi(
 	// Cumulative usage — accumulated from state snapshots so a reconnect picks
 	// up where we left off instead of zeroing the totals on the user's screen.
 	let lastSnapshot: SessionStateSnapshot | null = null;
+	// Usage baseline captured at the moment `/new` (or the equivalent
+	// mint-a-fresh-thread path from `/delete`) starts a genuinely empty
+	// thread — see `usageSinceBaseline` for why this exists instead of a
+	// server-side per-thread counter. `null` until the first such reset,
+	// so a plain connect/resume still shows the full cumulative totals
+	// exactly as before.
+	let usageBaseline: UsageBaseline | null = null;
+	// Set when a fresh-thread reset (`/new` etc.) is requested before the
+	// FIRST state snapshot has arrived (nothing gates command submission on
+	// that — `get-state` and the pushed `state` event are both async). Capturing
+	// {0,0,0} in that window would be wrong on a long-running gateway with real
+	// prior cumulative usage — the eventual snapshot would then read as if that
+	// whole history belonged to the brand-new thread. Deferred capture instead:
+	// `applyStateSnapshot` finishes the reset itself once real totals exist.
+	let usageBaselinePending = false;
+	/**
+	 * Snapshot the current cumulative totals as a fresh-thread baseline, or —
+	 * if no snapshot has arrived yet — defer the capture (see
+	 * `usageBaselinePending`) and leave `usageBaseline` at its current value.
+	 */
+	const captureUsageBaseline = (): void => {
+		if (lastSnapshot) {
+			usageBaseline = { in: lastSnapshot.totalTokensIn, out: lastSnapshot.totalTokensOut, cost: lastSnapshot.totalCostUsd };
+			usageBaselinePending = false;
+		} else {
+			usageBaselinePending = true;
+		}
+	};
 	// The last text the user sent as a prompt — the replay message for a `/switch`
 	// (Carrow) mid-turn model handoff: abort the live turn, swap, re-run this on the new model.
 	let lastUserPrompt = "";
@@ -685,11 +779,12 @@ export async function wireConnectUi(
 	const updateHeader = (extra?: string): void => {
 		const provider = lastSnapshot?.provider ?? "?";
 		const modelId = lastSnapshot?.modelId ?? "?";
-		const tokens = lastSnapshot && (lastSnapshot.totalTokensIn + lastSnapshot.totalTokensOut) > 0
-			? ` · ${(lastSnapshot.totalTokensIn + lastSnapshot.totalTokensOut).toLocaleString()} tok`
+		const usageDelta = usageSinceBaseline(lastSnapshot, usageBaseline);
+		const tokens = (usageDelta.in + usageDelta.out) > 0
+			? ` · ${(usageDelta.in + usageDelta.out).toLocaleString()} tok`
 			: "";
-		const cost = lastSnapshot && lastSnapshot.totalCostUsd > 0
-			? ` · $${lastSnapshot.totalCostUsd.toFixed(4)}`
+		const cost = usageDelta.cost > 0
+			? ` · $${usageDelta.cost.toFixed(4)}`
 			: "";
 		const usage = lastSnapshot?.contextUsagePercent ?? null;
 		let usageStr = "";
@@ -1322,7 +1417,14 @@ export async function wireConnectUi(
 			for (const ev of snap.recentSystemEvents ?? []) renderSystemEventLine(ev);
 			for (const appr of snap.pendingApprovals ?? []) renderApprovalPrompt(appr);
 			if (snap.snapshot) {
+				// Same gateway-restart self-heal + deferred-baseline-capture as
+				// `applyStateSnapshot` — `resume`'s snapshot bypasses that handler
+				// entirely (it's a direct RPC response, not a `state` broadcast), so
+				// without this a restart during `/reconnected` / `/resync` would mask
+				// real post-restart usage exactly like the bug this guards against.
+				usageBaseline = reanchorBaselineOnRollback(snap.snapshot, usageBaseline);
 				lastSnapshot = snap.snapshot;
+				if (usageBaselinePending) captureUsageBaseline();
 				if (!snap.snapshot.isAgentRunning) isAgentRunning = false;
 			}
 			updateHeader();
@@ -1376,7 +1478,12 @@ export async function wireConnectUi(
 	// triggered a broadcast. `--session` made it undeniable: it opened exactly the
 	// right thread and showed none of it.
 	const applyStateSnapshot = (snap: SessionStateSnapshot): void => {
+		// Gateway restart mid-connection — see `reanchorBaselineOnRollback`.
+		usageBaseline = reanchorBaselineOnRollback(snap, usageBaseline);
 		lastSnapshot = snap;
+		// Finish a fresh-thread reset that was requested before any snapshot had
+		// arrived yet — see `usageBaselinePending`.
+		if (usageBaselinePending) captureUsageBaseline();
 		maybeAnnounceUpdate(snap.updateAvailable ?? null);
 		// `snap.isAgentRunning` is AGENT-wide — it goes true when ANY session
 		// of this agent has a turn running (a WhatsApp chat, spawned
@@ -2701,6 +2808,11 @@ export async function wireConnectUi(
 			const agentForNew = boundAgentId ?? lastSnapshot?.agentId ?? "main";
 			const freshKey = `agent:${agentForNew}:t-${randomUUID().slice(0, 8)}`;
 			boundSessionKey = freshKey;
+			// Issue #136 — the gateway's usage totals are cumulative for the whole
+			// process, not per-thread, so a genuinely fresh thread still has to
+			// snapshot "where we were" and report the delta from here. See
+			// `usageSinceBaseline`.
+			captureUsageBaseline();
 			clearTranscriptRegion();
 			insertBeforeEditor(
 				new Text(
@@ -2754,7 +2866,24 @@ export async function wireConnectUi(
 				known = undefined; // gateway couldn't answer; claim nothing
 			}
 
+			// Re-binding to the thread already bound (e.g. pasting the header's own
+			// key back in to confirm it) must stay a no-op for usage tracking too —
+			// otherwise a same-key `/session` after `/new` wipes the fresh-thread
+			// baseline and the display jumps back to raw cumulative totals.
+			const wasAlreadyBound = target === boundSessionKey;
 			boundSessionKey = target;
+			// A confirmed-empty target is a fresh thread exactly like `/new` — reset
+			// the usage baseline the same way. Anything else (a known thread, or an
+			// unconfirmed one) drops any active baseline instead of misapplying a
+			// prior thread's offset to this one; see `usageSinceBaseline`.
+			if (!wasAlreadyBound) {
+				if (known === false) {
+					captureUsageBaseline();
+				} else {
+					usageBaseline = null;
+					usageBaselinePending = false;
+				}
+			}
 			clearTrayForContextSwitch("that thread");
 			insertBeforeEditor(
 				new Text(
@@ -2895,6 +3024,9 @@ export async function wireConnectUi(
 					// `/new` does.
 					const agentForNext = boundAgentId ?? lastSnapshot?.agentId ?? DEFAULT_AGENT_ID;
 					boundSessionKey = `agent:${agentForNext}:t-${randomUUID().slice(0, 8)}`;
+					// Same fresh-thread usage reset as `/new` — see issue #136 /
+					// `usageSinceBaseline`.
+					captureUsageBaseline();
 					clearTranscriptRegion();
 					insertBeforeEditor(new Text(`  ${brand.amber("✓")} deleted ${brand.white(key)}${note}`, 0, 0));
 					insertBeforeEditor(
@@ -3140,6 +3272,11 @@ export async function wireConnectUi(
 				return;
 			}
 			boundAgentId = arg;
+			// A different agent's default session may have real prior usage — don't
+			// carry over a baseline captured for the OLD agent's thread. See
+			// `usageSinceBaseline`.
+			usageBaseline = null;
+			usageBaselinePending = false;
 			clearTrayForContextSwitch(`agent ${arg}`);
 			insertBeforeEditor(
 				new Text(
@@ -3367,9 +3504,10 @@ export async function wireConnectUi(
 			return;
 		}
 
-		// /usage — render the cumulative usage block from the latest state
-		// snapshot. All fields come from the server's SessionStateSnapshot
-		// — no extra RPC needed.
+		// /usage — render the usage block from the latest state snapshot. All
+		// fields come from the server's SessionStateSnapshot — no extra RPC
+		// needed — EXCEPT tokens/cost, which are offset by `usageBaseline` so
+		// this agrees with the header after a `/new` (see `usageSinceBaseline`).
 		if (trimmed === "/usage") {
 			editor.setText("");
 			const snap = lastSnapshot;
@@ -3377,14 +3515,19 @@ export async function wireConnectUi(
 				insertBeforeEditor(new Text(`  ${brand.dim("no usage yet — server hasn't sent a state snapshot")}`, 0, 0));
 				return;
 			}
-			const tokenIn = snap.totalTokensIn.toLocaleString();
-			const tokenOut = snap.totalTokensOut.toLocaleString();
-			const tokenTotal = (snap.totalTokensIn + snap.totalTokensOut).toLocaleString();
-			const costStr = snap.totalCostUsd > 0 ? `$${snap.totalCostUsd.toFixed(4)}` : "$0.0000";
+			const usageDelta = usageSinceBaseline(snap, usageBaseline);
+			const tokenIn = usageDelta.in.toLocaleString();
+			const tokenOut = usageDelta.out.toLocaleString();
+			const tokenTotal = (usageDelta.in + usageDelta.out).toLocaleString();
+			const costStr = usageDelta.cost > 0 ? `$${usageDelta.cost.toFixed(4)}` : "$0.0000";
 			const ctxStr = snap.contextUsagePercent != null ? `${Math.round(snap.contextUsagePercent)}%` : "—";
+			// A baseline can come from `/new`, `/delete` (moved to a new thread), or
+			// `/session <unknown key>` — all three are "this thread started fresh",
+			// so the note stays command-agnostic rather than naming just one of them.
+			const sinceNote = usageBaseline ? brand.dim(" (since this thread started)") : "";
 			insertBeforeEditor(
 				new Markdown(
-					`${brand.dim("usage")}\n` +
+					`${brand.dim("usage")}${sinceNote}\n` +
 						`- ${chalk.bold("model:")}    ${snap.provider ?? "?"} · ${snap.modelId ?? "?"}\n` +
 						`- ${chalk.bold("turns:")}    ${snap.messageCount}\n` +
 						`- ${chalk.bold("tokens:")}   ${tokenIn} in · ${tokenOut} out · ${tokenTotal} total\n` +
