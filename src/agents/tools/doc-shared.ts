@@ -82,7 +82,18 @@ export function allowedDocRoots(opts: { workspaceDir?: string; cwd?: string }): 
 	const add = (p?: string) => {
 		if (!p) return;
 		try {
-			roots.add(path.resolve(p));
+			const abs = path.resolve(p);
+			roots.add(abs);
+			// Both forms, because the TARGET side is realpath'd and a root that is
+			// itself a symlink would then never match: on macOS `os.tmpdir()` is
+			// `/var/folders/…` while its realpath is `/private/var/folders/…`, so
+			// every file in temp read as "outside the allowed roots". Adding the
+			// realpath widens nothing — it names the same directory.
+			try {
+				roots.add(fs.realpathSync(abs));
+			} catch {
+				/* root doesn't exist (yet) — the resolved form still stands */
+			}
 		} catch {
 			/* ignore */
 		}

@@ -663,7 +663,16 @@ function allowedLocalRoots(opts: { workspaceDir?: string; cwd?: string; ownerLoc
 	const add = (p?: string) => {
 		if (!p) return;
 		try {
-			roots.add(path.resolve(p));
+			const abs = path.resolve(p);
+			roots.add(abs);
+			// Both forms — see `allowedDocRoots` in doc-shared.ts. The target side is
+			// realpath'd, so a symlinked root (macOS `/var` → `/private/var`) matches
+			// nothing unless its realpath is a root too.
+			try {
+				roots.add(fs.realpathSync(abs));
+			} catch {
+				/* root doesn't exist (yet) — the resolved form still stands */
+			}
 		} catch {
 			/* ignore */
 		}
