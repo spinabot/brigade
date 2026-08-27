@@ -2638,7 +2638,9 @@ export async function wireConnectUi(
 					`${brand.dim("commands")}\n` +
 						`- ${chalk.bold("/exit")} or ${chalk.bold("/quit")} — disconnect & quit\n` +
 						`- ${chalk.bold("/help")} — this list\n` +
-						`- ${chalk.bold("/model <id>")} — switch to a configured model on the gateway\n` +
+						`- ${chalk.bold("/model <id>")} — switch this agent's model (every thread without a pin follows)\n` +
+						`- ${chalk.bold("/model <id> --thread")} — pin THIS thread to a model, leaving the agent alone\n` +
+						`- ${chalk.bold("/model --unpin")} — drop this thread's pin so it follows the agent again\n` +
 						`- ${chalk.bold("/provider [<name>]")} — switch model provider, or add a new one with an API key (no arg = list)\n` +
 						`- ${chalk.bold("/thinking <level>")} — set reasoning effort (off|minimal|low|medium|high|xhigh)\n` +
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
@@ -3886,7 +3888,60 @@ export async function wireConnectUi(
 				return;
 			}
 
-			const arg = trimmed === "/model" ? "" : trimmed.slice("/model ".length).trim();
+			const rawArg = trimmed === "/model" ? "" : trimmed.slice("/model ".length).trim();
+			// Scope flags. `/model <id>` stays AGENT-wide (every thread without a
+			// pin of its own follows it, existing and future alike); `--thread`
+			// pins just this thread; `--unpin` drops that pin so the thread
+			// follows its agent again.
+			const argTokens = rawArg.split(/\s+/).filter(Boolean);
+			const flags = argTokens.filter((t) => t.startsWith("--"));
+			const arg = argTokens.filter((t) => !t.startsWith("--")).join(" ");
+			const wantsThread = flags.includes("--thread") || flags.includes("--session");
+			const wantsUnpin = flags.includes("--unpin");
+			// An unrecognised flag must NOT fall through to the agent-wide path —
+			// a typo like `--thred` would silently move every thread instead of
+			// the one the operator meant.
+			const unknownFlag = flags.find(
+				(f) => f !== "--thread" && f !== "--session" && f !== "--unpin",
+			);
+			if (unknownFlag) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error(`✗ unknown option ${unknownFlag}`)} ${brand.dim("— usage: /model <id> [--thread] · /model --unpin")}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
+			if (wantsUnpin) {
+				try {
+					const res = await client.request("clear-session-model", withBinding());
+					insertBeforeEditor(
+						new Text(
+							res.cleared
+								? `  ${brand.amber("✓")} ${brand.dim("this thread follows the agent again —")} ${brand.white(`${lastSnapshot?.provider ?? "?"} · ${lastSnapshot?.modelId ?? "?"}`)}`
+								: `  ${brand.dim("this thread wasn't pinned — it already follows the agent.")}`,
+							0,
+							0,
+						),
+					);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
+				}
+				return;
+			}
+			if (wantsThread && !arg) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error("✗ --thread needs a model id")} ${brand.dim("— usage: /model <id> --thread")}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
 			if (!arg) {
 				// Scope the list to the CURRENT provider and show ALL of its models,
 				// uncapped. `/model` is still a GLOBAL switcher — `/model <id>` switches
@@ -3920,7 +3975,7 @@ export async function wireConnectUi(
 					.join("\n");
 				insertBeforeEditor(
 					new Markdown(
-						`${brand.dim("models on your current provider:")}\n\n  ${head}\n${body}\n\n${brand.dim("usage: /model <id>  ·  switch provider with /provider")}`,
+						`${brand.dim("models on your current provider:")}\n\n  ${head}\n${body}\n\n${brand.dim("usage: /model <id>  ·  pin one thread: /model <id> --thread  ·  provider: /provider")}`,
 						1,
 						0,
 						markdownTheme,
@@ -3943,11 +3998,17 @@ export async function wireConnectUi(
 			try {
 				await client.request(
 					"set-model",
-					withBinding({ provider: target.provider, modelId: target.id }),
+					withBinding({
+						provider: target.provider,
+						modelId: target.id,
+						scope: wantsThread ? ("session" as const) : ("agent" as const),
+					}),
 				);
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.amber("✓")} ${brand.dim("switched to")} ${brand.white(`${target.provider} · ${target.id}`)}`,
+						wantsThread
+							? `  ${brand.amber("✓")} ${brand.dim("this thread pinned to")} ${brand.white(`${target.provider} · ${target.id}`)} ${brand.dim("— other threads unaffected; /model --unpin to undo")}`
+							: `  ${brand.amber("✓")} ${brand.dim("switched to")} ${brand.white(`${target.provider} · ${target.id}`)}`,
 						0,
 						0,
 					),

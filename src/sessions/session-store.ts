@@ -17,6 +17,7 @@ import {
   writeThroughSessionCache,
 } from "../storage/session-cache.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
+import { parseAgentSessionKey } from "./session-key-utils.js";
 
 /**
  * Wave L P2#11 — cross-process advisory file lock for `sessions.json`.
@@ -253,12 +254,30 @@ export interface SessionEntry {
   sessionId: string;
   createdAt: string;
   lastUsedAt: string;
-  // Optional per-session overrides — provider/model/auth profile/think level.
-  // Kept loose; Pi consumes whatever it understands and ignores the rest.
+  // What actually served this session's LAST turn. Every turn stamps these
+  // (see `runSingleTurn`'s `resolveOrCreateSession` overrides), so they are a
+  // record of what ran — NOT an operator choice. Do not read them to decide
+  // which model a turn should use; read `pinnedProvider`/`pinnedModelId`.
   provider?: string;
   modelId?: string;
   authProfile?: string;
   thinkingLevel?: string;
+  /**
+   * Explicit per-session model pin — the ONLY thing that makes a session
+   * diverge from its agent's current model.
+   *
+   * Deliberately a SEPARATE pair from `provider`/`modelId` above. Those are
+   * stamped on every turn, so every session that has ever run already carries
+   * one; reading them as a pin would retroactively freeze every historical
+   * thread to whatever model happened to serve its first turn, and an
+   * agent-wide `/model` would then silently fail to move any of them.
+   * Absence means "follow the agent", which is what we want for every
+   * pre-existing entry and every new session.
+   *
+   * Both fields are set and cleared together — a half-pin is never persisted.
+   */
+  pinnedProvider?: string;
+  pinnedModelId?: string;
   /** Primitive #6 — see `SubagentSessionMetadata`. Unset on top-level sessions. */
   subagent?: SubagentSessionMetadata;
   /**
@@ -643,6 +662,121 @@ export function upsertSessionEntry(
     // Convex mode never writes the JSONL here (inMemory + factory) — skip.
     if (tryGetRuntimeContext()?.mode !== "convex") ensureDir(resolveSessionsDir(agentId));
     return entry;
+  });
+}
+
+/* ─────────────────────── per-session model pin ─────────────────────── */
+
+/**
+ * A session's explicit model pin. Both halves are always present — the store
+ * never persists half a pin, so callers never have to reason about a provider
+ * without a model.
+ */
+export interface SessionModelPin {
+  provider: string;
+  modelId: string;
+}
+
+/** Upper bound on a pinned provider/model id. Well clear of the longest real
+ *  model id, while keeping a hand-edited or RPC-supplied value from bloating
+ *  the store. */
+export const MAX_MODEL_PIN_LENGTH = 200;
+
+/**
+ * Normalise one half of a pin. Anything unusable returns undefined, which
+ * callers read as "no pin" rather than an error: the store is a plain JSON
+ * file an operator can hand-edit, so a malformed value must degrade to
+ * "follow the agent" and never throw mid-turn.
+ */
+function sanitizeModelPinField(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  // Rejected, not stripped. Unlike a display name, an id containing a control
+  // character isn't a label we can tidy up — it's an id that will never match
+  // a registry entry, and it would corrupt every surface that prints it.
+  if (/[\u0000-\u001f\u007f]/.test(raw)) return undefined;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_MODEL_PIN_LENGTH) return undefined;
+  return trimmed;
+}
+
+/**
+ * Read a session's model pin, or null when it has none — the common case, and
+ * the one that makes an agent-wide `/model` move the session.
+ *
+ * Own-property only: a bare index hits `Object.prototype`, so a key like
+ * `constructor` would resolve to a function and get probed for a pin.
+ */
+export function readSessionModelPin(agentId: string, sessionKey: string): SessionModelPin | null {
+  const store = readSessionStore(agentId);
+  if (!Object.hasOwn(store.sessions, sessionKey)) return null;
+  const entry = store.sessions[sessionKey];
+  if (!entry) return null;
+  const provider = sanitizeModelPinField(entry.pinnedProvider);
+  const modelId = sanitizeModelPinField(entry.pinnedModelId);
+  // Half a pin is not a pin. Pins are always written as a pair, so this only
+  // fires on a hand-edited store — follow the agent rather than guess.
+  if (!provider || !modelId) return null;
+  return { provider, modelId };
+}
+
+/**
+ * Pin a session to a specific provider/model.
+ *
+ * Creates the entry when the session hasn't taken its first turn yet — the TUI
+ * mints a thread key the moment you open a new thread, so pinning a fresh
+ * thread has to persist rather than silently no-op. Only a canonical
+ * `agent:<id>:<rest>` key may CREATE; a non-canonical key can still pin an
+ * entry that already exists, but never conjures one.
+ */
+export function pinSessionModel(
+  agentId: string,
+  sessionKey: string,
+  provider: unknown,
+  modelId: unknown,
+): SessionEntry | null {
+  const cleanProvider = sanitizeModelPinField(provider);
+  const cleanModelId = sanitizeModelPinField(modelId);
+  if (!cleanProvider || !cleanModelId) return null;
+  return withSyncStoreLock(agentId, () => {
+    const store = readSessionStore(agentId);
+    const existing = Object.hasOwn(store.sessions, sessionKey)
+      ? store.sessions[sessionKey]
+      : undefined;
+    if (!existing && !parseAgentSessionKey(sessionKey)) return null;
+    const now = new Date().toISOString();
+    const next: SessionEntry = existing
+      ? { ...existing, pinnedProvider: cleanProvider, pinnedModelId: cleanModelId }
+      : {
+          sessionId: randomUUID(),
+          createdAt: now,
+          lastUsedAt: now,
+          pinnedProvider: cleanProvider,
+          pinnedModelId: cleanModelId,
+        };
+    store.sessions[sessionKey] = next;
+    writeSessionStore(agentId, store);
+    if (tryGetRuntimeContext()?.mode !== "convex") ensureDir(resolveSessionsDir(agentId));
+    return next;
+  });
+}
+
+/**
+ * Drop a session's pin so it follows its agent again. Returns null when there
+ * is no such session; returns the entry when there is, pinned or not, so
+ * clearing twice is idempotent.
+ */
+export function clearSessionModelPin(agentId: string, sessionKey: string): SessionEntry | null {
+  return withSyncStoreLock(agentId, () => {
+    const store = readSessionStore(agentId);
+    if (!Object.hasOwn(store.sessions, sessionKey)) return null;
+    const entry = store.sessions[sessionKey];
+    if (!entry) return null;
+    const next: SessionEntry = { ...entry };
+    delete next.pinnedProvider;
+    delete next.pinnedModelId;
+    store.sessions[sessionKey] = next;
+    writeSessionStore(agentId, store);
+    return next;
   });
 }
 

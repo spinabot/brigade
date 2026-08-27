@@ -252,8 +252,15 @@ import {
 	getLaneQueueSize,
 	sessionLane,
 } from "../process/lanes.js";
-import { defaultSessionKey, readSessionStore } from "../sessions/session-store.js";
+import {
+	clearSessionModelPin,
+	defaultSessionKey,
+	pinSessionModel,
+	readSessionModelPin,
+	readSessionStore,
+} from "../sessions/session-store.js";
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
+import { planStateFanout } from "./state-fanout.js";
 import { resolveSessionTranscriptPath } from "../config/paths.js";
 import {
 	flattenConversation,
@@ -1729,7 +1736,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		}
 	};
 
-	const buildSnapshot = (snapshotAgentId?: string): SessionStateSnapshot => {
+	const buildSnapshot = (
+		snapshotAgentId?: string,
+		snapshotSessionKey?: string,
+	): SessionStateSnapshot => {
 		// Wave K — per-binding snapshot. When the caller supplies a
 		// `snapshotAgentId`, the snapshot reflects THAT agent's runtime entry
 		// + workspace-derived persona name + per-agent live-session count, so
@@ -1743,25 +1753,42 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// session-init + refreshed by boot-agent set-model). Non-boot
 		// snapshots derive on the fly from the agent's selected model — the
 		// derivation is pure + cheap (no I/O).
-		const supportsThinking = isBoot ? cachedSupportsThinking : !!rt.model?.reasoning;
-		const availableThinkingLevels = isBoot
-			? cachedThinkingLevels
-			: rt.model ? deriveThinkingLevels(rt.model) : [];
-		// Per-binding session targeting: the TUI bound to `targetAgentId`
-		// defaults to that agent's canonical session key when nothing else
-		// is bound. Falls back to the gateway's boot `sessionKey` for the
-		// boot agent to keep legacy unchanged.
-		const targetSessionKey = isBoot ? sessionKey : defaultSessionKey(targetAgentId);
+		// Per-binding session targeting happens BEFORE the capability derivation
+		// below, because a pinned session runs a different model from its agent
+		// and every capability shown in the header has to describe the model
+		// that will actually serve the next turn in THIS thread.
+		const targetSessionKey =
+			snapshotSessionKey?.trim() || (isBoot ? sessionKey : defaultSessionKey(targetAgentId));
+		// Same resolution the turn performs (see the `turnPin` block in the
+		// prompt path) — if these two ever disagree the header lies about which
+		// model answered.
+		const pin = readSessionModelPin(targetAgentId, targetSessionKey);
+		// A pinned model is validated against the registry when it is set, but
+		// the registry can be refreshed/reseeded since; an unresolvable pin
+		// still shows its ids and simply reports conservative capabilities
+		// rather than borrowing the agent model's, which would be a lie.
+		const pinnedModel = pin ? modelRegistry.find(pin.provider, pin.modelId) : undefined;
+		const effectiveModel = pin ? pinnedModel : rt.model;
+		const supportsThinking = pin
+			? !!pinnedModel?.reasoning
+			: isBoot
+				? cachedSupportsThinking
+				: !!rt.model?.reasoning;
+		const availableThinkingLevels = pin
+			? pinnedModel ? deriveThinkingLevels(pinnedModel) : []
+			: isBoot
+				? cachedThinkingLevels
+				: rt.model ? deriveThinkingLevels(rt.model) : [];
 		return {
-			provider: rt.provider,
-			modelId: rt.modelId,
-			modelName: rt.model?.name,
+			provider: pin?.provider ?? rt.provider,
+			modelId: pin?.modelId ?? rt.modelId,
+			modelName: effectiveModel?.name ?? pin?.modelId,
 			thinkingLevel: rt.thinkingLevel,
 			supportsThinking,
 			// Same derivation the turn itself uses (`resolveInboundImagePrompt` gates
 			// inline image blocks on exactly this), so the TUI's "this model can't see
 			// images" warning can never disagree with what the turn does with them.
-			supportsVision: modelSupportsImageInput(rt.model) === true,
+			supportsVision: modelSupportsImageInput(effectiveModel) === true,
 			availableThinkingLevels,
 			...(latestUpdate ? { updateAvailable: latestUpdate } : {}),
 			contextUsagePercent: lastContextUsagePercent,
@@ -1970,6 +1997,46 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		);
 
 	/** Send one event to all connected clients (or a filtered subset). */
+	/**
+	 * Per-socket send guards, shared by `broadcast` (one payload for everyone)
+	 * and `broadcastStateAllBindings` (a payload built per connection). Returns
+	 * null when the socket must be skipped, having already closed a slow
+	 * consumer; otherwise the connection's id, which may be undefined during
+	 * the open/assign race.
+	 */
+	const prepareClient = (ws: WebSocket): { connId: string | undefined } | null => {
+		if (ws.readyState !== ws.OPEN) return null;
+		// Slow-consumer backpressure. A client that keeps answering
+		// protocol-level PINGs (so the ping reaper never reaps it) but can't
+		// drain its receive side accumulates every broadcast in its send buffer
+		// without bound. Close it (1008 = policy violation) rather than grow
+		// gateway memory; the `close` handler drops it from `clients` + subs.
+		if (ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
+			try {
+				ws.close(1008, "slow consumer");
+			} catch {
+				/* best-effort — socket may already be closing */
+			}
+			return null;
+		}
+		return { connId: clientConnIds.get(ws) };
+	};
+	/**
+	 * `ws.send` is wrapped because the `readyState === OPEN` check above narrows
+	 * but does not fully eliminate the window — a socket can transition between
+	 * the check and the send. Most not-OPEN sends surface as an async `error`
+	 * event rather than a synchronous throw, so an escaping throw is unlikely,
+	 * but the swallow keeps a hot broadcast path from ever crashing on one bad
+	 * socket — matching the try-wrapped `ws.ping()` in the reaper.
+	 */
+	const sendIfWritable = (ws: WebSocket, json: string): void => {
+		try {
+			ws.send(json);
+		} catch {
+			/* best-effort — drop send to a transitioning socket */
+		}
+	};
+
 	const broadcast = <K extends EventName>(event: K, payload: EventPayload[K]): void => {
 		// Untagged payloads broadcast to everyone (state, error, basic log).
 		// Tagged payloads (pi, log with agent/session, approval-request,
@@ -2022,71 +2089,63 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				: { type: "event", event, payload };
 		const json = JSON.stringify(frame);
 		for (const ws of clients) {
-			if (ws.readyState !== ws.OPEN) continue;
-			// Slow-consumer backpressure. A client that keeps answering
-			// protocol-level PINGs (so the ping reaper never reaps it) but
-			// can't drain its receive side accumulates every broadcast in its
-			// send buffer without bound — `broadcast` fires on every Pi event
-			// mid-turn. When the buffered bytes exceed the cap, close the
-			// socket (1008 = policy violation) and drop the client instead of
-			// growing gateway memory. The `close` handler removes it from
-			// `clients` + the subscription maps.
-			if (ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
-				try {
-					ws.close(1008, "slow consumer");
-				} catch {
-					/* best-effort — socket may already be closing */
-				}
-				continue;
-			}
-			const connId = clientConnIds.get(ws);
+			const ready = prepareClient(ws);
+			if (!ready) continue;
 			// No connId yet (race between socket open + onConnection assign):
 			// best-effort send (matches old behaviour).
-			//
-			// `ws.send` is wrapped because the `readyState === OPEN` check
-			// above narrows but does not fully eliminate the window — a socket
-			// can transition state between the check and the send. Most
-			// not-OPEN sends surface as an async `'error'` event (handled by
-			// `ws.on("error")`) rather than a synchronous throw, so an escaping
-			// throw is unlikely, but the swallow keeps a hot broadcast path
-			// (Pi events, tick, cron) from ever crashing on one bad socket —
-			// matching the try-wrapped `ws.ping()` in the reaper below.
-			if (!connId) {
-				try {
-					ws.send(json);
-				} catch {
-					/* best-effort — drop send to a transitioning socket */
-				}
-				continue;
-			}
-			if (connWantsFrame(connId, frameAgentId, frameSessionId)) {
-				try {
-					ws.send(json);
-				} catch {
-					/* best-effort — drop send to a transitioning socket */
-				}
+			if (!ready.connId || connWantsFrame(ready.connId, frameAgentId, frameSessionId)) {
+				sendIfWritable(ws, json);
 			}
 		}
 	};
 
 	/**
-	 * Wave K — fan out a state snapshot to every binding. Sends the boot-agent
-	 * snapshot (untagged → reaches legacy un-subscribed clients) PLUS one
-	 * tagged snapshot per distinct non-boot agentId any connected client is
-	 * subscribed to. The per-conn filter delivers each tagged frame only to
-	 * that agent's subscribers — so a TUI bound to `agent:ops` sees `ops`'s
-	 * header while an un-bound TUI keeps seeing the boot header.
+	 * Fan out a state snapshot to every binding.
+	 *
+	 * Built PER CONNECTION rather than once for everyone, because the model in
+	 * the snapshot now depends on the SESSION a connection is bound to, not
+	 * just its agent: a pinned thread runs a different model from its agent, so
+	 * a single shared payload cannot describe both. Two TUIs on the same agent
+	 * but different threads legitimately see different headers.
+	 *
+	 * Recipients are chosen explicitly here, so these frames bypass the tag
+	 * filter `broadcast()` applies. Fan-out per subscribed agent is preserved
+	 * exactly as before; the session is layered on top only where it is
+	 * unambiguous.
 	 */
 	const broadcastStateAllBindings = (): void => {
-		const seen = new Set<string>();
-		for (const subs of clientAgentSubs.values()) {
-			for (const id of subs) {
-				if (id && id !== agentId) seen.add(id);
+		// One connection per open socket, but many share a binding — build each
+		// distinct (agent, session) payload once.
+		const frames = new Map<string, string>();
+		const frameFor = (a: string | undefined, sk: string | undefined): string => {
+			const cacheKey = `${a ?? ""}\u0000${sk ?? ""}`;
+			let json = frames.get(cacheKey);
+			if (json === undefined) {
+				json = JSON.stringify({
+					type: "event",
+					event: "state",
+					payload: buildSnapshot(a, sk),
+				} satisfies Frame);
+				frames.set(cacheKey, json);
 			}
-		}
-		broadcast("state", buildSnapshot());
-		for (const id of seen) {
-			broadcast("state", buildSnapshot(id));
+			return json;
+		};
+		for (const ws of clients) {
+			const ready = prepareClient(ws);
+			if (!ready) continue;
+			const { connId } = ready;
+			// Recipient planning lives in `state-fanout.ts` so it is covered by a
+			// focused unit test rather than a live WS server — same split as
+			// `connWantsFrame` / `shouldDeliverFrame`.
+			const targets = planStateFanout({
+				agentSubs: connId ? clientAgentSubs.get(connId) : undefined,
+				sessionSubs: connId ? clientSessionSubs.get(connId) : undefined,
+				bootAgentId: agentId,
+				ownerOf: (sk) => parseAgentSessionKey(sk)?.agentId,
+			});
+			for (const t of targets) {
+				sendIfWritable(ws, frameFor(t.agentId, t.sessionKey));
+			}
 		}
 	};
 
@@ -2885,8 +2944,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// so a turn for `agent:ops` no longer sees mutations meant for
 				// `agent:main`.
 				const turnRuntime = getAgentRuntime(targetAgentId);
-				const turnProvider = turnRuntime.provider;
-				const turnModelId = turnRuntime.modelId;
+				// Per-session model pin, when this session has one. A pin is the
+				// ONLY thing that makes a session diverge from its agent: sessions
+				// without one read `turnRuntime` live, so an agent-wide `/model`
+				// still moves every unpinned session, existing or brand new.
+				//
+				// Deliberately NOT `entry.provider`/`entry.modelId` — every turn
+				// stamps those with whatever served it, so reading them here would
+				// freeze each session to its first turn's model and make an
+				// agent-wide switch a silent no-op. See `readSessionModelPin`.
+				const turnPin = turn.sessionKey
+					? readSessionModelPin(targetAgentId, turn.sessionKey)
+					: null;
+				const turnProvider = turnPin?.provider ?? turnRuntime.provider;
+				const turnModelId = turnPin?.modelId ?? turnRuntime.modelId;
 				const turnThinkingLevel = turnRuntime.thinkingLevel;
 
 				// C2: forward the per-agent `workspace` override from cfg so the
@@ -3145,6 +3216,41 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						authStorage: targetAuth,
 					})) as Model<string> | undefined);
 				if (!target) throw new Error(`model ${p.provider}/${p.modelId} not found`);
+				// Session scope — pin THIS session and stop. The agent's runtime
+				// entry and its persisted config are deliberately left alone:
+				// giving one thread a different model must not move the agent or
+				// any of its other threads. Validation above already ran, so a
+				// pin can only ever name a model that actually resolves.
+				if (p.scope === "session") {
+					const rawPinKey = typeof p.sessionKey === "string" ? p.sessionKey.trim() : "";
+					if (!rawPinKey) {
+						throw new Error('set-model: scope "session" requires a sessionKey');
+					}
+					// The pin is READ back at turn time under the turn's own
+					// agentId, so writing it under a different agent's store would
+					// file it where no turn will ever look for it. Reject the
+					// mismatch instead of silently cross-filing.
+					const parsedPinKey = parseAgentSessionKey(rawPinKey);
+					if (parsedPinKey && parsedPinKey.agentId !== targetAgentId) {
+						throw new Error(
+							`set-model: session ${rawPinKey} does not belong to agent ${targetAgentId}`,
+						);
+					}
+					const pinVerdict = sessionsAccessCheck({
+						action: "send",
+						targetSessionKey: rawPinKey,
+					});
+					if (!pinVerdict.allowed) {
+						const err = new Error(pinVerdict.reason ?? "set-model forbidden");
+						(err as Error & { code?: string }).code = "forbidden";
+						throw err;
+					}
+					if (!pinSessionModel(targetAgentId, rawPinKey, p.provider, p.modelId)) {
+						throw new Error(`set-model: cannot pin session ${rawPinKey}`);
+					}
+					broadcastStateAllBindings();
+					return undefined as ResponseFor[M];
+				}
 				// Mutate ONLY this agent's runtime entry — never spill model
 				// changes for one agent onto another's next turn.
 				perAgentRuntime.set(targetAgentId, {
@@ -3218,6 +3324,34 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				}
 				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
+			}
+			case "clear-session-model": {
+				const p = params as RequestParams["clear-session-model"];
+				const targetAgentId = p.agentId?.trim() || agentId;
+				const rawKey = typeof p.sessionKey === "string" ? p.sessionKey.trim() : "";
+				const pinKey = rawKey || defaultSessionKey(targetAgentId);
+				const parsedPinKey = parseAgentSessionKey(pinKey);
+				if (parsedPinKey && parsedPinKey.agentId !== targetAgentId) {
+					throw new Error(
+						`clear-session-model: session ${pinKey} does not belong to agent ${targetAgentId}`,
+					);
+				}
+				const clearVerdict = sessionsAccessCheck({
+					action: "send",
+					targetSessionKey: pinKey,
+				});
+				if (!clearVerdict.allowed) {
+					const err = new Error(clearVerdict.reason ?? "clear-session-model forbidden");
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
+				// Report whether a pin was actually dropped, so the TUI can say
+				// "this thread wasn't pinned" instead of implying it changed
+				// something. Read before the clear — after it, both look alike.
+				const hadPin = readSessionModelPin(targetAgentId, pinKey) !== null;
+				clearSessionModelPin(targetAgentId, pinKey);
+				if (hadPin) broadcastStateAllBindings();
+				return { cleared: hadPin } as ResponseFor[M];
 			}
 			case "switch-model-mid-turn": {
 				const p = params as RequestParams["switch-model-mid-turn"];
@@ -3699,7 +3833,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					pendingApprovals,
 					recentSystemEvents: recentSystemEvents.get(targetSessionKey) ?? [],
 					epoch: gatewayEpoch,
-					snapshot: buildSnapshot(targetAgentId),
+					snapshot: buildSnapshot(targetAgentId, targetSessionKey),
 				} as ResponseFor[M];
 			}
 			case "memory-graph": {
@@ -4003,7 +4137,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						const snapFrame: Frame = {
 							type: "event",
 							event: "state",
-							payload: buildSnapshot(p.agentId.trim()),
+							payload: buildSnapshot(
+								p.agentId.trim(),
+								typeof p.sessionId === "string" ? p.sessionId.trim() : undefined,
+							),
 						};
 						ws.send(JSON.stringify(snapFrame));
 					}
