@@ -38,6 +38,7 @@ import { parseAgentSessionKey } from "../../sessions/session-key-utils.js";
 import { spawnSubagentDirect } from "../../agents/subagent-spawn.js";
 import {
 	listSessionEntries,
+	readSessionModelPin,
 	readSessionStore,
 	deleteSessionEntry,
 	renameSessionEntry,
@@ -208,6 +209,11 @@ export async function handleSessionsList(
 				...(Number.isFinite(startedAt) ? { startedAt } : {}),
 				...(Number.isFinite(updatedAt) ? { updatedAt } : {}),
 				...(typeof entry.modelId === "string" ? { model: entry.modelId } : {}),
+				// The PIN, separate from `model` above (which is only what last
+				// served the session). A thread pinned but not yet messaged has a
+				// pin and a stale-or-absent `model`; surfacing only the latter
+				// would show a UI the wrong model for exactly that thread.
+				...(pinOf(agentId, sessionKey) ?? {}),
 				...(sanitizeSessionName(entry.name) ? { displayName: sanitizeSessionName(entry.name) } : {}),
 			});
 		}
@@ -218,6 +224,15 @@ export async function handleSessionsList(
 	let all = [...rows, ...persisted];
 	if (typeof params.limit === "number" && params.limit > 0) all = all.slice(0, params.limit);
 	return { sessions: all, count: all.length };
+}
+
+/** Pin fields for a list row, or undefined when the session follows its agent. */
+function pinOf(
+	agentId: string,
+	sessionKey: string,
+): { pinnedProvider: string; pinnedModel: string } | undefined {
+	const pin = readSessionModelPin(agentId, sessionKey);
+	return pin ? { pinnedProvider: pin.provider, pinnedModel: pin.modelId } : undefined;
 }
 
 function applyFilters(rows: LiveSessionRecord[], params: SessionsListParams): LiveSessionRecord[] {
