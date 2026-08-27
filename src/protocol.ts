@@ -116,6 +116,8 @@ export type RequestMethod =
 	| "steer"
 	/** Switch to a different model. Reply: void. */
 	| "set-model"
+	/** Drop a session's model pin so it follows its agent again. */
+	| "clear-session-model"
 	/** Mid-turn live model switch — abort + swap + re-prompt. Reply: void. */
 	| "switch-model-mid-turn"
 	/** Set thinking level. Pi clamps to model capabilities. Reply: void. */
@@ -305,6 +307,7 @@ export const REQUEST_METHODS = [
 	"abort",
 	"steer",
 	"set-model",
+	"clear-session-model",
 	"switch-model-mid-turn",
 	"set-thinking",
 	"compact",
@@ -517,6 +520,29 @@ export interface RequestParams {
 		modelId: string;
 		/** Agent id whose runtime entry is mutated; defaults to caller's bound agent. */
 		agentId?: string;
+		/**
+		 * Session to pin. Only read when `scope` is "session"; ignored for
+		 * agent scope, where the change deliberately spans every session.
+		 */
+		sessionKey?: string;
+		/**
+		 * "agent" (the default, and the pre-existing behaviour) — move the
+		 * agent's model. Every session WITHOUT its own pin follows, whether it
+		 * already exists or is created later.
+		 *
+		 * "session" — pin `sessionKey` alone and leave the agent untouched, so
+		 * one thread can run a different model without affecting the others.
+		 *
+		 * Optional for wire-compat: a client older than this field sends no
+		 * scope and keeps getting agent-wide behaviour.
+		 */
+		scope?: "agent" | "session";
+	};
+	"clear-session-model": {
+		/** Session whose pin is dropped; defaults to the caller's bound session. */
+		sessionKey?: string;
+		/** Agent owning that session; defaults to the caller's bound agent. */
+		agentId?: string;
 	};
 	"switch-model-mid-turn": {
 		provider: string;
@@ -667,6 +693,9 @@ export interface ResponseFor {
 	abort: void;
 	steer: void;
 	"set-model": void;
+	/** `cleared: false` means the session existed but had no pin — a no-op the
+	 *  TUI reports differently from an actual unpin. */
+	"clear-session-model": { cleared: boolean };
 	"switch-model-mid-turn": void;
 	"set-thinking": void;
 	compact: void;

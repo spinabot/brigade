@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 
 import { handleSessionsList } from "./sessions.js";
-import { upsertSessionEntry } from "../../sessions/session-store.js";
+import { pinSessionModel, upsertSessionEntry } from "../../sessions/session-store.js";
 
 let tmpRoot: string;
 let prevState: string | undefined;
@@ -83,4 +83,37 @@ test("an unreadable store yields an empty list, never a thrown RPC", async () =>
 	const res = await handleSessionsList({ agentId: "ghost-agent" });
 	assert.deepEqual(res.sessions, []);
 	assert.equal(res.count, 0);
+});
+
+// A UI listing threads reads these rows. `model` is only what last SERVED the
+// session, so on its own it mislabels the two cases below.
+test("sessions.list distinguishes a pin from what last ran", async () => {
+	// Pinned, then messaged on a DIFFERENT model earlier: `model` lags the pin.
+	pinSessionModel("main", "agent:main:t-pinned", "openrouter", "qwen/qwen-2.5-72b-instruct");
+	upsertSessionEntry("main", "agent:main:t-pinned", { modelId: "claude-opus-5" });
+	// Unpinned: follows its agent, so it must NOT look pinned to anything.
+	upsertSessionEntry("main", "agent:main:t-plain", { modelId: "claude-opus-5" });
+
+	const res = await handleSessionsList({ agentId: "main" });
+	const pinned = res.sessions.find((s) => s.sessionKey === "agent:main:t-pinned");
+	const plain = res.sessions.find((s) => s.sessionKey === "agent:main:t-plain");
+
+	assert.equal(pinned?.pinnedProvider, "openrouter");
+	assert.equal(pinned?.pinnedModel, "qwen/qwen-2.5-72b-instruct");
+	assert.equal(pinned?.model, "claude-opus-5", "last-served is reported separately");
+	assert.equal(plain?.pinnedModel, undefined, "an unpinned thread follows its agent");
+	assert.equal(plain?.model, "claude-opus-5");
+});
+
+// The case that has no honest answer without the pin field: pin a thread and
+// never message it. `model` is absent entirely, so a UI reading only `model`
+// would show no model for a thread the operator just pinned.
+test("a thread pinned but never messaged still reports its pin", async () => {
+	pinSessionModel("main", "agent:main:t-fresh", "openrouter", "qwen/qwen-2.5-72b-instruct");
+
+	const res = await handleSessionsList({ agentId: "main" });
+	const row = res.sessions.find((s) => s.sessionKey === "agent:main:t-fresh");
+	assert.ok(row, "the pin created the entry, so the thread is listed");
+	assert.equal(row?.model, undefined, "nothing has served it yet");
+	assert.equal(row?.pinnedModel, "qwen/qwen-2.5-72b-instruct", "but the pin is visible");
 });
