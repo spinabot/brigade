@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.33.0](https://github.com/spinabot/brigade/compare/brigade-v1.32.1...brigade-v1.33.0) (2026-08-27)
+
+
+### Features
+
+* **sessions:** per-session model pin, so one thread can run its own model ([9c7d43d](https://github.com/spinabot/brigade/commit/9c7d43dc3c054ae6cdf158dc2e92342532c6efe3))
+* **sessions:** per-session model pin, so one thread can run its own model ([ff63300](https://github.com/spinabot/brigade/commit/ff633004f04c5f140cfcfd69736a0e1c78521ef2))
+* **sessions:** surface the model pin on sessions.list rows ([84c3a9c](https://github.com/spinabot/brigade/commit/84c3a9c25f664b1210c46e9e87c5bd6d5bde609f))
+
 ## [1.32.1](https://github.com/spinabot/brigade/compare/brigade-v1.32.0...brigade-v1.32.1) (2026-08-22)
 
 
