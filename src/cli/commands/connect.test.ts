@@ -33,7 +33,70 @@ import {
 	BRIGADE_TAUNTS,
 } from "../../agents/org/pride-taunts.js";
 import type { OrgGraph } from "../../agents/org/types.js";
-import { snapshotSessionSeedable } from "./connect.js";
+import { reanchorBaselineOnRollback, snapshotSessionSeedable, usageSinceBaseline } from "./connect.js";
+
+describe("reanchorBaselineOnRollback — gateway restart mid-connection", () => {
+	it("no baseline captured → stays null (nothing to re-anchor)", () => {
+		const snap = { totalTokensIn: 10, totalTokensOut: 5, totalCostUsd: 0 };
+		assert.equal(reanchorBaselineOnRollback(snap, null), null);
+	});
+
+	it("normal growth (no rollback) → baseline unchanged", () => {
+		const baseline = { in: 500, out: 300, cost: 0.02 };
+		const snap = { totalTokensIn: 620, totalTokensOut: 380, totalCostUsd: 0.025 };
+		assert.deepEqual(reanchorBaselineOnRollback(snap, baseline), baseline);
+	});
+
+	it("totals drop below the baseline (gateway restarted) → re-anchors to the new lower totals", () => {
+		const baseline = { in: 500, out: 300, cost: 0.02 };
+		const snap = { totalTokensIn: 10, totalTokensOut: 5, totalCostUsd: 0 };
+		assert.deepEqual(reanchorBaselineOnRollback(snap, baseline), { in: 10, out: 5, cost: 0 });
+	});
+
+	it("after re-anchoring, usage since baseline reflects only post-restart activity", () => {
+		const baseline = { in: 500, out: 300, cost: 0.02 };
+		const restartSnap = { totalTokensIn: 10, totalTokensOut: 5, totalCostUsd: 0 };
+		const reanchored = reanchorBaselineOnRollback(restartSnap, baseline);
+		const laterSnap = { totalTokensIn: 45, totalTokensOut: 20, totalCostUsd: 0.001 };
+		assert.deepEqual(usageSinceBaseline(laterSnap, reanchored), { in: 35, out: 15, cost: 0.001 });
+	});
+});
+
+describe("usageSinceBaseline — /new token-count reset (issue #136)", () => {
+	it("no snapshot yet → all zero", () => {
+		assert.deepEqual(usageSinceBaseline(null, null), { in: 0, out: 0, cost: 0 });
+	});
+
+	it("no baseline captured → returns the raw cumulative snapshot totals", () => {
+		const snap = { totalTokensIn: 500, totalTokensOut: 300, totalCostUsd: 0.02 };
+		assert.deepEqual(usageSinceBaseline(snap, null), { in: 500, out: 300, cost: 0.02 });
+	});
+
+	it("baseline captured at /new time → only usage AFTER that point counts", () => {
+		// Operator has racked up 500 in / 300 out / $0.02 in the old thread,
+		// then runs /new (baseline captured = that exact total). Two more
+		// turns happen in the new thread, adding 120 in / 80 out / $0.005.
+		const baseline = { in: 500, out: 300, cost: 0.02 };
+		const snap = { totalTokensIn: 620, totalTokensOut: 380, totalCostUsd: 0.025 };
+		const result = usageSinceBaseline(snap, baseline);
+		assert.deepEqual(result, { in: 120, out: 80, cost: result.cost });
+		assert.ok(Math.abs(result.cost - 0.005) < 1e-9);
+	});
+
+	it("immediately after /new, before the new thread's first turn → zero", () => {
+		// This is the exact issue #136 repro: baseline == current totals
+		// because no turn has run in the new thread yet.
+		const baseline = { in: 500, out: 300, cost: 0.02 };
+		const snap = { totalTokensIn: 500, totalTokensOut: 300, totalCostUsd: 0.02 };
+		assert.deepEqual(usageSinceBaseline(snap, baseline), { in: 0, out: 0, cost: 0 });
+	});
+
+	it("clamps to zero rather than going negative (defensive: gateway restart mid-connection)", () => {
+		const baseline = { in: 500, out: 300, cost: 0.02 };
+		const snap = { totalTokensIn: 10, totalTokensOut: 5, totalCostUsd: 0 };
+		assert.deepEqual(usageSinceBaseline(snap, baseline), { in: 0, out: 0, cost: 0 });
+	});
+});
 
 describe("snapshotSessionSeedable — --agent cross-agent-session guard", () => {
 	it("seeds when unbound (normal first-snapshot path)", () => {
