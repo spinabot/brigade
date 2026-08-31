@@ -407,6 +407,42 @@ export function resetChannelPluginManagerStateForTests(): void {
 }
 
 /** Helper for plugins that need to fire a logout flow on operator command. */
+/**
+ * Run a plugin's `gateway.logoutAccount` hook for one account.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * STATUS: NOT INVOKED BY THE RUNTIME. Read this before building on it.
+ * ─────────────────────────────────────────────────────────────────────────
+ * Nothing in Brigade calls this today, and that is worth stating plainly
+ * rather than leaving a plausible-looking helper for someone to assume is
+ * live. Three separate facts have to change before it means anything:
+ *
+ *   1. Every in-repo plugin (Discord, Slack, Telegram, BlueBubbles)
+ *      implements `logoutAccount` as EXACTLY `stopAccount(ctx)` wrapped in a
+ *      result object. There is no behaviour here that stopping the account
+ *      does not already do, so calling it would change nothing Brigade ships.
+ *
+ *   2. `purge` is declared on `ChannelLogoutContext` and honoured by NO
+ *      plugin. A caller that passed `purge: true` expecting credentials to be
+ *      erased would be silently disappointed — the flag is plumbed to nowhere.
+ *
+ *   3. The natural caller — the operator-initiated disconnect in
+ *      `connect-channel-tool.ts` — reaches the plugin manager through
+ *      `plugin-channel-manager-facade`, whose `stopChannel` is a deliberate
+ *      no-op ("live stop is managed by the multi-account channel plugin
+ *      manager"). Wiring a logout through that path would be inert.
+ *
+ * Kept rather than deleted because `gateway.logoutAccount` is a PUBLIC SDK
+ * port (`types.adapters.ts`): a third-party channel plugin may implement a
+ * real logout — revoking a token at the provider rather than just closing a
+ * socket — and this is the shape that would call it. Deleting the helper
+ * while leaving the port advertised would be the worse of the two lies.
+ *
+ * To make it real: give the facade a working single-channel stop, then have
+ * the operator disconnect path pass a reason that distinguishes a deliberate
+ * logout from a gateway shutdown — a shutdown must NOT log accounts out, or
+ * they will not come back on the next boot.
+ */
 export async function logoutChannelAccount(params: {
 	plugin: ChannelPlugin;
 	accountId: string;
