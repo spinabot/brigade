@@ -1200,13 +1200,24 @@ export function wrapStreamFnWithPayloadMutations(session: AgentSession): void {
         applyAllPayloadMutations(next, m);
         return next;
       },
-      // RATE-LIMIT HEADERS, FOR EVERY PROVIDER.
+      // RATE-LIMIT HEADERS, WHEREVER THE PROVIDER SENDS THEM.
       //
-      // Pi hands back `ProviderResponse { status, headers }` on every provider
-      // call (`pi-ai types.d.ts:64`), and EVERY backend Pi drives goes through
-      // this one `streamFn`. So observing here — rather than in any single
-      // provider's adapter — is what makes "how much have I got left?"
-      // provider-agnostic instead of an Anthropic-only feature.
+      // Pi hands back `ProviderResponse { status, headers }` via `onResponse`,
+      // and observing here — rather than in any single provider's adapter —
+      // means one seam covers every backend that reports limits at all.
+      //
+      // NOT universal, and the difference matters. Verified in pi-ai: the
+      // Anthropic, OpenAI-completions, OpenAI-responses, Azure, Codex and
+      // Bedrock providers all invoke `onResponse` on the STREAMING path. The
+      // Google, Vertex, Mistral and Cloudflare providers never invoke it, and
+      // Brigade's own transports (`transport-dispatch.ts`) intercept before
+      // Pi's provider path — so `claude-cli` and `ollama-native` do not arrive
+      // here either. `claude-cli` is covered separately by `plan-limits.ts`,
+      // which reads the binary's own `rate_limit_event` frames.
+      //
+      // A backend that reports nothing simply records nothing, and the UI omits
+      // the block rather than drawing an empty bar: "unknown" and "none left"
+      // must never render the same way.
       //
       // `recordLimitsFromHeaders` already reads both conventions in use
       // (`anthropic-ratelimit-*` and `x-ratelimit-*`) and skips absent families

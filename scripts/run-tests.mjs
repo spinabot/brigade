@@ -37,6 +37,37 @@ const keepAlive = pathToFileURL(join(import.meta.dirname, "test-keepalive.mjs"))
 // Double quotes stop the shell expanding it on POSIX and are stripped by cmd.exe
 // on Windows, so in both cases Node's own test runner receives the pattern and
 // does the globbing itself — and Node's globber does understand `**`.
+// TYPECHECK FIRST — `npm test` DOES NOT TYPECHECK ON ITS OWN.
+//
+// The suite runs under `tsx`, which STRIPS types and never checks them. That
+// makes every compile-time guard in this repo invisible to `npm test`:
+// a `Record<BrigadeOwnKeys, true>` conformance guard, a `satisfies keyof
+// ToolCall` tripwire, a discriminant pinned to Pi's own literal type — all of
+// them can be violated and the suite still reports a confident green.
+//
+// Proven, not assumed: adding a field to `BrigadeTool` (which the tool-boundary
+// guard exists to catch) left all six of its tests passing. CI caught it only
+// because `ci.yml` runs `npm run typecheck` as a SEPARATE step — so the guards
+// worked in CI and were decorative locally, which is precisely backwards. The
+// whole point of a compile-time guard is to fail fast for the person editing.
+//
+// 6 seconds against a 4-minute suite. Skip with BRIGADE_SKIP_TYPECHECK=1 for a
+// tight edit loop; CI never skips.
+if (process.env.BRIGADE_SKIP_TYPECHECK !== "1") {
+  const tc = spawnSync("npx", ["tsc", "--noEmit", "-p", "tsconfig.json"], {
+    stdio: "inherit",
+    shell: true,
+  });
+  if (tc.status !== 0) {
+    console.error(
+      "\ntypecheck failed — the suite was NOT run.\n" +
+        "`tsx` strips types, so these errors would not have failed any test.\n" +
+        "Set BRIGADE_SKIP_TYPECHECK=1 to run the suite anyway.",
+    );
+    process.exit(tc.status ?? 1);
+  }
+}
+
 const extra = process.argv.slice(2);
 const res = spawnSync("npx", ["tsx", "--import", keepAlive, "--test", '"src/**/*.test.ts"', ...extra], {
   stdio: "inherit",

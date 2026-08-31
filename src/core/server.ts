@@ -80,6 +80,7 @@ import { createMcpHttpRoute } from "../agents/mcp/http-route.js";
 import { createMcpTurnRegistry, setActiveMcpToolPlaneHost } from "../agents/mcp/tool-plane-host.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
 import { shouldSendDeltaFrame, stripCumulativeContent } from "./delta-mode.js";
+import { classifyFrame, FrameRing } from "./frame-ring.js";
 import {
 	abandonedByRewind,
 	filesTouchedAfter,
@@ -1965,8 +1966,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			: isBoot
 				? cachedThinkingLevels
 				: rt.model ? deriveThinkingLevels(rt.model) : [];
+		// Computed once: the provider this snapshot actually reports (pin-aware),
+		// and the reasoning state (previously built twice per snapshot).
+		const snapshotProvider = pin?.provider ?? rt.provider;
+		const reasoningSnapshot = reasoningTracker.snapshot(targetAgentId, targetSessionKey);
 		return {
-			provider: pin?.provider ?? rt.provider,
+			provider: snapshotProvider,
 			modelId: pin?.modelId ?? rt.modelId,
 			modelName: effectiveModel?.name ?? pin?.modelId,
 			thinkingLevel: rt.thinkingLevel,
@@ -1980,9 +1985,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			contextUsagePercent: lastContextUsagePercent,
 			contextTokens: lastContextTokens,
 			contextWindow: lastContextWindow,
-			...(reasoningTracker.snapshot(targetAgentId, targetSessionKey)
-				? { reasoning: reasoningTracker.snapshot(targetAgentId, targetSessionKey)! }
-				: {}),
+			...(reasoningSnapshot ? { reasoning: reasoningSnapshot } : {}),
 			// PROVIDER CONSUMPTION WINDOWS.
 			//
 			// Recorded for every backend from the one `streamFn` all of them go
@@ -1993,15 +1996,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			//
 			// Omitted entirely when the provider reports no headers. "Unknown" and
 			// "exhausted" must never render the same way.
+			// Resolved from the SAME provider this snapshot reports, which honours
+			// the session's model pin. Reading the agent runtime directly showed
+			// the agent's provider limits beside a pinned model from a different
+			// provider — precisely the mismatch this block exists to avoid.
 			...(() => {
-				try {
-					const provider = getAgentRuntime(targetAgentId)?.provider;
-					if (!provider) return {};
-					const windows = getLimitsForProvider(provider);
-					return windows.length > 0 ? { limits: windows } : {};
-				} catch {
-					return {};
-				}
+				const windows = snapshotProvider ? getLimitsForProvider(snapshotProvider) : [];
+				return windows.length > 0 ? { limits: windows } : {};
 			})(),
 			// Per-binding, not process-wide: the snapshot already resolved which
 			// agent + session this client is bound to, and usage now honours that.
@@ -2195,6 +2196,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const seqCounters = new Map<string, number>();
 
 	/**
+	 * Replayable retention for the frames the TRANSCRIPT cannot rebuild.
+	 *
+	 * Sub-agent and synthetic frames were deliberately left unsequenced because
+	 * a seq you cannot replay turns every dropped decoration frame into an
+	 * unrepairable gap. This ring is the other half of that trade: retain the
+	 * bytes, and sequencing them becomes safe. See `frame-ring.ts`.
+	 */
+	const frameRing = new FrameRing();
+
+	/**
 	 * Bounded per-session tail of recent `system-event` notices (cron announces /
 	 * channel-health), so a client that was disconnected when one fired can still
 	 * recover it via `resume`. Oldest-first, capped at RECENT_SYSTEM_EVENTS_MAX.
@@ -2362,10 +2373,27 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		//  - `state` (self-healing cumulative snapshot), `error`, `log` (on disk).
 		const subDepth = event === "pi" ? Number((payload as { subagentDepth?: number }).subagentDepth) || 0 : 0;
 		const isSyntheticPi = event === "pi" && (payload as { synthetic?: boolean }).synthetic === true;
-		const isOrderedFrame =
-			(event === "pi" && subDepth === 0 && !isSyntheticPi) ||
-			event === "approval-request" ||
-			event === "system-event";
+		// Sub-agent and synthetic `pi` frames ARE now ordered. They were excluded
+		// for a sound reason — you cannot sequence a stream you cannot replay —
+		// and `frameRing` removes exactly that objection by retaining their bytes
+		// for `resume(sinceSeq)`.
+		//
+		// They are sequenced under their OWN session id, not the parent's. That
+		// keeps each stream independently gap-detectable: a client watching only
+		// the parent still sees an unbroken parent sequence, and a client that
+		// also watches the child (delivery rule 3, `parentSessionKey`) tracks the
+		// child's counter separately. Folding them into the parent's counter
+		// would make every unsubscribed child frame look like a parent gap and
+		// resync-thrash exactly the clients that opted out.
+		// The rule lives in `frame-ring.ts` so it is directly testable — inline,
+		// covering it meant booting a gateway, so the decision that determines
+		// what is recoverable had no test on the path where being wrong loses
+		// output silently.
+		const { ordered: isOrderedFrame, replayOnly: isReplayOnly } = classifyFrame({
+			event,
+			subagentDepth: subDepth,
+			synthetic: isSyntheticPi,
+		});
 		const seq = isOrderedFrame ? nextSeq(seqCounters, frameSessionId) : undefined;
 		// Retain a bounded per-session tail of system-events for `resume` recovery.
 		// delete+set moves this session to the end of the Map (LRU touch) so the
@@ -2393,6 +2421,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// (a headless cron or channel turn).
 		let fullJson: string | undefined;
 		const json = (): string => (fullJson ??= JSON.stringify(frame));
+		// RETAIN ONLY WHAT THE TRANSCRIPT CANNOT REBUILD.
+		//
+		// Sub-agent and synthetic frames exist in no JSONL, so `resume` can only
+		// return them from here. Top-level `message_update`s are deliberately not
+		// retained: they are cumulative, so buffering a long reply would cost
+		// O(n^2) memory to redeliver what the transcript already returns better —
+		// the exact cost delta mode exists to remove.
+		//
+		// This forces serialization for these frames even when every recipient is
+		// in delta mode. That is the intended trade: they are a small minority of
+		// traffic, and un-replayable sub-agent output is the hole being closed.
+		if (isReplayOnly && seq !== undefined && frameSessionId) {
+			frameRing.retain(frameSessionId, seq, json());
+		}
 		// Delta variant, built ONLY when some connection asked for it and this
 		// frame actually carries a delta. One extra stringify per qualifying
 		// broadcast (measured at GiB/s — far cheaper than the bytes it removes),
@@ -4664,11 +4706,36 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						...(a.agentId !== undefined ? { agentId: a.agentId } : {}),
 						...(a.sessionId !== undefined ? { sessionId: a.sessionId } : {}),
 					})) as EventPayload["approval-request"][];
+				// CURSOR REPLAY, for the streams the transcript cannot rebuild.
+				//
+				// Only meaningful within one gateway epoch: a restart resets the
+				// seq counters to 0, so an old cursor would replay the wrong
+				// frames. The client learns the epoch from `HelloOk` and from this
+				// response and discards a stale cursor — but the server must not
+				// depend on it having done so, hence the head check below.
+				//
+				// A cursor AHEAD of head means the client is describing a stream
+				// this gateway never emitted (a restart it has not noticed yet).
+				// Replaying nothing and reporting incomplete is the safe answer:
+				// it degrades to the transcript, which is always correct.
+				const cursor = typeof p.sinceSeq === "number" ? p.sinceSeq : undefined;
+				const replay =
+					cursor !== undefined && cursor >= 0 && cursor <= headSeq
+						? frameRing.replayFrom(targetSessionKey, cursor)
+						: cursor !== undefined
+							? { frames: [], complete: false }
+							: undefined;
 				return {
 					sessionKey: targetSessionKey,
 					agentId: targetAgentId,
 					messages: messages as WireMessage[],
 					headSeq,
+					...(replay
+						? {
+								replayedFrames: replay.frames.map((f) => f.json),
+								replayComplete: replay.complete,
+							}
+						: {}),
 					pendingApprovals,
 					recentSystemEvents: recentSystemEvents.get(targetSessionKey) ?? [],
 					epoch: gatewayEpoch,
@@ -5452,6 +5519,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					forgetSessionState: (forgetAgentId: string, forgetSessionKey: string) => {
 						usageLedger.forget(forgetAgentId, forgetSessionKey);
 						reasoningTracker.forget(forgetAgentId, forgetSessionKey);
+						frameRing.forget(forgetSessionKey);
 					},
 				},
 			),

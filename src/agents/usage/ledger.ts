@@ -344,7 +344,7 @@ export class UsageLedger {
 	 *
 	 * NOT a leak fix — `evict()` already bounds this map LRU-style, so nothing
 	 * grows without limit whether or not anyone calls this. It is a CORRECTNESS
-	 * fix, and it is currently unwired.
+	 * fix.
 	 *
 	 * The bug it closes: the ledger is keyed by `(agentId, sessionKey)`, and
 	 * `/new` rolls a fresh sessionId under the SAME sessionKey. A deleted
@@ -352,14 +352,12 @@ export class UsageLedger {
 	 * conversation created under that key — the operator's brand-new thread opens
 	 * already showing someone else's cost total.
 	 *
-	 * The seam is built and waiting: `handleSessionsDelete` calls
+	 * Wired at the gateway: `handleSessionsDelete` calls
 	 * `deps.forgetSessionState?.(agentId, sessionKey)`
-	 * (server-methods/sessions.ts), and `ReasoningTracker.forget` has the same
-	 * shape and the same gap. What is missing is one line at the gateway's
-	 * handler registration, where both instances are in scope, supplying that
-	 * dep. Kept rather than deleted for exactly that reason: removing it would
-	 * strand a half-built cleanup path and leave the inherited-cost bug with no
-	 * way to close.
+	 * (server-methods/sessions.ts), and `server.ts`'s `sessions.delete`
+	 * registration supplies that dep — dropping this session's ledger, its
+	 * reasoning state, and its retained frames together, since all three are
+	 * keyed the same way and would otherwise be inherited as a set.
 	 */
 	forget(agentId: string, sessionKey: string): void {
 		this.entries.delete(this.key(agentId, sessionKey));

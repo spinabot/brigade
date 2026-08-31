@@ -161,8 +161,17 @@ export function recordLimitsFromHeaders(
 	headers: Record<string, string | string[] | undefined>,
 	now = Date.now(),
 ): ProviderLimitWindow[] {
+	// Normalize the KEYS once, rather than lowercasing the name we search for —
+	// which was already lowercase at every call site, so mixed-case headers
+	// simply never matched. HTTP header names are case-insensitive by spec; Node
+	// happens to lowercase them, but `ProviderResponse.headers` is an ordinary
+	// object that any provider adapter may build by hand. A miss here is silent:
+	// every value reads as absent and the window renders as "no data", which is
+	// a confident wrong answer rather than a visible failure.
+	const lower: Record<string, string | string[] | undefined> = {};
+	for (const [k, v] of Object.entries(headers)) lower[k.toLowerCase()] = v;
 	const get = (name: string): string | undefined => {
-		const v = headers[name] ?? headers[name.toLowerCase()];
+		const v = lower[name.toLowerCase()];
 		return Array.isArray(v) ? v[0] : v;
 	};
 	const recorded: ProviderLimitWindow[] = [];

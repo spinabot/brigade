@@ -893,10 +893,19 @@ export interface RequestParams {
 		/** Canonical session key to resume; defaults to that agent's main session. */
 		sessionKey?: string;
 		/**
-		 * When set, the server omits messages the client already has and returns
-		 * only the tail. Today the server always returns the full transcript
-		 * (simple + correct — the client applies it idempotently by identity);
-		 * this is a forward-compat hint for a future tail optimisation. */
+		 * The last `seq` this client saw on this session.
+		 *
+		 * When set, the server additionally returns `replayedFrames` — the exact
+		 * frames after this cursor that the TRANSCRIPT cannot rebuild (sub-agent
+		 * and synthetic frames), so a gap in those streams is repairable rather
+		 * than merely detectable.
+		 *
+		 * The transcript itself is still returned in full and applied
+		 * idempotently by identity; this cursor does not shrink it.
+		 *
+		 * Only meaningful within one gateway `epoch`. After a restart the seq
+		 * counters begin again at 0, so a stale cursor must be discarded — the
+		 * `epoch` on `HelloOk` and on this response is how a client knows. */
 		sinceSeq?: number;
 	};
 	"memory-graph": {
@@ -1362,6 +1371,26 @@ export interface ResumeSnapshot {
 	 * a duplicate it can apply idempotently or skip.
 	 */
 	headSeq: number;
+	/**
+	 * Exact frames after the request's `sinceSeq` that no transcript can rebuild
+	 * — sub-agent and synthetic frames — each the serialized `Frame` as it was
+	 * originally broadcast. Absent when no cursor was supplied.
+	 *
+	 * Apply these in order AFTER materialising the transcript. They are the same
+	 * bytes the live stream would have delivered, so an identity-keyed renderer
+	 * dedupes them exactly as it does a live frame.
+	 */
+	replayedFrames?: string[];
+	/**
+	 * Whether `replayedFrames` actually closes the gap.
+	 *
+	 * `false` means retention was trimmed past the cursor and some frames are
+	 * gone for good — the client has the transcript and should treat the
+	 * un-replayable span as lost rather than assume it was empty. Reported
+	 * honestly because a client that believes a partial replay was total
+	 * silently skips real content.
+	 */
+	replayComplete?: boolean;
 	/**
 	 * Tool-approval prompts CURRENTLY pending on this session. Recovery for the
 	 * one event that loses an operator ACTION: a client that connected after —

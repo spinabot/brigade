@@ -33,13 +33,6 @@ import type { ReasoningVisibility, SessionReasoningState } from "../../protocol.
 
 interface Entry {
 	active: boolean;
-	/**
-	 * The turn ran a reasoning-capable model with thinking enabled.
-	 *
-	 * This is the THIRD proof that reasoning happened, and it exists because the
-	 * other two can both be absent on a perfectly ordinary turn. See `end()`.
-	 */
-	expected: boolean;
 	visibility: ReasoningVisibility;
 	startedAt?: number;
 	chars: number;
@@ -60,7 +53,48 @@ interface Entry {
 }
 
 function fresh(): Entry {
-	return { active: false, visibility: "none", chars: 0, everReasoned: false, expected: false };
+	return { active: false, visibility: "none", chars: 0, everReasoned: false };
+}
+
+/**
+ * What to REPORT, as opposed to what was declared.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY THIS IS DERIVED AND NOT STORED
+ * ─────────────────────────────────────────────────────────────────────────
+ * `visibility` starts as a static guess from the provider id — what this
+ * backend CAN return, not what this turn did. When a turn demonstrably
+ * reasoned and produced zero characters of text, reporting "provider summary"
+ * points the operator at a summary that does not exist.
+ *
+ * The first attempt at this MUTATED the stored value inside `end()`, and that
+ * was wrong in a way that inverted the very misrepresentation it was meant to
+ * fix. `end()` fires once per model ROUNDTRIP, not once per logical turn, so a
+ * tool-using turn settles several times: an empty first roundtrip latched
+ * `hidden`, and a second roundtrip streaming a genuine 900-character summary
+ * kept it — the real summary then rendered under a label saying the model's
+ * reasoning was never exposed.
+ *
+ * Deriving it at read time cannot latch. Every snapshot re-answers the
+ * question from the turn's cumulative evidence, so late text corrects an early
+ * empty phase automatically.
+ *
+ * `redacted` is never downgraded: pi-ai emits a redacted block as
+ * `thinking_start` → `thinking_end` with no deltas, so `chars` is always 0 and
+ * the downgrade would relabel every redacted phase as merely "not exposed".
+ */
+function reportedVisibility(e: {
+	visibility: ReasoningVisibility;
+	chars: number;
+	everReasoned: boolean;
+	active: boolean;
+}): ReasoningVisibility {
+	// Mid-phase, text may simply not have arrived YET. Only judge a settled turn.
+	if (e.active) return e.visibility;
+	if (!e.everReasoned) return e.visibility;
+	if (e.chars > 0) return e.visibility;
+	if (e.visibility === "summary" || e.visibility === "raw") return "hidden";
+	return e.visibility;
 }
 
 export class ReasoningTracker {
@@ -99,7 +133,6 @@ export class ReasoningTracker {
 	beginTurn(agentId: string, sessionKey: string): void {
 		const e = this.touch(agentId, sessionKey);
 		e.active = false;
-		e.expected = false;
 		e.startedAt = undefined;
 		e.chars = 0;
 		e.tokens = undefined;
@@ -108,11 +141,20 @@ export class ReasoningTracker {
 	}
 
 	/** A reasoning phase opened. */
-	start(agentId: string, sessionKey: string, visibility: ReasoningVisibility = "raw", now = Date.now()): void {
+	// Defaults to `summary`, not `raw`, matching `initialReasoningVisibility`:
+	// understating fidelity is a smaller error than telling the operator they
+	// are reading the model's own chain of thought when they are reading a
+	// paraphrase. Reachable whenever `setVisibility` did not run first.
+	start(agentId: string, sessionKey: string, visibility: ReasoningVisibility = "summary", now = Date.now()): void {
 		const e = this.touch(agentId, sessionKey);
 		e.active = true;
 		e.startedAt = now;
-		e.chars = 0;
+		// `chars` is deliberately NOT reset here. It counts the reasoning text
+		// seen across the whole logical TURN, and `beginTurn()` is what clears
+		// it. Resetting per phase meant a second reasoning item with no text
+		// erased the record of a first item that streamed a real summary — and
+		// providers emit several items per response routinely (OpenAI's o-series
+		// and GPT-5 open one per `output_item.added`, many of them empty).
 		e.everReasoned = true;
 		// A phase that opens tells us the model reasons; keep a more specific
 		// visibility if one was already established for this session.
@@ -146,39 +188,6 @@ export class ReasoningTracker {
 		if (e.active && e.startedAt !== undefined) e.lastDurationMs = Math.max(0, now - e.startedAt);
 		e.active = false;
 		e.startedAt = undefined;
-		// SETTLE AN UNOBSERVED-BUT-EXPECTED PHASE.
-		//
-		// The turn ran a reasoning model with thinking on, and yet nothing was
-		// ever observed: no thinking event, no reasoning-token count. That is not
-		// evidence the model skipped reasoning — it is the omitted-but-billed
-		// case, which is the DEFAULT on the current Claude generation.
-		//
-		// Report it as `hidden` so the UI can say "not exposed by this model"
-		// instead of showing an empty header that reads as "it didn't think".
-		// Only ever downgrades: a phase that WAS observed keeps whatever
-		// visibility the blocks proved, and a non-reasoning model never sets
-		// `expected`, so it still contributes no snapshot at all.
-		if (!e.everReasoned && e.expected) {
-			e.visibility = "hidden";
-			e.everReasoned = true;
-		}
-		// A SUMMARY THAT NEVER ARRIVED IS NOT A SUMMARY.
-		//
-		// `summary` is only ever a STATIC guess from the provider id — it says
-		// what this backend is capable of returning, not what this turn actually
-		// returned. When the model demonstrably reasoned (a duration, a billed
-		// token count) and produced ZERO characters of reasoning text, calling
-		// that "provider summary" tells the operator to look for something that
-		// is not there, and quietly misreports the omitted-but-billed case as a
-		// summary they simply cannot see.
-		//
-		// Observed emptiness outranks the static guess, so downgrade to `hidden`
-		// — whose label is "not exposed by this model", which is the truth.
-		// `raw` is downgraded for the same reason. `redacted` is left alone: it
-		// is already a stronger, block-proven statement.
-		if (e.everReasoned && e.chars === 0 && (e.visibility === "summary" || e.visibility === "raw")) {
-			e.visibility = "hidden";
-		}
 	}
 
 	/** Record separately-billed reasoning tokens, when a provider reports them. */
@@ -191,35 +200,6 @@ export class ReasoningTracker {
 			// omitted-but-billed case).
 			e.everReasoned = true;
 		}
-	}
-
-	/**
-	 * This turn is RUNNING a reasoning-capable model with thinking enabled.
-	 *
-	 * ─────────────────────────────────────────────────────────────────────────
-	 * WHY A THIRD SIGNAL IS NEEDED
-	 * ─────────────────────────────────────────────────────────────────────────
-	 * `everReasoned` was provable two ways: a thinking event arrived, or the
-	 * provider reported a separately-billed reasoning-token count. On the
-	 * current Claude generation BOTH are absent on a normal turn:
-	 *
-	 *   • `display: "omitted"` is the default, and it emits NO `thinking_delta`
-	 *     events at all — only an empty block with a real signature, fully
-	 *     billed (see `visibility.ts` for the vendor citation).
-	 *   • Pi folds reasoning tokens into `output` before Brigade sees a usage
-	 *     record, so `reasoningTokens` never arrives either.
-	 *
-	 * With neither proof, `snapshot()` returned `undefined`, the gateway sent no
-	 * reasoning state, and the TUI rendered NOTHING — which reads as "the model
-	 * did not think". It thought, and the operator paid for it. That is the
-	 * exact misrepresentation this whole subsystem exists to prevent.
-	 *
-	 * Deliberately keyed off the MODEL'S DECLARED CAPABILITY and the configured
-	 * thinking level, never off a provider name. A provider allow-list would be
-	 * wrong the day a new backend ships, and Brigade drives 22 of them.
-	 */
-	expectReasoning(agentId: string, sessionKey: string): void {
-		this.touch(agentId, sessionKey).expected = true;
 	}
 
 	/** Declare what this backend exposes. Called when the turn's model is known. */
@@ -242,7 +222,7 @@ export class ReasoningTracker {
 		if (!e.everReasoned && !e.active) return undefined;
 		return {
 			active: e.active,
-			visibility: e.visibility,
+			visibility: reportedVisibility(e),
 			...(e.startedAt !== undefined ? { startedAt: e.startedAt } : {}),
 			...(e.chars > 0 ? { chars: e.chars } : {}),
 			...(e.tokens !== undefined ? { tokens: e.tokens } : {}),

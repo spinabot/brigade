@@ -329,6 +329,45 @@ const MUTATIONS = [
     tests: "src/agents/tools/make-document-tool.test.ts",
   },
 
+  // ── Reasoning honesty ──
+  {
+    claim: "the no-text downgrade is derived, so it cannot stick to a turn",
+    file: "src/agents/reasoning/reasoning-state.ts",
+    find: "\t\t\tvisibility: reportedVisibility(e),",
+    replace: "\t\t\tvisibility: e.visibility,",
+    tests: "src/agents/reasoning/reasoning-state.test.ts",
+  },
+  {
+    claim: "reasoning chars count the whole turn, not the last phase",
+    file: "src/agents/reasoning/reasoning-state.ts",
+    find: "\t\te.startedAt = now;\n\t\t// `chars` is deliberately NOT reset here.",
+    replace: "\t\te.startedAt = now;\n\t\te.chars = 0;\n\t\t// `chars` is deliberately NOT reset here.",
+    tests: "src/agents/reasoning/reasoning-state.test.ts",
+  },
+  {
+    claim: "rate-limit headers are matched case-insensitively",
+    file: "src/agents/usage/limits.ts",
+    find: "\tfor (const [k, v] of Object.entries(headers)) lower[k.toLowerCase()] = v;",
+    replace: "\tfor (const [k, v] of Object.entries(headers)) lower[k] = v;",
+    tests: "src/agents/usage/limits.test.ts",
+  },
+
+  // ── Cursor replay ──
+  {
+    claim: "a partial replay is never reported as complete",
+    file: "src/core/frame-ring.ts",
+    find: "\t\tconst complete = oldest <= sinceSeq + 1;",
+    replace: "\t\tconst complete = true;",
+    tests: "src/core/frame-ring.test.ts",
+  },
+  {
+    claim: "sub-agent and synthetic frames are retained for replay",
+    file: "src/core/frame-ring.ts",
+    find: "\tconst replayOnly = isPi && (depth > 0 || synthetic);",
+    replace: "\tconst replayOnly = false;",
+    tests: "src/core/frame-ring.test.ts",
+  },
+
   // ── Delta streaming ──
   {
     claim: "the delta strip keeps the client's render key",

@@ -215,26 +215,84 @@ test("a redacted phase is NOT downgraded — it is already block-proven", () => 
 	assert.equal(t.snapshot("a", "s")?.visibility, "redacted");
 });
 
-test("an expected-but-entirely-silent phase still reports, as hidden", () => {
-	// No thinking event, no token count — the case where BOTH proofs are absent.
-	// Without `expectReasoning` this session reported nothing at all, and an
-	// empty header reads as "the model did not think".
+/* ─────────────────────────────────────────────────────────────────────────
+ * The regressions an adversarial review reproduced against the real class.
+ *
+ * `end()` fires once per model ROUNDTRIP, not per logical turn, and `start()`
+ * used to reset `chars` per PHASE. Together those made the "no text arrived"
+ * downgrade fire on turns that had streamed a real summary, and latch for the
+ * rest of the turn once it did.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+test("a second EMPTY reasoning item does not erase a real summary", () => {
+	// OpenAI's o-series / GPT-5 open one reasoning item per `output_item.added`
+	// and routinely emit several per response, many with empty summaries.
 	const t = new ReasoningTracker();
 	t.beginTurn("a", "s");
 	t.setVisibility("a", "s", "summary");
-	t.expectReasoning("a", "s");
+	t.start("a", "s", "summary");
+	t.delta("a", "s", "x".repeat(600)); // a real summary
+	t.end("a", "s");
+	t.start("a", "s", "summary"); // second item, no text at all
 	t.end("a", "s");
 
-	assert.equal(t.snapshot("a", "s")?.visibility, "hidden");
+	const snap = t.snapshot("a", "s");
+	assert.equal(snap?.visibility, "summary", "600 chars of summary did arrive");
+	assert.equal(snap?.chars, 600, "chars counts the whole turn, not the last phase");
 });
 
-test("a NON-reasoning model still contributes no snapshot at all", () => {
-	// The guard rail: `expected` is only set for a reasoning-capable model with
-	// thinking on, so an ordinary model must not gain a phantom "Thought" line.
+test("late reasoning text corrects an early empty phase", () => {
+	// Roundtrip 1 opens an empty phase; roundtrip 2 streams a genuine summary.
+	// The old code latched `hidden` on the first and never re-evaluated, so the
+	// real summary rendered under a label saying it was never exposed.
 	const t = new ReasoningTracker();
 	t.beginTurn("a", "s");
-	t.setVisibility("a", "s", "none");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
 	t.end("a", "s");
+	assert.equal(t.snapshot("a", "s")?.visibility, "hidden", "nothing seen yet");
 
-	assert.equal(t.snapshot("a", "s"), undefined);
+	t.start("a", "s", "summary");
+	t.delta("a", "s", "y".repeat(900));
+	t.end("a", "s");
+	assert.equal(
+		t.snapshot("a", "s")?.visibility,
+		"summary",
+		"the downgrade must not latch — it is derived, not stored",
+	);
+});
+
+test("an ACTIVE phase is never downgraded — text may not have arrived yet", () => {
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	assert.equal(t.snapshot("a", "s")?.visibility, "summary");
+});
+
+test("a new turn re-evaluates from scratch", () => {
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	t.end("a", "s");
+	assert.equal(t.snapshot("a", "s")?.visibility, "hidden");
+
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	t.delta("a", "s", "fresh reasoning");
+	t.end("a", "s");
+	assert.equal(t.snapshot("a", "s")?.visibility, "summary");
+});
+
+test("start() defaults to summary, never raw", () => {
+	// Understating fidelity is a smaller error than claiming a paraphrase is
+	// the model's own chain of thought (see visibility.ts).
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.start("a", "s");
+	t.delta("a", "s", "some text");
+	t.end("a", "s");
+	assert.equal(t.snapshot("a", "s")?.visibility, "summary");
 });

@@ -244,3 +244,37 @@ client.on("resync", recover);      // backfill after a mid-stream gap
 
 That is the whole contract: **subscribe → resume → apply live by identity →
 resume again on any gap.** In order, nothing missing, nothing misplaced.
+
+## Cursor replay for sub-agent and synthetic frames
+
+The ordered stream was gap-*detectable* everywhere and gap-*repairable* only
+where the JSONL transcript could rebuild it. Two kinds of frame it cannot:
+
+- **sub-agent frames** (`subagentDepth > 0`) carry the child's own session id
+  and live in a child transcript the parent's `resume` never reads;
+- **synthetic frames** — the tool events Brigade mints for a `claude-cli` turn,
+  whose tools run inside the binary's own loop — are in no transcript at all.
+
+Both were therefore left unsequenced, which was correct: stamping a seq on a
+frame you cannot replay turns every dropped decoration into an unrepairable
+gap, and the client resyncs forever. **You cannot sequence a stream you cannot
+replay.**
+
+`FrameRing` (`src/core/frame-ring.ts`) closes that from the other end. It
+retains those frames per session — bounded by count, bytes, and distinct
+sessions — so `resume({ sinceSeq })` can return `replayedFrames`: the exact
+bytes originally broadcast, applied after the transcript and deduped by the
+same identity keys as a live frame. With replay available, sequencing them is
+safe, and they now carry a seq under **their own** session id rather than the
+parent's — so a client watching only the parent still sees an unbroken parent
+sequence instead of a false gap for every child frame it filtered out.
+
+Top-level `message_update` frames are deliberately **not** retained: they are
+cumulative, so buffering a long reply would cost O(n²) memory to redeliver what
+the transcript already returns better.
+
+`replayComplete` is the load-bearing part of the contract. It is `false` when
+retention was trimmed past the cursor, meaning some frames are gone for good
+and the client should treat that span as lost rather than assume it was empty.
+A client that reads a partial replay as total silently skips real content —
+worse than the gap it set out to repair.

@@ -1157,6 +1157,7 @@ export async function wireConnectUi(
 			argumentHint: "[n]",
 		},
 		{ name: "usage", description: "show token totals + estimated cost so far" },
+		{ name: "context", description: "where this thread's context window is going" },
 		{ name: "compact", description: "summarize older turns to free context" },
 		{
 			name: "attach",
@@ -1398,7 +1399,7 @@ export async function wireConnectUi(
 	 * Extract the renderable text for an assistant message — mirrors
 	 * chat.ts's `extractAssistantText`. See chat.ts for the full rationale.
 	 */
-	const extractAssistantText = (message: any): string => {
+	const extractAssistantText = (message: any, opts?: { live?: boolean }): string => {
 		if (!message || !Array.isArray(message.content)) return "";
 
 		const thinkingParts: string[] = [];
@@ -1455,8 +1456,22 @@ export async function wireConnectUi(
 			// never has to hardcode provider knowledge.
 			const label = vis === "summary" ? "[reasoning summary]" : "[reasoning]";
 			parts.push(`${brand.dim(label)}\n${brand.dim(thinkingText)}`);
-		} else if (showThinking && !thinkingText && (vis === "hidden" || vis === "redacted")) {
+		} else if (
+			opts?.live === true &&
+			showThinking &&
+			!thinkingText &&
+			(vis === "hidden" || vis === "redacted")
+		) {
 			// REASONING IS ON, THE MODEL REASONED, AND THERE IS NOTHING TO SHOW.
+			//
+			// LIVE FRAMES ONLY. `visibility` describes the CURRENT turn, but this
+			// function also renders every historical message on resume — so
+			// without the gate, one hidden-reasoning turn stamped this note onto
+			// the whole thread: messages produced with thinking off, messages from
+			// a different model, and tool-only assistant messages that previously
+			// rendered no block at all (empty text is skipped by the caller; a
+			// note makes it non-empty). It would fabricate a billing claim about
+			// messages the snapshot says nothing about.
 			//
 			// Rendering nothing here is the worst of the three options: the
 			// operator explicitly asked to see reasoning, the model demonstrably
@@ -2045,7 +2060,7 @@ export async function wireConnectUi(
 				const text = hasFullContent
 					? (() => {
 							// Authoritative snapshot — reconcile the accumulator to it.
-							const full = extractAssistantText(msg);
+							const full = extractAssistantText(msg, { live: true });
 							if (event.type === "message_end" && depth === 0 && full.trim()) lastReplyText = full;
 							deltaText.set(deltaKey, full);
 							// The snapshot already contains the reasoning block, so the
@@ -4685,7 +4700,17 @@ export async function wireConnectUi(
 		const formatLimitLines = (windows: readonly ProviderLimitWindow[] | undefined): string[] => {
 			if (!windows || windows.length === 0) return [];
 			const out: string[] = [];
+			// AGE STALE WINDOWS OUT.
+			//
+			// `observedAt` was recorded and never read, so a window that reported
+			// `exhausted` once stayed exhausted on screen forever — the only thing
+			// that refreshes it is another call to that provider, which is exactly
+			// what an operator who just hit a limit has stopped doing. A stale
+			// reading is worse than none: it is a confident wrong answer.
+			const STALE_AFTER_MS = 15 * 60_000;
+			const now = Date.now();
 			for (const w of windows) {
+				if (typeof w.observedAt === "number" && now - w.observedAt > STALE_AFTER_MS) continue;
 				const parts: string[] = [];
 				if (typeof w.remaining === "number" && typeof w.limit === "number") {
 					parts.push(`${formatTokens(w.remaining)} of ${formatTokens(w.limit)} left`);
@@ -4702,7 +4727,7 @@ export async function wireConnectUi(
 				const body = parts.length > 0 ? parts.join(" · ") : "reported, no counts";
 				// `exhausted` is the one state a UI must never soften.
 				const label = w.label || w.kind;
-                const line = `${label}: ${body}`;
+				const line = `${label}: ${body}`;
 				out.push(w.status === "exhausted" ? brand.amber(`${line} — EXHAUSTED`) : brand.dim(line));
 			}
 			return out;
@@ -4814,6 +4839,11 @@ export async function wireConnectUi(
 						`- ${chalk.bold("context:")}  ${ctxStr}\n` +
 						`  ${brand.dim("what the NEXT request sends — this is the one that can run out")}\n` +
 						(reasoningStrUsage ? `- ${chalk.bold("reasoning:")} ${reasoningStrUsage}\n` : "") +
+						// The command named for consumption should answer "how much
+						// have I got left?", not just "how much have I spent?".
+						(formatLimitLines(snap.limits).length > 0
+							? `- ${chalk.bold("limits:")}   ${formatLimitLines(snap.limits).join("\n             ")}\n`
+							: "") +
 						`- ${chalk.bold("thinking:")} ${snap.thinkingLevel}` +
 						(snap.supportsThinking
 							? brand.dim(` (available: ${snap.availableThinkingLevels.join(", ")})`)
