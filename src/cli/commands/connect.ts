@@ -3749,7 +3749,7 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/expand [n]")} — show a truncated tool result in full (1 = most recent)\n` +
 						`- ${chalk.bold("/search <query>")} — search this conversation, including tool results\n` +
 						`- ${chalk.bold("/search --regex <pattern>")} — same, treating the query as a regular expression\n` +
-						`- ${chalk.bold("/export [full]")} — write this transcript to a Markdown file (secrets redacted; \`full\` keeps whole tool results)\n` +
+						`- ${chalk.bold("/export [full] [thinking]")} — write this transcript to a Markdown file (secrets redacted; \`full\` keeps whole tool results, \`thinking\` includes the model's reasoning)\n` +
 						`- ${chalk.bold("/rewind [n]")} — go back to one of your earlier messages (no arg = list; conversation only, never files)\n` +
 						`- ${chalk.bold("/flush")} — send everything you queued to the running turn right now\n` +
 						`- ${chalk.bold("/context")} — where this thread's context window is going\n` +
@@ -3904,7 +3904,24 @@ export async function wireConnectUi(
 				);
 			}
 			updateHeader();
-			void applySubscription();
+			// SWITCH THE VIEW, NOT JUST THE INPUT.
+			//
+			// Binding used to change where your typing GOES while leaving the
+			// previous thread's conversation on screen. You then read one thread
+			// and talked to another, with only the header line distinguishing
+			// them — and the header is the thing people stop seeing after a
+			// minute. `/new` has always cleared the region; binding to an
+			// EXISTING thread is the same context switch and needs the same
+			// treatment, plus the target's history rendered in place of what was
+			// there.
+			//
+			// Resubscribe FIRST so the gateway is already sending this thread's
+			// frames before we paint its transcript; otherwise a reply arriving
+			// mid-rebuild would be dropped by the off-lane guard.
+			void (async () => {
+				await applySubscription();
+				await doResume();
+			})();
 			return;
 		}
 
@@ -4290,7 +4307,24 @@ export async function wireConnectUi(
 				),
 			);
 			updateHeader();
-			void applySubscription();
+			// SWITCH THE VIEW, NOT JUST THE INPUT.
+			//
+			// Binding used to change where your typing GOES while leaving the
+			// previous thread's conversation on screen. You then read one thread
+			// and talked to another, with only the header line distinguishing
+			// them — and the header is the thing people stop seeing after a
+			// minute. `/new` has always cleared the region; binding to an
+			// EXISTING thread is the same context switch and needs the same
+			// treatment, plus the target's history rendered in place of what was
+			// there.
+			//
+			// Resubscribe FIRST so the gateway is already sending this thread's
+			// frames before we paint its transcript; otherwise a reply arriving
+			// mid-rebuild would be dropped by the off-lane guard.
+			void (async () => {
+				await applySubscription();
+				await doResume();
+			})();
 			return;
 		}
 
@@ -4818,9 +4852,26 @@ export async function wireConnectUi(
 		if (trimmed === "/export" || trimmed.startsWith("/export ")) {
 			editor.setText("");
 			const arg = trimmed === "/export" ? "" : trimmed.slice("/export ".length).trim();
-			const full = arg === "full";
-			if (arg && !full) {
-				insertBeforeEditor(new Text(`  ${brand.dim("usage: /export [full]")}`, 0, 0));
+			const words = arg ? arg.split(/\s+/) : [];
+			const full = words.includes("full");
+			// REASONING IS OPT-IN, AND UNTIL NOW IT WAS UNREACHABLE.
+			//
+			// The renderer has supported `includeThinking` since it was written,
+			// and nothing ever passed it — so the only way to see reasoning was to
+			// catch it live as it streamed. Miss it, or run with `/reasoning off`,
+			// and it was gone: there is no expand affordance in the TUI either.
+			//
+			// It stays opt-in rather than becoming the default. Reasoning is the
+			// largest single thing in a transcript, and it is the part most likely
+			// to contain something the operator would not choose to publish —
+			// which is exactly why the exporter excluded it by default to begin
+			// with. Asking for it is one word.
+			const includeThinking = words.includes("thinking");
+			const unknown = words.filter((w) => w !== "full" && w !== "thinking");
+			if (unknown.length > 0) {
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("usage: /export [full] [thinking]")}`, 0, 0),
+				);
 				tui.requestRender();
 				return;
 			}
@@ -4838,6 +4889,7 @@ export async function wireConnectUi(
 				const home = os.homedir();
 				const rendered = renderTranscriptMarkdown(messages, {
 					full,
+					includeThinking,
 					sessionKey: boundSessionKey,
 					now: () => at,
 					// Per-block redaction BEFORE truncation. A PEM key clipped at 2000

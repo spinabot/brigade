@@ -25,6 +25,7 @@
  */
 
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
+import { extractReasoningTokens } from "../agents/usage/reasoning-tokens.js";
 import { requestForcedCompaction } from "../agents/compaction/force-request.js";
 import { createServer as createTcpServer } from "node:net";
 import { pathToFileURL } from "node:url";
@@ -2962,15 +2963,22 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				reasoningTracker.beginTurn(agentIdForTurn, sessionKeyForTurn);
 			} else if (piEvent.type === "message_update") {
 				usageLedger.observePartial(agentIdForTurn, sessionKeyForTurn, (piEvent as any).message?.usage);
-				// Reasoning tokens, when the backend reports them. Pi folds them into
-				// `output` for its own providers, but Brigade's own transports read
-				// the raw relayed API frames and can carry the breakdown. Absent
-				// stays absent — the tracker ignores non-numbers, and the renderer
-				// omits the figure rather than printing a zero it cannot vouch for.
+				// Reasoning tokens, normalised across every provider shape.
+				//
+				// This used to read `usage.reasoningTokens` — a field Pi's `Usage`
+				// does not declare — through an `as any`, so it resolved for
+				// exactly one transport and silently to `undefined` everywhere
+				// else. `extractReasoningTokens` knows the Anthropic, OpenAI,
+				// Gemini and flat spellings, so any backend that reports the figure
+				// is read without a per-provider branch here.
+				//
+				// Absent stays absent: the tracker ignores non-numbers and the
+				// renderer falls back to reasoning VOLUME rather than printing a
+				// zero it cannot vouch for.
 				reasoningTracker.setTokens(
 					agentIdForTurn,
 					sessionKeyForTurn,
-					(piEvent as any).message?.usage?.reasoningTokens,
+					extractReasoningTokens((piEvent as any).message?.usage),
 				);
 				// Drive the live reasoning phase from the INNER streaming event.
 				// Pi carries `thinking_start` / `thinking_delta` / `thinking_end`
@@ -6540,6 +6548,36 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// wait on the npm registry, and an offline machine must boot in silence. The
 	// result rides the next state snapshot to every attached client, which ASKS the
 	// operator — we never update anything on our own. See `core/update-check.ts`.
+	// RE-CHECK PERIODICALLY, NOT ONCE AT BOOT.
+	//
+	// This ran exactly once, at startup, which makes the answer wrong for the
+	// normal case: a gateway that has been up for days booted BEFORE the release
+	// it is being asked about. `latestUpdate` stays `undefined`, and `/update`
+	// answers "You're on the latest published version" about a version that is
+	// no longer the latest — confidently, and self-reinforcingly, since the
+	// longer it runs the staler it gets. Observed with 1.35.1 published and
+	// 1.35.0 installed.
+	//
+	// Six hours is well under the interval at which anyone would notice a missed
+	// release, and it is one HEAD-ish request to the npm registry — negligible
+	// beside a daemon that streams tokens all day. `unref` so a pending timer can
+	// never hold the process open, and the check never rejects, so a laptop that
+	// is offline for a week simply keeps the last answer it had.
+	const UPDATE_RECHECK_MS = 6 * 60 * 60 * 1000;
+	const updateRecheck = setInterval(() => {
+		void checkForUpdate()
+			.then((found) => {
+				if (!found || found.latest === latestUpdate?.latest) return;
+				latestUpdate = found;
+				broadcastStateAllBindings();
+			})
+			.catch(() => {
+				/* never rejects; belt for a future refactor */
+			});
+	}, UPDATE_RECHECK_MS);
+	updateRecheck.unref?.();
+	disposeHandlers.push(() => clearInterval(updateRecheck));
+
 	void checkForUpdate()
 		.then((found) => {
 			if (!found) return;

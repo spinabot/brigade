@@ -127,3 +127,53 @@ test("a completed phase uses the duration carried on the state", () => {
 	});
 	assert.equal(line, "Thought for 12s · 4.2k reasoning tokens · provider summary");
 });
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Reasoning VOLUME when the token count is unavailable.
+ *
+ * A reasoning-token count reaches Brigade from exactly one backend —
+ * `claude-cli`, which parses `output_tokens_details.thinking_tokens` from the
+ * binary's own stream. Pi's `Usage` has no `reasoningTokens` field, and Pi
+ * folds reasoning tokens into `output`, so every Pi-native provider reports
+ * none.
+ *
+ * Reported live: the same model showed `400 reasoning tokens` on claude-cli
+ * and nothing at all on OpenRouter, with no explanation for the difference.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+test("falls back to reasoning VOLUME when no token count is reported", () => {
+	const line = formatReasoningLine({
+		state: { active: false, visibility: "summary", chars: 4200, durationMs: 12_000 },
+	});
+	assert.match(line ?? "", /4\.2k chars of reasoning/);
+	assert.ok(!/reasoning tokens/.test(line ?? ""), "must not imply a token count it lacks");
+});
+
+test("a real token count still wins over the volume fallback", () => {
+	const line = formatReasoningLine({
+		state: { active: false, visibility: "summary", tokens: 400, chars: 4200, durationMs: 12_000 },
+	});
+	assert.match(line ?? "", /400 reasoning tokens/);
+	assert.ok(!/chars of reasoning/.test(line ?? ""), "tokens are the better measure; show one, not both");
+});
+
+test("neither is invented when nothing was measured", () => {
+	// An omitted-but-billed phase: real duration, no text, no count. Printing a
+	// zero for either would claim a measurement we do not have.
+	const line = formatReasoningLine({
+		state: { active: false, visibility: "hidden", chars: 0, durationMs: 15_000 },
+	});
+	assert.ok(!/reasoning tokens/.test(line ?? ""));
+	assert.ok(!/chars of reasoning/.test(line ?? ""));
+	assert.match(line ?? "", /not exposed by this model/);
+});
+
+test("volume shows DURING an active phase, so a long think visibly progresses", () => {
+	// The property tokens lack: usage arrives at message end, chars stream.
+	const line = formatReasoningLine({
+		state: { active: true, visibility: "summary", chars: 1500, startedAt: Date.now() - 5000 },
+		now: Date.now(),
+	});
+	assert.match(line ?? "", /Thinking/);
+	assert.match(line ?? "", /1\.5k chars of reasoning/);
+});

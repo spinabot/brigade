@@ -168,3 +168,45 @@ test("redaction runs before truncation, not after", () => {
 	});
 	assert.equal(sawLength, 9000, "the redactor saw a clipped body — ordering is wrong");
 });
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * `includeThinking` was supported by this renderer from the day it was
+ * written, and no caller ever passed it — so reasoning could not be exported
+ * at all. A code-quality bot caught the flag being parsed in the TUI and
+ * dropped on the floor, which is the same "built but never called" shape this
+ * whole batch of work exists to remove.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+test("reasoning is excluded by default", () => {
+	const md = renderTranscriptMarkdown(
+		[
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "SECRET-CHAIN-OF-THOUGHT" },
+					{ type: "text", text: "the answer" },
+				],
+			} as never,
+		],
+		{ now: () => new Date(0) },
+	);
+	assert.ok(!md.includes("SECRET-CHAIN-OF-THOUGHT"), "thinking must not leak into a default export");
+	assert.match(md, /the answer/);
+});
+
+test("reasoning is included when asked for, and the banner says so", () => {
+	const md = renderTranscriptMarkdown(
+		[
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "SECRET-CHAIN-OF-THOUGHT" },
+					{ type: "text", text: "the answer" },
+				],
+			} as never,
+		],
+		{ includeThinking: true, now: () => new Date(0) },
+	);
+	assert.match(md, /SECRET-CHAIN-OF-THOUGHT/);
+	assert.match(md, /Includes the model's reasoning/, "the artifact must disclose what it carries");
+});

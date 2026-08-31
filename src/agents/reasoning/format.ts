@@ -118,6 +118,27 @@ export function formatReasoningLine(input: ReasoningLineInput): string | undefin
 	// Absent must never render as `0`: that would claim a measurement we do not have.
 	if (typeof s.tokens === "number" && s.tokens > 0) {
 		parts.push(`${formatTokens(s.tokens)} reasoning tokens`);
+	} else if (typeof s.chars === "number" && s.chars > 0) {
+		// FALL BACK TO WHAT WE ACTUALLY MEASURED.
+		//
+		// A reasoning-token COUNT reaches Brigade from exactly one backend:
+		// `claude-cli`, which parses `output_tokens_details.thinking_tokens` out
+		// of the binary's own stream and attaches it. Every Pi-native provider —
+		// OpenRouter, the Anthropic API, OpenAI — reports nothing, because Pi
+		// folds reasoning tokens into `output` before Brigade sees a usage
+		// record. `Usage` has no `reasoningTokens` field at all.
+		//
+		// So on most backends the line read `Thinking 2m 44s… · provider summary`
+		// while the same model on `claude-cli` read `… · 400 reasoning tokens ·
+		// provider summary`, with nothing to explain the difference. The operator
+		// reasonably reads the gap as a bug.
+		//
+		// Characters of reasoning text ARE counted, on every backend, from the
+		// deltas as they stream. It is a different unit and it is labelled as
+		// one — never dressed up as a token count we do not have. It also has a
+		// property tokens lack: it grows LIVE during the phase, so a long think
+		// visibly progresses instead of sitting on a bare timer.
+		parts.push(`${formatTokens(s.chars)} chars of reasoning`);
 	}
 
 	const suffix = reasoningSuffix(s.visibility);
