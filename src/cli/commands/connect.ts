@@ -1276,8 +1276,39 @@ export async function wireConnectUi(
 	// Pi-TUI's slash-command spec: `name` is the command WITHOUT the leading
 	// `/`. Pi adds the `/` itself on accept; including it here produces
 	// `//reasoning` instead of `/reasoning`.
+	// ─────────────────────────────────────────────────────────────────────────
+	// THIS LIST IS NOT COSMETIC.
+	//
+	// It drives autocomplete AND `isKnownSlashCommand`, which is the gate that
+	// decides whether something typed mid-turn is a COMMAND or is steering text
+	// for the model. A handled command missing from here is therefore not merely
+	// undiscoverable — it stops working mid-turn, silently, and gets delivered
+	// to the model as prose instead.
+	//
+	// Nine commands were in exactly that state: `/switch`, `/clip` and `/cancel`
+	// appeared in no list at all, and `/agents`, `/delete`, `/mute`, `/org`,
+	// `/rename` and `/sessions` were documented in `/help` while absent here —
+	// advertised, and unusable at the moment an operator would reach for them.
+	//
+	// `connect-slash-commands.test.ts` reads the handler chain out of this file
+	// and fails if any command it dispatches is not registered here, so the
+	// three lists cannot drift apart again unnoticed.
+	// ─────────────────────────────────────────────────────────────────────────
 	const SLASH_COMMANDS: SlashCommand[] = [
 		{ name: "help", description: "show all slash commands" },
+		{ name: "switch", description: "switch the TUI to another session", argumentHint: "<session-key>" },
+		{ name: "cancel", description: "cancel the pending prompt (provider key entry)" },
+		{ name: "clip", description: "copy the last reply to your clipboard (alias of /clipboard)" },
+		{ name: "agents", description: "list every agent the gateway knows about" },
+		{ name: "sessions", description: "list live sessions (bound agent or all)", argumentHint: "[--all]" },
+		{ name: "rename", description: "name this thread (no argument clears the name)", argumentHint: "[<name>]" },
+		{
+			name: "delete",
+			description: "permanently delete a thread + transcript (repeat to confirm)",
+			argumentHint: "<session-key>",
+		},
+		{ name: "mute", description: "unsubscribe from an agent id or session key", argumentHint: "<id|key>" },
+		{ name: "org", description: "show the Pride hierarchy chart", argumentHint: "[<agent-id>|--departments]" },
 		{ name: "exit", description: "quit Brigade connect" },
 		{ name: "quit", description: "quit Brigade connect" },
 		{ name: "abort", description: "abort the in-flight turn (same as Ctrl+C)" },
