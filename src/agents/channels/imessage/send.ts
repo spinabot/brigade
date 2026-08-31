@@ -90,8 +90,16 @@ function resolveMessageId(result: unknown): string | null {
  * already refused is worse than not sending it.
  */
 export function isThreadingUnsupported(err: unknown): boolean {
-	const m = (err instanceof Error ? err.message : String(err)).toLowerCase();
-	return m.includes("reply_to") && (m.includes("bridge transport") || m.includes("threaded replies"));
+	const m = err instanceof Error ? err.message : String(err);
+	// Pattern widened to match OpenClaw's `isThreadedReplyUnsupportedError`,
+	// which drives the same fallback against the same `imsg` binary and has
+	// therefore already met the error shapes this one had not. The narrower
+	// first version required the literal `reply_to`, so a bridge that said only
+	// "threaded replies are unavailable" would have been treated as a real
+	// failure and lost the message — the exact bug being fixed.
+	return /reply_to requires bridge transport|cannot send threaded repl|threaded repl(?:y|ies)\b.*(?:unsupported|not supported|requires|unavailable)|requires bridge transport/iu.test(
+		m,
+	);
 }
 
 export async function sendMessageIMessage(

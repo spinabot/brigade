@@ -268,6 +268,22 @@ describe("sendMessageIMessage — threaded-reply fallback", () => {
 		assert.equal(client.attempts.length, 1, "failed once, did not retry");
 	});
 
+	// Error shapes the narrow first version missed. OpenClaw's equivalent
+	// predicate matches all of these against the same `imsg` binary.
+	for (const msg of [
+		"cannot send threaded replies",
+		"threaded replies are unavailable",
+		"threaded reply not supported on this transport",
+		"requires bridge transport",
+	]) {
+		it(`recognises: ${msg}`, async () => {
+			const client = new ReplyRejectingClient(msg);
+			const res = await sendMessageIMessage("+15551234567", "hi", { client, replyToId: "p:1" });
+			assert.equal(res.messageId, "M-9", "fell back to a flat send");
+			assert.equal(client.attempts.length, 2);
+		});
+	}
+
 	it("does not retry when there was no reply_to to drop", async () => {
 		const client = new ReplyRejectingClient("reply_to requires bridge transport");
 		const res = await sendMessageIMessage("+15551234567", "hi", { client });
