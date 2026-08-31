@@ -674,6 +674,22 @@ export async function wireConnectUi(
 	 * out. Reset from the authoritative snapshot exactly like `deltaText`.
 	 */
 	const deltaThinking = new Map<string, string>();
+	/**
+	 * What is QUEUED for the running turn, from Pi's `queue_update`.
+	 *
+	 * Pi emits this whenever the queue changes, Brigade forwards it, the
+	 * protocol declares it — and the TUI dropped it on the floor. The result:
+	 * each message printed a one-line "queued" confirmation as it went in, and
+	 * then nothing. Send three, look away, come back, and there was no way to
+	 * answer "what is still waiting?" short of remembering.
+	 *
+	 * That matters most in exactly the situation the queue exists for: a long
+	 * turn you have stacked work behind. `/flush` acts on this queue, so an
+	 * operator deciding whether to flush needs to see it first.
+	 */
+	let queuedSteering: readonly string[] = [];
+	let queuedFollowUp: readonly string[] = [];
+
 	/** The last completed assistant reply, for `/copy`. Plain text, unstyled. */
 	let lastReplyText = "";
 
@@ -954,8 +970,17 @@ export async function wireConnectUi(
 	const updateHeader = (extra?: string): void => {
 		const provider = lastSnapshot?.provider ?? "?";
 		const modelId = lastSnapshot?.modelId ?? "?";
+		// TWO NUMBERS THAT MEAN DIFFERENT THINGS, SO SAY WHICH IS WHICH.
+		//
+		// This one is CUMULATIVE spend for the thread; the `ctx` figure beside it
+		// is current window occupancy. They diverge fast — every turn re-sends
+		// the history, so a 68k-token context routinely sits next to 285k billed
+		// — and a bare `285,589 tok` reads as "my context is 285k", which is both
+		// alarming and false. Every comparable harness has an open issue for
+		// exactly this conflation (codex #21799, #3630; claude-code #13765).
+		// `billed` is one word and removes the ambiguity entirely.
 		const tokens = lastSnapshot && (lastSnapshot.totalTokensIn + lastSnapshot.totalTokensOut) > 0
-			? ` · ${(lastSnapshot.totalTokensIn + lastSnapshot.totalTokensOut).toLocaleString()} tok`
+			? ` · ${(lastSnapshot.totalTokensIn + lastSnapshot.totalTokensOut).toLocaleString()} billed`
 			: "";
 		// COST. Four situations used to render as the same `$0.0000`: a genuinely
 		// cheap metered turn, a subscription with no marginal cost, local
@@ -992,6 +1017,36 @@ export async function wireConnectUi(
 			const colored = pct >= 75 ? brand.amber(`${pct}% ctx`) : brand.dim(`${pct}% ctx`);
 			usageStr = ` · ${colored}`;
 		}
+
+		// THINKING LEVEL — the setting, as distinct from the live phase below.
+		//
+		// It was only visible inside `/usage`, which is the wrong place for it:
+		// `/thinking high` is a deliberate, sticky, cost-bearing choice, and the
+		// one thing an operator wants afterwards is confirmation that it took and
+		// is still in force three days later. Reading it back required running a
+		// command, so in practice nobody did, and there was no way to notice a
+		// thread silently running at a different effort than intended.
+		//
+		// Rendered only when the model actually reasons and the level is above
+		// `off`: on a non-reasoning model the field is meaningless noise, and
+		// `off` is the default, which does not earn header space.
+		const thinkingLevel =
+			lastSnapshot?.supportsThinking === true &&
+			typeof lastSnapshot.thinkingLevel === "string" &&
+			lastSnapshot.thinkingLevel !== "off"
+				? ` · ${brand.dim(`${lastSnapshot.thinkingLevel} effort`)}`
+				: "";
+
+		// QUEUE DEPTH. Only while something is actually waiting.
+		//
+		// The per-message "queued" confirmations scroll away; this is the standing
+		// answer to "what is still waiting?", and it is what `/flush` acts on, so
+		// an operator deciding whether to flush can see the queue first.
+		const queuedTotal = queuedSteering.length + queuedFollowUp.length;
+		const queuedStr =
+			queuedTotal > 0
+				? ` · ${brand.amber(`${queuedTotal} queued`)}`
+				: "";
 
 		// REASONING. The live phase, and what kind of reasoning this backend
 		// actually exposes — a provider summary is not the model's own thinking,
@@ -1059,7 +1114,7 @@ export async function wireConnectUi(
 		// The live readout. Pinned under the editor, so it survives the viewport
 		// scroll AND is cheap to repaint.
 		footer.setText(
-			`  ${dot} ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${reasoningStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
+			`  ${dot} ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${thinkingLevel}${queuedStr}${reasoningStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
 		);
 	};
 
@@ -2444,6 +2499,16 @@ export async function wireConnectUi(
 				}
 				break;
 			}
+			case "queue_update": {
+				// Authoritative: Pi owns the queue, so this replaces local state
+				// rather than incrementing it. `/flush` drains it and Pi emits an
+				// empty update, which is what clears the indicator.
+				const q = event as { steering?: readonly string[]; followUp?: readonly string[] };
+				queuedSteering = Array.isArray(q.steering) ? q.steering : [];
+				queuedFollowUp = Array.isArray(q.followUp) ? q.followUp : [];
+				updateHeader();
+				break;
+			}
 			case "turn_end": {
 				// Intentionally a no-op. Token totals (totalTokensIn / Out /
 				// CostUsd) are accumulated SERVER-SIDE in server.ts:156-163
@@ -2657,6 +2722,11 @@ export async function wireConnectUi(
 				break;
 			}
 			case "agent_end": {
+				// The turn is over, so anything queued has been delivered. Clearing
+				// here as well as on `queue_update` means a missed final event can
+				// never strand a phantom "2 queued" on an idle session.
+				queuedSteering = [];
+				queuedFollowUp = [];
 				if (isChildTurn) {
 					// The child is done. Its final text has already streamed; the parent's
 					// `✓ spawn_agent` chip lands when the tool returns. Touch no parent state —
@@ -3623,6 +3693,35 @@ export async function wireConnectUi(
 			const agentForNew = boundAgentId ?? lastSnapshot?.agentId ?? "main";
 			const freshKey = `agent:${agentForNew}:t-${randomUUID().slice(0, 8)}`;
 			boundSessionKey = freshKey;
+			// ZERO THE USAGE FIGURES OPTIMISTICALLY.
+			//
+			// Accounting is per (agent, sessionKey) since v1.34.0, so the gateway
+			// WILL report zero for a brand-new key — but only once the `subscribe`
+			// below round-trips and pushes a fresh snapshot. Until then the header
+			// paints from the previous thread's snapshot, and an operator who
+			// looks in that window sees the old thread's totals under a new
+			// thread's banner. The reasonable conclusion is the one issue #136
+			// drew: "is my context being carried over?"
+			//
+			// It is not — a fresh key has no transcript and no ledger entry — so
+			// this is a display race, and the honest fix is to stop displaying a
+			// number we already know is about to be replaced by zero. Cheap, and
+			// it also covers the case where `boundAgentId` is not yet set, where
+			// the server pushes no snapshot at all and the stale figure would
+			// otherwise persist until the first reply.
+			if (lastSnapshot) {
+				lastSnapshot = {
+					...lastSnapshot,
+					totalTokensIn: 0,
+					totalTokensOut: 0,
+					totalCostUsd: 0,
+					contextUsagePercent: null,
+					contextTokens: null,
+					contextWindow: lastSnapshot.contextWindow,
+					messageCount: 0,
+					...(lastSnapshot.reasoning ? { reasoning: undefined } : {}),
+				} as typeof lastSnapshot;
+			}
 			clearTranscriptRegion();
 			insertBeforeEditor(
 				new Text(
@@ -5094,10 +5193,25 @@ export async function wireConnectUi(
 		// can take a while on a big transcript, beyond the default 60s.
 		if (trimmed === "/compact") {
 			editor.setText("");
-			insertBeforeEditor(new Text(`  ${brand.dim("Compacting…")}`, 0, 0));
+			// Only claim to be compacting when a turn is actually live. Between
+			// turns there is no session to act on, so the gateway records the ask
+			// and the next turn honours it — and saying "Compacting…" for that
+			// would be a second untruth on top of the one this replaced.
+			const compactingNow = isAgentRunning;
+			if (compactingNow) {
+				insertBeforeEditor(new Text(`  ${brand.dim("Compacting…")}`, 0, 0));
+			}
 			try {
 				await client.request("compact", withBinding(), { timeoutMs: 0 });
-				insertBeforeEditor(new Text(`  ${brand.amber("✓")} ${brand.dim("Compacted")}`, 0, 0));
+				insertBeforeEditor(
+					new Text(
+						compactingNow
+							? `  ${brand.amber("✓")} ${brand.dim("Compacted")}`
+							: `  ${brand.amber("✓")} ${brand.dim("will compact when you send your next message — compaction needs a live turn to act on")}`,
+						0,
+						0,
+					),
+				);
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				insertBeforeEditor(

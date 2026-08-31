@@ -329,6 +329,24 @@ const MUTATIONS = [
     tests: "src/agents/tools/make-document-tool.test.ts",
   },
 
+  // ── Manual compaction ──
+  {
+    claim: "an explicit /compact is honoured exactly once",
+    file: "src/agents/compaction/force-request.ts",
+    find: "\treturn requested.delete(sessionKey);",
+    replace: "\treturn requested.has(sessionKey);",
+    tests: "src/agents/compaction/force-request.test.ts",
+  },
+  {
+    claim: "an explicit /compact overrides the fill threshold",
+    file: "src/agents/agent-loop.ts",
+    find: "  if (!decision.shouldRecommendCompaction && !args.force) {",
+    replace: "  if (!decision.shouldRecommendCompaction) {",
+    tests: "src/agents/compaction/force-request.test.ts",
+    expectMissed: true,
+    reason: "the force flag's effect is inside runSingleTurn, which has no unit-level harness; the module's one-shot semantics are covered, the turn wiring is not",
+  },
+
   // ── Reasoning honesty ──
   {
     claim: "an empty reasoning block cannot pin a turn to hidden",

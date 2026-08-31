@@ -28,6 +28,7 @@ import {
   createAgentSession,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { consumeForcedCompaction } from "./compaction/force-request.js";
 import { warnUnhandledPiDroppedFields } from "./tools/pi-tool-boundary.js";
 import fs from "node:fs";
 
@@ -2032,6 +2033,8 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // The incoming user message (with any drained prefixes) that prompt()
     // will send below; maybeTriggerCompaction runs BEFORE that send.
     incomingMessage: scrubbedMessage,
+    // An explicit `/compact` issued while this thread was idle. One-shot.
+    force: consumeForcedCompaction(resolved.sessionKey),
     ...(recallOrigin ? { origin: recallOrigin } : {}),
   });
 
@@ -3297,6 +3300,17 @@ async function maybeTriggerCompaction(args: {
   /** The user message about to be sent this turn (prompt() runs AFTER this
    *  check), folded in so the estimate reflects the true pre-prompt fill. */
   incomingMessage?: string;
+  /**
+   * The operator asked for this explicitly, so compact regardless of fill.
+   *
+   * `/compact` between turns cannot act immediately — a session only exists
+   * inside a turn — so the gateway records the request and it lands here. An
+   * explicit ask must not be second-guessed by the threshold: someone who
+   * types `/compact` at 40% has a reason (a long tool dump they want out of
+   * the window before asking the next question), and silently declining is how
+   * a command becomes folklore.
+   */
+  force?: boolean;
 }): Promise<void> {
   // WHY THIS TRIGGER MUST NOT USE PROVIDER-REPORTED USAGE.
   //
@@ -3332,7 +3346,7 @@ async function maybeTriggerCompaction(args: {
     contextWindowTokens: contextWindow,
     estimatedUsageTokens: estimatedTokens,
   });
-  if (!decision.shouldRecommendCompaction) {
+  if (!decision.shouldRecommendCompaction && !args.force) {
     log.debug("compaction not needed", {
       agentId: args.agentId,
       sessionId: args.sessionId,
