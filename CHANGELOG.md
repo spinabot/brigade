@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.36.0](https://github.com/spinabot/brigade/compare/brigade-v1.35.3...brigade-v1.36.0) (2026-08-31)
+
+
+### Features
+
+* **imessage:** show a typing indicator while the agent thinks ([5751c67](https://github.com/spinabot/brigade/commit/5751c67889f6a00519ec0e08b204187177889c06))
+* **providers:** add OrcaRouter as a first-class provider ([e89f76c](https://github.com/spinabot/brigade/commit/e89f76cab07c2306c105c07be0cd331403395ba3))
+
+
+### Bug Fixes
+
+* **catalog:** OrcaRouter entry was missing the required billing field ([f707b68](https://github.com/spinabot/brigade/commit/f707b6844ab37c83ffd9d36702e14e4df15d6815))
+* **catalog:** OrcaRouter entry was missing the required billing field ([e508a76](https://github.com/spinabot/brigade/commit/e508a76350efef0f255bfc3925c713e6f02fdfc7))
+* **channels:** close four dead-setting bugs, and the DM/group misclassification behind them ([ff7a8e5](https://github.com/spinabot/brigade/commit/ff7a8e5ea1519bceefc63d1bf317fc6e3e4b46e3))
+* **channels:** four dead settings, a DM/group misclassification, and the missing iMessage typing indicator ([c83973f](https://github.com/spinabot/brigade/commit/c83973fa0d47d94692abb1c3d3018ca6c0dc0083))
+* **update:** the update command warned about a stale install on every success, and answered from cache ([e377d63](https://github.com/spinabot/brigade/commit/e377d63bda2c462621caad78d606ff54b88404d0))
+* **update:** warned about a stale install on every success, and answered from cache ([6973de4](https://github.com/spinabot/brigade/commit/6973de46b70d35f60f45e82e9a545d3f6387de78))
+
 ## [1.35.3](https://github.com/spinabot/brigade/compare/brigade-v1.35.2...brigade-v1.35.3) (2026-08-31)
 
 
