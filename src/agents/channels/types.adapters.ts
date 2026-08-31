@@ -181,7 +181,15 @@ export type ChannelGatewayAdapter<ResolvedAccount = unknown> = {
 	startAccount?: (ctx: ChannelGatewayContext<ResolvedAccount>) => Promise<unknown>;
 	/** Tear down the listener for this account. */
 	stopAccount?: (ctx: ChannelGatewayContext<ResolvedAccount>) => Promise<void>;
-	/** Tear down + purge creds for this account. */
+	/**
+	 * Tear down + purge creds for this account.
+	 *
+	 * NOTE: the Brigade runtime does not invoke this yet — see
+	 * `logoutChannelAccount` in `channel-plugin-manager.ts` for exactly what
+	 * has to change first. Implement it if your plugin has a real logout
+	 * (revoking a token at the provider); do not rely on it being called.
+	 * `ChannelLogoutContext.purge` is likewise honoured by no plugin today.
+	 */
 	logoutAccount?: (ctx: ChannelLogoutContext<ResolvedAccount>) => Promise<ChannelLogoutResult>;
 	/**
 	 * Paths the gateway HTTP server should NOT require operator auth for
