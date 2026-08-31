@@ -25,6 +25,7 @@
  */
 
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
+import { requestForcedCompaction } from "../agents/compaction/force-request.js";
 import { createServer as createTcpServer } from "node:net";
 import { pathToFileURL } from "node:url";
 
@@ -4435,9 +4436,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				}
 				const liveSession = liveSessionsByKey.get(targetKey);
 				if (!liveSession) {
-					throw new Error(
-						"nothing to compact yet — compaction runs during a turn and auto-triggers near the context limit",
-					);
+					// NO LIVE SESSION — DEFER, DO NOT REFUSE.
+					//
+					// A session only exists inside a turn, and the moment a person
+					// types `/compact` is precisely when they are idle, looking at a
+					// full context bar. Failing there made an advertised command
+					// unusable exactly when it was wanted, and told the operator
+					// "nothing to compact" about a thread that plainly had plenty.
+					//
+					// Record the request instead: the next turn compacts before it
+					// sends, regardless of fill, and clears the flag. The window is
+					// reclaimed before the operator's next message is processed,
+					// which is the outcome they were asking for.
+					requestForcedCompaction(targetKey);
+					return undefined as ResponseFor[M];
 				}
 				await (liveSession as AgentSession & { compact?: () => Promise<unknown> }).compact?.();
 				broadcastStateAllBindings();

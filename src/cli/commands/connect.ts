@@ -674,6 +674,22 @@ export async function wireConnectUi(
 	 * out. Reset from the authoritative snapshot exactly like `deltaText`.
 	 */
 	const deltaThinking = new Map<string, string>();
+	/**
+	 * What is QUEUED for the running turn, from Pi's `queue_update`.
+	 *
+	 * Pi emits this whenever the queue changes, Brigade forwards it, the
+	 * protocol declares it — and the TUI dropped it on the floor. The result:
+	 * each message printed a one-line "queued" confirmation as it went in, and
+	 * then nothing. Send three, look away, come back, and there was no way to
+	 * answer "what is still waiting?" short of remembering.
+	 *
+	 * That matters most in exactly the situation the queue exists for: a long
+	 * turn you have stacked work behind. `/flush` acts on this queue, so an
+	 * operator deciding whether to flush needs to see it first.
+	 */
+	let queuedSteering: readonly string[] = [];
+	let queuedFollowUp: readonly string[] = [];
+
 	/** The last completed assistant reply, for `/copy`. Plain text, unstyled. */
 	let lastReplyText = "";
 
@@ -777,6 +793,45 @@ export async function wireConnectUi(
 		asstKeyByDepth.clear();
 		asstContinuation.clear();
 	};
+	/**
+	 * Why turning reasoning ON may still show you nothing.
+	 *
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * THE CONFUSION THIS REMOVES
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * `reasoning: on` describes a RENDERER preference — "show me reasoning text
+	 * if any arrives". It says nothing about whether any will. Three ordinary
+	 * situations produce an empty result, and the toggle looked identical in all
+	 * of them:
+	 *
+	 *   • the model does not reason at all (most fast/flash models);
+	 *   • the model reasons, but this thread's effort is `off`;
+	 *   • the model reasons and the provider does not expose the text
+	 *     (Anthropic's current default: billed, and omitted).
+	 *
+	 * An operator who flips the toggle and sees nothing reasonably concludes the
+	 * toggle is broken. It is not — there is nothing to show, and the honest
+	 * thing is to say which of the three it is at the moment they ask.
+	 *
+	 * Returns "" when reasoning genuinely is expected, so the common case stays
+	 * a clean one-liner.
+	 */
+	const reasoningAvailabilityNote = (): string => {
+		const snap = lastSnapshot;
+		if (!snap) return "";
+		if (snap.supportsThinking !== true) {
+			return "  — this model does not expose reasoning, so nothing will appear";
+		}
+		if (typeof snap.thinkingLevel === "string" && snap.thinkingLevel === "off") {
+			return "  — thinking is off for this thread; set a level with /thinking";
+		}
+		const vis = snap.reasoning?.visibility;
+		if (vis === "hidden" || vis === "redacted") {
+			return `  — ${describeReasoningVisibility(vis)}`;
+		}
+		return "";
+	};
+
 	/** Take the "thinking" spinner down. Called only when a paint is about to land. */
 	const dismissLoader = (): void => {
 		if (!activeLoader) return;
@@ -939,7 +994,7 @@ export async function wireConnectUi(
 			new Text(
 				`  ${brand.dim(
 					next
-						? "reasoning: on  (ctrl+t to hide)"
+						? `reasoning: on  (ctrl+t to hide)${reasoningAvailabilityNote()}`
 						: "reasoning: off (ctrl+t to show)",
 				)}`,
 				0,
@@ -954,8 +1009,17 @@ export async function wireConnectUi(
 	const updateHeader = (extra?: string): void => {
 		const provider = lastSnapshot?.provider ?? "?";
 		const modelId = lastSnapshot?.modelId ?? "?";
+		// TWO NUMBERS THAT MEAN DIFFERENT THINGS, SO SAY WHICH IS WHICH.
+		//
+		// This one is CUMULATIVE spend for the thread; the `ctx` figure beside it
+		// is current window occupancy. They diverge fast — every turn re-sends
+		// the history, so a 68k-token context routinely sits next to 285k billed
+		// — and a bare `285,589 tok` reads as "my context is 285k", which is both
+		// alarming and false. Every comparable harness has an open issue for
+		// exactly this conflation (codex #21799, #3630; claude-code #13765).
+		// `billed` is one word and removes the ambiguity entirely.
 		const tokens = lastSnapshot && (lastSnapshot.totalTokensIn + lastSnapshot.totalTokensOut) > 0
-			? ` · ${(lastSnapshot.totalTokensIn + lastSnapshot.totalTokensOut).toLocaleString()} tok`
+			? ` · ${(lastSnapshot.totalTokensIn + lastSnapshot.totalTokensOut).toLocaleString()} billed`
 			: "";
 		// COST. Four situations used to render as the same `$0.0000`: a genuinely
 		// cheap metered turn, a subscription with no marginal cost, local
@@ -992,6 +1056,36 @@ export async function wireConnectUi(
 			const colored = pct >= 75 ? brand.amber(`${pct}% ctx`) : brand.dim(`${pct}% ctx`);
 			usageStr = ` · ${colored}`;
 		}
+
+		// THINKING LEVEL — the setting, as distinct from the live phase below.
+		//
+		// It was only visible inside `/usage`, which is the wrong place for it:
+		// `/thinking high` is a deliberate, sticky, cost-bearing choice, and the
+		// one thing an operator wants afterwards is confirmation that it took and
+		// is still in force three days later. Reading it back required running a
+		// command, so in practice nobody did, and there was no way to notice a
+		// thread silently running at a different effort than intended.
+		//
+		// Rendered only when the model actually reasons and the level is above
+		// `off`: on a non-reasoning model the field is meaningless noise, and
+		// `off` is the default, which does not earn header space.
+		const thinkingLevel =
+			lastSnapshot?.supportsThinking === true &&
+			typeof lastSnapshot.thinkingLevel === "string" &&
+			lastSnapshot.thinkingLevel !== "off"
+				? ` · ${brand.dim(`${lastSnapshot.thinkingLevel} effort`)}`
+				: "";
+
+		// QUEUE DEPTH. Only while something is actually waiting.
+		//
+		// The per-message "queued" confirmations scroll away; this is the standing
+		// answer to "what is still waiting?", and it is what `/flush` acts on, so
+		// an operator deciding whether to flush can see the queue first.
+		const queuedTotal = queuedSteering.length + queuedFollowUp.length;
+		const queuedStr =
+			queuedTotal > 0
+				? ` · ${brand.amber(`${queuedTotal} queued`)}`
+				: "";
 
 		// REASONING. The live phase, and what kind of reasoning this backend
 		// actually exposes — a provider summary is not the model's own thinking,
@@ -1059,7 +1153,7 @@ export async function wireConnectUi(
 		// The live readout. Pinned under the editor, so it survives the viewport
 		// scroll AND is cheap to repaint.
 		footer.setText(
-			`  ${dot} ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${reasoningStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
+			`  ${dot} ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${thinkingLevel}${queuedStr}${reasoningStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
 		);
 	};
 
@@ -1292,6 +1386,42 @@ export async function wireConnectUi(
 			argumentHint: "[<agent-id>|--departments|--explain <from> <to>]",
 		},
 	];
+	/**
+	 * Is this submit a COMMAND rather than something to say to the model?
+	 *
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * WHY THIS GUARDS THE MID-TURN GATE
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * `handleSubmit` dispatches commands in source order, and the
+	 * `isAgentRunning` steer gate sits in the middle of that run. Everything
+	 * below it was therefore unreachable while a turn was streaming — and not
+	 * inertly: the text was sent to the MODEL as chat. Typing `/compact` during
+	 * a long turn did not compact anything, it told the assistant the word
+	 * "/compact".
+	 *
+	 * Nine commands were below the line — `/compact`, `/model`, `/provider`,
+	 * `/thinking`, `/switch`, `/update`, `/allow-all`, `/grant-skill`,
+	 * `/revoke-skill` — and the gate's own comment documented the hazard while
+	 * the fix was to keep hoisting individual handlers above it, which only
+	 * holds until the next one is added below.
+	 *
+	 * `/compact` is the sharpest case: its handler exists to act on a LIVE
+	 * session, so the one command that most needed to run mid-turn was the one
+	 * mid-turn made impossible.
+	 *
+	 * Checking membership here inverts that. Anything the operator could have
+	 * tab-completed reaches its handler whatever the turn is doing, and a
+	 * handler that genuinely cannot run mid-turn refuses in its own words
+	 * instead of being silently mailed to the model.
+	 */
+	const isKnownSlashCommand = (text: string): boolean => {
+		if (!text.startsWith("/")) return false;
+		// The word only, so `/model gpt-5` and `/model` both match.
+		const word = text.slice(1).split(/\s/, 1)[0]?.toLowerCase() ?? "";
+		if (!word) return false;
+		return SLASH_COMMANDS.some((c) => c.name.toLowerCase() === word);
+	};
+
 	editor.setAutocompleteProvider(new CombinedAutocompleteProvider(SLASH_COMMANDS, process.cwd()));
 
 	// `/provider` switches the model provider and can add an API-key provider
@@ -2444,6 +2574,16 @@ export async function wireConnectUi(
 				}
 				break;
 			}
+			case "queue_update": {
+				// Authoritative: Pi owns the queue, so this replaces local state
+				// rather than incrementing it. `/flush` drains it and Pi emits an
+				// empty update, which is what clears the indicator.
+				const q = event as { steering?: readonly string[]; followUp?: readonly string[] };
+				queuedSteering = Array.isArray(q.steering) ? q.steering : [];
+				queuedFollowUp = Array.isArray(q.followUp) ? q.followUp : [];
+				updateHeader();
+				break;
+			}
 			case "turn_end": {
 				// Intentionally a no-op. Token totals (totalTokensIn / Out /
 				// CostUsd) are accumulated SERVER-SIDE in server.ts:156-163
@@ -2657,6 +2797,11 @@ export async function wireConnectUi(
 				break;
 			}
 			case "agent_end": {
+				// The turn is over, so anything queued has been delivered. Clearing
+				// here as well as on `queue_update` means a missed final event can
+				// never strand a phantom "2 queued" on an idle session.
+				queuedSteering = [];
+				queuedFollowUp = [];
 				if (isChildTurn) {
 					// The child is done. Its final text has already streamed; the parent's
 					// `✓ spawn_agent` chip lands when the tool returns. Touch no parent state —
@@ -3084,36 +3229,69 @@ export async function wireConnectUi(
 			// defeat the commonest reason to switch (moving to a model that can see).
 			lastUserPrompt = outgoing;
 			lastUserAttachments = toPromptAttachments(attachments);
-			await client.request(
-				"prompt",
-				withBinding({
-					text: outgoing,
-					// Omitted entirely when nothing is attached, so a plain text turn is
-					// byte-identical on the wire to what a pre-attachment TUI sent.
-					...(attachments.length > 0
-						? { attachments: toPromptAttachments(attachments) }
-						: {}),
-				}),
-				{ timeoutMs: 0 },
-			);
+			// DISPATCH, DO NOT AWAIT THE TURN.
+			//
+			// `prompt` resolves only when the whole turn FINISHES (`timeoutMs: 0`,
+			// no deadline). Awaiting it here held `submitInFlight` — the
+			// re-entrancy guard in `editor.onSubmit` — for the entire turn, so
+			// every keystroke sent while the model was streaming hit
+			// `if (submitInFlight) return;` and was discarded in silence.
+			//
+			// That is why mid-turn input appeared to do nothing at all: no echo,
+			// no "queued" line, no command, no error. The steer/queue path below
+			// and every slash command were unreachable from the moment a turn
+			// started — not because the gate rejected them, but because the
+			// submit never got past the first line of the handler. The paths
+			// looked correct in review and in tests, because a test drives
+			// `handleSubmit` directly and never contends with the guard.
+			//
+			// The guard exists to stop two fast Enters sending the same text
+			// twice, which needs to cover the DISPATCH, not the turn's lifetime.
+			// Errors still surface — the same handler, attached to the promise —
+			// and the turn's progress was always frame-driven, never awaited.
+			void client
+				.request(
+					"prompt",
+					withBinding({
+						text: outgoing,
+						// Omitted entirely when nothing is attached, so a plain text turn is
+						// byte-identical on the wire to what a pre-attachment TUI sent.
+						...(attachments.length > 0
+							? { attachments: toPromptAttachments(attachments) }
+							: {}),
+					}),
+					{ timeoutMs: 0 },
+				)
+				.catch((err: unknown) => {
+					onSendFailed(err, attachments);
+				});
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
-			// RE-STAGE on failure. The files never reached the gateway, and silently
-			// discarding them would mean an operator who pasted an 8 MiB screenshot has
-			// to go and paste it again — without being told that they must. Re-arming is
-			// safe precisely because we say so.
-			if (attachments.length > 0) {
-				stagedAttachments = attachments;
-				renderAttachBar();
-				insertBeforeEditor(
-					new Text(
-						`  ${brand.dim(`${attachments.length} file${attachments.length === 1 ? " is" : "s are"} still staged — resend when you're ready.`)}`,
-						0,
-						0,
-					),
-				);
-			}
+			onSendFailed(err, attachments);
+		}
+	};
+
+	/**
+	 * A turn failed to send. Shared by the synchronous throw and the async
+	 * rejection, so a dispatch failure and a mid-turn failure are reported and
+	 * recovered identically.
+	 */
+	const onSendFailed = (err: unknown, attachments: readonly StagedAttachment[]): void => {
+		const msg = err instanceof Error ? err.message : String(err);
+		insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
+		// RE-STAGE on failure. The files never reached the gateway, and silently
+		// discarding them would mean an operator who pasted an 8 MiB screenshot has
+		// to go and paste it again — without being told that they must. Re-arming is
+		// safe precisely because we say so.
+		if (attachments.length > 0) {
+			stagedAttachments = [...attachments];
+			renderAttachBar();
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.dim(`${attachments.length} file${attachments.length === 1 ? " is" : "s are"} still staged — resend when you're ready.`)}`,
+					0,
+					0,
+				),
+			);
 		}
 	};
 
@@ -3623,6 +3801,35 @@ export async function wireConnectUi(
 			const agentForNew = boundAgentId ?? lastSnapshot?.agentId ?? "main";
 			const freshKey = `agent:${agentForNew}:t-${randomUUID().slice(0, 8)}`;
 			boundSessionKey = freshKey;
+			// ZERO THE USAGE FIGURES OPTIMISTICALLY.
+			//
+			// Accounting is per (agent, sessionKey) since v1.34.0, so the gateway
+			// WILL report zero for a brand-new key — but only once the `subscribe`
+			// below round-trips and pushes a fresh snapshot. Until then the header
+			// paints from the previous thread's snapshot, and an operator who
+			// looks in that window sees the old thread's totals under a new
+			// thread's banner. The reasonable conclusion is the one issue #136
+			// drew: "is my context being carried over?"
+			//
+			// It is not — a fresh key has no transcript and no ledger entry — so
+			// this is a display race, and the honest fix is to stop displaying a
+			// number we already know is about to be replaced by zero. Cheap, and
+			// it also covers the case where `boundAgentId` is not yet set, where
+			// the server pushes no snapshot at all and the stale figure would
+			// otherwise persist until the first reply.
+			if (lastSnapshot) {
+				lastSnapshot = {
+					...lastSnapshot,
+					totalTokensIn: 0,
+					totalTokensOut: 0,
+					totalCostUsd: 0,
+					contextUsagePercent: null,
+					contextTokens: null,
+					contextWindow: lastSnapshot.contextWindow,
+					messageCount: 0,
+					...(lastSnapshot.reasoning ? { reasoning: undefined } : {}),
+				} as typeof lastSnapshot;
+			}
 			clearTranscriptRegion();
 			insertBeforeEditor(
 				new Text(
@@ -5013,7 +5220,8 @@ export async function wireConnectUi(
 		// Enter and queue on Tab — the same two operations with the dangerous one
 		// under the reflex finger. DeepSeek's harness splits them the way this
 		// does.
-		if (isAgentRunning) {
+		// A COMMAND IS NEVER STEER TEXT. See `isKnownSlashCommand`.
+		if (isAgentRunning && !isKnownSlashCommand(trimmed)) {
 			editor.setText("");
 			const deliverAs: "steer" | "followUp" = steerThisSubmit ? "steer" : "followUp";
 			// A steer injects TEXT into a turn that is already running — there is no
@@ -5094,10 +5302,25 @@ export async function wireConnectUi(
 		// can take a while on a big transcript, beyond the default 60s.
 		if (trimmed === "/compact") {
 			editor.setText("");
-			insertBeforeEditor(new Text(`  ${brand.dim("Compacting…")}`, 0, 0));
+			// Only claim to be compacting when a turn is actually live. Between
+			// turns there is no session to act on, so the gateway records the ask
+			// and the next turn honours it — and saying "Compacting…" for that
+			// would be a second untruth on top of the one this replaced.
+			const compactingNow = isAgentRunning;
+			if (compactingNow) {
+				insertBeforeEditor(new Text(`  ${brand.dim("Compacting…")}`, 0, 0));
+			}
 			try {
 				await client.request("compact", withBinding(), { timeoutMs: 0 });
-				insertBeforeEditor(new Text(`  ${brand.amber("✓")} ${brand.dim("Compacted")}`, 0, 0));
+				insertBeforeEditor(
+					new Text(
+						compactingNow
+							? `  ${brand.amber("✓")} ${brand.dim("Compacted")}`
+							: `  ${brand.amber("✓")} ${brand.dim("will compact when you send your next message — compaction needs a live turn to act on")}`,
+						0,
+						0,
+					),
+				);
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				insertBeforeEditor(
@@ -5115,6 +5338,21 @@ export async function wireConnectUi(
 		// which is the thing the operator actually wants to know.
 		if (trimmed === "/update") {
 			editor.setText("");
+			// The one command that must NOT run mid-turn. It replaces the binary
+			// underneath a live gateway; refusing in the operator's own words is
+			// the point of routing commands past the steer gate — before this,
+			// typing `/update` during a turn sent the model the word "/update",
+			// which is not a refusal, it is a non sequitur.
+			if (isAgentRunning) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim("/update needs a quiet moment — finish or /abort the running turn first")}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
 			const upd = lastSnapshot?.updateAvailable;
 			if (!upd) {
 				insertBeforeEditor(

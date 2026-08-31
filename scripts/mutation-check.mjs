@@ -329,6 +329,40 @@ const MUTATIONS = [
     tests: "src/agents/tools/make-document-tool.test.ts",
   },
 
+  // ── Tool-loop guard honesty ──
+  {
+    claim: "the per-turn block does not allege repetition it never checked",
+    file: "src/agents/tool-loop-detector.ts",
+    find: "\t\t\t\t`(${distinct} of them distinct). The per-turn budget is spent — this may be a loop, ` +",
+    replace: "\t\t\t\t`This many calls is a runaway loop — you're repeating variations. ` +",
+    tests: "src/agents/tool-loop-detector.test.ts",
+  },
+  {
+    claim: "no source file contains a raw control byte",
+    file: "src/agents/skills/eligibility.ts",
+    find: "const cacheKey = `${name}\\x00${pathValue}`;",
+    replace: "const cacheKey = `${name}\u0000${pathValue}`;",
+    tests: "src/agents/source-is-text.test.ts",
+  },
+
+  // ── Manual compaction ──
+  {
+    claim: "an explicit /compact is honoured exactly once",
+    file: "src/agents/compaction/force-request.ts",
+    find: "\treturn requested.delete(sessionKey);",
+    replace: "\treturn requested.has(sessionKey);",
+    tests: "src/agents/compaction/force-request.test.ts",
+  },
+  {
+    claim: "an explicit /compact overrides the fill threshold",
+    file: "src/agents/agent-loop.ts",
+    find: "  if (!decision.shouldRecommendCompaction && !args.force) {",
+    replace: "  if (!decision.shouldRecommendCompaction) {",
+    tests: "src/agents/compaction/force-request.test.ts",
+    expectMissed: true,
+    reason: "the force flag's effect is inside runSingleTurn, which has no unit-level harness; the module's one-shot semantics are covered, the turn wiring is not",
+  },
+
   // ── Reasoning honesty ──
   {
     claim: "an empty reasoning block cannot pin a turn to hidden",

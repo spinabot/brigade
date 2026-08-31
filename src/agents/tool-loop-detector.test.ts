@@ -410,3 +410,58 @@ describe("makeToolLoopDetector — per-turn runaway guard (varied flail)", () =>
 		}
 	});
 });
+
+describe("makeToolLoopDetector — the block message reports facts, not a diagnosis", () => {
+	// The old wording asserted "you're repeating variations of the same
+	// approach" on EVERY per-turn trip. That cap counts volume and never checks
+	// repetition, so on a refactor touching many files the claim was false — and
+	// costly, because it then ordered the model to stop and report partial
+	// results. Real work truncated on a diagnosis nothing verified.
+	//
+	// Inferring a loop from a low distinct count would be wrong too: this guard
+	// exists for a VARIED flail (browser navigate → screenshot → click with
+	// drifting args), which is a loop WITH a high distinct count.
+	const distinctCall = (i: number) =>
+		({ toolCall: { name: "read", arguments: { path: `/src/file-${i}.ts` } } }) as never;
+	const sameCall = () =>
+		({ toolCall: { name: "read", arguments: { path: "/src/same.ts" } } }) as never;
+
+	it("does not allege repetition when it only counted volume", async () => {
+		const detector = makeToolLoopDetector({
+			config: { perTurnBlockAt: 5, perTurnWarnAt: 100, warnAfter: 1000, blockAfter: 1000 },
+		});
+		let last: { block?: boolean; reason?: string } | undefined;
+		for (let i = 0; i < 5; i++) last = (await detector(distinctCall(i))) as typeof last;
+
+		assert.equal(last?.block, true, "the budget is still enforced");
+		const reason = last?.reason ?? "";
+		assert.ok(
+			!/repeating variations/.test(reason),
+			`must not allege repetition it never checked:\n${reason}`,
+		);
+		assert.match(reason, /may be a loop, or a task larger than one turn/);
+	});
+
+	it("reports the distinct count as evidence rather than a verdict", async () => {
+		const detector = makeToolLoopDetector({
+			config: { perTurnBlockAt: 5, perTurnWarnAt: 100, warnAfter: 1000, blockAfter: 1000 },
+		});
+		let last: { block?: boolean; reason?: string } | undefined;
+		for (let i = 0; i < 5; i++) last = (await detector(distinctCall(i))) as typeof last;
+		assert.match(last?.reason ?? "", /5 of them distinct/);
+	});
+
+	it("still blocks a VARIED flail — the incident this guard exists for", async () => {
+		// High distinct count AND a loop. Any heuristic that excused this would
+		// have defeated the guard's original purpose.
+		const varied = (i: number) =>
+			({ toolCall: { name: "browser", arguments: { action: "screenshot", n: i } } }) as never;
+		const detector = makeToolLoopDetector({
+			config: { perTurnBlockAt: 5, perTurnWarnAt: 100, warnAfter: 1000, blockAfter: 1000 },
+		});
+		let last: { block?: boolean; reason?: string } | undefined;
+		for (let i = 0; i < 5; i++) last = (await detector(varied(i))) as typeof last;
+		assert.equal(last?.block, true);
+	});
+
+});
