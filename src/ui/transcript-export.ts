@@ -141,6 +141,17 @@ export function renderTranscriptMarkdown(
 	out.push(
 		"> Secrets matching common patterns have been redacted, and home paths replaced with `~`.",
 	);
+	// SAY WHEN REASONING IS IN THE FILE.
+	//
+	// It is excluded by default precisely because it is the part most likely to
+	// contain something the operator would not choose to publish. When they DO
+	// ask for it, the artifact should say so — an export that travels to a bug
+	// report should not surprise the next reader, or the person attaching it.
+	if (opts.includeThinking) {
+		out.push(
+			"> **Includes the model's reasoning** (`/export thinking`) — review it before sharing.",
+		);
+	}
 	out.push("> This is pattern matching, not a guarantee — **read before sharing.**");
 	out.push("");
 	out.push("---");

@@ -3749,7 +3749,7 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/expand [n]")} — show a truncated tool result in full (1 = most recent)\n` +
 						`- ${chalk.bold("/search <query>")} — search this conversation, including tool results\n` +
 						`- ${chalk.bold("/search --regex <pattern>")} — same, treating the query as a regular expression\n` +
-						`- ${chalk.bold("/export [full]")} — write this transcript to a Markdown file (secrets redacted; \`full\` keeps whole tool results)\n` +
+						`- ${chalk.bold("/export [full] [thinking]")} — write this transcript to a Markdown file (secrets redacted; \`full\` keeps whole tool results, \`thinking\` includes the model's reasoning)\n` +
 						`- ${chalk.bold("/rewind [n]")} — go back to one of your earlier messages (no arg = list; conversation only, never files)\n` +
 						`- ${chalk.bold("/flush")} — send everything you queued to the running turn right now\n` +
 						`- ${chalk.bold("/context")} — where this thread's context window is going\n` +
@@ -4889,6 +4889,7 @@ export async function wireConnectUi(
 				const home = os.homedir();
 				const rendered = renderTranscriptMarkdown(messages, {
 					full,
+					includeThinking,
 					sessionKey: boundSessionKey,
 					now: () => at,
 					// Per-block redaction BEFORE truncation. A PEM key clipped at 2000
