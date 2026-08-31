@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.35.0](https://github.com/spinabot/brigade/compare/brigade-v1.34.0...brigade-v1.35.0) (2026-08-31)
+
+
+### Features
+
+* surface reasoning honestly, provider-agnostic limits, /context ([087fac2](https://github.com/spinabot/brigade/commit/087fac2d9052b71b7d91e378ef8c526962e2265a))
+* surface reasoning honestly, provider-agnostic limits, /context ([e79a612](https://github.com/spinabot/brigade/commit/e79a61294e78cf7f5f6187dc774ae6473d1270a9))
+
+
+### Bug Fixes
+
+* **channels:** stop advertising a logout hook the runtime never calls ([46a15ce](https://github.com/spinabot/brigade/commit/46a15cea8faa55767674420f5c0053886a9ce6a1))
+* **config:** delete the dead parallel config implementation ([46a15ce](https://github.com/spinabot/brigade/commit/46a15cea8faa55767674420f5c0053886a9ce6a1))
+* delete the dead parallel config implementation; stop advertising an uncalled logout hook ([02867ab](https://github.com/spinabot/brigade/commit/02867ab4bec91603a905c9b143a491721bb09e07))
+* four reviewers found the cursor-replay design was net-negative ([d384279](https://github.com/spinabot/brigade/commit/d38427911558533c595cae626a954c7211483b4e))
+* reasoning label could invert the misrepresentation it fixes; add cursor replay ([813e991](https://github.com/spinabot/brigade/commit/813e991cc84537b534caf993a21237b723d6a1b9))
+
 ## [1.34.0](https://github.com/spinabot/brigade/compare/brigade-v1.33.0...brigade-v1.34.0) (2026-08-31)
 
 
