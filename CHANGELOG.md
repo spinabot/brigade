@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.35.1](https://github.com/spinabot/brigade/compare/brigade-v1.35.0...brigade-v1.35.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* a source file was BINARY, and the loop guard accused the model of looping ([477fb09](https://github.com/spinabot/brigade/commit/477fb094df9d1610cc56b716f85ef61a16519be5))
+* **tui:** /compact refused when idle, and the header hid what it knew ([762ac24](https://github.com/spinabot/brigade/commit/762ac2481a8ae607be54d4fc70fbd7a16cebb5d8))
+* **tui:** say why reasoning shows nothing instead of leaving it blank ([6382580](https://github.com/spinabot/brigade/commit/63825806afc5aea8de07bae5938a0e3f5e02c18c))
+* **tui:** surface what the TUI already knew — queue, effort, compaction, and why reasoning is blank ([db533c9](https://github.com/spinabot/brigade/commit/db533c9f3c9e4d8c5547b12227dac9371475c4e0))
+
 ## [1.35.0](https://github.com/spinabot/brigade/compare/brigade-v1.34.0...brigade-v1.35.0) (2026-08-31)
 
 
