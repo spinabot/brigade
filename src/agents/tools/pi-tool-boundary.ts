@@ -35,7 +35,22 @@
  *
  *   • consume it Brigade-side (add to BRIGADE_LOCAL_TOOL_FIELDS), or
  *   • carry it across yourself, because Pi will not.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHERE THIS IS ENFORCED
+ * ─────────────────────────────────────────────────────────────────────────
+ * A declaration nobody reads is just a comment, so both halves are wired:
+ *
+ *   • the conformance test (`pi-tool-boundary.test.ts`) covers every field the
+ *     COMPILER can see — the `BrigadeTool` type, and Brigade's own assembled
+ *     tool surface;
+ *   • `warnUnhandledPiDroppedFields` covers what it cannot — tools built at
+ *     runtime by an extension or an MCP server. It is called where each of
+ *     those crosses into Pi: `session-wiring.ts` (the `customTools` array) and
+ *     `extensions/registry.ts` (`pi.registerTool`).
  */
+
+import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 
 /**
  * Fields `wrapToolDefinition` copies into the object Pi's loop actually sees.
@@ -89,4 +104,58 @@ export function fieldsPiWillDrop(tool: object): string[] {
 export function unhandledPiDroppedFields(tool: object): string[] {
 	const local = new Set<string>(BRIGADE_LOCAL_TOOL_FIELDS);
 	return fieldsPiWillDrop(tool).filter((k) => !local.has(k));
+}
+
+/* ─────────────────────── runtime side of the boundary ─────────────────────── */
+
+const log = createSubsystemLogger("tools/pi-boundary");
+
+/**
+ * Warn-once ledger, keyed by source + tool name + the exact field set.
+ *
+ * The Brigade tool surface is rebuilt once per TURN, so an unconditional warn
+ * would repeat the same line for the life of the gateway — which is how a real
+ * signal gets trained into background noise. Keying on the field SET as well as
+ * the name keeps a plugin that LATER grows a second unmodelled field reportable.
+ */
+const reported = new Set<string>();
+
+/**
+ * Report — never refuse — tools carrying fields that will not survive Pi.
+ *
+ * The conformance test covers what the compiler can see. This covers what it
+ * cannot: a tool assembled at runtime by an extension, an MCP server, or a
+ * plugin factory, whose shape no `BrigadeTool` declaration ever described.
+ * Those are precisely the tools that can carry a field nobody modelled, and
+ * the whole problem with this boundary is that its failure mode is silence.
+ *
+ * `source` names the seam the tool crossed at, so the log line points at an
+ * assembly path instead of leaving the operator to guess which of several tool
+ * arrays a name came from.
+ */
+export function warnUnhandledPiDroppedFields(tools: Iterable<object>, source: string): void {
+	for (const tool of tools) {
+		// A tool object can be a Proxy built by a third-party module, and a
+		// hostile or buggy `ownKeys` trap throws. A diagnostic must never be the
+		// thing that kills a turn, so each tool is inspected in isolation.
+		try {
+			if (!tool || typeof tool !== "object") continue;
+			const unhandled = unhandledPiDroppedFields(tool);
+			if (unhandled.length === 0) continue;
+			const rawName = (tool as { name?: unknown }).name;
+			const name = typeof rawName === "string" && rawName.length > 0 ? rawName : "<unnamed>";
+			const key = `${source} ${name} ${unhandled.join(",")}`;
+			if (reported.has(key)) continue;
+			reported.add(key);
+			log.warn("tool fields will not survive the crossing into Pi", {
+				tool: name,
+				source,
+				droppedFields: unhandled,
+				carriedFields: [...PI_CARRIED_TOOL_FIELDS],
+				hint: "Pi copies a fixed field list onto the tool its loop sees; consume these Brigade-side or carry them across yourself.",
+			});
+		} catch {
+			/* an uninspectable tool is not a reason to fail the turn */
+		}
+	}
 }

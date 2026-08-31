@@ -194,6 +194,61 @@ test("an abort abandons the wait and does NOT burn the turn's attempt", async ()
 	assert.equal(calls, 1);
 });
 
+test("an abort raised INSIDE the summarizer does not disable the compactor", async () => {
+	// Once the signal is actually plumbed to the isolated LLM call, the abort can
+	// surface as a rejection from `summarize` itself rather than from this
+	// module's own signal watcher — and it can arrive with no signal on THIS
+	// call at all (the isolated session holds the turn's signal, we do not).
+	// Classified as an error it would set `disabled`, so a Ctrl+C would cost the
+	// turn its one compaction attempt and truncate history nobody asked to lose.
+	const outcomes: MidTurnOutcome[] = [];
+	let calls = 0;
+	const compact = createMidTurnCompactor({
+		contextWindowTokens: WINDOW,
+		summarize: async () => {
+			calls += 1;
+			if (calls === 1) {
+				throw Object.assign(new Error("isolated LLM call was cancelled by the caller"), {
+					name: "AbortError",
+					code: "ABORT_ERR",
+				});
+			}
+			return "## GOAL\nship";
+		},
+		onEnd: (o) => outcomes.push(o),
+	});
+	const messages = bigConversation();
+
+	assert.equal(await compact(messages), messages, "no truncation on a cancelled turn");
+	assert.equal(outcomes.at(-1)!.reason, "aborted");
+
+	// The SAME instance, not a fresh one: the claim is that the turn's single
+	// attempt was not burned, and only the same compactor can prove that.
+	const out = await compact(messages);
+	assert.equal(calls, 2, "the compactor is still armed after an interrupt");
+	assert.ok(out.length < messages.length);
+	assert.equal(outcomes.at(-1)!.reason, "applied");
+});
+
+test("a genuine summarizer failure still disables the compactor", async () => {
+	// The other half of the classification. Cancellations must be forgiven;
+	// real failures must not be, or one broken call becomes one per request for
+	// the rest of the tool loop.
+	let calls = 0;
+	const compact = createMidTurnCompactor({
+		contextWindowTokens: WINDOW,
+		deterministicFallback: false,
+		summarize: async () => {
+			calls += 1;
+			throw new Error("provider exploded");
+		},
+	});
+	const messages = bigConversation();
+	await compact(messages);
+	await compact(messages);
+	assert.equal(calls, 1, "one wasted call per turn, never one per request");
+});
+
 test("an empty summary is treated as a failure, not as a valid compaction", async () => {
 	// A blank summary would otherwise be injected as the entire record of
 	// everything that came before.

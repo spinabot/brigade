@@ -163,3 +163,78 @@ test("a new turn clears the previous phase's duration", () => {
 	t.beginTurn(A, S);
 	assert.equal(t.snapshot(A, S), undefined, "a fresh turn has nothing to report yet");
 });
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * A summary that never arrived is not a summary.
+ *
+ * Reported from a live session: the footer read
+ *
+ *     Thought for 15s · 400 reasoning tokens · provider summary
+ *
+ * with `/reasoning on` and NOTHING rendered in the conversation. The model
+ * reasoned and was billed for it; the "provider summary" label came from the
+ * static provider map, not from anything the turn actually returned. It sent
+ * the operator looking for text that does not exist.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+test("reasoning with tokens but ZERO text is reported as hidden, not summary", () => {
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary"); // the static guess for this provider
+	t.start("a", "s", "summary");
+	t.setTokens("a", "s", 400); // billed…
+	// …and not one character of reasoning text ever arrives.
+	t.end("a", "s");
+
+	const snap = t.snapshot("a", "s");
+	assert.equal(snap?.visibility, "hidden");
+	assert.equal(snap?.tokens, 400);
+	assert.equal(snap?.chars, undefined);
+});
+
+test("a real summary keeps its label — the downgrade is not indiscriminate", () => {
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	t.delta("a", "s", "the model explained itself here");
+	t.setTokens("a", "s", 400);
+	t.end("a", "s");
+
+	assert.equal(t.snapshot("a", "s")?.visibility, "summary");
+});
+
+test("a redacted phase is NOT downgraded — it is already block-proven", () => {
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "redacted");
+	t.start("a", "s", "redacted");
+	t.setTokens("a", "s", 120);
+	t.end("a", "s");
+
+	assert.equal(t.snapshot("a", "s")?.visibility, "redacted");
+});
+
+test("an expected-but-entirely-silent phase still reports, as hidden", () => {
+	// No thinking event, no token count — the case where BOTH proofs are absent.
+	// Without `expectReasoning` this session reported nothing at all, and an
+	// empty header reads as "the model did not think".
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.expectReasoning("a", "s");
+	t.end("a", "s");
+
+	assert.equal(t.snapshot("a", "s")?.visibility, "hidden");
+});
+
+test("a NON-reasoning model still contributes no snapshot at all", () => {
+	// The guard rail: `expected` is only set for a reasoning-capable model with
+	// thinking on, so an ordinary model must not gain a phantom "Thought" line.
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "none");
+	t.end("a", "s");
+
+	assert.equal(t.snapshot("a", "s"), undefined);
+});

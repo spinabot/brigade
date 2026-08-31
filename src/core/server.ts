@@ -79,7 +79,7 @@ import { composeAttachmentTurn } from "./prompt-attachments.js";
 import { createMcpHttpRoute } from "../agents/mcp/http-route.js";
 import { createMcpTurnRegistry, setActiveMcpToolPlaneHost } from "../agents/mcp/tool-plane-host.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
-import { shouldSendDeltaFrame } from "./delta-mode.js";
+import { shouldSendDeltaFrame, stripCumulativeContent } from "./delta-mode.js";
 import {
 	abandonedByRewind,
 	filesTouchedAfter,
@@ -175,6 +175,7 @@ import { UsageLedger } from "../agents/usage/ledger.js";
 import { ReasoningTracker } from "../agents/reasoning/reasoning-state.js";
 import { resolveAgentIdFromSessionKey } from "../agents/routing/session-key.js";
 import { initialReasoningVisibility, refineReasoningVisibility } from "../agents/reasoning/visibility.js";
+import { getLimitsForProvider } from "../agents/usage/limits.js";
 import { classifyBillingModeWithAuth } from "../agents/usage/billing-mode.js";
 import {
 	estimateContextTokensFromMessages,
@@ -1982,6 +1983,26 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			...(reasoningTracker.snapshot(targetAgentId, targetSessionKey)
 				? { reasoning: reasoningTracker.snapshot(targetAgentId, targetSessionKey)! }
 				: {}),
+			// PROVIDER CONSUMPTION WINDOWS.
+			//
+			// Recorded for every backend from the one `streamFn` all of them go
+			// through (`payload-mutators`' `onResponse`), so this is not an
+			// Anthropic-only feature. Scoped to the provider actually serving this
+			// binding — showing another provider's remaining quota next to this
+			// session's model would be worse than showing nothing.
+			//
+			// Omitted entirely when the provider reports no headers. "Unknown" and
+			// "exhausted" must never render the same way.
+			...(() => {
+				try {
+					const provider = getAgentRuntime(targetAgentId)?.provider;
+					if (!provider) return {};
+					const windows = getLimitsForProvider(provider);
+					return windows.length > 0 ? { limits: windows } : {};
+				} catch {
+					return {};
+				}
+			})(),
 			// Per-binding, not process-wide: the snapshot already resolved which
 			// agent + session this client is bound to, and usage now honours that.
 			totalTokensIn: snapshotUsage.input + snapshotUsage.cacheRead + snapshotUsage.cacheWrite,
@@ -2376,26 +2397,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// frame actually carries a delta. One extra stringify per qualifying
 		// broadcast (measured at GiB/s — far cheaper than the bytes it removes),
 		// and none at all when nobody opted in.
-		let deltaJson: string | undefined;
-		if (event === "pi") {
-			const pi = (payload as { event?: { type?: string; assistantMessageEvent?: unknown; message?: unknown } })?.event;
-			if (pi?.type === "message_update" && pi.assistantMessageEvent !== undefined && pi.message !== undefined) {
-				// Strip only `content` — the cumulative blocks, which are the entire
-				// O(n²) payload. `role`, `timestamp` and `usage` stay: the timestamp
-				// is the client's RENDER KEY (without it a delta cannot be attached to
-				// a block), and `usage` drives the live token counter. Both are a
-				// handful of bytes.
-				const msg = pi.message as Record<string, unknown>;
-				const { content: _omitted, ...msgWithoutContent } = msg;
-				deltaJson = JSON.stringify({
-					...(frame as unknown as Record<string, unknown>),
-					payload: {
-						...(payload as Record<string, unknown>),
-						event: { ...(pi as Record<string, unknown>), message: msgWithoutContent },
-					},
-				});
-			}
-		}
+		// Lives in `delta-mode.ts` so a test can actually call it — see that
+		// function's header for why being inline here meant the producer side
+		// was untested while its test reported green.
+		const deltaJson = stripCumulativeContent(frame);
 		for (const ws of clients) {
 			const ready = prepareClient(ws);
 			if (!ready) continue;
@@ -5438,7 +5443,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		registerGatewayHandler("sessions.delete", (params: unknown) =>
 			handleSessionsDelete(
 				params as Parameters<typeof handleSessionsDelete>[0],
-				{ accessCheck: sessionsAccessCheck },
+				{
+					accessCheck: sessionsAccessCheck,
+					// The gateway's in-memory accounting for this key is now stale,
+					// and `/new` rolls a fresh sessionId under the SAME sessionKey —
+					// so without this a brand-new conversation silently inherits the
+					// deleted one's cost total and reasoning state, permanently.
+					forgetSessionState: (forgetAgentId: string, forgetSessionKey: string) => {
+						usageLedger.forget(forgetAgentId, forgetSessionKey);
+						reasoningTracker.forget(forgetAgentId, forgetSessionKey);
+					},
+				},
 			),
 		),
 	);

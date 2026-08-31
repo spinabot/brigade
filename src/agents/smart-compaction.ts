@@ -730,6 +730,26 @@ export const MAX_COMPACTIONS_WITHOUT_REPLY = 2;
  */
 export const COMPACTION_BREAKER_COOLDOWN_MS = 5 * 60_000;
 
+/**
+ * Was a compaction CANCELLED rather than failed?
+ *
+ * The two have to be told apart before the breaker sees them. A failure is
+ * evidence — it says compaction is not working for this session and the guard
+ * should count it. A cancellation is the operator, and it says nothing at all;
+ * charging it to the budget lets a user close their own guard by pressing
+ * Ctrl+C twice.
+ *
+ * Matched on the DOM `AbortError` shape (`name` / `code`), the same pair
+ * `retry-policy.ts` and `model-fallback.ts` classify by, so an abort raised
+ * anywhere below — Pi's own run abort, an isolated summarization call, a
+ * provider fetch — is recognised without each layer inventing its own spelling.
+ */
+export function isCompactionCancellation(value: unknown): boolean {
+	if (!value || typeof value !== "object") return false;
+	const v = value as { name?: unknown; code?: unknown };
+	return v.name === "AbortError" || v.code === "ABORT_ERR" || v.code === 20;
+}
+
 export class CompactionBreaker {
 	private readonly consecutive = new Map<string, number>();
 	/** When each session's guard last closed, for the cooldown. */
@@ -788,6 +808,36 @@ export class CompactionBreaker {
 		this.consecutive.set(sessionKey, next);
 		if (next >= this.max) this.closedAt.set(sessionKey, this.now());
 		this.evictIfNeeded();
+	}
+
+	/**
+	 * Give back an attempt that never actually happened.
+	 *
+	 * `noteCompaction` is counted BEFORE the summarization, deliberately: the
+	 * guard has to hold even if the call never returns. A CANCELLED compaction is
+	 * the one case where that is wrong. The operator pressed Ctrl+C — no
+	 * summarization was paid for, and nothing was learned about whether
+	 * compaction can help this session, which is the only question the guard
+	 * exists to answer. Counting it means two interrupts in a row close the guard
+	 * for the whole cooldown and leave a perfectly healthy session unable to
+	 * compact for five minutes, on the strength of an operator's own keystrokes.
+	 *
+	 * Not the same as `noteReply`: that CLEARS the budget because a reply proved
+	 * the context figure moved. This only rewinds the one uncounted attempt, so a
+	 * genuine failure that happened to be followed by an interrupt still counts.
+	 */
+	undoCompaction(sessionKey: string): void {
+		const current = this.consecutive.get(sessionKey);
+		if (current === undefined) return;
+		const next = current - 1;
+		// delete+set, like `noteCompaction` — a bare `set` on an existing key
+		// preserves insertion order and would leave a stale LRU position behind.
+		this.consecutive.delete(sessionKey);
+		if (next > 0) this.consecutive.set(sessionKey, next);
+		// Below the bound the guard is open again, so the cooldown stamp that
+		// would have reopened it is meaningless — and leaving it would let a later
+		// `allow()` clear a legitimately-earned count the moment it elapsed.
+		if (next < this.max) this.closedAt.delete(sessionKey);
 	}
 
 	/**

@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { after, test } from "node:test";
 
+import { TUI, type Component, type Terminal } from "@earendil-works/pi-tui";
+
+import { wireConnectUi } from "../cli/commands/connect.js";
+import type { BrigadeClient } from "../tui/client.js";
+import type { SessionStateSnapshot } from "../protocol.js";
 import {
 	CompactionBreaker,
 	describeCompactionOutcome,
 	estimateContextTokensFromMessages,
+	isCompactionCancellation,
 	MAX_COMPACTIONS_WITHOUT_REPLY,
 	summarizeCompactionOutcome,
 } from "./smart-compaction.js";
@@ -55,6 +61,59 @@ test("sessions are independent — one stuck thread cannot block another", () =>
 	b.noteCompaction("a");
 	assert.equal(b.allow("a"), false);
 	assert.equal(b.allow("b"), true);
+});
+
+test("an operator's Ctrl+C cannot close their own guard", () => {
+	// `noteCompaction` is counted BEFORE the summarization on purpose — the guard
+	// has to hold even if the call never returns. A CANCELLED compaction is the
+	// one case where that is wrong: nothing was paid for and nothing was learned
+	// about whether compaction helps this session, which is the only question
+	// this guard exists to answer. Counted anyway, two interrupts in a row would
+	// lock a perfectly healthy session out of compaction for the whole cooldown.
+	const b = new CompactionBreaker();
+	for (let i = 0; i < MAX_COMPACTIONS_WITHOUT_REPLY + 3; i += 1) {
+		assert.equal(b.allow(S), true, `interrupt ${i} still leaves the guard open`);
+		b.noteCompaction(S);
+		b.undoCompaction(S); // the operator pressed Ctrl+C
+	}
+	assert.equal(b.count(S), 0);
+	assert.equal(b.allow(S), true);
+});
+
+test("undoing a cancellation rewinds ONE attempt, it does not clear the budget", () => {
+	// The distinction from `noteReply`. A real failure followed by an interrupt
+	// must still leave the real failure on the books — otherwise a session that
+	// alternates failure and cancellation compacts forever, which is the exact
+	// loop the breaker was written for.
+	const b = new CompactionBreaker();
+	b.noteCompaction(S); // a genuine failure
+	b.noteCompaction(S); // a cancelled attempt
+	assert.equal(b.allow(S), false, "the guard closed on the second attempt");
+	b.undoCompaction(S);
+	assert.equal(b.count(S), 1, "the genuine failure survives");
+	assert.equal(b.allow(S), true, "but the cancelled attempt is given back");
+});
+
+test("undoCompaction on an unknown session is a no-op, not a negative count", () => {
+	const b = new CompactionBreaker();
+	b.undoCompaction("never-seen");
+	assert.equal(b.count("never-seen"), 0);
+	assert.equal(b.size, 0);
+});
+
+test("a cancellation is recognised by shape, not by message text", () => {
+	// The same pair `retry-policy.ts` and `model-fallback.ts` classify by, so an
+	// abort raised anywhere below — Pi's run abort, an isolated summarization
+	// call, a provider fetch — is recognised without each layer inventing its
+	// own spelling.
+	assert.equal(isCompactionCancellation(Object.assign(new Error("x"), { name: "AbortError" })), true);
+	assert.equal(isCompactionCancellation(Object.assign(new Error("x"), { code: "ABORT_ERR" })), true);
+	assert.equal(isCompactionCancellation(Object.assign(new Error("x"), { code: 20 })), true);
+	// A real failure must NOT be forgiven — that would retry a broken
+	// summarization on every attempt, which is the loop the breaker exists for.
+	assert.equal(isCompactionCancellation(new Error("Connection error.")), false);
+	assert.equal(isCompactionCancellation(undefined), false);
+	assert.equal(isCompactionCancellation("AbortError"), false);
 });
 
 test("forget clears a session", () => {
@@ -145,15 +204,117 @@ test("trip opens the guard immediately, without spending the attempt budget", ()
 
 /* ───────────── what the operator is told, end to end ───────────── */
 
-/** The line the TUI renders from `compaction_end.outcome`. */
-function compactionLine(oc: { freedTokens: number; messagesBefore: number; messagesAfter: number; madeProgress: boolean } | undefined): string {
-	if (!oc) return "compacted · usage refreshes on the next reply";
-	return oc.madeProgress
-		? `compacted · freed ${oc.freedTokens} tokens · ${oc.messagesBefore} → ${oc.messagesAfter} messages`
-		: `compacted · reclaimed almost nothing (${oc.messagesBefore} → ${oc.messagesAfter} messages)`;
+// These used to call a `compactionLine()` declared right here in the test file,
+// which was a COPY of the expression inside `connect.ts`'s `compaction_end`
+// handler — and a stale one: it asserted `freed 118000 tokens` where production
+// runs the figure through `formatTokens` and prints `freed 118k tokens`. The
+// test agreed with itself and disagreed with the screen, and deleting the real
+// line from `connect.ts` would not have failed it.
+//
+// The real line is built inline inside a closure in `wireConnectUi`, so there is
+// nothing to import. What CAN be driven is the whole path: boot the real connect
+// UI against a fake terminal and a fake gateway, push the `compaction_end` frame
+// the gateway really sends, and read the row off the widget tree.
+
+/** A Terminal that renders nowhere. */
+class FakeTerminal implements Terminal {
+	onInput: (data: string) => void = () => {};
+	start(onInput: (data: string) => void): void {
+		this.onInput = onInput;
+	}
+	stop(): void {}
+	async drainInput(): Promise<void> {}
+	write(): void {}
+	get columns(): number {
+		return 120;
+	}
+	get rows(): number {
+		return 40;
+	}
+	get kittyProtocolActive(): boolean {
+		return false;
+	}
+	moveBy(): void {}
+	hideCursor(): void {}
+	showCursor(): void {}
+	clearLine(): void {}
+	clearFromCursor(): void {}
+	clearScreen(): void {}
+	setTitle(): void {}
+	setProgress(): void {}
 }
 
-test("a real compaction tells the operator what it freed", () => {
+const UI_AGENT = "main";
+const UI_SESSION = "agent:main:main";
+
+const UI_SNAPSHOT = {
+	provider: "claude-cli",
+	modelId: "opus-4-8",
+	modelName: "Opus 4.8",
+	thinkingLevel: "off",
+	supportsThinking: true,
+	supportsVision: true,
+	availableThinkingLevels: ["off"],
+	contextUsagePercent: 889,
+	totalTokensIn: 0,
+	totalTokensOut: 0,
+	totalCostUsd: 0,
+	isAgentRunning: false,
+	messageCount: 0,
+	agentId: UI_AGENT,
+	agentName: "brigade",
+	sessionKey: UI_SESSION,
+} as unknown as SessionStateSnapshot;
+
+const bootedUis: TUI[] = [];
+after(() => {
+	for (const tui of bootedUis) {
+		for (const child of (tui as unknown as { children: Component[] }).children) {
+			(child as unknown as { stop?: () => void }).stop?.();
+		}
+	}
+});
+
+/** Boot the real connect UI and hand back a way to push one `compaction_end`. */
+async function compactionScreen(event: Record<string, unknown>): Promise<string> {
+	const tui = new TUI(new FakeTerminal());
+	bootedUis.push(tui);
+	const handlers = new Map<string, Array<(...a: never[]) => void>>();
+	const client = {
+		on(name: string, fn: (...a: never[]) => void) {
+			const list = handlers.get(name) ?? [];
+			list.push(fn);
+			handlers.set(name, list);
+			return client;
+		},
+		connect: async () => {},
+		resume: async () => {},
+		close: () => {},
+		request: async (method: string) => {
+			if (method === "get-state") return UI_SNAPSHOT;
+			if (method === "list-models") return [];
+			if (method === "sessions.list" || method === "list-sessions") return [];
+			if (method === "list-agents") return [];
+			return undefined;
+		},
+	};
+	await wireConnectUi(tui, client as unknown as BrigadeClient, UI_AGENT, UI_SESSION);
+	const emit = (name: string, payload: unknown): void => {
+		for (const fn of handlers.get(name) ?? []) (fn as (p: unknown) => void)(payload);
+	};
+	emit("state", UI_SNAPSHOT);
+	emit("pi", { event, subagentDepth: 0, agentId: UI_AGENT, sessionId: UI_SESSION });
+	return (tui as unknown as { children: Component[] }).children
+		.map((c) => (c as unknown as { render(width: number): string[] }).render(120).join("\n"))
+		.join("\n");
+}
+
+/** The `compaction_end` frame the gateway sends for a SUCCESSFUL compaction. */
+function compactionEnd(outcome: unknown): Record<string, unknown> {
+	return { type: "compaction_end", aborted: false, result: {}, outcome };
+}
+
+test("a real compaction tells the operator what it freed", async () => {
 	// The summarization's COST cannot be priced — the provider reports no usage
 	// for it — but what it RECLAIMED is always measurable, and saying nothing was
 	// how a no-progress loop kept passing for success.
@@ -163,27 +324,44 @@ test("a real compaction tells the operator what it freed", () => {
 		messagesBefore: 142,
 		messagesAfter: 12,
 	});
-	assert.equal(
-		compactionLine(o),
-		"compacted · freed 118000 tokens · 142 → 12 messages",
+	const screen = await compactionScreen(compactionEnd(o));
+	assert.ok(
+		screen.includes("compacted · freed 118k tokens · 142 → 12 messages"),
+		`the operator must be told what was freed; screen tail:\n${screen.slice(-400)}`,
 	);
 });
 
-test("a compaction that achieved nothing says so, instead of claiming success", () => {
+test("a compaction that achieved nothing says so, instead of claiming success", async () => {
 	const o = summarizeCompactionOutcome({
 		tokensBefore: 150_000,
 		tokensAfter: 149_500,
 		messagesBefore: 100,
 		messagesAfter: 100,
 	});
-	assert.match(compactionLine(o), /reclaimed almost nothing/);
-	assert.doesNotMatch(compactionLine(o), /freed/);
+	assert.equal(o.madeProgress, false, "0.3% freed is not progress");
+	const screen = await compactionScreen(compactionEnd(o));
+	assert.ok(screen.includes("reclaimed almost nothing (100 → 100 messages)"), "it must say so");
+	assert.equal(screen.includes("freed"), false, "and must not also claim a saving");
 });
 
-test("an older gateway with no outcome falls back to the honest old wording", () => {
+test("an older gateway with no outcome falls back to the honest old wording", async () => {
 	// The percentage genuinely is stale until the next successful reply, so the
 	// fallback is not a lie — just less useful.
-	assert.match(compactionLine(undefined), /usage refreshes on the next reply/);
+	const screen = await compactionScreen(compactionEnd(undefined));
+	assert.ok(screen.includes("compacted · usage refreshes on the next reply"));
+});
+
+test("a compaction that FAILED is never reported as a compaction", async () => {
+	// Pi emits `compaction_end` on every failure path with `aborted: false` and
+	// no `result`. Branching on `aborted` alone printed "✓ compacted · reclaimed
+	// almost nothing" for a summarization that never ran.
+	const screen = await compactionScreen({
+		type: "compaction_end",
+		aborted: false,
+		errorMessage: "rate limited",
+	});
+	assert.ok(screen.includes("compaction failed · rate limited"), "the failure is named");
+	assert.equal(screen.includes("compacted ·"), false, "and never dressed up as success");
 });
 
 test("one estimator is shared, so the trigger and the measurement cannot disagree", () => {

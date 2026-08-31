@@ -2,13 +2,15 @@ import { strict as assert } from "node:assert";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, test } from "node:test";
 
 import { FactStore } from "./records.js";
 import { linksFrom } from "./links.js";
 import {
 	flattenConversation,
 	getCursor,
+	IsolatedLlmAbortError,
+	makeIsolatedLlm,
 	parseExtractedFacts,
 	runExtractionSweep,
 	storeExtractedFacts,
@@ -362,4 +364,43 @@ describe("runExtractionSweep — semantic relationship edges (SAME call, no extr
 		assert.equal(res.ran, false);
 		assert.equal(new FactStore(dir).readAll().length, 0, "no facts, hence no edges");
 	});
+});
+
+test("an aborted signal cancels an isolated LLM call before it costs anything", async () => {
+	// `makeIsolatedLlm` is the bottom of every Brigade-owned model call — memory
+	// sweeps, skill distillation, and mid-turn compaction, which summarizes an
+	// entire context window and is the single largest of them. Pi's `prompt()`
+	// takes no signal (pi-agent-core agent.d.ts:104-105), so before this the
+	// runner had NOTHING to cancel with: a Ctrl+C stopped Brigade waiting and
+	// left the provider request running, and billing.
+	//
+	// The workspace, registry and model here are deliberate junk. An aborted
+	// signal has to short-circuit before any of them is read, so the assertion
+	// is not just "it rejected" but "it rejected as a cancellation": drop the
+	// pre-flight check and this same junk produces a TypeError from the model
+	// registry instead.
+	const llm = makeIsolatedLlm("system", {
+		workspaceDir: "/nonexistent-brigade-abort-probe",
+		agentDir: "/nonexistent-brigade-abort-probe",
+		authStorage: {},
+		modelRegistry: {},
+		model: { id: "probe" },
+	});
+	const controller = new AbortController();
+	controller.abort();
+	await assert.rejects(
+		llm("distill this", controller.signal),
+		(err: Error & { code?: string }) => err.name === "AbortError" && err.code === "ABORT_ERR",
+	);
+});
+
+test("an IsolatedLlmAbortError is shaped so a retry policy never re-bills it", () => {
+	// `retry-policy.ts` and `model-fallback.ts` both classify aborts by exactly
+	// `name === "AbortError" || code === "ABORT_ERR" || code === 20`. A
+	// cancellation wearing any other shape would be read as a transient provider
+	// fault and retried — re-spending the money the cancellation just saved.
+	const err = new IsolatedLlmAbortError();
+	assert.equal(err.name, "AbortError");
+	assert.equal(err.code, "ABORT_ERR");
+	assert.ok(err instanceof Error);
 });

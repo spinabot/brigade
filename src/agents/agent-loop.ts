@@ -28,6 +28,7 @@ import {
   createAgentSession,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { warnUnhandledPiDroppedFields } from "./tools/pi-tool-boundary.js";
 import fs from "node:fs";
 
 import {
@@ -158,6 +159,7 @@ import {
   CompactionBreaker,
   describeCompactionOutcome,
   evaluateCompactionDecision,
+  isCompactionCancellation,
   summarizeCompactionOutcome,
 } from "./smart-compaction.js";
 import { resolveToolSummary } from "./tool-summaries.js";
@@ -1224,6 +1226,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   ];
   const webToolNames = webTools.map((t) => t.name);
   brigadeCustomTools.push(...webTools);
+  // These three are pushed AFTER `assembleBrigadeToolset` returns, so they miss
+  // the boundary check in `session-wiring.ts`. Pi copies a fixed field list and
+  // silently drops the rest; checking here is what keeps that from being an
+  // invisible hole for the one group of tools that skips the normal path.
+  warnUnhandledPiDroppedFields(brigadeCustomTools, "agent-loop");
   // Gate the system-prompt ## Web section on whether ANY web tool actually
   // landed in customTools. `fetch_url` is always available (built-in raw
   // fetch needs no provider), so this is effectively always true today;
@@ -3437,6 +3444,23 @@ async function maybeTriggerCompaction(args: {
       });
     }
   } catch (err) {
+    // A CANCELLED compaction is not a failed one. `noteCompaction` was counted
+    // up front on purpose — the guard must hold even if the call never returns
+    // — but an operator's Ctrl+C paid for nothing and proved nothing about
+    // whether compaction helps this session. Left counted, two interrupts in a
+    // row close the guard for the full cooldown and a healthy session cannot
+    // compact for five minutes because the user cancelled twice. So give the
+    // attempt back and say nothing louder than debug: this is the user getting
+    // what they asked for, not a fault.
+    if (isCompactionCancellation(err)) {
+      compactionBreaker.undoCompaction(args.sessionId);
+      log.debug("pre-emptive compaction cancelled by the operator", {
+        agentId: args.agentId,
+        sessionId: args.sessionId,
+        consecutive: compactionBreaker.count(args.sessionId),
+      });
+      return;
+    }
     // Compaction failure isn't fatal — Pi's auto-compaction gets a chance
     // to run during the prompt, and worst case the request fails with a
     // context-window error that the retry policy classifies as transient.
