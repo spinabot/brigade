@@ -10,25 +10,34 @@
  * frame and it calls `resume`. Resume then rebuilds from the JSONL transcript,
  * which is the single source of truth — for anything the transcript contains.
  *
- * Two kinds of frame it does NOT contain:
+ * The frames it does NOT contain are SYNTHETIC ones — the tool events Brigade
+ * mints for a `claude-cli` turn, whose tools run inside the binary's own loop
+ * via the MCP route. They are real work the operator watched happen and they
+ * are in no transcript at all, but they carry the ROUTING session key, so
+ * `resume` can find them again.
  *
- *   • SUB-AGENT frames (`subagentDepth > 0`). They carry the child's own
- *     session id and live in a separate child transcript that the parent's
- *     resume never reads.
- *   • SYNTHETIC frames — the tool events Brigade mints for a `claude-cli` turn,
- *     whose tools run inside the binary's own loop via the MCP route. They are
- *     real work the operator watched happen, and they are in no transcript at
- *     all.
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY SUB-AGENT FRAMES ARE *NOT* HERE, HAVING BRIEFLY BEEN
+ * ─────────────────────────────────────────────────────────────────────────
+ * They look like the same case and they are not, for one reason: a sub-agent
+ * frame is tagged with the CHILD's Pi session UUID, while `resume` is called
+ * with an `agent:…` session KEY. Retaining under one namespace and replaying
+ * from the other means the replay can never fire — so sequencing them would
+ * rest on a guarantee that does not exist, which is exactly the mistake the
+ * original "do not sequence what you cannot replay" rule forbids.
  *
- * Both were therefore left UNSEQUENCED, and that was the correct call at the
- * time: stamping a seq on a frame you cannot replay turns every dropped
- * decoration into an unrepairable gap, and the client resyncs forever. You
- * cannot sequence a stream you cannot replay.
+ * Sequencing them also had costs the promise was supposed to justify: every
+ * `spawn_agent` minted a new entry in the gateway's per-session counter map,
+ * which evicts in CREATION order — so the operator's own long-lived session,
+ * created first, was evicted first, restarting its counter and triggering a
+ * full transcript repaint on every connected client. And a terminal `agent_end`
+ * frame carries the child's entire transcript, which the oversize carve-out
+ * below would retain permanently on a session that never receives another
+ * frame.
  *
- * So this closes the loop from the other end. Buffer those frames, bounded, and
- * resume can hand back the exact bytes for a named cursor — at which point
- * sequencing them becomes safe and `docs/reliable-streaming.md`'s promise that
- * nothing emitted is lost finally covers sub-agent output too.
+ * Making sub-agent replay real means teaching `resume` the child namespace and
+ * having a client that actually sends a cursor. Until both exist, retaining
+ * them is pure cost, so they stay unsequenced and unretained as before.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * WHAT IS DELIBERATELY *NOT* BUFFERED
@@ -40,9 +49,15 @@
  * exists strictly for what it does not.
  *
  * That means a replay can be PARTIAL: the ring may hold frames 7 and 9 while 8
- * was a `message_update`. `replayFrom` reports that honestly via `complete`
- * rather than implying the cursor was fully satisfied, because a client that
- * believes a partial replay was total would silently skip real content.
+ * was a `message_update` recoverable from the transcript instead.
+ *
+ * `complete` answers exactly one question — "is the oldest frame I still hold
+ * the next one this cursor expects?" — and deliberately NOT "are there interior
+ * gaps?". Interior gaps are expected by design here, because the frames that
+ * create them are the ones the transcript rebuilds better. A caller must apply
+ * the transcript FIRST and treat these frames as an overlay; `complete: true`
+ * means "nothing has aged out from under your cursor", never "this is every
+ * frame in that range".
  */
 
 /** One retained frame: its sequence, and the exact bytes that were broadcast. */
@@ -212,14 +227,15 @@ export function classifyFrame(input: FrameClassInput): FrameClass {
 	const depth = Number.isFinite(rawDepth) && rawDepth > 0 ? rawDepth : 0;
 	const synthetic = isPi && input.synthetic === true;
 
-	// No transcript holds these: a sub-agent writes to its own child transcript
-	// that the parent's `resume` never reads, and a synthetic frame is minted by
-	// Brigade for a backend whose tools run outside Pi's loop entirely.
-	const replayOnly = isPi && (depth > 0 || synthetic);
+	// SYNTHETIC DEPTH-0 FRAMES ONLY. Sub-agent frames are deliberately excluded
+	// again — see the header for the full account. In short: they are retained
+	// under the child's Pi session UUID while `resume` reads by session key, so
+	// they were sequenced on a promise of replayability that never held, and
+	// sequencing them flooded the gateway's per-session counter map.
+	const replayOnly = isPi && depth === 0 && synthetic;
 
 	const ordered =
-		(isPi && depth === 0 && !synthetic) ||
-		replayOnly ||
+		(isPi && depth === 0) ||
 		input.event === "approval-request" ||
 		input.event === "system-event";
 

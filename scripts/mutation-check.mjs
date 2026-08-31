@@ -331,6 +331,26 @@ const MUTATIONS = [
 
   // ── Reasoning honesty ──
   {
+    claim: "an empty reasoning block cannot pin a turn to hidden",
+    file: "src/core/server.ts",
+    find: "\t\t\t\t\t\treasoningTracker.noteThinkingBlock(agentIdForTurn, sessionKeyForTurn, b);",
+    replace: "\t\t\t\t\t\treasoningTracker.setVisibility(agentIdForTurn, sessionKeyForTurn, refineReasoningVisibility(reasoningTracker.declaredVisibility(agentIdForTurn, sessionKeyForTurn), b));",
+    tests: "src/agents/reasoning/reasoning-state.test.ts",
+    expectMissed: true,
+    reason: "the mutant reintroduces the gateway-side latch, which only the gateway wiring exercises; the tracker-level tests model that loop via a helper and stay green. Verified by hand instead.",
+  },
+  {
+    claim: "the per-session seq counter evicts least-recently-USED",
+    file: "src/protocol/stream-seq.ts",
+    find: "\tcounters.delete(sessionId);\n\tcounters.set(sessionId, next);",
+    replace: "\tcounters.set(sessionId, next);",
+    tests: "src/protocol/stream-seq.test.ts",
+    expectMissed: true,
+    reason: "Map insertion-order semantics are not asserted by the existing seq tests; the eviction sweep that depends on it lives in server.ts and has no gateway-level test",
+  },
+
+
+  {
     claim: "the no-text downgrade is derived, so it cannot stick to a turn",
     file: "src/agents/reasoning/reasoning-state.ts",
     find: "\t\t\tvisibility: reportedVisibility(e),",
@@ -361,9 +381,9 @@ const MUTATIONS = [
     tests: "src/core/frame-ring.test.ts",
   },
   {
-    claim: "sub-agent and synthetic frames are retained for replay",
+    claim: "synthetic frames are retained for replay",
     file: "src/core/frame-ring.ts",
-    find: "\tconst replayOnly = isPi && (depth > 0 || synthetic);",
+    find: "\tconst replayOnly = isPi && depth === 0 && synthetic;",
     replace: "\tconst replayOnly = false;",
     tests: "src/core/frame-ring.test.ts",
   },

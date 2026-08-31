@@ -2999,12 +2999,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				if (Array.isArray(blocks)) {
 					for (const b of blocks) {
 						if (b?.type !== "thinking") continue;
-						const prev = reasoningTracker.snapshot(agentIdForTurn, sessionKeyForTurn)?.visibility ?? "summary";
-						reasoningTracker.setVisibility(
-							agentIdForTurn,
-							sessionKeyForTurn,
-							refineReasoningVisibility(prev, b),
-						);
+						// Record what the block REVEALED; never overwrite what the
+						// backend can return. Refining into `visibility` meant the
+						// first empty reasoning item pinned the session to `hidden`
+						// for the rest of the turn — `refineReasoningVisibility`
+						// never widens — so a later block carrying a real summary
+						// rendered under a label saying reasoning was never exposed.
+						reasoningTracker.noteThinkingBlock(agentIdForTurn, sessionKeyForTurn, b);
 					}
 				}
 			} else if (piEvent.type === "agent_start" || piEvent.type === "agent_end") {
@@ -4719,12 +4720,21 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// Replaying nothing and reporting incomplete is the safe answer:
 				// it degrades to the transcript, which is always correct.
 				const cursor = typeof p.sinceSeq === "number" ? p.sinceSeq : undefined;
-				const replay =
-					cursor !== undefined && cursor >= 0 && cursor <= headSeq
-						? frameRing.replayFrom(targetSessionKey, cursor)
-						: cursor !== undefined
-							? { frames: [], complete: false }
-							: undefined;
+				const replay = ((): { frames: { json: string }[]; complete: boolean } | undefined => {
+					if (cursor === undefined) return undefined;
+					// A cursor outside this epoch's range describes a stream this
+					// gateway never emitted. Degrade to the transcript, which is
+					// always correct.
+					if (cursor < 0 || cursor > headSeq) return { frames: [], complete: false };
+					// ALREADY CURRENT. The ring cannot know this — it only sees its
+					// own contents — so the comparison belongs here, where `headSeq`
+					// is in scope. Without it every resume of a perfectly healthy
+					// session (no sub-agents, no synthetic frames, so nothing ever
+					// retained) reported `replayComplete: false`, telling a
+					// conforming client that data had been lost when none had.
+					if (cursor === headSeq) return { frames: [], complete: true };
+					return frameRing.replayFrom(targetSessionKey, cursor);
+				})();
 				return {
 					sessionKey: targetSessionKey,
 					agentId: targetAgentId,

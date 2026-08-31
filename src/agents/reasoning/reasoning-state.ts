@@ -33,6 +33,15 @@ import type { ReasoningVisibility, SessionReasoningState } from "../../protocol.
 
 interface Entry {
 	active: boolean;
+	/**
+	 * A provider safety filter removed a block this turn.
+	 *
+	 * Kept apart from `visibility` because it is an OBSERVATION about one block,
+	 * whereas `visibility` is a statement about what the backend can return. The
+	 * two used to be crushed into one field, which is what let a single empty
+	 * block permanently rewrite the backend's capability.
+	 */
+	redactedSeen: boolean;
 	visibility: ReasoningVisibility;
 	startedAt?: number;
 	chars: number;
@@ -53,7 +62,7 @@ interface Entry {
 }
 
 function fresh(): Entry {
-	return { active: false, visibility: "none", chars: 0, everReasoned: false };
+	return { active: false, visibility: "none", chars: 0, everReasoned: false, redactedSeen: false };
 }
 
 /**
@@ -88,15 +97,41 @@ function reportedVisibility(e: {
 	chars: number;
 	everReasoned: boolean;
 	active: boolean;
+	redactedSeen: boolean;
 }): ReasoningVisibility {
+	// A safety filter removed something. Strongest statement available, and it
+	// outranks everything else — including text that arrived in another block.
+	if (e.redactedSeen) return "redacted";
 	// Mid-phase, text may simply not have arrived YET. Only judge a settled turn.
 	if (e.active) return e.visibility;
 	if (!e.everReasoned) return e.visibility;
+	// Text DID arrive somewhere in this turn, so the backend exposed its
+	// reasoning and the declared capability stands. This is the branch that
+	// stops one empty reasoning item — providers emit several per response,
+	// many empty — from relabelling a turn that produced a real summary.
 	if (e.chars > 0) return e.visibility;
+	// Reasoned, settled, and not one character of it was exposed.
 	if (e.visibility === "summary" || e.visibility === "raw") return "hidden";
 	return e.visibility;
 }
 
+/**
+ * Note what one `thinking` block revealed, WITHOUT overwriting the declared
+ * capability.
+ *
+ * The gateway used to refine visibility per block and write the result back:
+ *
+ *     prev = <current>;  setVisibility(refine(prev, block))
+ *
+ * `refineReasoningVisibility` never widens fidelity, so the first empty block
+ * pinned the session to `hidden` for the rest of the turn and a later block
+ * carrying a genuine summary could not lift it. The label then said the
+ * model's reasoning was never exposed while that summary sat on screen.
+ *
+ * Redaction is an observation, so it is recorded as one. Emptiness needs no
+ * recording at all: `chars` already knows whether any text arrived, and
+ * `reportedVisibility` reads it per snapshot.
+ */
 export class ReasoningTracker {
 	private readonly entries = new Map<string, Entry>();
 
@@ -134,6 +169,7 @@ export class ReasoningTracker {
 		const e = this.touch(agentId, sessionKey);
 		e.active = false;
 		e.startedAt = undefined;
+		e.redactedSeen = false;
 		e.chars = 0;
 		e.tokens = undefined;
 		e.everReasoned = false;
@@ -200,6 +236,40 @@ export class ReasoningTracker {
 			// omitted-but-billed case).
 			e.everReasoned = true;
 		}
+	}
+
+	/**
+	 * The STORED visibility, before the derived no-text downgrade.
+	 *
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * WHY THIS IS SEPARATE FROM `snapshot().visibility`
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * `snapshot()` reports a DERIVED value — a `summary` with no text becomes
+	 * `hidden`, recomputed on every read so it cannot latch. That is right for a
+	 * renderer and catastrophic for the refine loop.
+	 *
+	 * The gateway refines visibility per thinking block:
+	 *   prev = <read current>; setVisibility(refine(prev, block))
+	 * If `prev` is the DERIVED value, the downgrade gets written back into
+	 * storage, and `refineReasoningVisibility` never widens fidelity — so it is
+	 * permanent. One empty reasoning item then pins the whole turn to `hidden`,
+	 * and a later item streaming a genuine summary renders under a label saying
+	 * the model's reasoning was never exposed. That is the precise inversion the
+	 * derivation was introduced to remove, re-entering through the back door.
+	 *
+	 * So: read THIS to refine, read `snapshot()` to display.
+	 */
+	declaredVisibility(agentId: string, sessionKey: string): ReasoningVisibility {
+		return this.entries.get(this.key(agentId, sessionKey))?.visibility ?? "none";
+	}
+
+	noteThinkingBlock(
+		agentId: string,
+		sessionKey: string,
+		block: { thinking?: string; thinkingSignature?: string; redacted?: boolean } | undefined,
+	): void {
+		if (!block) return;
+		if (block.redacted === true) this.touch(agentId, sessionKey).redactedSeen = true;
 	}
 
 	/** Declare what this backend exposes. Called when the turn's model is known. */

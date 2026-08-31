@@ -1699,7 +1699,19 @@ export async function wireConnectUi(
 	// empty thread), never a blanked view of a thread that's secretly full.
 	// The replay is BOUNDED server-side — the `resume` RPC caps how many
 	// transcript messages it ships — so a 10k-message thread stays snappy.
-	const doResume = async (): Promise<void> => {
+	/**
+	 * The live `pi` frame handler, forward-declared.
+	 *
+	 * `doResume` (above) needs it to apply replayed frames, and it is registered
+	 * further down where the rest of the stream wiring lives. A forward
+	 * reference keeps the replay path going through the EXACT handler the live
+	 * stream uses — a second, parallel apply path would drift from it, and
+	 * drifting is how a replayed frame ends up rendering differently from the
+	 * live one it is standing in for.
+	 */
+	let handlePiFrame: ((payload: unknown) => void) | undefined;
+
+	const doResume = async (sinceSeq?: number): Promise<void> => {
 		if (resumeInFlight) {
 			resumePending = true;
 			return;
@@ -1708,7 +1720,14 @@ export async function wireConnectUi(
 		try {
 			let snap: Awaited<ReturnType<typeof client.resume>> | undefined;
 			try {
-				snap = await client.resume(withBinding());
+				// Pass the cursor when a gap was detected. The transcript rebuilds
+				// everything it holds; `sinceSeq` additionally asks for the frames
+				// it CANNOT hold (the synthetic tool events Brigade mints for a
+				// claude-cli turn, which are in no JSONL). Without this the server
+				// retained those frames and nothing ever asked for them.
+				snap = await client.resume(
+					sinceSeq === undefined ? withBinding() : withBinding({ sinceSeq }),
+				);
 			} catch {
 				return;
 			}
@@ -1716,6 +1735,36 @@ export async function wireConnectUi(
 			clearTranscriptRegion();
 			const messages = Array.isArray(snap.messages) ? snap.messages : [];
 			for (const m of messages) renderTranscriptMessage(m);
+			// REPLAYED FRAMES, applied AFTER the transcript.
+			//
+			// These are the frames no transcript can rebuild. They are the exact
+			// bytes originally broadcast, so they go back through the same handler
+			// the live stream uses and dedupe on the same identity keys.
+			//
+			// `replayComplete === false` means retention was trimmed past the
+			// cursor and some frames are gone for good. Say so once rather than
+			// leaving the operator to assume the gap was empty — a silent partial
+			// recovery is the failure this whole path exists to avoid.
+			const replayed = Array.isArray(snap.replayedFrames) ? snap.replayedFrames : [];
+			for (const raw of replayed) {
+				try {
+					const parsed = JSON.parse(raw) as { event?: string; payload?: unknown };
+					if (parsed?.event === "pi" && parsed.payload !== undefined) {
+						handlePiFrame?.(parsed.payload as never);
+					}
+				} catch {
+					/* a malformed retained frame must never break the rebuild */
+				}
+			}
+			if (snap.replayComplete === false && replayed.length === 0) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim("some stream updates could not be recovered — the transcript above is complete, but tool activity in that gap is lost")}`,
+						0,
+						0,
+					),
+				);
+			}
 			// Recover the non-transcript events too ("nothing lost"): recent
 			// system-event notices, then any tool-approval prompts STILL pending
 			// on this session — re-rendered answerable so a prompt that arrived or
@@ -1928,7 +1977,12 @@ export async function wireConnectUi(
 	// mutations. Primitive #6: when `subagentDepth > 0`, indent child events
 	// by `2 * depth` spaces so nested sub-agent activity is visually distinct
 	// from the parent's stream.
-	client.on("pi", (payload: { event: any; subagentDepth?: number; agentId?: string; sessionId?: string }) => {
+	const onPiFrame = (payload: {
+		event: any;
+		subagentDepth?: number;
+		agentId?: string;
+		sessionId?: string;
+	}): void => {
 		const { event, subagentDepth } = payload;
 		// Wave N3 (bug #3) — defensive lane drop. The gateway already
 		// filters via subscribe; this catches the gap between an /agent or
@@ -2703,7 +2757,9 @@ export async function wireConnectUi(
 				break;
 			}
 		}
-	});
+	};
+	client.on("pi", onPiFrame);
+	handlePiFrame = onPiFrame as (payload: unknown) => void;
 
 	// Reconnect notifications — let the user know what just happened so a
 	// dropped/restored gateway doesn't look like phantom output.
@@ -2741,8 +2797,11 @@ export async function wireConnectUi(
 	// reordered, or the gateway restarted and reset its counters. Resume to
 	// rebuild from the transcript so the live view self-heals with no missing or
 	// misplaced messages and WITHOUT waiting for a reconnect or a manual refresh.
-	client.on("resync", () => {
-		void doResume();
+	client.on("resync", ({ lastSeq }) => {
+		// `lastSeq` is the last seq we actually saw, which is exactly the cursor
+		// the server needs to replay forward from. Discarding it (as this handler
+		// used to) is what left the whole retention path unreachable.
+		void doResume(typeof lastSeq === "number" ? lastSeq : undefined);
 	});
 
 	// Switch the live session onto a CONFIGURED provider by reusing the same

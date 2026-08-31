@@ -296,3 +296,83 @@ test("start() defaults to summary, never raw", () => {
 	t.end("a", "s");
 	assert.equal(t.snapshot("a", "s")?.visibility, "summary");
 });
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * The PRODUCTION wiring, not the tracker in isolation.
+ *
+ * Every test above seeds `setVisibility(...,"summary")` right after
+ * `beginTurn`, which is exactly the step the gateway does NOT do per block.
+ * The gateway instead refines per thinking block:
+ *
+ *     prev = <read current>;  setVisibility(refine(prev, block))
+ *
+ * A reviewer showed that reading the DERIVED value there wrote the no-text
+ * downgrade back into storage, where `refineReasoningVisibility` — which never
+ * widens fidelity — made it permanent. These reproduce that loop.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/** Exactly what `server.ts` does for each `thinking` block on a message. */
+function refineLikeGateway(
+	t: ReasoningTracker,
+	block: { thinking?: string; thinkingSignature?: string; redacted?: boolean },
+): void {
+	t.noteThinkingBlock("a", "s", block);
+}
+
+test("an empty reasoning item does not permanently pin the turn to hidden", () => {
+	// OpenAI's o-series / GPT-5 emit one reasoning item per `output_item.added`,
+	// many of them empty, each settling as empty-text + signature.
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+
+	// Item 1: empty, but signed — legitimately refines to `hidden`.
+	t.start("a", "s", "summary");
+	refineLikeGateway(t, { thinking: "", thinkingSignature: "sig-1" });
+	t.end("a", "s");
+
+	// Item 2: a genuine 900-character summary.
+	t.start("a", "s", "summary");
+	t.delta("a", "s", "y".repeat(900));
+	refineLikeGateway(t, { thinking: "y".repeat(900), thinkingSignature: "sig-2" });
+	t.end("a", "s");
+
+	const snap = t.snapshot("a", "s");
+	assert.equal(snap?.chars, 900, "the summary did arrive");
+	assert.notEqual(
+		snap?.visibility,
+		"hidden",
+		"900 chars of summary must not render as 'not exposed by this model'",
+	);
+});
+
+test("the derived downgrade is never written back into storage", () => {
+	// The mechanism itself: after a settled empty turn the REPORTED value is
+	// `hidden`, but the STORED value must still be `summary` — otherwise the
+	// next refine reads `hidden` as its floor and can never climb back.
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	t.end("a", "s");
+
+	assert.equal(t.snapshot("a", "s")?.visibility, "hidden", "reported: nothing arrived");
+	assert.equal(t.declaredVisibility("a", "s"), "summary", "stored: what the backend can return");
+
+	// An empty block records nothing at all now — `chars` already knows whether
+	// text arrived, so there is no value to write back and therefore nothing
+	// that can latch.
+	refineLikeGateway(t, { thinking: "" });
+	assert.equal(t.declaredVisibility("a", "s"), "summary");
+});
+
+test("a genuinely redacted phase still refines to redacted", () => {
+	// The guard must not block real downgrades — only the derived one.
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	refineLikeGateway(t, { redacted: true, thinkingSignature: "sig" });
+	t.end("a", "s");
+	assert.equal(t.snapshot("a", "s")?.visibility, "redacted");
+});

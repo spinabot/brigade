@@ -405,7 +405,10 @@ export class BrigadeClient extends EventEmitter {
 			// a gateway restart); emit `"resync"` so the consumer `resume`s and
 			// backfills (transcript + pending approvals + recent system-events).
 			// Frames without `seq` (state/error/log + sub-agent pi) are unordered
-			// side-channels and skip the check.
+			// side-channels and skip the check. Sub-agent frames stay unsequenced
+			// deliberately: they are tagged with the child's Pi session UUID, which
+			// `resume` cannot look up, so a gap in them is undetectable-but-honest
+			// rather than detectable-but-unrepairable.
 			if (typeof frame.seq === "number") {
 				const sid = (frame.payload as { sessionId?: string } | undefined)?.sessionId;
 				if (sid) {

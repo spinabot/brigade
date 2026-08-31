@@ -125,20 +125,38 @@ test("a top-level pi frame is ordered but rebuilt from the transcript", () => {
 	assert.equal(c.replayOnly, false, "the JSONL transcript already holds it");
 });
 
-test("a sub-agent frame is ordered AND must be retained", () => {
-	// It carries the child's session id and lives in a child transcript the
-	// parent's resume never reads — retention is its only recovery path.
+test("a sub-agent frame is NEITHER sequenced NOR retained", () => {
+	// Briefly it was both, and that was wrong in two ways at once.
+	//
+	// It is tagged with the CHILD's Pi session UUID, while `resume` is called
+	// with an `agent:…` session KEY — so retaining it under one namespace and
+	// replaying from the other means the replay can never fire. Sequencing it
+	// therefore rested on a replay guarantee that did not exist, which is the
+	// exact mistake the "never sequence what you cannot replay" rule forbids.
+	//
+	// It also cost: every `spawn_agent` minted a new per-session counter, and
+	// that map evicts in creation order — so the operator's own long-lived
+	// session, created first, was evicted first, restarting its counter and
+	// repainting the transcript on every connected client.
 	const c = classifyFrame({ event: "pi", subagentDepth: 1 });
+	assert.equal(c.ordered, false);
+	assert.equal(c.replayOnly, false);
+});
+
+test("a depth-0 synthetic frame is ordered AND must be retained", () => {
+	// Minted for a claude-cli turn whose tools run in the binary's own loop, so
+	// it is in no transcript — but unlike a sub-agent frame it carries the
+	// ROUTING session key, which is the key `resume` looks up. That is what
+	// makes it genuinely replayable, and therefore safe to sequence.
+	const c = classifyFrame({ event: "pi", subagentDepth: 0, synthetic: true });
 	assert.equal(c.ordered, true);
 	assert.equal(c.replayOnly, true);
 });
 
-test("a synthetic frame is ordered AND must be retained", () => {
-	// Minted for a claude-cli turn whose tools run in the binary's own loop.
-	// In no transcript at all.
-	const c = classifyFrame({ event: "pi", subagentDepth: 0, synthetic: true });
-	assert.equal(c.ordered, true);
-	assert.equal(c.replayOnly, true);
+test("a synthetic frame at depth > 0 is not retained either", () => {
+	// Same namespace problem as any other sub-agent frame.
+	const c = classifyFrame({ event: "pi", subagentDepth: 2, synthetic: true });
+	assert.equal(c.replayOnly, false);
 });
 
 test("retention implies sequencing — never a seq we cannot replay", () => {
@@ -147,6 +165,7 @@ test("retention implies sequencing — never a seq we cannot replay", () => {
 	for (const input of [
 		{ event: "pi", subagentDepth: 0 },
 		{ event: "pi", subagentDepth: 3 },
+		{ event: "pi", subagentDepth: 2, synthetic: true },
 		{ event: "pi", subagentDepth: 0, synthetic: true },
 		{ event: "approval-request" },
 		{ event: "system-event" },
