@@ -204,14 +204,14 @@ export function renderDepartmentsOnly(
   while (i < lines.length) {
     const line = lines[i] ?? "";
     // Strip ANSI before matching so the test runs with both colour modes.
-    const stripped = line.replace(/\[[0-9;]*m/g, "");
+    const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
     if (HEADING_RE.test(stripped)) {
       // Skip lines until we hit a blank then a non-blank section bar/heading.
       i += 1;
       // Eat the topOrder member line(s) + optional bio + trailing blank.
       while (i < lines.length) {
         const peek = lines[i] ?? "";
-        const peekStripped = peek.replace(/\[[0-9;]*m/g, "");
+        const peekStripped = peek.replace(/\x1b\[[0-9;]*m/g, "");
         if (peekStripped.trim() === "") {
           // Consume the blank line and stop — next iteration resumes at
           // the next section.

@@ -752,7 +752,7 @@ async function promptHidden(rl: readline.Interface, label: string): Promise<stri
 					resolve(buf);
 					return;
 				}
-				if (ch === "") {
+				if (ch === "\x03") {
 					// Ctrl+C — restore the terminal and re-emit so SIGINT semantics work.
 					stdin.setRawMode?.(false);
 					stdin.pause();

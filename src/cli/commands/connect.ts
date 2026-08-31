@@ -1386,6 +1386,42 @@ export async function wireConnectUi(
 			argumentHint: "[<agent-id>|--departments|--explain <from> <to>]",
 		},
 	];
+	/**
+	 * Is this submit a COMMAND rather than something to say to the model?
+	 *
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * WHY THIS GUARDS THE MID-TURN GATE
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * `handleSubmit` dispatches commands in source order, and the
+	 * `isAgentRunning` steer gate sits in the middle of that run. Everything
+	 * below it was therefore unreachable while a turn was streaming — and not
+	 * inertly: the text was sent to the MODEL as chat. Typing `/compact` during
+	 * a long turn did not compact anything, it told the assistant the word
+	 * "/compact".
+	 *
+	 * Nine commands were below the line — `/compact`, `/model`, `/provider`,
+	 * `/thinking`, `/switch`, `/update`, `/allow-all`, `/grant-skill`,
+	 * `/revoke-skill` — and the gate's own comment documented the hazard while
+	 * the fix was to keep hoisting individual handlers above it, which only
+	 * holds until the next one is added below.
+	 *
+	 * `/compact` is the sharpest case: its handler exists to act on a LIVE
+	 * session, so the one command that most needed to run mid-turn was the one
+	 * mid-turn made impossible.
+	 *
+	 * Checking membership here inverts that. Anything the operator could have
+	 * tab-completed reaches its handler whatever the turn is doing, and a
+	 * handler that genuinely cannot run mid-turn refuses in its own words
+	 * instead of being silently mailed to the model.
+	 */
+	const isKnownSlashCommand = (text: string): boolean => {
+		if (!text.startsWith("/")) return false;
+		// The word only, so `/model gpt-5` and `/model` both match.
+		const word = text.slice(1).split(/\s/, 1)[0]?.toLowerCase() ?? "";
+		if (!word) return false;
+		return SLASH_COMMANDS.some((c) => c.name.toLowerCase() === word);
+	};
+
 	editor.setAutocompleteProvider(new CombinedAutocompleteProvider(SLASH_COMMANDS, process.cwd()));
 
 	// `/provider` switches the model provider and can add an API-key provider
@@ -3193,36 +3229,69 @@ export async function wireConnectUi(
 			// defeat the commonest reason to switch (moving to a model that can see).
 			lastUserPrompt = outgoing;
 			lastUserAttachments = toPromptAttachments(attachments);
-			await client.request(
-				"prompt",
-				withBinding({
-					text: outgoing,
-					// Omitted entirely when nothing is attached, so a plain text turn is
-					// byte-identical on the wire to what a pre-attachment TUI sent.
-					...(attachments.length > 0
-						? { attachments: toPromptAttachments(attachments) }
-						: {}),
-				}),
-				{ timeoutMs: 0 },
-			);
+			// DISPATCH, DO NOT AWAIT THE TURN.
+			//
+			// `prompt` resolves only when the whole turn FINISHES (`timeoutMs: 0`,
+			// no deadline). Awaiting it here held `submitInFlight` — the
+			// re-entrancy guard in `editor.onSubmit` — for the entire turn, so
+			// every keystroke sent while the model was streaming hit
+			// `if (submitInFlight) return;` and was discarded in silence.
+			//
+			// That is why mid-turn input appeared to do nothing at all: no echo,
+			// no "queued" line, no command, no error. The steer/queue path below
+			// and every slash command were unreachable from the moment a turn
+			// started — not because the gate rejected them, but because the
+			// submit never got past the first line of the handler. The paths
+			// looked correct in review and in tests, because a test drives
+			// `handleSubmit` directly and never contends with the guard.
+			//
+			// The guard exists to stop two fast Enters sending the same text
+			// twice, which needs to cover the DISPATCH, not the turn's lifetime.
+			// Errors still surface — the same handler, attached to the promise —
+			// and the turn's progress was always frame-driven, never awaited.
+			void client
+				.request(
+					"prompt",
+					withBinding({
+						text: outgoing,
+						// Omitted entirely when nothing is attached, so a plain text turn is
+						// byte-identical on the wire to what a pre-attachment TUI sent.
+						...(attachments.length > 0
+							? { attachments: toPromptAttachments(attachments) }
+							: {}),
+					}),
+					{ timeoutMs: 0 },
+				)
+				.catch((err: unknown) => {
+					onSendFailed(err, attachments);
+				});
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
-			// RE-STAGE on failure. The files never reached the gateway, and silently
-			// discarding them would mean an operator who pasted an 8 MiB screenshot has
-			// to go and paste it again — without being told that they must. Re-arming is
-			// safe precisely because we say so.
-			if (attachments.length > 0) {
-				stagedAttachments = attachments;
-				renderAttachBar();
-				insertBeforeEditor(
-					new Text(
-						`  ${brand.dim(`${attachments.length} file${attachments.length === 1 ? " is" : "s are"} still staged — resend when you're ready.`)}`,
-						0,
-						0,
-					),
-				);
-			}
+			onSendFailed(err, attachments);
+		}
+	};
+
+	/**
+	 * A turn failed to send. Shared by the synchronous throw and the async
+	 * rejection, so a dispatch failure and a mid-turn failure are reported and
+	 * recovered identically.
+	 */
+	const onSendFailed = (err: unknown, attachments: readonly StagedAttachment[]): void => {
+		const msg = err instanceof Error ? err.message : String(err);
+		insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
+		// RE-STAGE on failure. The files never reached the gateway, and silently
+		// discarding them would mean an operator who pasted an 8 MiB screenshot has
+		// to go and paste it again — without being told that they must. Re-arming is
+		// safe precisely because we say so.
+		if (attachments.length > 0) {
+			stagedAttachments = [...attachments];
+			renderAttachBar();
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.dim(`${attachments.length} file${attachments.length === 1 ? " is" : "s are"} still staged — resend when you're ready.`)}`,
+					0,
+					0,
+				),
+			);
 		}
 	};
 
@@ -5151,7 +5220,8 @@ export async function wireConnectUi(
 		// Enter and queue on Tab — the same two operations with the dangerous one
 		// under the reflex finger. DeepSeek's harness splits them the way this
 		// does.
-		if (isAgentRunning) {
+		// A COMMAND IS NEVER STEER TEXT. See `isKnownSlashCommand`.
+		if (isAgentRunning && !isKnownSlashCommand(trimmed)) {
 			editor.setText("");
 			const deliverAs: "steer" | "followUp" = steerThisSubmit ? "steer" : "followUp";
 			// A steer injects TEXT into a turn that is already running — there is no
@@ -5268,6 +5338,21 @@ export async function wireConnectUi(
 		// which is the thing the operator actually wants to know.
 		if (trimmed === "/update") {
 			editor.setText("");
+			// The one command that must NOT run mid-turn. It replaces the binary
+			// underneath a live gateway; refusing in the operator's own words is
+			// the point of routing commands past the steer gate — before this,
+			// typing `/update` during a turn sent the model the word "/update",
+			// which is not a refusal, it is a non sequitur.
+			if (isAgentRunning) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim("/update needs a quiet moment — finish or /abort the running turn first")}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
 			const upd = lastSnapshot?.updateAvailable;
 			if (!upd) {
 				insertBeforeEditor(

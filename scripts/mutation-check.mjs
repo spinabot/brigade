@@ -329,6 +329,22 @@ const MUTATIONS = [
     tests: "src/agents/tools/make-document-tool.test.ts",
   },
 
+  // ── Tool-loop guard honesty ──
+  {
+    claim: "the per-turn block does not allege repetition it never checked",
+    file: "src/agents/tool-loop-detector.ts",
+    find: "\t\t\t\t`(${distinct} of them distinct). The per-turn budget is spent — this may be a loop, ` +",
+    replace: "\t\t\t\t`This many calls is a runaway loop — you're repeating variations. ` +",
+    tests: "src/agents/tool-loop-detector.test.ts",
+  },
+  {
+    claim: "no source file contains a raw control byte",
+    file: "src/agents/skills/eligibility.ts",
+    find: "const cacheKey = `${name}\\x00${pathValue}`;",
+    replace: "const cacheKey = `${name}\u0000${pathValue}`;",
+    tests: "src/agents/source-is-text.test.ts",
+  },
+
   // ── Manual compaction ──
   {
     claim: "an explicit /compact is honoured exactly once",
