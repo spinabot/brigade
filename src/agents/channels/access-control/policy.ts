@@ -22,6 +22,12 @@ export interface EvaluateAccessArgs {
 	 * vice-versa.
 	 */
 	senderLid?: string;
+	/**
+	 * Additional canonical spellings of the same sender (and, where a channel
+	 * supports conversation-scoped entries, of the conversation). Matched by the
+	 * same exact equality as `senderId` — see `InboundMessage.senderAliases`.
+	 */
+	senderAliases?: ReadonlyArray<string>;
 	/** The linked-self id, when known (operator messaging themselves → allow). */
 	selfId?: string;
 	/** Approved senders for this channel (from `allow-from.json` + config). */
@@ -80,11 +86,20 @@ function isOnAllowList(
 	senderId: string,
 	allowFrom: ReadonlyArray<string>,
 	senderLid?: string,
+	senderAliases?: ReadonlyArray<string>,
 ): boolean {
 	for (const entry of allowFrom) if (entry === "*") return true;
-	// Identity overlap — a sender matches if the list carries EITHER of their
-	// stable handles (phone number OR `@lid` privacy alias).
-	return allowFrom.includes(senderId) || (senderLid !== undefined && allowFrom.includes(senderLid));
+	// Identity overlap — a sender matches if the list carries ANY of their
+	// stable handles: the primary id, a `@lid` privacy alias, or a canonical
+	// spelling the channel supplied. Still exact equality on every candidate.
+	if (allowFrom.includes(senderId)) return true;
+	if (senderLid !== undefined && allowFrom.includes(senderLid)) return true;
+	if (senderAliases) {
+		for (const alias of senderAliases) {
+			if (alias && allowFrom.includes(alias)) return true;
+		}
+	}
+	return false;
 }
 
 /**
@@ -146,7 +161,7 @@ export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
 		// self-tags — a self-tag is just a mention of the operator's own number
 		// (which IS the bot's id) and must never become a summon backdoor. A `*`
 		// in the list is a wildcard and matches everyone (still mention-gated below).
-		const senderAllowed = isOnAllowList(args.senderId, allow, args.senderLid);
+		const senderAllowed = isOnAllowList(args.senderId, allow, args.senderLid, args.senderAliases);
 		if (!senderAllowed) return { kind: "block", reason: "group:not-allowlisted" };
 		return addressed
 			? {
@@ -172,11 +187,11 @@ export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
 		case "disabled":
 			return { kind: "block", reason: "policy:disabled" };
 		case "allowlist":
-			return isOnAllowList(args.senderId, args.allowFrom, args.senderLid)
+			return isOnAllowList(args.senderId, args.allowFrom, args.senderLid, args.senderAliases)
 				? { kind: "allow", reason: "allow-from" }
 				: { kind: "block", reason: "not-allowlisted" };
 		case "pairing":
-			if (isOnAllowList(args.senderId, args.allowFrom, args.senderLid))
+			if (isOnAllowList(args.senderId, args.allowFrom, args.senderLid, args.senderAliases))
 				return { kind: "allow", reason: "allow-from" };
 			// Caller will mint/refresh the code via the store and send a reply.
 			return { kind: "challenge", code: "", reason: "needs-pairing" };

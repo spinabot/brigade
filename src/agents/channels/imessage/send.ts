@@ -92,9 +92,20 @@ export async function sendMessageIMessage(
 	// Target — an explicit chatId wins, else parse the `to` string.
 	const target = parseIMessageTarget(opts.chatId ? formatIMessageChatTarget(opts.chatId) : to);
 
-	// Service — explicit opt → the handle's parsed service → the account default.
-	const service: IMessageService =
-		opts.service ?? (target.kind === "handle" ? target.service : undefined) ?? "auto";
+	// Service — the target's own prefix, then the account default, then `auto`.
+	//
+	// THE ORDER USED TO BE BACKWARDS AND THAT MADE THE PREFIX DEAD. This read
+	// `opts.service ?? target.service`, and `opts.service` is the ACCOUNT DEFAULT,
+	// which `coerceIMessageService` always resolves to a real value — so the left
+	// side never fell through and the right side was unreachable. Every documented
+	// `sms:+1555…` / `imessage:…` prefix parsed correctly and was then discarded,
+	// sending over whatever the account was configured for.
+	//
+	// `serviceExplicit` rather than `service !== "auto"`, because a deliberate
+	// `auto:` on an account pinned to `sms` is a real instruction too.
+	const targetService: IMessageService | undefined =
+		target.kind === "handle" && target.serviceExplicit ? target.service : undefined;
+	const service: IMessageService = targetService ?? opts.service ?? "auto";
 	const region = opts.region?.trim() || "US";
 	const maxBytes = typeof opts.maxBytes === "number" ? opts.maxBytes : 16 * 1024 * 1024;
 

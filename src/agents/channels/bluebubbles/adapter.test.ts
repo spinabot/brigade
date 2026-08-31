@@ -358,3 +358,26 @@ describe("BlueBubbles adapter", () => {
 		assert.equal(fake.catchupRuns.count, 1);
 	});
 });
+
+// BlueBubbles carries the same Apple handles as the iMessage channel, so it has
+// the same allow-list spelling gap: the server reports what the chat database
+// stores, the operator types what the wizard showed them, and matching is exact.
+describe("BlueBubbles adapter — allow-list canonicalisation", () => {
+	const norm = (e: string): string => createBlueBubblesAdapter().normalizeAclEntry!(e);
+
+	it("canonicalises Apple handles the same way the iMessage channel does", () => {
+		assert.equal(norm("+1 (555) 123-4567"), norm("+15551234567"));
+		assert.equal(norm("User@Example.com"), norm("user@example.com"));
+	});
+
+	it("carries a chat guid through verbatim under one prefix", () => {
+		// Opaque server identifier — case and punctuation are significant.
+		assert.equal(norm("chat_guid:iMessage;-;+15551234567"), "chat_guid:iMessage;-;+15551234567");
+		assert.equal(norm("guid: iMessage;-;+15551234567"), "chat_guid:iMessage;-;+15551234567");
+	});
+
+	it("does not collapse two different identities", () => {
+		assert.notEqual(norm("+15551234567"), norm("+15559999999"));
+		assert.notEqual(norm("chat_guid:A"), norm("chat_guid:B"));
+	});
+});
