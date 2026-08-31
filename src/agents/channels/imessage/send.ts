@@ -81,6 +81,19 @@ function resolveMessageId(result: unknown): string | null {
  * Send an iMessage. `to` is the target string; `opts.chatId` (when set) wins and
  * forces a `chat_id:` target. Resolves the message id (or a coarse fallback).
  */
+/**
+ * Does this error mean the transport cannot thread replies, as opposed to the
+ * send being refused for a real reason?
+ *
+ * Matched on the bridge's own wording. Deliberately narrow: a broad match here
+ * would retry sends that genuinely failed, and re-sending a message the bridge
+ * already refused is worse than not sending it.
+ */
+export function isThreadingUnsupported(err: unknown): boolean {
+	const m = (err instanceof Error ? err.message : String(err)).toLowerCase();
+	return m.includes("reply_to") && (m.includes("bridge transport") || m.includes("threaded replies"));
+}
+
 export async function sendMessageIMessage(
 	to: string,
 	text: string,
@@ -155,9 +168,42 @@ export async function sendMessageIMessage(
 			: await createIMessageRpcClient({ cliPath, dbPath }));
 	const shouldClose = !opts.client;
 	try {
-		const result = await client.request<{ ok?: string } & Record<string, unknown>>("send", params, {
+		const requestOpts = {
 			...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-		});
+		};
+		let result: ({ ok?: string } & Record<string, unknown>) | undefined;
+		try {
+			result = await client.request<{ ok?: string } & Record<string, unknown>>(
+				"send",
+				params,
+				requestOpts,
+			);
+		} catch (err) {
+			// A REPLY THAT CANNOT BE THREADED IS STILL A REPLY.
+			//
+			// `reply_to` needs the bridge transport; the AppleScript fallback
+			// rejects it outright:
+			//
+			//   "reply_to requires bridge transport; AppleScript fallback cannot
+			//    send threaded replies"
+			//
+			// That killed the whole send. Threading is a nicety — being ANSWERED
+			// is not — and the message this cost most often is the pairing
+			// challenge, which is the one that tells a new sender how to get
+			// authorised. Losing it leaves them messaging into silence with no
+			// way to discover why, which is exactly what it looks like from the
+			// other end: a bot that is simply ignoring you.
+			//
+			// So: drop the threading and send it flat. Only for this specific
+			// refusal — any other failure is still a failure.
+			if (!replyTo || !isThreadingUnsupported(err)) throw err;
+			delete params.reply_to;
+			result = await client.request<{ ok?: string } & Record<string, unknown>>(
+				"send",
+				params,
+				requestOpts,
+			);
+		}
 		const resolvedId = resolveMessageId(result);
 		// A SEND IS NOT SUCCESSFUL BECAUSE IT RETURNED.
 		//

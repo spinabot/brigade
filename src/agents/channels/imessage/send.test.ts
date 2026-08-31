@@ -215,3 +215,63 @@ describe("sendMessageIMessage — refuses to claim an unconfirmed delivery", () 
 		assert.equal(r.messageId, "ok");
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// A reply that cannot be threaded is still a reply.
+//
+// `reply_to` needs the bridge transport; the AppleScript fallback rejects it,
+// and that used to kill the whole send. The message it cost most often is the
+// pairing challenge — the one that tells a new sender how to get authorised —
+// so losing it leaves them messaging into silence with no way to find out why.
+// Observed live: "sendText failed … reply_to requires bridge transport".
+// ─────────────────────────────────────────────────────────────────────────
+describe("sendMessageIMessage — threaded-reply fallback", () => {
+	class ReplyRejectingClient implements IMessageRpcLike {
+		attempts: Array<Record<string, unknown>> = [];
+		constructor(private readonly message: string) {}
+		async start(): Promise<void> {}
+		async stop(): Promise<void> {}
+		async request<T = unknown>(_m: string, params?: unknown): Promise<T> {
+			const p = (params ?? {}) as Record<string, unknown>;
+			// Snapshot: the sender reuses one params object across the retry, so
+			// recording the reference would show both attempts as the second one.
+			this.attempts.push({ ...p });
+			if (p.reply_to !== undefined) throw new Error(this.message);
+			return { message_id: "M-9" } as T;
+		}
+		async waitForClose(): Promise<void> {}
+	}
+
+	it("retries flat when the transport cannot thread", async () => {
+		const client = new ReplyRejectingClient(
+			"Invalid params: code=-32602 reply_to requires bridge transport; AppleScript fallback cannot send threaded replies",
+		);
+		const res = await sendMessageIMessage("+15551234567", "you need to pair", {
+			client,
+			replyToId: "p:1",
+		});
+		assert.equal(res.messageId, "M-9", "the reply still went out");
+		assert.equal(client.attempts.length, 2, "threaded first, then flat");
+		assert.equal(client.attempts[0]?.reply_to, "p:1");
+		assert.equal(client.attempts[1]?.reply_to, undefined);
+		assert.equal(client.attempts[1]?.text, "you need to pair", "same message, unthreaded");
+	});
+
+	it("does NOT retry a send the bridge refused for a real reason", async () => {
+		// Re-sending something the bridge already refused is worse than not
+		// sending it, so the fallback is narrow on purpose.
+		const client = new ReplyRejectingClient("no such handle");
+		await assert.rejects(
+			() => sendMessageIMessage("+15551234567", "hi", { client, replyToId: "p:1" }),
+			/no such handle/,
+		);
+		assert.equal(client.attempts.length, 1, "failed once, did not retry");
+	});
+
+	it("does not retry when there was no reply_to to drop", async () => {
+		const client = new ReplyRejectingClient("reply_to requires bridge transport");
+		const res = await sendMessageIMessage("+15551234567", "hi", { client });
+		assert.equal(res.messageId, "M-9");
+		assert.equal(client.attempts.length, 1);
+	});
+});

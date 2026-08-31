@@ -3880,8 +3880,7 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
 						`- ${chalk.bold("/copy [code]")} — copy the last reply (or just its code block)\n` +
 						`- ${chalk.bold("/expand [n]")} — show a truncated tool result in full (1 = most recent)\n` +
-						`- ${chalk.bold("/search <query>")} — search this conversation, including tool results\n` +
-						`- ${chalk.bold("/search --regex <pattern>")} — same, treating the query as a regular expression\n` +
+						`- ${chalk.bold("/search [--regex] [--case] <query>")} — search this conversation, including tool results\n` +
 						`- ${chalk.bold("/export [full] [thinking]")} — write this transcript to a Markdown file (secrets redacted; \`full\` keeps whole tool results, \`thinking\` includes the model's reasoning)\n` +
 						`- ${chalk.bold("/rewind [n]")} — go back to one of your earlier messages (no arg = list; conversation only, never files)\n` +
 						`- ${chalk.bold("/flush")} — send everything you queued to the running turn right now\n` +
@@ -4940,16 +4939,54 @@ export async function wireConnectUi(
 		// achievable and, for "what was that path", the more useful answer.
 		if (trimmed === "/search" || trimmed.startsWith("/search ")) {
 			editor.setText("");
-			const q = trimmed === "/search" ? "" : trimmed.slice("/search ".length).trim();
+			// PARSE THE FLAGS THE HELP TEXT ADVERTISES.
+			//
+			// `searchTranscript` has supported `regex` and `caseSensitive` since it
+			// was written, `/help` documents `--regex`, and this passed the whole
+			// tail through as the literal QUERY — so `/search --regex \bfoo\b`
+			// searched for the string "--regex \bfoo\b" and reported "no matches",
+			// which is a silent false negative on a documented flag.
+			const rawArgs = trimmed === "/search" ? "" : trimmed.slice("/search ".length).trim();
+			const searchOpts: { regex?: boolean; caseSensitive?: boolean } = {};
+			let q = rawArgs;
+			// Flags only at the FRONT, so a query containing "--regex" later on is
+			// still searchable verbatim.
+			for (;;) {
+				if (q.startsWith("--regex ") || q === "--regex") {
+					searchOpts.regex = true;
+					q = q.slice("--regex".length).trim();
+					continue;
+				}
+				if (q.startsWith("--case ") || q === "--case") {
+					searchOpts.caseSensitive = true;
+					q = q.slice("--case".length).trim();
+					continue;
+				}
+				break;
+			}
 			if (!q) {
-				insertBeforeEditor(new Text(`  ${brand.dim("usage: /search <text>")}`, 0, 0));
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("usage: /search [--regex] [--case] <text>")}`, 0, 0),
+				);
 				tui.requestRender();
 				return;
 			}
 			try {
 				const snap = await client.resume(withBinding());
 				const messages = (snap?.messages ?? []) as WireMessage[];
-				const { hits, truncated } = searchTranscript(messages, q);
+				const { hits, truncated, usedRegex } = searchTranscript(messages, q, searchOpts);
+				// An invalid pattern falls back to a literal search rather than
+				// throwing — say so, or the operator reads the literal result as a
+				// regex result and concludes their pattern matched nothing.
+				if (searchOpts.regex && !usedRegex) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.dim("that isn't a valid regular expression — searched for it literally instead")}`,
+							0,
+							0,
+						),
+					);
+				}
 				// A search that silently sees only a window is a false negative
 				// dressed as an answer, so the scope is always stated.
 				const windowed = messages.length >= RESUME_TRANSCRIPT_WINDOW;
