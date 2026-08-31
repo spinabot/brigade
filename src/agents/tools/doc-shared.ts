@@ -518,12 +518,67 @@ export interface PdfFontLike {
  * the embedded font. Embeds PER document (a pdf-lib font is document-bound).
  * `registerFontkit` is idempotent, so calling it once per document is safe.
  */
+/**
+ * Whether font SUBSETTING can actually round-trip, probed once per process.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY THIS PROBE EXISTS
+ * ─────────────────────────────────────────────────────────────────────────
+ * `@cantoo/pdf-lib` 2.8.1 with `@pdf-lib/fontkit` 1.1.1 accepts
+ * `embedFont(bytes, { subset: true })` happily and then throws
+ * `Cannot read properties of undefined (reading 'pos')` out of
+ * `TTFSubset.encode` — but only later, during `save()`, because pdf-lib defers
+ * font serialization to document write time.
+ *
+ * That timing is the whole problem. Callers wrap the EMBED in a try/catch and
+ * fall back to a standard font, which looks correct and is completely
+ * ineffective: the embed succeeds, the fallback never runs, and the throw
+ * escapes from `save()` instead. Every PDF taking the Unicode path failed.
+ *
+ * Hardcoding `subset: false` would fix it and permanently cost ~400 KB per
+ * PDF — the entire DejaVu face embedded even for a one-line document. So
+ * instead we ask the question once, the only way it can honestly be asked:
+ * build a throwaway single-glyph document and SAVE it. If that works,
+ * subsetting is safe and PDFs stay small; if it throws, we embed the full
+ * face for the rest of the process and still produce a correct document.
+ *
+ * The probe self-heals — when the upstream bug is fixed, subsetting simply
+ * starts working again with no code change here.
+ */
+let subsettingUsable: boolean | undefined;
+
+async function canSubsetFont(ttf: Buffer, fontkit: unknown): Promise<boolean> {
+	if (subsettingUsable !== undefined) return subsettingUsable;
+	try {
+		const { PDFDocument } = await import("@cantoo/pdf-lib");
+		const probe = await PDFDocument.create();
+		(probe as unknown as PdfDocLike).registerFontkit(fontkit);
+		const font = await (probe as unknown as PdfDocLike).embedFont(new Uint8Array(ttf), {
+			subset: true,
+		});
+		// Draw a glyph so the subset is non-empty, then SAVE — the step that
+		// actually exercises `TTFSubset.encode`, and the step that throws.
+		probe.addPage().drawText("Aa", { x: 10, y: 10, size: 8, font: font as never });
+		await probe.save();
+		subsettingUsable = true;
+	} catch {
+		subsettingUsable = false;
+	}
+	return subsettingUsable;
+}
+
+/** Test seam: forget the probe result so a test can exercise both branches. */
+export function resetFontSubsettingProbe(): void {
+	subsettingUsable = undefined;
+}
+
 export async function embedUnicodeFont(pdf: PdfDocLike): Promise<PdfFontLike> {
 	const ttf = await loadUnicodeFontBytes();
 	const fk = await import("@pdf-lib/fontkit");
 	const fontkit = (fk as { default?: unknown }).default ?? fk;
 	pdf.registerFontkit(fontkit);
-	return pdf.embedFont(new Uint8Array(ttf), { subset: true });
+	const subset = await canSubsetFont(ttf, fontkit);
+	return pdf.embedFont(new Uint8Array(ttf), { subset });
 }
 
 /**

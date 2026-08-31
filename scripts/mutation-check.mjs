@@ -320,6 +320,15 @@ const MUTATIONS = [
     tests: "src/agents/compaction/mid-turn-runner.test.ts",
   },
 
+  // ── PDF font embedding ──
+  {
+    claim: "a PDF that cannot subset its font still saves",
+    file: "src/agents/tools/doc-shared.ts",
+    find: "\tconst subset = await canSubsetFont(ttf, fontkit);\n\treturn pdf.embedFont(new Uint8Array(ttf), { subset });",
+    replace: "\treturn pdf.embedFont(new Uint8Array(ttf), { subset: true });",
+    tests: "src/agents/tools/make-document-tool.test.ts",
+  },
+
   // ── Pi/Anthropic dialect boundary ──
   {
     claim: "the Pi and Anthropic tool dialects stay distinct",
