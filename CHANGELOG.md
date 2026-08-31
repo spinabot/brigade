@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.35.2](https://github.com/spinabot/brigade/compare/brigade-v1.35.1...brigade-v1.35.2) (2026-08-31)
+
+
+### Bug Fixes
+
+* **export:** /export thinking parsed the flag and then ignored it ([1f333e3](https://github.com/spinabot/brigade/commit/1f333e3b6ea68b82e1d47b5638026cee7471326e))
+* reasoning tokens for every provider, and an update check that re-checks ([ccd9894](https://github.com/spinabot/brigade/commit/ccd98948096bedc7edb339a02117f08ef065407a))
+* reasoning tokens on every provider, and an update check that actually re-checks ([ecf0243](https://github.com/spinabot/brigade/commit/ecf0243ad564c6739161522d5dd7142d08877134))
+* **tui:** /session and /agent bound the input but not the view ([14a507d](https://github.com/spinabot/brigade/commit/14a507de6fdd645b56e825d4f9516fc6eacb5c78))
+
 ## [1.35.1](https://github.com/spinabot/brigade/compare/brigade-v1.35.0...brigade-v1.35.1) (2026-08-31)
 
 
