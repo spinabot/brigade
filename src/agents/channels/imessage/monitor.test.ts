@@ -373,3 +373,41 @@ describe("normalizeHandle / echoScope agreement", () => {
 		assert.equal(echoScope("default", { chat_id: 21, sender: "whoever" }), "default:chat_id:21");
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// `chat_id` is the conversation's row id — every thread has one, DMs
+// included — so treating it as proof of a group put ordinary DMs behind the
+// group requireMention gate and the group allow-list.
+// ─────────────────────────────────────────────────────────────────────────
+describe("normalizeIMessageMessage — group classification", () => {
+	it("a DM carrying a chat_id is still a DM", () => {
+		const out = normalizeIMessageMessage({
+			sender: "+15551234567",
+			text: "hi",
+			chat_id: 7,
+			is_group: false,
+		});
+		assert.equal(out.isGroup, false);
+		assert.equal(out.chatId, 7, "the chat id is still carried through");
+	});
+
+	it("an explicit is_group:true is a group", () => {
+		assert.equal(
+			normalizeIMessageMessage({ sender: "+1555", text: "hi", chat_id: 7, is_group: true }).isGroup,
+			true,
+		);
+	});
+
+	it("falls back to participant count when is_group is absent", () => {
+		assert.equal(
+			normalizeIMessageMessage({ sender: "+1555", text: "hi", participants: ["+1555", "+1666"] })
+				.isGroup,
+			true,
+		);
+		assert.equal(
+			normalizeIMessageMessage({ sender: "+1555", text: "hi", participants: ["+1555"] }).isGroup,
+			false,
+		);
+		assert.equal(normalizeIMessageMessage({ sender: "+1555", text: "hi", chat_id: 9 }).isGroup, false);
+	});
+});

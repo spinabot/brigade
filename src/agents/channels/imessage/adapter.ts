@@ -49,6 +49,35 @@ import {
 	type IMessageInboundMessage,
 } from "./connection.js";
 import { markdownToIMessageText } from "./format.js";
+import { normalizeIMessageAclEntry, normalizeIMessageHandle } from "./targets.js";
+
+/**
+ * The identities one inbound message can be allow-listed under.
+ *
+ * `from` is whatever the chat database stores — `+1 (555) 123-4567`,
+ * `User@Example.com`, sometimes an `iMessage;-;` service-prefixed handle. The
+ * operator types what the setup wizard showed them. Exact matching between
+ * those two spellings fails, so the sender is refused despite being listed.
+ *
+ * The wizard also documents `chat_id:123`, which describes the THREAD, not the
+ * sender, and so could never equal `from` under any spelling. It is listed here
+ * so allow-listing a conversation does what the wizard says it does.
+ */
+function imessageSenderAliases(msg: {
+	from: string;
+	chatId?: number;
+	chatIdentifier?: string;
+}): string[] {
+	const out = new Set<string>();
+	const handle = normalizeIMessageHandle(msg.from);
+	if (handle) out.add(handle);
+	if (typeof msg.chatId === "number" && Number.isFinite(msg.chatId)) {
+		out.add(`chat_id:${msg.chatId}`);
+	}
+	const ident = normalizeIMessageHandle(msg.chatIdentifier ?? "");
+	if (ident) out.add(`chat_identifier:${ident}`);
+	return [...out];
+}
 
 /** iMessage's practical per-message text limit for chunked sends (default; config can override). */
 const IMESSAGE_TEXT_LIMIT = DEFAULT_IMESSAGE_TEXT_CHUNK_LIMIT;
@@ -162,6 +191,7 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 							...(msg.messageId ? { messageId: msg.messageId } : {}),
 							...(msg.createdAtMs !== undefined ? { messageTimestampMs: msg.createdAtMs } : {}),
 							from: msg.from,
+							senderAliases: imessageSenderAliases(msg),
 							...(msg.fromName !== undefined ? { fromName: msg.fromName } : {}),
 							text: body,
 							chatType: msg.isGroup ? "group" : "direct",
@@ -299,6 +329,18 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 		// the bot runs AS the operator (Messages.app), so the pairing card uses the
 		// "account" label and ownership is NOT bootstrapped from a separate bot.
 		pairing: { idLabel: "account" as const },
+
+		/**
+		 * Canonicalize the operator's allow-list entries to the same spelling
+		 * `imessageSenderAliases` produces, so exact matching can succeed.
+		 *
+		 * `chat_id:` / `chat_identifier:` entries keep their prefix — they are
+		 * conversation identities, matched against the thread rather than the
+		 * sender. Everything else is a handle: an email lowercases, a phone
+		 * becomes E.164. Neither mapping can collide two real identities, so the
+		 * allow-list is not widened.
+		 */
+		normalizeAclEntry: normalizeIMessageAclEntry,
 
 		// iMessage has no bot token — the `imsg` binary path + Messages.app sign-in
 		// are the auth. `brigade channels add imessage` walks: cliPath → dmPolicy →

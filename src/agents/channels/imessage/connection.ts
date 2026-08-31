@@ -199,6 +199,14 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 	}
 
 	const handleNotification = (msg: IMessageRpcNotification): void => {
+		// A CLOSED CONNECTION DELIVERS NOTHING.
+		//
+		// `close()` can land while a `watch.subscribe` is still in flight, and the
+		// client it was building stays subscribed and keeps calling this. Without
+		// this line those rows reach `onMessage` after close — and if the account
+		// has since reconnected, the operator is answered twice for one message.
+		// `subscribeOnce` tears the orphan down; this closes the window before it.
+		if (closed || args.signal?.aborted) return;
 		// Wrap the whole handler so a synchronous throw (malformed payload, a
 		// decideInbound bug, a downstream onMessage error) can NEVER escape into the
 		// RPC client's notification loop and wedge the watch / crash the gateway.
@@ -244,14 +252,26 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 			// then record THIS message for the next turn. iMessage's `imsg rpc`
 			// transport exposes no history method, so this is a pure in-memory buffer
 			// of messages the monitor has already seen (mirrors the upstream monitor).
-			const isUntaggedGroup =
-				normalized.isGroup && (!normalized.mentions || normalized.mentions.length === 0) && !normalized.replyTo;
-			if (account.historyLimit > 0 && isUntaggedGroup && normalized.text.trim()) {
-				const entries = history.recent(normalized.conversationId, account.historyLimit);
+			//
+			// GROUPS USE `historyLimit`, DMs USE `dmHistoryLimit`. Both are
+			// resolved by `account-config`, documented, and settable — but only
+			// the group one was ever read here, so setting `dmHistoryLimit` did
+			// nothing at all. (BlueBubbles' `historyLimitFor` has always honoured
+			// both; this is the same rule.)
+			const untagged =
+				(!normalized.mentions || normalized.mentions.length === 0) && !normalized.replyTo;
+			const historyLimit = normalized.isGroup ? account.historyLimit : account.dmHistoryLimit;
+			if (historyLimit > 0 && untagged && normalized.text.trim()) {
+				const entries = history.recent(normalized.conversationId, historyLimit);
 				const block = renderIMessageHistoryBlock(entries);
 				if (block) (normalized as IMessageInboundMessage).historyContext = block;
 			}
-			if (normalized.isGroup) {
+			// RECORD WHEREVER WE MIGHT LATER READ. This was `if (isGroup)`, so
+			// enabling `dmHistoryLimit` alone would have read a buffer nothing
+			// ever wrote to — the setting would still look inert, just one layer
+			// deeper. Gated on the limit so an install that leaves DM history off
+			// (the default) buffers nothing for its DMs, as before.
+			if (historyLimit > 0 || normalized.isGroup) {
 				history.record(normalized.conversationId, {
 					sender: normalized.fromName || normalized.from || "Unknown",
 					body: normalized.text,
@@ -328,7 +348,26 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 		for (let i = 1; i <= WATCH_SUBSCRIBE_MAX_ATTEMPTS; i++) {
 			if (closed || args.signal?.aborted) return;
 			try {
-				client = await subscribeAttempt();
+				const c = await subscribeAttempt();
+				// RE-CHECK AFTER THE AWAIT, NOT ONLY BEFORE IT.
+				//
+				// The guard at the top of this loop runs before two awaits (spawn,
+				// then `watch.subscribe`). `close()` during either one saw
+				// `client === null` and stopped nothing, and then this line
+				// published a live, subscribed client into a connection that had
+				// already been closed — a leaked `imsg` subprocess that no code
+				// path can reach to stop, still streaming rows. Reconnecting the
+				// account then delivered every message twice: once from the orphan,
+				// once from its replacement.
+				if (closed || args.signal?.aborted) {
+					try {
+						await c.stop();
+					} catch {
+						/* best-effort; the process is already unreachable */
+					}
+					return;
+				}
+				client = c;
 				connected = true;
 				connectedAtMs = Date.now();
 				attempt = 0;

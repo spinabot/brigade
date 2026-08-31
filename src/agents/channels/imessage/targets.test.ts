@@ -5,6 +5,7 @@ import {
 	formatIMessageChatTarget,
 	inferIMessageTargetChatType,
 	isAllowedIMessageSender,
+	normalizeIMessageAclEntry,
 	normalizeE164,
 	normalizeIMessageHandle,
 	parseIMessageAllowTarget,
@@ -182,5 +183,41 @@ describe("normalizeE164 — refuses to invent a number", () => {
 		// survive normalisation rather than being mangled into a number.
 		assert.equal(normalizeIMessageHandle("Line 2"), "Line2");
 		assert.equal(normalizeIMessageHandle("me@Example.com"), "me@example.com");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// The allow-list spelling gap.
+//
+// `evaluateAccess` matches by exact string equality — correct, and only safe
+// when both sides are spelled the same way. iMessage delivers whatever the
+// chat database stores while the operator types what the wizard showed them,
+// so the two sides disagreed and listed senders were refused. These pin the
+// canonicalisation that closes the gap without loosening the comparison.
+// ─────────────────────────────────────────────────────────────────────────
+describe("iMessage allow-list canonicalisation", () => {
+	const norm = normalizeIMessageAclEntry;
+
+	it("a punctuated phone and the stored form canonicalise to one string", () => {
+		assert.equal(norm("+1 (555) 123-4567"), normalizeIMessageHandle("+15551234567"));
+	});
+
+	it("email case does not decide access", () => {
+		assert.equal(norm("User@Example.com"), normalizeIMessageHandle("user@example.com"));
+	});
+
+	it("every chat_id spelling the parser accepts lands on one form", () => {
+		assert.equal(norm("chat_id:42"), "chat_id:42");
+		assert.equal(norm("chatid: 42"), "chat_id:42");
+		assert.equal(norm("chat:42"), "chat_id:42");
+	});
+
+	it("does NOT collapse two different identities onto one entry", () => {
+		// The whole reason matching stays exact. If canonicalisation ever mapped
+		// distinct people to the same string it would widen the allow-list
+		// silently, which is worse than the bug it fixes.
+		assert.notEqual(norm("+15551234567"), norm("+15559999999"));
+		assert.notEqual(norm("a@example.com"), norm("b@example.com"));
+		assert.notEqual(norm("chat_id:42"), norm("chat_id:43"));
 	});
 });

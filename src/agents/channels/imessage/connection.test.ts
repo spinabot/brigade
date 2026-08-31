@@ -384,3 +384,183 @@ describe("connectIMessage — remote-host attachment fetch (Fix 4)", () => {
 		await conn.close();
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Close during an in-flight subscribe.
+//
+// The guard used to be checked only BEFORE the two awaits (spawn, then
+// `watch.subscribe`). `close()` landing in between saw `client === null` and
+// stopped nothing, and the resolved client was then published into a closed
+// connection: a live `imsg` subprocess no code path can reach, still streaming
+// rows. Reconnecting the account delivered every message twice.
+// ─────────────────────────────────────────────────────────────────────────
+describe("connectIMessage — abort during an in-flight subscribe", () => {
+	it("stops the orphaned client instead of publishing it", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((r) => {
+			release = r;
+		});
+		let stops = 0;
+		let built = 0;
+		const ac = new AbortController();
+
+		class SlowClient implements IMessageRpcLike {
+			async start(): Promise<void> {}
+			async stop(): Promise<void> {
+				stops += 1;
+			}
+			async request<T = unknown>(): Promise<T> {
+				// Hold `watch.subscribe` open so the abort lands mid-flight — the
+				// window the old check-then-await guard could not see.
+				await gate;
+				return {} as T;
+			}
+			waitForClose(): Promise<void> {
+				return new Promise<void>(() => {});
+			}
+		}
+
+		const connecting = connectIMessage({
+			account: account(),
+			loadConfig: () => ({}) as unknown as BrigadeConfig,
+			log: () => {},
+			onMessage: () => {},
+			signal: ac.signal,
+			clientFactory: async () => {
+				built += 1;
+				return new SlowClient();
+			},
+			probeImpl: async () => ({ ok: true, elapsedMs: 0 }),
+			sleepImpl: async () => {},
+		});
+
+		// Let the factory run and the subscribe genuinely block.
+		await new Promise<void>((r) => setImmediate(r));
+		assert.equal(built, 1, "a client exists but the subscribe has not resolved");
+
+		// Abort NOW — mid-subscribe. The old code re-checked nothing after the
+		// await, so this client was published into an already-closed connection
+		// and never stopped: a live `imsg` subprocess streaming rows that a
+		// later reconnect would then duplicate.
+		ac.abort();
+		release();
+		const conn = await connecting;
+
+		assert.equal(stops, 1, "the client built during the abort was stopped exactly once");
+		assert.equal(conn.isConnected(), false, "an aborted connection never reports connected");
+		await conn.close();
+	});
+});
+
+describe("connectIMessage — a closed connection delivers nothing", () => {
+	it("drops notifications that arrive after close", async () => {
+		const delivered: string[] = [];
+		let notify: ((m: IMessageRpcNotification) => void) | undefined;
+		const conn = await connectIMessage({
+			account: account(),
+			loadConfig: () => ({}) as unknown as BrigadeConfig,
+			log: () => {},
+			onMessage: (m) => delivered.push(m.text),
+			clientFactory: async (opts) => {
+				notify = opts.onNotification;
+				return new FakeClient();
+			},
+			probeImpl: async () => ({ ok: true, elapsedMs: 0 }),
+			sleepImpl: async () => {},
+		});
+		const push = (text: string) =>
+			notify?.({
+				method: "message",
+				params: { message: { sender: "+15551234567", text, is_from_me: false } },
+			} as unknown as IMessageRpcNotification);
+
+		push("before");
+		await new Promise<void>((r) => setImmediate(r));
+		assert.deepEqual(delivered, ["before"]);
+
+		await conn.close();
+		// A subscribe that was still in flight at close keeps a live client
+		// pointed at this handler. Without the guard those rows reach the agent
+		// after close — and once the account reconnects, the operator is
+		// answered twice for the same message.
+		push("after");
+		await new Promise<void>((r) => setImmediate(r));
+		assert.deepEqual(delivered, ["before"], "nothing is delivered after close");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// `dmHistoryLimit` was resolved, documented, and never read — only
+// `historyLimit` was, gated on the message being a group. Setting it did
+// nothing. `record` was group-only too, so honouring the limit alone would
+// have read a buffer nothing ever wrote to.
+// ─────────────────────────────────────────────────────────────────────────
+describe("connectIMessage — dmHistoryLimit", () => {
+	const dmNotification = (text: string): IMessageRpcNotification =>
+		({
+			method: "message",
+			params: {
+				message: {
+					sender: "+15551234567",
+					text,
+					chat_identifier: "+15551234567",
+					is_group: false,
+					is_from_me: false,
+					chat_id: 7,
+				},
+			},
+		}) as unknown as IMessageRpcNotification;
+
+	it("attaches DM history once dmHistoryLimit is set", async () => {
+		const seen: Array<{ text: string; ctx?: string }> = [];
+		let notify: ((m: IMessageRpcNotification) => void) | undefined;
+		const conn = await connectIMessage({
+			account: account({ dmHistoryLimit: 5 }),
+			loadConfig: () => ({}) as unknown as BrigadeConfig,
+			log: () => {},
+			onMessage: (m) =>
+				seen.push({
+					text: m.text,
+					...((m as { historyContext?: string }).historyContext !== undefined
+						? { ctx: (m as { historyContext?: string }).historyContext }
+						: {}),
+				}),
+			clientFactory: async (opts) => {
+				notify = opts.onNotification;
+				return new FakeClient();
+			},
+			probeImpl: async () => ({ ok: true, elapsedMs: 0 }),
+			sleepImpl: async () => {},
+		});
+		notify?.(dmNotification("first"));
+		notify?.(dmNotification("second"));
+		await new Promise<void>((r) => setImmediate(r));
+		assert.equal(seen.length, 2);
+		assert.equal(seen[0]?.ctx, undefined, "nothing buffered yet for the first message");
+		assert.ok(seen[1]?.ctx, "the second DM carries the first as context");
+		assert.match(String(seen[1]?.ctx), /first/);
+		await conn.close();
+	});
+
+	it("buffers nothing for DMs when the limit is left at its default", async () => {
+		const seen: Array<string | undefined> = [];
+		let notify: ((m: IMessageRpcNotification) => void) | undefined;
+		const conn = await connectIMessage({
+			account: account(),
+			loadConfig: () => ({}) as unknown as BrigadeConfig,
+			log: () => {},
+			onMessage: (m) => seen.push((m as { historyContext?: string }).historyContext),
+			clientFactory: async (opts) => {
+				notify = opts.onNotification;
+				return new FakeClient();
+			},
+			probeImpl: async () => ({ ok: true, elapsedMs: 0 }),
+			sleepImpl: async () => {},
+		});
+		notify?.(dmNotification("first"));
+		notify?.(dmNotification("second"));
+		await new Promise<void>((r) => setImmediate(r));
+		assert.deepEqual(seen, [undefined, undefined]);
+		await conn.close();
+	});
+});

@@ -429,3 +429,67 @@ describe("pairing store", () => {
 		assert.equal(revokePairingCode("wa", code), false); // gone
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// `senderAliases` generalises the WhatsApp `senderLid` identity overlap so a
+// channel can supply canonical spellings of the same sender. It must stay
+// ADDITIVE: a channel that supplies none keeps verbatim matching exactly as
+// before, because a fuzzy allow-list is how the wrong person gets admitted.
+// ─────────────────────────────────────────────────────────────────────────
+describe("evaluateAccess — senderAliases stays additive", () => {
+	it("changes nothing for a channel that supplies no aliases", () => {
+		// WhatsApp/Telegram/Discord/Slack shape: exact ids, no aliases.
+		assert.equal(
+			evaluateAccess({ policy: "allowlist", senderId: "1555@s.whatsapp.net", allowFrom: ["1555@s.whatsapp.net"] })
+				.kind,
+			"allow",
+		);
+		assert.equal(
+			evaluateAccess({ policy: "allowlist", senderId: "1555@s.whatsapp.net", allowFrom: ["1999@s.whatsapp.net"] })
+				.kind,
+			"block",
+		);
+		// A near-miss is still a miss — no normalisation is applied for them.
+		assert.equal(
+			evaluateAccess({ policy: "allowlist", senderId: "1555@s.whatsapp.net", allowFrom: ["1555"] }).kind,
+			"block",
+		);
+	});
+
+	it("an empty alias list cannot admit anyone", () => {
+		assert.equal(
+			evaluateAccess({ policy: "allowlist", senderId: "a", allowFrom: ["b"], senderAliases: [] }).kind,
+			"block",
+		);
+	});
+
+	it("an alias matches only when the list actually carries it", () => {
+		assert.equal(
+			evaluateAccess({
+				policy: "allowlist",
+				senderId: "+1 (555) 123-4567",
+				allowFrom: ["+15551234567"],
+				senderAliases: ["+15551234567"],
+			}).kind,
+			"allow",
+		);
+		assert.equal(
+			evaluateAccess({
+				policy: "allowlist",
+				senderId: "+1 (555) 123-4567",
+				allowFrom: ["+15559999999"],
+				senderAliases: ["+15551234567"],
+			}).kind,
+			"block",
+		);
+	});
+
+	it("an empty-string alias never matches an empty-string entry", () => {
+		// Defensive: a channel that emits "" for an unknown handle must not be
+		// able to match a stray empty allow-list entry.
+		assert.equal(
+			evaluateAccess({ policy: "allowlist", senderId: "x", allowFrom: [""], senderAliases: [""] }).kind,
+			"block",
+		);
+	});
+});

@@ -189,7 +189,23 @@ export function conversationIdFor(payload: IMessagePayload): string {
  * central group requireMention gate can fire.
  */
 export function normalizeIMessageMessage(payload: IMessagePayload, selfHandle?: string): NormalizedIMessage {
-	const isGroup = Boolean(payload.is_group) || typeof payload.chat_id === "number";
+	// A `chat_id` IS NOT EVIDENCE OF A GROUP.
+	//
+	// This was `is_group || typeof chat_id === "number"`, and `chat_id` is the
+	// chat.db row id of the CONVERSATION — every thread has one, DMs included.
+	// So any DM whose payload carried a chat id was classified as a group, which
+	// put it behind the group `requireMention` gate (a plain DM ignored unless it
+	// named the bot), matched it against `groupAllowFrom` instead of `allowFrom`,
+	// and sent it down the `historyLimit` path instead of `dmHistoryLimit`.
+	//
+	// `is_group` is authoritative in BOTH directions when the bridge sends it —
+	// an explicit `false` now means not-a-group rather than being overridden.
+	// `participants` is the fallback when it is absent: more than one other party
+	// in the thread is what actually makes a room a room.
+	const isGroup =
+		typeof payload.is_group === "boolean"
+			? payload.is_group
+			: Array.isArray(payload.participants) && payload.participants.length > 1;
 	const createdAtMs = payload.created_at ? Date.parse(payload.created_at) : NaN;
 	const messageId = payload.guid?.trim() || (typeof payload.id === "number" ? String(payload.id) : undefined);
 	const out: NormalizedIMessage = {
