@@ -2017,9 +2017,38 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// under `anthropic`, so the provider id alone cannot tell a Pro/Max
 			// subscription turn from a metered API-key one; the credential's
 			// `type` can.
+			// PASS THE CREDENTIAL TYPE, WHICH IS THE WHOLE POINT OF THIS FUNCTION.
+			//
+			// `classifyBillingModeWithAuth` narrows metered → subscription only
+			// when `authType` says the credential is an OAuth/browser login — and
+			// no call site ever passed it, so this was a pure static catalog
+			// lookup. The catalog marks `anthropic` metered, so a Claude Pro/Max
+			// turn reported `metered`, `shouldRenderCost` returned true, and a
+			// confident dollar figure was printed for a subscription with no
+			// marginal cost. That is precisely the case this module exists to
+			// prevent, defeated by an unpassed argument.
+			//
+			// Resolved from the SAME provider and model this snapshot reports, so
+			// a session pinned to another provider is classified against the
+			// credential that will actually be charged.
 			billing: classifyBillingModeWithAuth({
-				provider: rt?.provider,
-				...(rt?.model?.cost ? { cost: rt.model.cost as { input?: number; output?: number } } : {}),
+				provider: snapshotProvider,
+				...(() => {
+					try {
+						const store = getAuthStorageForAgent(targetAgentId) as unknown as {
+							get?: (p: string) => { type?: string } | undefined;
+						};
+						const t = snapshotProvider ? store.get?.(snapshotProvider)?.type : undefined;
+						return t === "oauth" || t === "token" || t === "api_key" ? { authType: t } : {};
+					} catch {
+						// Never let a credential read break a snapshot; an absent
+						// type simply leaves the static classification in place.
+						return {};
+					}
+				})(),
+				...(effectiveModel?.cost
+					? { cost: effectiveModel.cost as { input?: number; output?: number } }
+					: {}),
 			}),
 			costComplete: snapshotUsage.costComplete,
 			// Wave K — per-agent live-session count. Was process-wide before,

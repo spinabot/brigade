@@ -2203,6 +2203,9 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
               assertNoProviderErrorStop(session as AgentSession);
             },
             {
+              // The operator's cancellation, read at decision time. An abort
+              // must never be answered with a fresh billed turn.
+              aborted: () => args.signal?.aborted === true,
               onRetry: (reason: NonNullable<ContentQualityIssue>) => {
                 log.warn("content-quality retry triggered", {
                   agentId,

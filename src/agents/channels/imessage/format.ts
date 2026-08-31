@@ -140,8 +140,24 @@ function stripReasoningBlocks(text: string): string {
 
 /**
  * Strip Brigade-internal scaffolding from outbound text before it hits the wire.
- * Returns the cleaned text; if stripping leaves nothing, returns the trimmed
- * original (better to send something than confuse the recipient with silence).
+ *
+ * Returns "" when stripping leaves nothing — the caller must then send NOTHING.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY THE OLD FALLBACK WAS EXACTLY BACKWARDS
+ * ─────────────────────────────────────────────────────────────────────────
+ * This used to return the raw original in that case, reasoning that it is
+ * "better to send something than confuse the recipient with silence". But the
+ * case where stripping empties the text is precisely the case where the body
+ * was ENTIRELY internal scaffolding — so "something" is the model's private
+ * reasoning, or a `[[reply_to:…]]` directive, delivered verbatim to another
+ * person. Proven: `"&lt;think&gt;secret plan&lt;/think&gt;"` went out as-is,
+ * contradicting this module's own rule that such text "must never reach a
+ * recipient's iMessage thread".
+ *
+ * Silence is the correct outcome. A recipient seeing nothing is a bug the
+ * operator can notice and report; a recipient seeing the model's reasoning
+ * cannot be taken back.
  */
 export function sanitizeOutboundIMessageText(text: string): string {
 	if (!text) return text;
@@ -153,8 +169,7 @@ export function sanitizeOutboundIMessageText(text: string): string {
 	cleaned = cleaned.replace(ROLE_TURN_MARKER_RE, "");
 	// Collapse runs of spaces a strip can leave mid-line, then blank lines.
 	cleaned = cleaned.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
-	const trimmed = cleaned.trim();
-	return trimmed.length > 0 ? trimmed : text.trim();
+	return cleaned.trim();
 }
 
 /** Outbound media kind → the placeholder text used when the message has no body. */

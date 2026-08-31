@@ -141,3 +141,52 @@ describe("sendMessageIMessage", () => {
 		/* tmp dirs are left for the OS to reap; no global state to reset */
 	});
 });
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * A send is not successful because it returned.
+ *
+ * The transport rejects on a JSON-RPC `error` member, so this code only ever
+ * sees a 200-shaped answer — but the bridge reports a refused send INSIDE the
+ * result. `{ok:false, error:"no such handle"}` fell through to
+ * `messageId:"unknown"`, which every caller reads as success, so an
+ * undeliverable message was reported delivered.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+describe("sendMessageIMessage — refuses to claim an unconfirmed delivery", () => {
+	const clientReturning = (result: unknown) => ({
+		request: async () => result,
+		stop: async () => {},
+	});
+
+	it("throws when the bridge refuses the send", async () => {
+		await assert.rejects(
+			() => sendMessageIMessage("+16464201739", "hi", { client: clientReturning({ ok: false, error: "no such handle" }) as never }),
+			/no such handle/,
+		);
+	});
+
+	it("throws when the result carries an error string", async () => {
+		await assert.rejects(
+			() => sendMessageIMessage("+16464201739", "hi", { client: clientReturning({ error: "not signed in" }) as never }),
+			/not signed in/,
+		);
+	});
+
+	it("throws when nothing acknowledges the send", async () => {
+		// No id, no ack. Absence of evidence is not evidence of delivery.
+		await assert.rejects(
+			() => sendMessageIMessage("+16464201739", "hi", { client: clientReturning({}) as never }),
+			/not confirmed/,
+		);
+	});
+
+	it("accepts a real message id", async () => {
+		const r = await sendMessageIMessage("+16464201739", "hi", { client: clientReturning({ messageId: "ABC-123" }) as never });
+		assert.equal(r.messageId, "ABC-123");
+	});
+
+	it("accepts a positive acknowledgement without an id", async () => {
+		const r = await sendMessageIMessage("+16464201739", "hi", { client: clientReturning({ ok: true }) as never });
+		assert.equal(r.messageId, "ok");
+	});
+});

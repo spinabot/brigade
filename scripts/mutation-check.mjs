@@ -345,6 +345,49 @@ const MUTATIONS = [
     tests: "src/agents/source-is-text.test.ts",
   },
 
+  // ── iMessage self-thread ──
+  {
+    claim: "a refused send is not reported as delivered",
+    file: "src/agents/channels/imessage/send.ts",
+    find: "\t\tif (explicitFailure) {",
+    replace: "\t\tif (false) {",
+    tests: "src/agents/channels/imessage/send.test.ts",
+  },
+  {
+    claim: "an all-scaffolding reply is never sent raw to the recipient",
+    file: "src/agents/channels/imessage/format.ts",
+    find: "\treturn cleaned.trim();",
+    replace: "\tconst t = cleaned.trim();\n\treturn t.length > 0 ? t : text.trim();",
+    tests: "src/agents/channels/imessage/format.test.ts",
+  },
+
+
+  {
+    claim: "a name is never converted into a phone number",
+    file: "src/agents/channels/imessage/targets.ts",
+    find: "\tif (/[a-z]/i.test(stripped)) return \"\";",
+    replace: "\tif (false) return \"\";",
+    tests: "src/agents/channels/imessage/targets.test.ts",
+  },
+  {
+    claim: "an agent echo in a self-thread does not mute the conversation",
+    file: "src/agents/channels/imessage/monitor.ts",
+    find: "\t\t\t\treturn { kind: \"drop\", reason: \"agent echo in self-chat\" };",
+    replace: "\t\t\t\tstate.loopRateLimiter.record(rateKey);\n\t\t\t\treturn { kind: \"drop\", reason: \"agent echo in self-chat\" };",
+    tests: "src/agents/channels/imessage/monitor.test.ts",
+    expectMissed: true,
+    reason: "the mute needs five hits across two exchanges to manifest; the unit tests decide one message at a time. Verified by hand with a five-turn simulation against the built module.",
+  },
+
+
+  {
+    claim: "a reply in a self-thread reaches the agent",
+    file: "src/agents/channels/imessage/monitor.ts",
+    find: "\t\t\tskipSelfChatHasCheck = true;\n\t\t} else if (isSelfChat) {",
+    replace: "\t\t\treturn { kind: \"drop\", reason: \"from me\" };\n\t\t} else if (isSelfChat) {",
+    tests: "src/agents/channels/imessage/monitor.test.ts",
+  },
+
   // ── Manual compaction ──
   {
     claim: "an explicit /compact is honoured exactly once",

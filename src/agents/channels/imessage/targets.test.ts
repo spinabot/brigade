@@ -128,3 +128,59 @@ describe("formatIMessageChatTarget + inferIMessageTargetChatType", () => {
 		assert.equal(inferIMessageTargetChatType("chat_id:5"), "group");
 	});
 });
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * A name must never become a phone number.
+ *
+ * `normalizeE164` stripped every non-digit and prepended `+`, so it never
+ * decided whether the input WAS a phone number — it manufactured one.
+ * `"Line 2"` became `"+2"`, and a private conversation went to whoever
+ * answers at that number. Sending to the wrong recipient is the worst outcome
+ * this channel has, and it took one plausible typo.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+describe("normalizeE164 — refuses to invent a number", () => {
+	it("a contact-ish name with a stray digit is NOT a phone number", () => {
+		assert.equal(normalizeE164("Line 2"), "");
+		assert.equal(normalizeE164("Room 101"), "");
+		assert.equal(normalizeE164("Mum"), "");
+	});
+
+	it("a NAME containing a full-length digit run is still refused", () => {
+		// The case only the letter check catches: the digit-count guard is
+		// satisfied, so without it this becomes a real, dialable number
+		// belonging to a stranger. "call 5551234567 for support" in a contact
+		// field is the shape that reaches here.
+		assert.equal(normalizeE164("Room 5551234567"), "");
+		assert.equal(normalizeE164("call 5551234567"), "");
+		assert.equal(normalizeE164("Support x16464201739"), "");
+	});
+
+	it("a digit fragment is refused rather than prefixed", () => {
+		// A fragment with a `+` in front is a real number belonging to someone.
+		assert.equal(normalizeE164("2"), "");
+		assert.equal(normalizeE164("12345"), "");
+	});
+
+	it("an over-long digit run is refused", () => {
+		// E.164 caps at 15 digits; longer is an id, an order number, anything.
+		assert.equal(normalizeE164("12345678901234567890"), "");
+	});
+
+	it("genuine numbers still normalise", () => {
+		assert.equal(normalizeE164("+1 (646) 420-1739"), "+16464201739");
+		assert.equal(normalizeE164("+16464201739"), "+16464201739");
+		assert.equal(normalizeE164("555-123-4567"), "+5551234567");
+	});
+
+	it("an email is not a phone number", () => {
+		assert.equal(normalizeE164("me@example.com"), "");
+	});
+
+	it("a handle that is not a phone falls through intact", () => {
+		// The caller treats "" as "try the other handle shapes", so a name must
+		// survive normalisation rather than being mangled into a number.
+		assert.equal(normalizeIMessageHandle("Line 2"), "Line2");
+		assert.equal(normalizeIMessageHandle("me@Example.com"), "me@example.com");
+	});
+});

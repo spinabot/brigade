@@ -832,6 +832,71 @@ export async function wireConnectUi(
 		return "";
 	};
 
+	/**
+	 * Everything that must forget the old thread when the context changes.
+	 *
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * WHY THIS IS ONE FUNCTION
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * Four commands switch context — `/new`, `/session`, `/agent`, `/delete` —
+	 * and each maintained its own hand-written sequence. They diverged, exactly
+	 * as that arrangement guarantees: one cleared the transcript, another zeroed
+	 * the totals, a third did neither, and a whole set of per-thread values was
+	 * cleared by NONE of them.
+	 *
+	 * The ones nothing reset are the dangerous half, because they are read by
+	 * commands that then act on the wrong thread:
+	 *
+	 *   • `lastUserPrompt` / `lastUserAttachments` — `/switch` replays these, so
+	 *     it re-sent the PREVIOUS thread's message, with its attachments, into
+	 *     the new one. That does not merely mislead; it acts.
+	 *   • `toolCallInfo` — `/expand` with no argument is documented as "the
+	 *     result you just saw", and printed one from a thread whose transcript
+	 *     had been wiped off the screen.
+	 *   • `lastReplyText` — `/copy` copied the previous thread's reply and
+	 *     confirmed with a byte count, so it looked like it worked.
+	 *   • the queue chip and the running/elapsed state — the old lane's
+	 *     `agent_end` is dropped by the off-lane guard, so a `●` dot and a
+	 *     climbing timer sat over an idle thread while `/abort` insisted a turn
+	 *     was running and `/update` refused to run because of it.
+	 *
+	 * Adding a per-thread value now means adding it HERE, once, instead of
+	 * remembering four call sites.
+	 */
+	const switchContext = (what: string, opts: { zeroTotals?: boolean } = {}): void => {
+		clearTrayForContextSwitch(what);
+		// The collapsed-notice widget lives in the region about to be cleared.
+		lastSystemEventLine = undefined;
+		// Replay + "last thing" state. All of these answer "in this thread",
+		// and after a switch this thread has no answer yet.
+		lastUserPrompt = "";
+		lastUserAttachments = [];
+		lastReplyText = "";
+		toolCallInfo.clear();
+		// Turn state belongs to the lane we just left. Its terminal event will be
+		// filtered out as off-lane, so nothing else will ever clear these.
+		queuedSteering = [];
+		queuedFollowUp = [];
+		isAgentRunning = false;
+		agentStartedAt = null;
+		// Usage figures are per (agent, sessionKey) at the gateway, so a fresh
+		// binding WILL report zero — but only after `subscribe` round-trips.
+		// Zeroing here stops the previous thread's totals sitting under the new
+		// thread's banner in the meantime, which reads as context carrying over.
+		if (opts.zeroTotals !== false && lastSnapshot) {
+			lastSnapshot = {
+				...lastSnapshot,
+				totalTokensIn: 0,
+				totalTokensOut: 0,
+				totalCostUsd: 0,
+				contextUsagePercent: null,
+				contextTokens: null,
+				messageCount: 0,
+				reasoning: undefined,
+			} as typeof lastSnapshot;
+		}
+	};
+
 	/** Take the "thinking" spinner down. Called only when a paint is about to land. */
 	const dismissLoader = (): void => {
 		if (!activeLoader) return;
@@ -1444,7 +1509,17 @@ export async function wireConnectUi(
 	);
 
 	type AnyChild = Text | Markdown | CancellableLoader | BrigadeEditor | ApprovalPrompt;
+	/**
+	 * The last system-event line, kept so an identical CONSECUTIVE repeat can
+	 * update it in place instead of adding another row. Reset by any other
+	 * insert below, which is what makes "consecutive" mean consecutive — a
+	 * repeat after real activity is a new occurrence and must print anew,
+	 * rather than retroactively bumping a counter far up the scrollback.
+	 */
+	let lastSystemEventLine: { widget: Text; body: string; count: number } | undefined;
+
 	const insertBeforeEditor = (component: AnyChild): void => {
+		lastSystemEventLine = undefined;
 		const children = tui.children;
 		const editorIdx = children.indexOf(editor);
 		if (editorIdx < 0) {
@@ -1796,16 +1871,43 @@ export async function wireConnectUi(
 	const renderSystemEventLine = (event: EventPayload["system-event"]): void => {
 		const eventText = scrubRenderable(event.text);
 		const isCron = event.source === "cron" || event.jobName !== undefined;
+		let body: string;
 		if (isCron) {
 			const name = event.jobName ?? "cron";
 			const heading = brand.amber(`🦁 [cron "${name}"]`);
 			let suffix = "";
 			if (event.delivered === true) suffix = ` ${brand.dim("· delivered")}`;
 			else if (event.delivered === false) suffix = ` ${brand.dim("· not delivered (TUI only)")}`;
-			insertBeforeEditor(new Text(`${heading} ${eventText}${suffix}`, 0, 0));
+			body = `${heading} ${eventText}${suffix}`;
 		} else {
-			insertBeforeEditor(new Text(`${brand.amber("🦁")} ${eventText}`, 0, 0));
+			body = `${brand.amber("🦁")} ${eventText}`;
 		}
+
+		// COLLAPSE AN IDENTICAL REPEAT INSTEAD OF REPRINTING IT.
+		//
+		// A channel in a retry loop re-emits the same notice on every attempt.
+		// Observed: a WhatsApp socket stuck reconnecting printed "scan the QR
+		// code shown in the gateway logs" five times inside one turn, between
+		// the operator's own messages, burying the conversation it was
+		// interleaved with. The notice is worth showing; the fifth copy is not.
+		//
+		// Updating the EXISTING widget rather than appending keeps the count
+		// visible without consuming scrollback — the same discipline the live
+		// tool panes use. Only a CONSECUTIVE repeat collapses: an identical
+		// notice separated by real activity is genuinely new information about a
+		// second occurrence, and merging those would hide it.
+		if (lastSystemEventLine && lastSystemEventLine.body === body) {
+			lastSystemEventLine.count += 1;
+			lastSystemEventLine.widget.setText(
+				`${body} ${brand.dim(`(×${lastSystemEventLine.count})`)}`,
+			);
+			tui.requestRender();
+			return;
+		}
+
+		const widget = new Text(body, 0, 0);
+		insertBeforeEditor(widget);
+		lastSystemEventLine = { widget, body, count: 1 };
 		tui.requestRender();
 	};
 
@@ -3840,7 +3942,7 @@ export async function wireConnectUi(
 			);
 			// AFTER clearTranscriptRegion, or the notice is wiped along with the chips —
 			// which is precisely the silent-carry this call exists to prevent.
-			clearTrayForContextSwitch("the new thread");
+			switchContext("the new thread");
 			updateHeader();
 			void applySubscription();
 			return;
@@ -3884,7 +3986,7 @@ export async function wireConnectUi(
 			}
 
 			boundSessionKey = target;
-			clearTrayForContextSwitch("that thread");
+			switchContext("that thread");
 			insertBeforeEditor(
 				new Text(
 					`  ${brand.amber("✓")} ${brand.dim("bound to session")} ${brand.amber(target)}`,
@@ -4050,7 +4152,7 @@ export async function wireConnectUi(
 					// Omitting these left files staged for the DELETED thread armed to
 					// upload into the new one, and the connection still subscribed to a
 					// key that no longer exists — so the next turn streamed nothing.
-					clearTrayForContextSwitch("the new thread");
+					switchContext("the new thread");
 					updateHeader();
 					void applySubscription();
 				}
@@ -4298,7 +4400,21 @@ export async function wireConnectUi(
 				return;
 			}
 			boundAgentId = arg;
-			clearTrayForContextSwitch(`agent ${arg}`);
+			// DROP THE OLD AGENT'S SESSION KEY.
+			//
+			// This rebound the agent and left `boundSessionKey` pointing at the
+			// PREVIOUS agent's thread, so `withBinding()` emitted an incoherent
+			// pair — `{agentId: "research", sessionKey: "agent:main:t-abc"}`. The
+			// gateway resolves those independently: `resume` returned MAIN's
+			// transcript, and the next prompt ran research's runtime into main's
+			// thread. Nothing on screen revealed it, because the header renders
+			// the agent and `formatSessionLabel` returns nothing for a main key.
+			//
+			// `--agent X` at launch has always left the key undefined and let the
+			// gateway resolve that agent's own default session. Doing the same
+			// here makes the runtime path match the launch path.
+			boundSessionKey = undefined;
+			switchContext(`agent ${arg}`);
 			insertBeforeEditor(
 				new Text(
 					`  ${brand.amber("✓")} ${brand.dim("bound to agent")} ${brand.amber(arg)}`,
@@ -4729,6 +4845,19 @@ export async function wireConnectUi(
 					withBinding({ entryId: chosen.entryId }),
 				)) as SessionRewindResult;
 
+				// REBUILD THE VIEW BEFORE SAYING ANYTHING.
+				//
+				// The gateway moved the leaf, so the conversation on screen above
+				// this point is no longer the conversation the agent has. Leaving
+				// it there is the worst of the context-switch failures: the
+				// operator scrolls up, reads turns that were abandoned, and reasons
+				// and replies against them. `/new`, `/session`, `/agent` and
+				// `/delete` all rebuild — `/rewind` changes the history more than
+				// any of them and rebuilt nothing.
+				//
+				// Rebuilt FIRST so the confirmations below survive: a resume clears
+				// the region, which would wipe them if they were printed first.
+				await doResume();
 				insertBeforeEditor(
 					new Text(
 						`  ${brand.amber("✓")} ${brand.dim(`rewound to #${chosen.ordinal} — ${done.abandoned ?? 0} entries are no longer on the active path (nothing was deleted)`)}`,
@@ -4887,19 +5016,42 @@ export async function wireConnectUi(
 				}
 				const at = new Date();
 				const home = os.homedir();
+				// COUNT WHERE THE REDACTION ACTUALLY HAPPENS.
+				//
+				// Per-block redaction runs BEFORE truncation, because a PEM key
+				// clipped at 2000 chars loses the END marker its rule is anchored
+				// on. That fix was right and it broke the COUNT, which was still
+				// taken from a second pass over the already-redacted document —
+				// and five of the seven rules replace with text that cannot
+				// re-match them (`[redacted private key block]` contains no PEM
+				// header). So an export whose only secret was a key in a tool
+				// result reported `total: 0` and the banner said "no secrets
+				// matched" over a file that had just had a key removed from it.
+				//
+				// Accumulating here counts each redaction once, at the moment it
+				// is made. The document pass below still runs as defence in depth
+				// — for prose outside tool results — and its counts are merged.
+				const blockCounts: Record<string, number> = {};
 				const rendered = renderTranscriptMarkdown(messages, {
 					full,
 					includeThinking,
 					sessionKey: boundSessionKey,
 					now: () => at,
-					// Per-block redaction BEFORE truncation. A PEM key clipped at 2000
-					// chars loses its END marker, and the rule that catches it stops
-					// matching — so the default export leaked key material while the
-					// banner said "no secrets matched". The whole-document pass below
-					// still runs, for the count and as defence in depth.
-					redact: (t) => redactForExport(t, { homeDir: home }).text,
+					redact: (t) => {
+						const r = redactForExport(t, { homeDir: home });
+						for (const [rule, n] of Object.entries(r.counts)) {
+							blockCounts[rule] = (blockCounts[rule] ?? 0) + n;
+						}
+						return r.text;
+					},
 				});
-				const { text, counts, total } = redactForExport(rendered, { homeDir: home });
+				const doc = redactForExport(rendered, { homeDir: home });
+				const text = doc.text;
+				const counts: Record<string, number> = { ...blockCounts };
+				for (const [rule, n] of Object.entries(doc.counts)) {
+					counts[rule] = (counts[rule] ?? 0) + n;
+				}
+				const total = Object.values(counts).reduce((a, b) => a + b, 0);
 				const dir = nodePath.join(resolveStateDir(), "exports");
 				// 0700 — the filenames embed session keys, so the directory listing is
 				// itself information. Matches the convention used for other sensitive
