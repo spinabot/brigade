@@ -793,6 +793,45 @@ export async function wireConnectUi(
 		asstKeyByDepth.clear();
 		asstContinuation.clear();
 	};
+	/**
+	 * Why turning reasoning ON may still show you nothing.
+	 *
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * THE CONFUSION THIS REMOVES
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * `reasoning: on` describes a RENDERER preference — "show me reasoning text
+	 * if any arrives". It says nothing about whether any will. Three ordinary
+	 * situations produce an empty result, and the toggle looked identical in all
+	 * of them:
+	 *
+	 *   • the model does not reason at all (most fast/flash models);
+	 *   • the model reasons, but this thread's effort is `off`;
+	 *   • the model reasons and the provider does not expose the text
+	 *     (Anthropic's current default: billed, and omitted).
+	 *
+	 * An operator who flips the toggle and sees nothing reasonably concludes the
+	 * toggle is broken. It is not — there is nothing to show, and the honest
+	 * thing is to say which of the three it is at the moment they ask.
+	 *
+	 * Returns "" when reasoning genuinely is expected, so the common case stays
+	 * a clean one-liner.
+	 */
+	const reasoningAvailabilityNote = (): string => {
+		const snap = lastSnapshot;
+		if (!snap) return "";
+		if (snap.supportsThinking !== true) {
+			return "  — this model does not expose reasoning, so nothing will appear";
+		}
+		if (typeof snap.thinkingLevel === "string" && snap.thinkingLevel === "off") {
+			return "  — thinking is off for this thread; set a level with /thinking";
+		}
+		const vis = snap.reasoning?.visibility;
+		if (vis === "hidden" || vis === "redacted") {
+			return `  — ${describeReasoningVisibility(vis)}`;
+		}
+		return "";
+	};
+
 	/** Take the "thinking" spinner down. Called only when a paint is about to land. */
 	const dismissLoader = (): void => {
 		if (!activeLoader) return;
@@ -955,7 +994,7 @@ export async function wireConnectUi(
 			new Text(
 				`  ${brand.dim(
 					next
-						? "reasoning: on  (ctrl+t to hide)"
+						? `reasoning: on  (ctrl+t to hide)${reasoningAvailabilityNote()}`
 						: "reasoning: off (ctrl+t to show)",
 				)}`,
 				0,
