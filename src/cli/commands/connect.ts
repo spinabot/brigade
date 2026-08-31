@@ -3904,7 +3904,24 @@ export async function wireConnectUi(
 				);
 			}
 			updateHeader();
-			void applySubscription();
+			// SWITCH THE VIEW, NOT JUST THE INPUT.
+			//
+			// Binding used to change where your typing GOES while leaving the
+			// previous thread's conversation on screen. You then read one thread
+			// and talked to another, with only the header line distinguishing
+			// them — and the header is the thing people stop seeing after a
+			// minute. `/new` has always cleared the region; binding to an
+			// EXISTING thread is the same context switch and needs the same
+			// treatment, plus the target's history rendered in place of what was
+			// there.
+			//
+			// Resubscribe FIRST so the gateway is already sending this thread's
+			// frames before we paint its transcript; otherwise a reply arriving
+			// mid-rebuild would be dropped by the off-lane guard.
+			void (async () => {
+				await applySubscription();
+				await doResume();
+			})();
 			return;
 		}
 
@@ -4290,7 +4307,24 @@ export async function wireConnectUi(
 				),
 			);
 			updateHeader();
-			void applySubscription();
+			// SWITCH THE VIEW, NOT JUST THE INPUT.
+			//
+			// Binding used to change where your typing GOES while leaving the
+			// previous thread's conversation on screen. You then read one thread
+			// and talked to another, with only the header line distinguishing
+			// them — and the header is the thing people stop seeing after a
+			// minute. `/new` has always cleared the region; binding to an
+			// EXISTING thread is the same context switch and needs the same
+			// treatment, plus the target's history rendered in place of what was
+			// there.
+			//
+			// Resubscribe FIRST so the gateway is already sending this thread's
+			// frames before we paint its transcript; otherwise a reply arriving
+			// mid-rebuild would be dropped by the off-lane guard.
+			void (async () => {
+				await applySubscription();
+				await doResume();
+			})();
 			return;
 		}
 
