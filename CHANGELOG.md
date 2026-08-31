@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.35.3](https://github.com/spinabot/brigade/compare/brigade-v1.35.2...brigade-v1.35.3) (2026-08-31)
+
+
+### Bug Fixes
+
+* **tui:** one context-switch routine, an abort that stays aborted, and two regressions of my own ([28f1d17](https://github.com/spinabot/brigade/commit/28f1d1750082eeeb5af98803d3edc4508eb47066))
+
 ## [1.35.2](https://github.com/spinabot/brigade/compare/brigade-v1.35.1...brigade-v1.35.2) (2026-08-31)
 
 
