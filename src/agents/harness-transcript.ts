@@ -59,6 +59,7 @@
 // session to an API provider mid-conversation.
 
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import { PI_ASSISTANT, PI_TOOL_CALL, PI_TOOL_RESULT } from "./pi-dialect.js";
 
 const log = createSubsystemLogger("harness/transcript");
 
@@ -99,8 +100,8 @@ const ZERO_USAGE = {
 export function buildHarnessToolMessages(rec: HarnessToolRecord, model: HarnessModelInfo): unknown[] {
 	const timestamp = Date.now();
 	const assistant = {
-		role: "assistant",
-		content: [{ type: "toolCall", id: rec.toolCallId, name: rec.toolName, arguments: rec.args }],
+		role: PI_ASSISTANT,
+		content: [{ type: PI_TOOL_CALL, id: rec.toolCallId, name: rec.toolName, arguments: rec.args }],
 		api: model.api,
 		provider: model.provider,
 		model: model.model,
@@ -112,7 +113,7 @@ export function buildHarnessToolMessages(rec: HarnessToolRecord, model: HarnessM
 		timestamp,
 	};
 	const result = {
-		role: "toolResult",
+		role: PI_TOOL_RESULT,
 		toolCallId: rec.toolCallId,
 		toolName: rec.toolName,
 		content: rec.content,

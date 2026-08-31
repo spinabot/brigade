@@ -118,6 +118,34 @@ recovered here.
    `closed`).
 2. **Subscribe** to the lane you want: `req subscribe { agentId, sessionId }`.
    Without a subscribe you receive everything (back-compat).
+
+   **Delivery rules**, in order — the first that matches wins:
+
+   - A frame carrying neither `agentId` nor `sessionId` goes to everyone.
+   - A frame whose `parentSessionKey` is a session you subscribed to is
+     delivered: a sub-agent spawned by your thread is yours to see.
+   - **If you named a session on the frame's agent, that is your scope** —
+     the agent's *other* sessions (cron runs, channel traffic, a second chat)
+     are filtered out. Pass `scope: "agent"` to opt out and take the agent's
+     whole stream instead; `scope: "session"` is the default.
+   - Otherwise you get anything matching a broader `agentId` or `sessionId`
+     subscription.
+
+   Naming a session used to widen delivery to the agent as well, which meant
+   other threads bled into your view. If your client names a session for a
+   reason OTHER than narrowing — a snapshot push gated on the session id, say —
+   pass `scope: "agent"`.
+
+   **Deltas** are opt-in: `subscribe { deltas: true }` strips `message.content`
+   from `message_update` frames (roughly 18x fewer bytes on a long answer) and
+   requires the client to append `text_delta` / `thinking_delta` itself. Leave
+   it unset and frames stay byte-identical to the pre-delta protocol.
+
+   Both are advertised in `hello-ok` under `features.capabilities`
+   (`subscribe.scope`, `subscribe.deltas`, `resume.seq`). **Feature-detect on
+   those names, not on `protocol`** — the version integer is bumped only if the
+   frames themselves become unparseable, and behaviour changes ride capabilities
+   so an unknown name is safely ignorable.
 3. **Resume.** `resume` → render `messages` (see render contract), set the seq
    cursor to `headSeq`. This loads history on first connect and backfills the
    gap on a reconnect.

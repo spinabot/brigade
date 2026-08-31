@@ -36,6 +36,7 @@ import {
 } from "../protocol.js";
 import type { HelloOk } from "../protocol/handshake.js";
 import { isSeqGap } from "../protocol/stream-seq.js";
+import { BrigadeRequestError } from "../protocol/errors.js";
 
 /** Payload of the client-emitted `"resync"` event: a seq gap was detected on a
  *  session's ordered `pi` stream, so the consumer should `resume()` to backfill. */
@@ -386,9 +387,12 @@ export class BrigadeClient extends EventEmitter {
 			if (frame.ok) {
 				pending.resolve(frame.payload);
 			} else {
-				pending.reject(
-					new Error(frame.error?.message ?? `request failed (${frame.error?.code ?? "unknown"})`),
-				);
+				// Reject with the server's STRUCTURED error, not a flattened string.
+				// Collapsing it here meant no caller could ever tell a rate-limit
+				// that clears in 30s from a permanent authorization failure.
+				// `BrigadeRequestError extends Error`, so existing `err.message`
+				// handlers are unaffected.
+				pending.reject(new BrigadeRequestError(frame.error ?? {}));
 			}
 			return;
 		}

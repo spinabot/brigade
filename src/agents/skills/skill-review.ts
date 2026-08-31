@@ -28,7 +28,12 @@ import * as path from "node:path";
 
 import { resolveSkillsDir } from "../../config/paths.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
-import { balancedObjects, makeIsolatedLlm, type MakeExtractionLlmArgs } from "../memory/extract.js";
+import {
+	balancedObjects,
+	makeIsolatedLlm,
+	type IsolatedLlmUsage,
+	type MakeExtractionLlmArgs,
+} from "../memory/extract.js";
 import {
 	appendSkillSection,
 	isPathInside,
@@ -296,8 +301,11 @@ function existingSkillNames(root: string): Set<string> {
  * consolidation sweeps use), its reply parsed into proposals. One extra model
  * call per skill-review fire (cadence-gated), never per turn.
  */
-export function makeSkillReviewer(args: MakeExtractionLlmArgs): SkillReviewer {
-	const llm = makeIsolatedLlm(SKILL_REVIEW_PROMPT, args);
+export function makeSkillReviewer(
+	args: MakeExtractionLlmArgs,
+	onUsage?: (usage: IsolatedLlmUsage) => void,
+): SkillReviewer {
+	const llm = makeIsolatedLlm(SKILL_REVIEW_PROMPT, args, undefined, onUsage);
 	return async (_prompt: string, transcript: string): Promise<SkillProposal[]> => {
 		const reply = await llm(transcript);
 		return parseSkillProposals(reply);

@@ -67,6 +67,26 @@ export interface ProviderInfo {
 	/** Subscription / OAuth-login support — onboarding offers a browser login instead of an API key. */
 	subscription?: { oauthProviderId: string; label: string };
 	/**
+	 * How this provider CHARGES — the provider-agnostic answer to "what does
+	 * consumption mean here?". Drives every usage surface: which figure to show,
+	 * and what a `$0.00` means.
+	 *
+	 *   - `metered`      per-token pricing; dollars are the real signal.
+	 *   - `subscription` a plan/seat. Marginal cost is genuinely zero, so a cost
+	 *                    figure is misleading and the PLAN WINDOW is the signal.
+	 *   - `local`        runs on the operator's hardware; nothing to meter.
+	 *   - `unknown`      no pricing on record — must render as an absence, never
+	 *                    as `$0`, or an unmeasured turn reads as a free one.
+	 *
+	 * Declared per entry rather than inferred, for two reasons. `providerId`
+	 * routing means the RESOLVED provider is often not the billing one — a
+	 * `claude-code` turn resolves through Pi's `anthropic` provider and would
+	 * otherwise be misread as metered against Anthropic's price card. And a
+	 * hardcoded list living in another module silently goes stale every time a
+	 * provider is added here.
+	 */
+	billing: "metered" | "subscription" | "local" | "unknown";
+	/**
 	 * Reuse a vendor CLI's already-stored login on this machine. When set,
 	 * onboarding reads the named CLI's credential file and offers a one-keystroke
 	 * "reuse this login" path (no browser, no key) before the subscription / key
@@ -98,6 +118,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Claude models via an Anthropic API key",
 		keyUrl: "https://console.anthropic.com/settings/keys",
 		envVar: "ANTHROPIC_API_KEY",
+		billing: "metered",
 		// `ANTHROPIC_OAUTH_TOKEN` (exported by the Claude CLI subscription auth)
 		// stays a valid fallback so the runtime credential pipeline still resolves
 		// it. The subscription PATH itself lives on the "claude-code" entry below —
@@ -114,6 +135,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Claude Pro / Max via browser sign-in — heavy turns can draw extra-usage (for none, pick 'Claude via Claude Code CLI')",
 		keyUrl: "https://claude.ai",
 		envVar: "",
+		billing: "subscription",
 		subscription: { oauthProviderId: "anthropic", label: "Log in with Claude Pro / Max" },
 		cliLogin: { read: "claude", label: "Use your existing Claude Code login" },
 	},
@@ -132,6 +154,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Run on your Claude subscription through the installed claude binary — no key, no extra-usage",
 		keyUrl: "https://claude.ai/download",
 		envVar: "",
+		billing: "subscription",
 		noAuth: true,
 		local: true,
 	},
@@ -141,6 +164,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "GPT-5, GPT-4o",
 		keyUrl: "https://platform.openai.com/api-keys",
 		envVar: "OPENAI_API_KEY",
+		billing: "metered",
 	},
 	{
 		id: "google",
@@ -148,6 +172,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Gemini 2.5 — generous free tier",
 		keyUrl: "https://aistudio.google.com/apikey",
 		envVar: "GEMINI_API_KEY",
+		billing: "metered",
 	},
 	{
 		id: "openrouter",
@@ -155,6 +180,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "300+ models from one key",
 		keyUrl: "https://openrouter.ai/settings/keys",
 		envVar: "OPENROUTER_API_KEY",
+		billing: "metered",
 	},
 	{
 		id: "groq",
@@ -162,6 +188,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Very fast inference (Llama, Qwen, Kimi)",
 		keyUrl: "https://console.groq.com/keys",
 		envVar: "GROQ_API_KEY",
+		billing: "metered",
 	},
 	{
 		id: "cerebras",
@@ -169,6 +196,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Extremely fast inference",
 		keyUrl: "https://cloud.cerebras.ai",
 		envVar: "CEREBRAS_API_KEY",
+		billing: "metered",
 	},
 	{
 		id: "xai",
@@ -176,6 +204,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Grok models",
 		keyUrl: "https://console.x.ai",
 		envVar: "XAI_API_KEY",
+		billing: "metered",
 	},
 	{
 		id: "deepseek",
@@ -183,6 +212,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Cheap reasoning models",
 		keyUrl: "https://platform.deepseek.com/api_keys",
 		envVar: "DEEPSEEK_API_KEY",
+		billing: "metered",
 	},
 	{
 		id: "mistral",
@@ -190,6 +220,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "European, strong open-weight roots",
 		keyUrl: "https://console.mistral.ai/api-keys",
 		envVar: "MISTRAL_API_KEY",
+		billing: "metered",
 	},
 	{
 		id: "openai-codex",
@@ -197,6 +228,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Use your ChatGPT Plus/Pro subscription",
 		keyUrl: "https://chatgpt.com",
 		envVar: "",
+		billing: "subscription",
 		subscription: { oauthProviderId: "openai-codex", label: "Log in with ChatGPT Plus / Pro" },
 		cliLogin: { read: "codex", label: "Use your existing Codex login" },
 	},
@@ -206,6 +238,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Use your Copilot subscription ($10/mo, multi-model)",
 		keyUrl: "https://github.com/settings/copilot",
 		envVar: "",
+		billing: "subscription",
 		subscription: { oauthProviderId: "github-copilot", label: "Log in with GitHub Copilot" },
 	},
 	{
@@ -214,6 +247,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Use your Z.ai GLM coding-plan key",
 		keyUrl: "https://z.ai/manage-apikey/apikey-list",
 		envVar: "",
+		billing: "subscription",
 		custom: true,
 		api: "anthropic-messages",
 		baseUrl: "https://api.z.ai/api/anthropic",
@@ -225,6 +259,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Use your Moonshot / Kimi key",
 		keyUrl: "https://platform.moonshot.ai/console/api-keys",
 		envVar: "",
+		billing: "metered",
 		custom: true,
 		api: "anthropic-messages",
 		baseUrl: "https://api.moonshot.ai/anthropic",
@@ -236,6 +271,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Use your Alibaba DashScope key",
 		keyUrl: "https://bailian.console.alibabacloud.com",
 		envVar: "",
+		billing: "metered",
 		custom: true,
 		api: "anthropic-messages",
 		baseUrl: "https://dashscope-intl.aliyuncs.com/apps/anthropic",
@@ -247,6 +283,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Use your MiniMax key",
 		keyUrl: "https://platform.minimax.io",
 		envVar: "",
+		billing: "subscription",
 		custom: true,
 		api: "anthropic-messages",
 		baseUrl: "https://api.minimax.io/anthropic",
@@ -258,6 +295,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Use your DeepSeek key",
 		keyUrl: "https://platform.deepseek.com/api_keys",
 		envVar: "",
+		billing: "subscription",
 		custom: true,
 		api: "anthropic-messages",
 		baseUrl: "https://api.deepseek.com/anthropic",
@@ -269,6 +307,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "NVIDIA-hosted open models (Llama, DeepSeek, Nemotron, Qwen…) — live catalog",
 		keyUrl: "https://build.nvidia.com",
 		envVar: "NVIDIA_API_KEY",
+		billing: "metered",
 		envVarFallbacks: ["NVIDIA_NIM_API_KEY", "NGC_API_KEY"],
 		custom: true,
 		liveModels: true, // models fetched live from /v1/models at onboarding
@@ -281,6 +320,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Run models locally — no API key, fully private",
 		keyUrl: "https://ollama.com/download",
 		envVar: "", // no env key
+		billing: "local",
 		noAuth: true,
 		local: true,
 		baseUrl: "http://127.0.0.1:11434",
@@ -291,6 +331,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Together, Fireworks, vLLM, LM Studio — any OpenAI-compatible endpoint",
 		keyUrl: "—",
 		envVar: "",
+		billing: "unknown",
 		custom: true,
 	},
 ];

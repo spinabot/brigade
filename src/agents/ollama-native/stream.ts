@@ -12,6 +12,7 @@
 // built-in providers do.
 
 import { randomUUID } from "node:crypto";
+import { PI_TOOL_CALL, PI_TOOL_RESULT, WIRE_TOOL_USE } from "../pi-dialect.js";
 
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type {
@@ -173,9 +174,9 @@ function extractWireToolCalls(content: unknown): OllamaWireToolCall[] {
 	if (!Array.isArray(content)) return [];
 	const out: OllamaWireToolCall[] = [];
 	for (const part of content as InputContentPart[]) {
-		if (part?.type === "toolCall") {
+		if (part?.type === PI_TOOL_CALL) {
 			out.push({ function: { name: part.name, arguments: ensureArgsObject(part.arguments) } });
-		} else if (part?.type === "tool_use") {
+		} else if (part?.type === WIRE_TOOL_USE) {
 			out.push({ function: { name: part.name, arguments: ensureArgsObject(part.input) } });
 		}
 	}
@@ -209,7 +210,7 @@ export function convertToOllamaMessages(
 			});
 			continue;
 		}
-		if (msg.role === "tool" || msg.role === "toolResult") {
+		if (msg.role === "tool" || msg.role === PI_TOOL_RESULT) {
 			const toolName = typeof msg.toolName === "string" ? msg.toolName : undefined;
 			out.push({
 				role: "tool",
@@ -594,7 +595,7 @@ export function createOllamaStreamFn(defaultHeaders?: Record<string, string>): S
 				if (accumulatedContent) content.push({ type: "text", text: accumulatedContent } as TextContent);
 				for (const tc of accumulatedToolCalls) {
 					content.push({
-						type: "toolCall",
+						type: PI_TOOL_CALL,
 						id: `ollama_call_${randomUUID()}`,
 						name: tc.function.name,
 						arguments: ensureArgsObject(tc.function.arguments),

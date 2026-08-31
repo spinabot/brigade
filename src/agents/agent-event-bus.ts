@@ -33,6 +33,10 @@ export type AgentBusEvent =
 			runId: string;
 			agentId: string;
 			sessionId: string;
+			/** For a sub-agent run, the session key that SPAWNED it. Lets the
+			 *  gateway route child frames to the operator watching the PARENT
+			 *  session — the child's own key shares no prefix with it. */
+			parentSessionKey?: string;
 			/** Raw Pi `AgentSessionEvent`. Consumers narrow as they need. */
 			piEvent: unknown;
 			/** Sub-agent depth this event originated at (Primitive #6). 0 (or

@@ -20,8 +20,16 @@
  */
 
 import { COPILOT_AUTO_MODEL_ID } from "../../agents/github-copilot-transport.js";
+import { PI_TOOL_CALL, PI_TOOL_RESULT } from "../../agents/pi-dialect.js";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+
+import { resolveStateDir } from "../../config/paths.js";
+import { exportFileName, renderTranscriptMarkdown } from "../../ui/transcript-export.js";
+import { searchTranscript } from "../../ui/transcript-search.js";
+import { describeRedactions, redactForExport } from "../../ui/transcript-redact.js";
 
 import { sanitizeSessionName } from "../../sessions/session-store.js";
 import * as nodePath from "node:path";
@@ -29,6 +37,7 @@ import * as nodePath from "node:path";
 import {
 	CancellableLoader,
 	CombinedAutocompleteProvider,
+	isKittyProtocolActive,
 	ProcessTerminal,
 	type SlashCommand,
 	Text,
@@ -57,11 +66,18 @@ import chalk from "chalk";
 // of leaking literal underscores. Same shape as Pi-TUI's `Markdown` — drop-in.
 import { Markdown } from "../../ui/markdown.js";
 import { loaderIndicator, probeTerminalAnimationSupport } from "../../ui/animations.js";
+import { formatReasoningLine, formatTokens } from "../../agents/reasoning/format.js";
+import { formatCostSegment, formatUsd} from "../../agents/usage/format.js";
+import { describeRetry } from "../../protocol/errors.js";
+import type { SessionListRow } from "../../protocol/methods.js";
+import { mutateConfigAtomic, readConfigOrInit } from "../../config/io.js";
 import { renderBrandHeader } from "../../ui/brand.js";
 import { formatCrewLabel, formatSessionLabel } from "../../ui/format-session.js";
 import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { brand, editorTheme, markdownTheme } from "../../ui/theme.js";
-import { summarizeToolResult } from "../../ui/tool-result.js";
+import { summarizeToolResult, formatToolArgs, looksLikeUnifiedDiff, classifyDiffLine, summarizeDiffStats, parseTodoArgs, todoMarker, summarizeTodos, isShellLikeTool, tailLines, describeOutputSize} from "../../ui/tool-result.js";
+import { notifyTurnComplete } from "../../ui/notify.js";
+import { buildOsc52, lastCodeBlock } from "../../ui/osc52.js";
 import { BrigadeClient } from "../../tui/client.js";
 import { DEFAULT_AGENT_ID } from "../../config/paths.js";
 import { loadConfig } from "../../core/config.js";
@@ -78,8 +94,10 @@ import type {
 	PromptAttachment,
 	SessionDeleteResult,
 	SessionRenameResult,
+	SessionRewindResult,
 	SessionStateSnapshot,
 	SessionSummary,
+	WireMessage,
 } from "../../protocol.js";
 import {
 	computeExplain,
@@ -397,6 +415,31 @@ export async function wireConnectUi(
 	// the current model can't see it, so move to one that can.
 	let lastUserAttachments: PromptAttachment[] = [];
 	let isAgentRunning = false;
+	/**
+	 * Set by Ctrl/Cmd+Enter, consumed by the very next submit.
+	 *
+	 * A one-shot flag rather than a mode: steering is the exceptional gesture,
+	 * so it must be re-asserted every time rather than left armed where a later
+	 * reflex Enter would inherit it.
+	 */
+	/**
+	 * How many messages `resume` returns at most. `/export` and `/search` both
+	 * read through it, so both must say when the head was clipped rather than
+	 * presenting a window as the whole conversation.
+	 */
+	const RESUME_TRANSCRIPT_WINDOW = 200;
+	let steerNextSubmit = false;
+	/** The mid-turn queue/steer tip is shown once per session, never again. */
+	let midTurnHintShown = false;
+	/**
+	 * Re-entrancy guard against a double-tapped Enter.
+	 *
+	 * The submit path is async (an RPC round-trip), so two fast Enters can both
+	 * pass the `isAgentRunning` gate and send the same text twice. opencode uses
+	 * a `submitting` flag for exactly this and Cline's boolean-returning handler
+	 * is the same idea after a duplicate-execution bug.
+	 */
+	let submitInFlight = false;
 	// `/provider <name>` for an UNCONFIGURED provider arms this — the NEXT line
 	// the operator submits is captured as that provider's API key (sent to the
 	// gateway's `add-provider`, never echoed into the transcript or input
@@ -467,10 +510,23 @@ export async function wireConnectUi(
 			if (Object.keys(priorParams).length > 0) {
 				await client.request("unsubscribe", priorParams);
 			}
-			const nextParams: Record<string, string> = {};
+			const nextParams: Record<string, string | boolean> = {};
 			if (boundAgentId !== undefined) nextParams.agentId = boundAgentId;
 			if (boundSessionKey !== undefined) nextParams.sessionId = boundSessionKey;
+			// ASK FOR DELTAS EXPLICITLY.
+			//
+			// The gateway sends full frames unless a client opts in, because
+			// stripping `message.content` from a client that has never heard of
+			// deltas leaves it rendering nothing until `message_end` — and the
+			// desktop app, the watch app and every third-party consumer are exactly
+			// that client. Brigade's own TUI knows how to append, so it asks.
+			//
+			// The renderer below handles BOTH shapes — it appends when a frame
+			// carries a delta and no content, and reconciles from the snapshot
+			// whenever content IS present — so an older gateway that ignores this
+			// flag and sends full frames works unchanged.
 			if (Object.keys(nextParams).length > 0) {
+				nextParams.deltas = true;
 				await client.request("subscribe", nextParams);
 			}
 			lastSubscribedAgentId = boundAgentId;
@@ -565,6 +621,139 @@ export async function wireConnectUi(
 	const activeAssistants = new Map<string, Markdown>();
 	let activeLoader: CancellableLoader | null = null;
 	const pendingTools = new Map<string, Text>();
+	/**
+	 * What each tool call was ABOUT, and what it actually returned.
+	 *
+	 * Two jobs. The completed `✓` chip re-renders with `setText`, which would
+	 * otherwise drop the argument summary the `⚡` chip showed — so the args are
+	 * kept and re-applied. And the full result text is retained so `/expand` can
+	 * show it: previews are hard-truncated at 120 chars (800 for errors) and the
+	 * remainder used to be discarded on arrival, which silently swallowed
+	 * citations, diffs and any long command output, unrecoverably.
+	 *
+	 * Bounded — this holds tool output, which can be large.
+	 */
+	/** Best-effort text for a non-string tool result. Never throws on a cycle. */
+	const safeStringify = (v: unknown): string | undefined => {
+		if (v === null || v === undefined) return undefined;
+		if (typeof v === "string") return v;
+		try {
+			return JSON.stringify(v, null, 2);
+		} catch {
+			return String(v);
+		}
+	};
+	/**
+	 * Partial tool-call arguments, keyed by the message's `contentIndex`.
+	 *
+	 * Lives separately from `pendingTools` (keyed by `toolCallId`) because the
+	 * call id is not minted until the arguments are COMPLETE — the whole point
+	 * here is the window before that.
+	 */
+	/**
+	 * Reconstructed assistant text per render key, for delta streaming.
+	 *
+	 * In delta mode a `message_update` arrives without `message.content`, so the
+	 * text has to be rebuilt by appending. Keyed identically to the render blocks
+	 * (`asstKey`), so a delta always lands on the block it belongs to.
+	 *
+	 * `message_start` and `message_end` still carry full content and RESET this
+	 * from the authoritative snapshot, so any drift is corrected within one
+	 * message rather than persisting.
+	 */
+	const deltaText = new Map<string, string>();
+	/**
+	 * Reasoning text per render key, for delta streaming.
+	 *
+	 * Delta mode strips `message.content`, and reasoning lives ONLY in that
+	 * content — so without a parallel buffer, `thinking_delta` frames had nothing
+	 * to paint and a 40-second reasoning phase rendered as a single lump at
+	 * `message_end`. The two features shipped together and cancelled each other
+	 * out. Reset from the authoritative snapshot exactly like `deltaText`.
+	 */
+	const deltaThinking = new Map<string, string>();
+	/** The last completed assistant reply, for `/copy`. Plain text, unstyled. */
+	let lastReplyText = "";
+
+	/**
+	 * Live tail panes for running shell-like tools, keyed by tool call id.
+	 *
+	 * One widget per running command, updated in place, retired when the command
+	 * finishes — so a chatty build does not splice a new component per update.
+	 */
+	const liveOutputPanes = new Map<string, Text>();
+
+	const pendingToolArgs = new Map<number, string>();
+	const pendingToolArgRows = new Map<number, Text>();
+
+	/** Paint or update the provisional "…writing call" row for one content block. */
+	const renderPendingToolArgs = (contentIndex: number): void => {
+		const raw = pendingToolArgs.get(contentIndex) ?? "";
+		// Partial JSON is not parseable mid-stream, so show it verbatim —
+		// collapsed to one line, scrubbed, and truncated. `formatToolArgs` needs a
+		// complete object and would return nothing useful here.
+		const flat = scrubRenderable(raw).replace(/\s+/g, " ").trim();
+		const shown = flat.length > 72 ? `${flat.slice(0, 71)}…` : flat;
+		const text = `  ${brand.tool("⚡")} ${brand.dim(shown ? `…${shown}` : "…preparing call")}`;
+		const existing = pendingToolArgRows.get(contentIndex);
+		if (existing) {
+			existing.setText(text);
+		} else {
+			const row = new Text(text, 0, 0);
+			pendingToolArgRows.set(contentIndex, row);
+			insertBeforeEditor(row);
+		}
+		tui.requestRender();
+	};
+
+	/** Retire the provisional row — the real `⚡` chip takes over from here. */
+	const clearPendingToolArgs = (contentIndex: number): void => {
+		const row = pendingToolArgRows.get(contentIndex);
+		if (row) {
+			try {
+				removeChild(row);
+			} catch {
+				/* already detached by a transcript rebuild */
+			}
+			pendingToolArgRows.delete(contentIndex);
+		}
+		pendingToolArgs.delete(contentIndex);
+	};
+
+	/** Drop every provisional row (turn ended, aborted, or transcript rebuilt). */
+	const clearAllPendingToolArgs = (): void => {
+		for (const idx of [...pendingToolArgRows.keys()]) clearPendingToolArgs(idx);
+	};
+
+	const toolCallInfo = new Map<string, { name: string; args?: string; result?: string; isError?: boolean }>();
+	const TOOL_INFO_MAX = 200;
+	/**
+	 * Byte budget per retained tool result.
+	 *
+	 * The entry COUNT was capped and the bytes were not — a `read` of a large
+	 * file or a chatty `bash` put megabytes into a single entry, so 200 entries
+	 * could hold hundreds of MB in the TUI process. `/expand` exists to show what
+	 * the 120-char preview cut, not to be a file viewer, so a generous per-entry
+	 * cap costs nothing real.
+	 */
+	const TOOL_RESULT_MAX_CHARS = 64 * 1024;
+	const rememberToolInfo = (id: string, patch: { name?: string; args?: string; result?: string; isError?: boolean }): void => {
+		const prev = toolCallInfo.get(id);
+		if (prev) toolCallInfo.delete(id); // keep insertion order = least-recently-used
+		const capped =
+			typeof patch.result === "string" && patch.result.length > TOOL_RESULT_MAX_CHARS
+				? {
+						...patch,
+						result: `${patch.result.slice(0, TOOL_RESULT_MAX_CHARS)}\n… (truncated — ${patch.result.length.toLocaleString()} chars total)`,
+					}
+				: patch;
+		toolCallInfo.set(id, { name: patch.name ?? prev?.name ?? "tool", ...prev, ...capped });
+		while (toolCallInfo.size > TOOL_INFO_MAX) {
+			const oldest = toolCallInfo.keys().next().value as string | undefined;
+			if (oldest === undefined) break;
+			toolCallInfo.delete(oldest);
+		}
+	};
 	// HARNESS backends (claude-cli) stream ONE assistant message for the whole turn:
 	// the external binary emits text, calls a tool, then keeps writing into the SAME
 	// message. So `asstKey` — which identity-keys a block by `<depth>:<timestamp>` —
@@ -672,32 +861,141 @@ export async function wireConnectUi(
 		"conjuring",
 	];
 	let whimsicalIdx = 0;
-	// Thinking-block visibility toggle. Default `false` matches today's UX
-	// (thinking blocks excluded from `extractAssistantText` filter). When
-	// flipped to `true` via the `/show-thinking` slash command, the
-	// extractor includes `{ type: "thinking" }` block text alongside the
-	// regular text blocks, dimmed so it stays distinct from the agent's
-	// final reply. Brigade uses the base Pi-TUI Editor which doesn't
-	// expose key handlers, so the toggle is surfaced through the slash-
-	// command path instead of a `Ctrl+T` binding.
-	let showThinking = false;
+	// Thinking-block visibility. Defaults ON.
+	//
+	// It defaulted OFF, which meant most operators never learned reasoning
+	// existed — and because the toggle is a plain local, anyone who did find
+	// `/reasoning on` had to retype it every launch. Every comparable harness
+	// surveyed shows reasoning by default (Cline, Roo, Continue, Aider, Grok
+	// Build, Gemini CLI); the one that hides it, Claude Code, does so because
+	// its CLI actively asks the API to redact it.
+	//
+	// Brigade now requests thinking summaries from the claude-cli backend (see
+	// `buildClaudeCliArgs`), so on the most common install there is finally
+	// something to show. The header carries the one-line state regardless of
+	// this flag — this controls only whether the reasoning TEXT is rendered
+	// inline with the reply.
+	//
+	// Persisted in `chat.showReasoning`, so a choice survives the next launch —
+	// it used to be a bare local, which meant retyping `/reasoning on` every
+	// time. Read defensively: a missing or unreadable config falls back to the
+	// default rather than failing the session over a preference.
+	let showThinking = true;
+	// Ring when a long turn finishes. Default on; a short turn stays silent, so
+	// this is not noise for the interactive case.
+	let notifyOnComplete = true;
+	try {
+		const cfg = readConfigOrInit().chat;
+		if (typeof cfg?.showReasoning === "boolean") showThinking = cfg.showReasoning;
+		if (typeof cfg?.notifyOnComplete === "boolean") notifyOnComplete = cfg.notifyOnComplete;
+	} catch {
+		/* unreadable config — keep the defaults */
+	}
 
+	/**
+	 * Render a failed request with the server's own guidance attached.
+	 *
+	 * The wire carries `retryable` and `retryAfterMs`; the client used to flatten
+	 * every failure into a bare message, so a rate limit that clears in 30
+	 * seconds and a permanent auth failure looked identical. Appending the hint
+	 * is the difference between "try again in a moment" and "stop and fix your
+	 * credentials".
+	 */
+	/** "just now" / "4m ago" / "2h ago" / "3d ago". Absent input renders nothing. */
+	const formatRelativeAge = (at: number): string => {
+		const ms = Date.now() - at;
+		if (!Number.isFinite(ms) || ms < 0) return "";
+		const s = Math.round(ms / 1000);
+		if (s < 45) return "just now";
+		const m = Math.round(s / 60);
+		if (m < 60) return `${m}m ago`;
+		const h = Math.round(m / 60);
+		if (h < 24) return `${h}h ago`;
+		return `${Math.round(h / 24)}d ago`;
+	};
+
+	const describeError = (err: unknown): string => {
+		const msg = err instanceof Error ? err.message : String(err);
+		const hint = describeRetry(err);
+		return hint ? `${msg} (${hint})` : msg;
+	};
+
+	/**
+	 * Apply a reasoning-visibility choice: update the session, persist it, and
+	 * echo what happened. Shared by `/reasoning` and Ctrl+T so the two can never
+	 * drift — the toggle must mean the same thing however it was reached.
+	 */
+	const applyReasoningVisibility = (next: boolean): void => {
+		showThinking = next;
+		void mutateConfigAtomic((cfg) => ({
+			...cfg,
+			chat: { ...(cfg.chat ?? {}), showReasoning: next },
+		})).catch(() => {
+			/* best-effort — the toggle still applies to this session */
+		});
+		insertBeforeEditor(
+			new Text(
+				`  ${brand.dim(
+					next
+						? "reasoning: on  (ctrl+t to hide)"
+						: "reasoning: off (ctrl+t to show)",
+				)}`,
+				0,
+				0,
+			),
+		);
+		tui.requestRender();
+	};
+
+	/** Last header string actually written — see the no-op guard below. */
+	let lastHeaderText = "";
 	const updateHeader = (extra?: string): void => {
 		const provider = lastSnapshot?.provider ?? "?";
 		const modelId = lastSnapshot?.modelId ?? "?";
 		const tokens = lastSnapshot && (lastSnapshot.totalTokensIn + lastSnapshot.totalTokensOut) > 0
 			? ` · ${(lastSnapshot.totalTokensIn + lastSnapshot.totalTokensOut).toLocaleString()} tok`
 			: "";
-		const cost = lastSnapshot && lastSnapshot.totalCostUsd > 0
-			? ` · $${lastSnapshot.totalCostUsd.toFixed(4)}`
-			: "";
+		// COST. Four situations used to render as the same `$0.0000`: a genuinely
+		// cheap metered turn, a subscription with no marginal cost, local
+		// inference, and an unpriced model that IS costing money. The last one is
+		// why this can never print a bare zero by default.
+		const costSegment = lastSnapshot
+			? formatCostSegment({
+					billing: lastSnapshot.billing,
+					costUsd: lastSnapshot.totalCostUsd,
+					...(lastSnapshot.costComplete !== undefined ? { costComplete: lastSnapshot.costComplete } : {}),
+				})
+			: undefined;
+		const cost = costSegment ? ` · ${costSegment}` : "";
+		// CONTEXT. Always visible, not just past 50%.
+		//
+		// The old `>= 50` gate meant that for most of a session's life the
+		// operator saw nothing — and context fill is the one number that should
+		// change their behaviour (compact, or start a fresh thread). Now that the
+		// gateway sends `contextTokens`/`contextWindow` alongside the percentage,
+		// show the pair: "34k/200k" answers "how much room is left" far better
+		// than a bare percent, which is meaningless without the window size.
 		const usage = lastSnapshot?.contextUsagePercent ?? null;
+		const ctxTokens = lastSnapshot?.contextTokens ?? null;
+		const ctxWindow = lastSnapshot?.contextWindow ?? null;
 		let usageStr = "";
-		if (usage != null && usage >= 50) {
+		if (ctxTokens != null && ctxWindow != null && ctxWindow > 0) {
+			const pct = Math.round((ctxTokens / ctxWindow) * 100);
+			const body = `${formatTokens(ctxTokens)}/${formatTokens(ctxWindow)} ctx`;
+			usageStr = ` · ${pct >= 75 ? brand.amber(body) : brand.dim(body)}`;
+		} else if (usage != null) {
+			// No raw pair (an older gateway, or right after a compaction when Pi
+			// deliberately reports unknown) — fall back to the percentage alone.
 			const pct = Math.round(usage);
 			const colored = pct >= 75 ? brand.amber(`${pct}% ctx`) : brand.dim(`${pct}% ctx`);
 			usageStr = ` · ${colored}`;
 		}
+
+		// REASONING. The live phase, and what kind of reasoning this backend
+		// actually exposes — a provider summary is not the model's own thinking,
+		// and an omitted-but-billed phase is not "no thinking happened".
+		const reasoningLine = formatReasoningLine({ state: lastSnapshot?.reasoning });
+		const reasoningStr = reasoningLine ? ` · ${brand.dim(reasoningLine)}` : "";
 		// Elapsed time during a running turn. Hidden when idle; shown as
 		// `· 12s` (under a minute) or `· 1m 4s` so the user has a sense of
 		// "is the model still working or has it stalled?".
@@ -729,14 +1027,37 @@ export async function wireConnectUi(
 		// key is unparseable so we never lose information.
 		const sessionLabel = formatSessionLabel(lastSnapshot?.sessionKey);
 		const sessionSegment = sessionLabel ? ` ${brand.dim(`· ${sessionLabel}`)}` : "";
-		header.setText(
-			`  ${dot} 🦁 ${brand.white(personaLabel)}${crewSegment}${sessionSegment}  ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
-		);
-		// Mirror the live model + token/cost/context readout into the bottom
-		// status footer so it survives the viewport scroll while a turn streams
-		// (the top header scrolls out of view; this stays pinned by the editor).
+		// ─────────────────────────────────────────────────────────────────────
+		// THE HEADER IS LINE 0, AND LINE 0 IS EXPENSIVE.
+		// ─────────────────────────────────────────────────────────────────────
+		// `header` is the FIRST child, so it occupies render-buffer line 0. Once
+		// the transcript grows past the terminal height, pi-tui's differential
+		// renderer sees `firstChanged (0) < previousViewportTop` and bails to
+		// `fullRender(true)` (tui.js:1169) — which emits `\x1b[2J\x1b[H\x1b[3J`.
+		// That `3J` CLEARS THE USER'S SCROLLBACK.
+		//
+		// So anything volatile in the header destroys scroll history every time
+		// it changes. With a 1s elapsed ticker, a 4s phrase rotation, and live
+		// token/cost/context/reasoning, that was roughly once a second for the
+		// whole turn — measured at ~39 scrollback wipes and 96% of all bytes
+		// written across a 40-second turn.
+		//
+		// The header therefore carries only IDENTITY, which changes when the
+		// operator switches agent/session/model and not otherwise. Everything
+		// that ticks lives in the footer, which is pinned near the bottom of the
+		// buffer where a change is inside the viewport and renders differentially.
+		// The footer already mirrored this data for exactly that reason.
+		const headerText = `  🦁 ${brand.white(personaLabel)}${crewSegment}${sessionSegment}  ${brand.dim(`${provider} · ${modelId}`)}`;
+		// Guard against a no-op write: `setText` marks the widget dirty even when
+		// the string is identical, and a dirty line 0 is a full redraw.
+		if (headerText !== lastHeaderText) {
+			lastHeaderText = headerText;
+			header.setText(headerText);
+		}
+		// The live readout. Pinned under the editor, so it survives the viewport
+		// scroll AND is cheap to repaint.
 		footer.setText(
-			`  ${dot} ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
+			`  ${dot} ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${reasoningStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
 		);
 	};
 
@@ -799,6 +1120,40 @@ export async function wireConnectUi(
 		{ name: "exit", description: "quit Brigade connect" },
 		{ name: "quit", description: "quit Brigade connect" },
 		{ name: "abort", description: "abort the in-flight turn (same as Ctrl+C)" },
+		{
+			name: "copy",
+			description: "copy the last reply to your clipboard (code = just the code block)",
+			argumentHint: "[code]",
+		},
+		{
+			name: "expand",
+			description: "show a truncated tool result in full (no arg = the most recent)",
+			argumentHint: "[<n>]",
+		},
+		{
+			name: "steer",
+			description: "interrupt the running turn — the model sees it mid-task (Enter queues instead)",
+			argumentHint: "<text>",
+		},
+		{
+			name: "flush",
+			description: "promote everything you queued into the running turn, now",
+		},
+		{
+			name: "export",
+			description: "write this conversation to a redacted markdown file",
+			argumentHint: "[full]",
+		},
+		{
+			name: "search",
+			description: "find text in this conversation, including tool output",
+			argumentHint: "<text>",
+		},
+		{
+			name: "rewind",
+			description: "go back to an earlier message (conversation only — files are untouched)",
+			argumentHint: "[n]",
+		},
 		{ name: "usage", description: "show token totals + estimated cost so far" },
 		{ name: "compact", description: "summarize older turns to free context" },
 		{
@@ -881,7 +1236,7 @@ export async function wireConnectUi(
 		},
 		{
 			name: "reasoning",
-			description: "show/hide the model's thinking blocks before replies",
+			description: "show/hide the model's reasoning (or press ctrl+t) — remembered across launches",
 			argumentHint: "<on|off>",
 			getArgumentCompletions: (prefix) => {
 				const opts = ["on", "off"];
@@ -942,7 +1297,7 @@ export async function wireConnectUi(
 	// providers still need `brigade onboard` on the gateway machine.
 	tui.addChild(
 		new Text(
-			brand.dim("  connect-mode: /new /agent /agents /session /sessions /rename /delete · /model /provider /thinking /reasoning · /abort /steer /compact · /usage /help"),
+			brand.dim("  connect-mode: /new /agent /agents /session /sessions /rename /delete · /model /provider /thinking /reasoning · /abort /steer /flush /compact · /export /search /rewind /usage /help"),
 			0,
 			0,
 		),
@@ -1051,6 +1406,11 @@ export async function wireConnectUi(
 			if (b.type === "thinking" && typeof b.thinking === "string") {
 				const t = b.thinking.trim();
 				if (t) thinkingParts.push(t);
+				// A REDACTED block has no readable text — only an opaque payload in
+				// `thinkingSignature`. It was dropped silently, which reads as "the
+				// model didn't reason" when in fact it did, was billed for it, and a
+				// safety filter removed the text. Say so.
+				else if (b.redacted === true) thinkingParts.push("(reasoning redacted by the provider)");
 				continue;
 			}
 			// Some forwarded shapes use `text` instead of `thinking` on the
@@ -1085,7 +1445,14 @@ export async function wireConnectUi(
 
 		const parts: string[] = [];
 		if (showThinking && thinkingText) {
-			parts.push(`${brand.dim("[thinking]")}\n${brand.dim(thinkingText)}`);
+			// Label what this actually IS. A literal "[thinking]" over an
+			// Anthropic / OpenAI / Grok response is wrong: those return a summary
+			// written by a DIFFERENT model, not the model's own chain of thought.
+			// The visibility rides the state snapshot precisely so the renderer
+			// never has to hardcode provider knowledge.
+			const vis = lastSnapshot?.reasoning?.visibility;
+			const label = vis === "summary" ? "[reasoning summary]" : "[reasoning]";
+			parts.push(`${brand.dim(label)}\n${brand.dim(thinkingText)}`);
 		}
 		if (contentText) parts.push(contentText);
 		return parts.join("\n\n");
@@ -1126,6 +1493,10 @@ export async function wireConnectUi(
 		}
 		activeAssistants.clear();
 		pendingTools.clear();
+		clearAllPendingToolArgs();
+		liveOutputPanes.clear();
+		deltaText.clear();
+		deltaThinking.clear();
 		clearHarnessContinuations();
 		if (activeLoader) {
 			removeChild(activeLoader);
@@ -1167,7 +1538,7 @@ export async function wireConnectUi(
 			// the matching toolResult message (below) fills in the ✓/✗ + preview.
 			if (Array.isArray(m.content)) {
 				for (const b of m.content) {
-					if (b?.type === "toolCall" && typeof b.id === "string") {
+					if (b?.type === PI_TOOL_CALL && typeof b.id === "string") {
 						const indicator = new Text(
 							`  ${brand.tool("⚡")} ${brand.tool(typeof b.name === "string" ? b.name : "tool")}`,
 							0,
@@ -1180,7 +1551,7 @@ export async function wireConnectUi(
 			}
 			return;
 		}
-		if (m.role === "toolResult" && typeof m.toolCallId === "string") {
+		if (m.role === PI_TOOL_RESULT && typeof m.toolCallId === "string") {
 			const mark = m.isError ? brand.error("✗") : brand.tool("✓");
 			const name = typeof m.toolName === "string" ? m.toolName : "tool";
 			// The SAME summariser the live path uses, not a second one. This view used
@@ -1323,7 +1694,14 @@ export async function wireConnectUi(
 			for (const appr of snap.pendingApprovals ?? []) renderApprovalPrompt(appr);
 			if (snap.snapshot) {
 				lastSnapshot = snap.snapshot;
-				if (!snap.snapshot.isAgentRunning) isAgentRunning = false;
+				if (!snap.snapshot.isAgentRunning) {
+					isAgentRunning = false;
+					// Belt-and-braces: a turn reconciled off by a resume must never
+					// leave the editor unable to submit. Nothing sets this true today,
+					// but a missed `agent_end` used to lock the input for the rest of
+					// the session with no visible cause.
+					editor.disableSubmit = false;
+				}
 			}
 			updateHeader();
 			tui.requestRender();
@@ -1386,7 +1764,10 @@ export async function wireConnectUi(
 		// direction is safe from the snapshot (it reconciles a missed
 		// agent_end after a disconnect); the lane's own agent_start /
 		// agent_end events own the upward direction.
-		if (!snap.isAgentRunning) isAgentRunning = false;
+		if (!snap.isAgentRunning) {
+			isAgentRunning = false;
+			editor.disableSubmit = false;
+		}
 		// Seed the connection-bound agent from the first snapshot the
 		// gateway pushes. The operator can override via `/agent <id>` —
 		// once set explicitly, snapshot updates no longer reset the binding.
@@ -1559,7 +1940,18 @@ export async function wireConnectUi(
 				isAgentRunning = true;
 				agentStartedAt = Date.now();
 				whimsicalIdx = 0; // reset so the first phrase is always "thinking"
-				editor.disableSubmit = true;
+				// Submit stays ENABLED during a turn.
+				//
+				// Blocking it made pi-tui return early from Enter
+				// (components/editor.js: `if (this.disableSubmit) return`), which made
+				// the entire mid-turn path below unreachable: steering, the queued
+				// message notice, and the deliberate hoisting of `/attach` + `/paste`
+				// above the steer gate so a screenshot can be staged while the model
+				// works. All of it was written, tested by eye, and dead.
+				//
+				// Every comparable harness accepts input during a turn — it is how you
+				// redirect a model that has misunderstood without throwing the turn
+				// away. The submit handler already routes a mid-turn Enter to `steer`.
 				updateHeader(WHIMSICAL_PHRASES[0]);
 				activeLoader = new CancellableLoader(
 					tui,
@@ -1573,14 +1965,92 @@ export async function wireConnectUi(
 			}
 			case "message_update":
 			case "message_end": {
+				// LIVE TOOL-CALL ARGUMENTS.
+				//
+				// The provider streams a tool's arguments as partial JSON while the
+				// model is still writing them (`toolcall_delta`), and Pi carries that
+				// on `message_update.assistantMessageEvent`. Every other harness
+				// surveyed assembles the complete call before rendering anything —
+				// three of them have the delta on the wire and discard it — so the
+				// operator watches a spinner while the model decides which file to
+				// edit. Showing it as it forms is the single clearest thing this
+				// renderer can do that the others do not.
+				//
+				// Rendered as a PROVISIONAL row keyed by `contentIndex`, because the
+				// real `toolCallId` does not exist until `tool_execution_start`, which
+				// fires only once the call is complete. That handler retires this row.
+				const inner = (event as { assistantMessageEvent?: { type?: string; contentIndex?: number; delta?: unknown } })
+					.assistantMessageEvent;
+				if (inner && typeof inner.contentIndex === "number" && depth === 0) {
+					if (inner.type === "toolcall_start") {
+						pendingToolArgs.set(inner.contentIndex, "");
+						renderPendingToolArgs(inner.contentIndex);
+					} else if (inner.type === "toolcall_delta" && typeof inner.delta === "string") {
+						const prev = pendingToolArgs.get(inner.contentIndex) ?? "";
+						// Bounded: partial JSON for a big write can be enormous, and only
+						// the head is legible on one row anyway.
+						pendingToolArgs.set(inner.contentIndex, (prev + inner.delta).slice(0, 2000));
+						renderPendingToolArgs(inner.contentIndex);
+					} else if (inner.type === "toolcall_end") {
+						clearPendingToolArgs(inner.contentIndex);
+					}
+				}
 				const msg = event.message;
 				if (!msg || msg.role !== "assistant") break;
+				// DELTA MODE. When we asked for deltas, `message_update` arrives with
+				// no `content` — the cumulative blocks are exactly the payload we
+				// asked the gateway to stop resending. Rebuild the text by appending,
+				// keyed the same way the render block is.
+				//
+				// A frame that DOES carry content (message_start, message_end, an
+				// older gateway, or a resume rebuild) is authoritative and RESETS the
+				// accumulator, so drift can never outlive a single message.
+				const deltaKey = asstKey(depth, msg);
+				const hasFullContent = Array.isArray((msg as { content?: unknown }).content);
+				if (!hasFullContent) {
+					const innerDelta = (event as { assistantMessageEvent?: { type?: string; delta?: unknown } })
+						.assistantMessageEvent;
+					if (innerDelta?.type === "text_delta" && typeof innerDelta.delta === "string") {
+						deltaText.set(deltaKey, (deltaText.get(deltaKey) ?? "") + innerDelta.delta);
+					} else if (innerDelta?.type === "thinking_delta" && typeof innerDelta.delta === "string") {
+						// Reasoning DOES change visible text now that it renders by
+						// default. Accumulating it here is what keeps the thinking phase
+						// streaming under delta mode instead of arriving as one lump.
+						deltaThinking.set(deltaKey, (deltaThinking.get(deltaKey) ?? "") + innerDelta.delta);
+					} else {
+						// A tool-call delta or a phase marker — no visible text changed.
+						break;
+					}
+				}
 				// Scrub server-pushed assistant text before it reaches the
 				// Markdown widget (see `scrubRenderable`). The model can be
 				// steered to emit ANSI/OSC control bytes; the widget preserves
 				// raw escapes, so strip them here. The brand-coloured label
 				// prefix added below is Brigade-internal chalk and stays intact.
-				const text = scrubRenderable(extractAssistantText(msg));
+				const text = hasFullContent
+					? (() => {
+							// Authoritative snapshot — reconcile the accumulator to it.
+							const full = extractAssistantText(msg);
+							if (event.type === "message_end" && depth === 0 && full.trim()) lastReplyText = full;
+							deltaText.set(deltaKey, full);
+							// The snapshot already contains the reasoning block, so the
+							// parallel buffer must not be composed in on top of it.
+							deltaThinking.delete(deltaKey);
+							return scrubRenderable(full);
+						})()
+					: (() => {
+							// Same composition `extractAssistantText` produces, so the two
+							// modes render identically: the labelled reasoning block, then
+							// a blank line, then the reply.
+							const think = showThinking ? (deltaThinking.get(deltaKey) ?? "").trim() : "";
+							const body = (deltaText.get(deltaKey) ?? "").trim();
+							const vis = lastSnapshot?.reasoning?.visibility;
+							const label = vis === "summary" ? "[reasoning summary]" : "[reasoning]";
+							const composed = think
+								? `${brand.dim(label)}\n${brand.dim(think)}${body ? `\n\n${body}` : ""}`
+								: body;
+							return scrubRenderable(composed);
+						})();
 				if (!text) break;
 				// NOTE: the loader is dismissed further down, only once we know this
 				// update actually paints something. A harness re-emits its partial on
@@ -1619,8 +2089,15 @@ export async function wireConnectUi(
 					} else {
 						cont.block.setText(tailText);
 					}
-					if (event.type === "message_end") flushStreamingRender();
-					else scheduleStreamingRender();
+					if (event.type === "message_end") {
+						// The message is final and its block is static from here, so the
+						// reconstruction buffer is dead weight. Dropping it keeps the map
+						// bounded by the number of IN-FLIGHT messages rather than by the
+						// length of the session.
+						deltaText.delete(deltaKey);
+						deltaThinking.delete(deltaKey);
+						flushStreamingRender();
+					} else scheduleStreamingRender();
 					break;
 				}
 				// Identity-keyed streaming block (see `asstKey`). Each logical
@@ -1663,6 +2140,11 @@ export async function wireConnectUi(
 					// so a 200-token reply paints ~12 times instead of ~200,
 					// killing the flicker that blocked terminal scroll-back.
 					if (event.type === "message_end") {
+						// Final message — drop its reconstruction buffer (see the
+						// continuation branch above), so the map stays bounded by
+						// in-flight messages rather than session length.
+						deltaText.delete(deltaKey);
+						deltaThinking.delete(deltaKey);
 						flushStreamingRender();
 					} else {
 						scheduleStreamingRender();
@@ -1696,12 +2178,55 @@ export async function wireConnectUi(
 				if (openKey !== undefined) {
 					asstContinuation.set(openKey, { prefixLen: asstTextLen.get(openKey) ?? 0 });
 				}
+				// A PLAN UPDATE is not a tool call to read — it is a checklist.
+				//
+				// `TodoWrite` is in the allowed tool set (claude-cli/catalog.ts), so the
+				// model calls it, and it fell through to the generic chip: a naked
+				// `✓ TodoWrite · {"todos":[{"content":"Rea…` clipped at 120 chars, once
+				// per plan update. On a long task that is eight rows of noise where
+				// most harnesses show live progress. Rendered as its own block, which
+				// the `tool_execution_end` handler then leaves alone.
+				const todoItems = /todo|plan/i.test(event.toolName) ? parseTodoArgs(event.args) : undefined;
+				if (todoItems) {
+					const lines = todoItems.map((item) => {
+						const mark = todoMarker(item.status);
+						const paint =
+							item.status === "completed"
+								? brand.dim
+								: item.status === "in_progress"
+									? brand.amber
+									: item.status === "cancelled"
+										? brand.dim
+										: brand.white;
+						return `${subIndent}      ${paint(`${mark} ${scrubRenderable(item.text)}`)}`;
+					});
+					insertBeforeEditor(
+						new Text(
+							`${subIndent}  ${brand.tool("▤")} ${brand.tool("plan")} ${brand.dim(summarizeTodos(todoItems))}\n${lines.join("\n")}`,
+							0,
+							0,
+						),
+					);
+					tui.requestRender();
+					break;
+				}
+				// Show WHAT the tool is acting on, not just that one is running.
+				// `⚡ bash` / `⚡ edit` told the operator nothing — which command,
+				// which file. `args` was on the wire the whole time and discarded.
+				const argSummary = scrubRenderable(formatToolArgs(event.args) ?? "");
 				const indicator = new Text(
-					`${subIndent}  ${brand.tool("⚡")} ${brand.tool(event.toolName)}`,
+					`${subIndent}  ${brand.tool("⚡")} ${brand.tool(event.toolName)}` +
+						(argSummary ? ` ${brand.dim(argSummary)}` : ""),
 					0,
 					0,
 				);
+				// The real chip supersedes any provisional "…writing call" row.
+				clearAllPendingToolArgs();
 				pendingTools.set(event.toolCallId, indicator);
+				rememberToolInfo(event.toolCallId, {
+					name: event.toolName,
+					...(argSummary ? { args: argSummary } : {}),
+				});
 				insertBeforeEditor(indicator);
 				break;
 			}
@@ -1715,10 +2240,39 @@ export async function wireConnectUi(
 				// can't thrash the terminal.
 				const liveIndicator = pendingTools.get(event.toolCallId);
 				if (liveIndicator) {
-					const summary = summarizeToolResult(event.partialResult, { preserveNewlines: false });
-					const previewText = scrubRenderable(summary.preview);
-					const tail = summary.hasContent ? ` ${brand.dim(`· ${previewText}`)}` : "";
-					liveIndicator.setText(`${subIndent}  ${brand.tool("⚡")} ${brand.tool(event.toolName)}${tail}`);
+					// A SHELL-LIKE tool's output is a running log, not a value. Collapsed
+					// to a 120-char one-liner it was the worst moment in the product: a
+					// four-minute test run showed one truncated flickering row, and you
+					// could not see which test failed until it ended. Give it a bounded
+					// tail pane instead — the last lines, updated in place.
+					const raw =
+						typeof event.partialResult === "string"
+							? event.partialResult
+							: (summarizeToolResult(event.partialResult, { preserveNewlines: true }).preview ?? "");
+					if (isShellLikeTool(event.toolName) && raw.includes("\n")) {
+						const argsTail = toolCallInfo.get(event.toolCallId)?.args;
+						liveIndicator.setText(
+							`${subIndent}  ${brand.tool("⚡")} ${brand.tool(event.toolName)}` +
+								(argsTail ? ` ${brand.dim(argsTail)}` : "") +
+								` ${brand.dim(`· ${describeOutputSize(raw)}`)}`,
+						);
+						const pane = liveOutputPanes.get(event.toolCallId);
+						const body = tailLines(scrubRenderable(raw))
+							.map((line) => `${subIndent}      ${brand.dim(line)}`)
+							.join("\n");
+						if (pane) {
+							pane.setText(body);
+						} else {
+							const created = new Text(body, 0, 0);
+							liveOutputPanes.set(event.toolCallId, created);
+							insertBeforeEditor(created);
+						}
+					} else {
+						const summary = summarizeToolResult(event.partialResult, { preserveNewlines: false });
+						const previewText = scrubRenderable(summary.preview);
+						const tail = summary.hasContent ? ` ${brand.dim(`· ${previewText}`)}` : "";
+						liveIndicator.setText(`${subIndent}  ${brand.tool("⚡")} ${brand.tool(event.toolName)}${tail}`);
+					}
 					scheduleStreamingRender();
 				}
 				break;
@@ -1740,8 +2294,29 @@ export async function wireConnectUi(
 					// a `bash`/`read` result can carry ANSI/OSC control bytes.
 					// Done once here so both render branches below stay clean.
 					const previewText = scrubRenderable(summary.preview);
+					// Retain the FULL result (not the preview) so `/expand` can show
+					// what was cut, and carry the argument summary onto the completed
+					// chip — `setText` below replaces the whole row, so without this
+					// the `✓` chip forgets which file or command it was about.
+					const keptArgs = toolCallInfo.get(event.toolCallId)?.args;
+					rememberToolInfo(event.toolCallId, {
+						name: event.toolName,
+						result: typeof event.result === "string" ? event.result : safeStringify(event.result),
+						isError: event.isError,
+					});
+					const argTail = keptArgs ? ` ${brand.dim(keptArgs)}` : "";
+					// A file edit's result is a unified diff on most backends. `+12 −3`
+					// says more at a glance than the first 120 characters of it, and it
+					// is what the operator actually wants to know.
+					const rawResult = typeof event.result === "string" ? event.result : "";
+					const diffTail = looksLikeUnifiedDiff(rawResult)
+						? (() => {
+								const { added, removed } = summarizeDiffStats(rawResult);
+								return ` ${brand.tool(`+${added}`)} ${brand.error(`−${removed}`)}`;
+							})()
+						: "";
 					if (event.isError && summary.multiline) {
-						indicator.setText(`${subIndent}  ${mark} ${brand.tool(event.toolName)}`);
+						indicator.setText(`${subIndent}  ${mark} ${brand.tool(event.toolName)}${argTail}`);
 						const errIndent = `${subIndent}      `;
 						const indentedBody = previewText
 							.split("\n")
@@ -1750,7 +2325,18 @@ export async function wireConnectUi(
 						insertBeforeEditor(new Text(indentedBody, 0, 0));
 					} else {
 						const preview = summary.hasContent ? ` ${brand.dim(`· ${previewText}`)}` : "";
-						indicator.setText(`${subIndent}  ${mark} ${brand.tool(event.toolName)}${preview}`);
+						indicator.setText(`${subIndent}  ${mark} ${brand.tool(event.toolName)}${argTail}${diffTail}${preview}`);
+					}
+					// The final result replaces the live tail; retire the pane so the
+					// finished command leaves one summary row, not a stale window.
+					const donePane = liveOutputPanes.get(event.toolCallId);
+					if (donePane) {
+						try {
+							removeChild(donePane);
+						} catch {
+							/* already detached by a transcript rebuild */
+						}
+						liveOutputPanes.delete(event.toolCallId);
 					}
 					tui.requestRender();
 					pendingTools.delete(event.toolCallId);
@@ -1801,8 +2387,25 @@ export async function wireConnectUi(
 				break;
 			}
 			case "compaction_end": {
+				// Pi emits `compaction_end` on FAILURE too, with `aborted: false`,
+				// no `result`, and an `errorMessage` — a summarization error, a 401,
+				// a rate limit, or overflow-recovery exhaustion. Branching on
+				// `aborted` alone printed "✓ compacted" for a compaction that never
+				// happened, which is exactly the unfalsifiable claim that let the
+				// 1.33 loop report success while making no progress.
+				const compactionFailed =
+					typeof event.errorMessage === "string" && event.errorMessage.length > 0;
 				if (event.aborted) {
 					insertBeforeEditor(new Text(`${subIndent}  ${brand.dim("compaction aborted")}`, 0, 0));
+				} else if (compactionFailed) {
+					const why = clipOneLine(scrubRenderable(event.errorMessage ?? ""), 90);
+					insertBeforeEditor(
+						new Text(
+							`${subIndent}  ${brand.error("✗")} ${brand.dim(`compaction failed · ${why}`)}`,
+							0,
+							0,
+						),
+					);
 				} else if (isChildTurn) {
 					// The child compacted its OWN context. Say so, and leave the parent's
 					// header figure alone — it still describes the parent's session.
@@ -1820,14 +2423,116 @@ export async function wireConnectUi(
 					// Drop our own stale copy too, so the header stops advertising a
 					// context figure that no longer describes the session.
 					if (lastSnapshot) lastSnapshot = { ...lastSnapshot, contextUsagePercent: null };
+					// SAY WHAT IT FREED.
+					//
+					// "compacted · usage refreshes on the next reply" is honest about
+					// the percentage being stale, and tells the operator nothing about
+					// whether the compaction achieved anything — which is exactly how a
+					// no-progress loop kept reporting success. The summarization's COST
+					// cannot be priced (the provider reports no usage for it), but the
+					// gateway measures what it RECLAIMED, so report that.
+					const oc = (event as { outcome?: { freedTokens?: number; messagesBefore?: number; messagesAfter?: number; madeProgress?: boolean } }).outcome;
+					const freedLine = oc
+						? oc.madeProgress
+							? `compacted · freed ${formatTokens(oc.freedTokens ?? 0)} tokens · ${oc.messagesBefore} → ${oc.messagesAfter} messages`
+							: `compacted · reclaimed almost nothing (${oc.messagesBefore} → ${oc.messagesAfter} messages)`
+						: "compacted · usage refreshes on the next reply";
 					insertBeforeEditor(
 						new Text(
-							`  ${brand.amber("✓")} ${brand.dim("compacted · usage refreshes on the next reply")}`,
+							`  ${brand.amber("✓")} ${brand.dim(freedLine)}`,
 							0,
 							0,
 						),
 					);
 					updateHeader();
+				}
+				break;
+			}
+			case "mid_turn_compaction_start": {
+				// The turn is PAUSING to compact. Without this line the operator sees
+				// a live tool loop stop dead for up to two minutes with no
+				// explanation — indistinguishable from a hang, and the single most
+				// likely reason someone kills a turn that was about to succeed.
+				//
+				// Say it is mid-turn and that the turn continues, because "compacting"
+				// alone reads as "your conversation is being replaced".
+				insertBeforeEditor(
+					new Text(
+						`${subIndent}  ${brand.dim(`⚡ context full mid-turn — compacting, the turn will continue…`)}`,
+						0,
+						0,
+					),
+				);
+				break;
+			}
+			case "mid_turn_compaction_end": {
+				const ev = event as {
+					applied?: boolean;
+					reason?: string;
+					freedTokens?: number;
+					messagesBefore?: number;
+					messagesAfter?: number;
+					durationMs?: number;
+					errorMessage?: string;
+				};
+				if (ev.reason === "fallback-truncated") {
+					// Summarization failed and we dropped the old prefix anyway, to
+					// keep the turn alive. That is a LOSS, not a compaction, and
+					// reporting it as "✓ compacted" would be the same unfalsifiable
+					// claim this work exists to remove.
+					insertBeforeEditor(
+						new Text(
+							`${subIndent}  ${brand.amber("!")} ${brand.dim(
+								`summary unavailable — dropped ${formatTokens(ev.freedTokens ?? 0)} tokens of older context to keep the turn alive · full history kept on disk`,
+							)}`,
+							0,
+							0,
+						),
+					);
+				} else if (ev.applied) {
+					const secs = ev.durationMs ? ` in ${Math.round(ev.durationMs / 100) / 10}s` : "";
+					// SAY WHAT IT COST. A compaction on a full window is one of the
+					// largest single model calls a harness makes, and of every harness
+					// surveyed only Roo Code shows the operator a figure for it. We can
+					// show one because the summarization runs on a session we own.
+					const u = (
+						event as {
+							usage?: { cost?: number; costKnown?: boolean; input?: number; output?: number };
+						}
+					).usage;
+					const costPart = u
+						? u.costKnown && (u.cost ?? 0) > 0
+							? ` · cost ${formatUsd(u.cost ?? 0)}`
+							: u.costKnown
+								? " · no charge"
+								: " · cost unknown"
+						: "";
+					// The transcript is untouched — say so. This is the difference
+					// between mid-turn compaction and Pi's `compact()`, and an operator
+					// who thinks their history was just deleted will not trust it.
+					insertBeforeEditor(
+						new Text(
+							`${subIndent}  ${brand.amber("✓")} ${brand.dim(
+								`compacted${secs} · freed ${formatTokens(ev.freedTokens ?? 0)} tokens for this turn${costPart} · ${ev.messagesBefore} → ${ev.messagesAfter} messages sent · full history kept`,
+							)}`,
+							0,
+							0,
+						),
+					);
+				} else {
+					// It declined or failed. Never silent: the turn is proceeding at
+					// full size and may still overflow, and the operator should know
+					// that is what happened rather than reading the failure as random.
+					const why = ev.errorMessage
+						? clipOneLine(scrubRenderable(ev.errorMessage), 80)
+						: (ev.reason ?? "unknown");
+					insertBeforeEditor(
+						new Text(
+							`${subIndent}  ${brand.dim(`compaction skipped (${why}) · continuing at full size`)}`,
+							0,
+							0,
+						),
+					);
 				}
 				break;
 			}
@@ -1884,8 +2589,29 @@ export async function wireConnectUi(
 					break;
 				}
 				isAgentRunning = false;
+				// Tell the operator the turn is done, if it ran long enough that they
+				// plausibly walked away. `turn_end` was an explicit no-op and a
+				// six-minute turn finished in silence. Duration is read BEFORE the
+				// start time is cleared.
+				if (agentStartedAt != null) {
+					notifyTurnComplete({
+						durationMs: Date.now() - agentStartedAt,
+						enabled: notifyOnComplete,
+						isTty: Boolean(process.stderr.isTTY),
+						summary: `${lastSnapshot?.agentName ?? "agent"} finished`,
+					});
+				}
 				agentStartedAt = null;
 				editor.disableSubmit = false;
+				// A turn that ends mid-tool-call (error, refusal, abort) must not
+				// strand a provisional "…writing call" row on screen.
+				clearAllPendingToolArgs();
+				liveOutputPanes.clear();
+				// The turn is over; no message can still be streaming, so the
+				// reconstruction buffers are dead. Without this the map grew for the
+				// life of the connect process.
+				deltaText.clear();
+				deltaThinking.clear();
 				activeAssistants.clear();
 				// The turn just created the store entry a pre-turn `/rename` had
 				// nothing to write to. Apply it now — but only if we are STILL on the
@@ -2001,7 +2727,7 @@ export async function wireConnectUi(
 		} catch (err) {
 			insertBeforeEditor(
 				new Text(
-					`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+					`  ${brand.error("✗")} ${brand.error(describeError(err))}`,
 					0,
 					0,
 				),
@@ -2375,12 +3101,76 @@ export async function wireConnectUi(
 	// `process.emit`, not `process.kill(process.pid, "SIGINT")`: on Windows the latter
 	// terminates instead of running the handler, turning "abort this turn" into "kill
 	// the client mid-stream".
+	/**
+	 * Promote everything queued for this turn into immediate steering.
+	 *
+	 * Reports the count rather than a bare acknowledgement: "flushed" alone
+	 * leaves the operator unsure whether it found anything, and the empty case
+	 * is the one they most need told, since it means their messages already
+	 * landed and the model has moved on.
+	 */
+	const flushQueuedMessages = async (): Promise<void> => {
+		try {
+			const res = (await client.request("flush-queue", withBinding({}))) as
+				| { promoted?: number }
+				| undefined;
+			const n = res?.promoted ?? 0;
+			insertBeforeEditor(
+				new Text(
+					n > 0
+						? `  ${brand.amber("↳")} ${brand.dim(`flushed ${n} queued message${n === 1 ? "" : "s"} into the running turn`)}`
+						: `  ${brand.dim("nothing queued — the model has already seen everything you sent")}`,
+					0,
+					0,
+				),
+			);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			insertBeforeEditor(new Text(`  ${brand.dim(`flush failed: ${msg}`)}`, 0, 0));
+		}
+		tui.requestRender();
+	};
+
 	editor.onInterrupt = () => {
 		process.emit("SIGINT", "SIGINT");
 	};
 
+	// Ctrl+Enter / Cmd+Enter — steer instead of queue.
+	//
+	// Arms the one-shot flag and then submits through the SAME path a plain
+	// Enter takes, so steering cannot drift from ordinary submit behaviour
+	// (attachment handling, the echo, the stale-busy-flag recovery). Only fires
+	// in terminals that can report the modifier; elsewhere `/steer` is the path,
+	// which is what the first-touch hint says when it detects that.
+	editor.onSteerSubmit = (): boolean => {
+		// EMPTY DRAFT + the steer key = "flush what I already queued into the
+		// running turn". DeepSeek's gesture, and the reason the empty case is a
+		// distinct action rather than a no-op: having queued three messages, the
+		// natural next thought is "actually, show it those now" — and there was
+		// no way to say that without retyping them.
+		//
+		// Fire-and-forget: this handler is synchronous (it decides whether the
+		// editor submits), and there is nothing to submit here.
+		if (editor.getText().trim().length === 0) {
+			if (isAgentRunning) void flushQueuedMessages();
+			// Either way, an empty buffer never submits.
+			return false;
+		}
+		// Nothing running means there is nothing to steer; submit as an ordinary
+		// message rather than swallowing the keystroke. The operator did press
+		// Enter, after all.
+		if (isAgentRunning) steerNextSubmit = true;
+		return true;
+	};
+
 	// Ctrl+V / Alt+V raw keystroke — reaches us only in terminals that DON'T bind
 	// Ctrl+V to their own paste. See `BrigadeEditor.onImagePaste`.
+	// Ctrl+T — show/hide reasoning. Same code path as `/reasoning`, so the key
+	// and the command can never disagree about what the toggle means.
+	editor.onToggleReasoning = () => {
+		applyReasoningVisibility(!showThinking);
+	};
+
 	editor.onImagePaste = () => {
 		void pasteFromClipboard({ quiet: false });
 	};
@@ -2555,12 +3345,44 @@ export async function wireConnectUi(
 	};
 
 	editor.onSubmit = async (value: string) => {
+		// RE-ENTRANCY GUARD. This handler is async — it awaits an RPC — so two
+		// fast Enters can both pass the `isAgentRunning` gate and send the same
+		// text twice. opencode carries a `submitting` flag for exactly this;
+		// Cline's boolean-returning handler is the same fix after a
+		// duplicate-execution bug. The flag is cleared in a `finally` so a throw
+		// anywhere below cannot wedge the editor.
+		if (submitInFlight) return;
+		submitInFlight = true;
+		// CONSUME THE STEER ARM HERE, unconditionally.
+		//
+		// It used to be cleared only inside the mid-turn branch, so any submit
+		// that returned earlier — every slash command, an empty line — left it
+		// armed. The next PLAIN Enter then inherited it and interrupted the model
+		// mid-task: exactly the reflex-key mistake the queue/steer split exists to
+		// prevent, reintroduced by the flag's lifetime. It also survived a thread
+		// switch, arming a steer against a session the operator had left.
+		const steerThisSubmit = steerNextSubmit;
+		steerNextSubmit = false;
+		try {
+			await handleSubmit(value, steerThisSubmit);
+		} finally {
+			submitInFlight = false;
+		}
+	};
+
+	const handleSubmit = async (value: string, steerThisSubmit = false): Promise<unknown> => {
 		// SECURITY — scrub terminal escape sequences, leaked bracketed-paste markers,
 		// and lone surrogates from input BEFORE it reaches command dispatch, the model
 		// payload, or the echo. A hostile paste (or text the agent was told to copy
 		// from a malicious page) can otherwise corrupt the terminal or smuggle control
 		// bytes into the transcript. The single submit chokepoint covers every path.
 		const trimmed = sanitizeTerminalInput(value).trim();
+		// Up-arrow prompt recall. pi-tui's `Editor` ships the whole history stack
+		// (`addToHistory` / `navigateHistory`, editor.js:218-330) and Brigade never
+		// called the one method that fills it — so up-arrow recalled nothing and a
+		// long prompt had to be retyped from scratch. Recorded on the sanitized
+		// text so a hostile paste cannot smuggle control bytes back in via recall.
+		if (trimmed) editor.addToHistory(trimmed);
 		// Any line that is not a `/delete` disarms a pending confirmation. Without
 		// this the armed key survived arbitrary intervening work, so repeating the
 		// command an hour later — expecting the warning again — deleted on the
@@ -2656,7 +3478,10 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/revoke-skill <name>")} — remove a skill's granted commands\n` +
 						`- ${chalk.bold("/abort")} — stop the in-flight turn\n` +
 						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
-						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's thinking blocks before replies (default: off)\n` +
+						`- ${chalk.bold("/copy [code]")} — copy the last reply (or just its code block)\n` +
+						`- ${chalk.bold("/expand [n]")} — show a truncated tool result in full (1 = most recent)\n` +
+						`- ${chalk.bold("/steer <text>")} — redirect the running turn (or just type mid-turn)\n` +
+						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's reasoning, or press ctrl+t (default: on, remembered)\n` +
 						`- ${chalk.bold("/new")} — start a fresh thread (new session, clean screen, no prior context)\n` +
 						`- ${chalk.bold("/agent [<id>]")} — show/bind the connection's active agent\n` +
 						`- ${chalk.bold("/session [<key>]")} — show/bind the connection's active session\n` +
@@ -2749,8 +3574,8 @@ export async function wireConnectUi(
 					boundAgentId !== undefined ? { agentId: boundAgentId } : {},
 				);
 				const list = Array.isArray(res)
-					? (res as SessionSummary[])
-					: ((res as { sessions?: SessionSummary[] }).sessions ?? []);
+					? (res as SessionListRow[])
+					: ((res as { sessions?: SessionListRow[] }).sessions ?? []);
 				known = list.some((s) => s.sessionKey === target);
 			} catch {
 				known = undefined; // gateway couldn't answer; claim nothing
@@ -2795,7 +3620,7 @@ export async function wireConnectUi(
 			} catch (err) {
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+						`  ${brand.error("✗")} ${brand.error(describeError(err))}`,
 						0,
 						0,
 					),
@@ -2916,7 +3741,7 @@ export async function wireConnectUi(
 				if (pendingRename?.sessionKey === key) pendingRename = undefined;
 			} catch (err) {
 				insertBeforeEditor(
-					new Text(`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`, 0, 0),
+					new Text(`  ${brand.error("✗")} ${brand.error(describeError(err))}`, 0, 0),
 				);
 			}
 			return;
@@ -2975,7 +3800,7 @@ export async function wireConnectUi(
 				);
 			} catch (err) {
 				insertBeforeEditor(
-					new Text(`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`, 0, 0),
+					new Text(`  ${brand.error("✗")} ${brand.error(describeError(err))}`, 0, 0),
 				);
 			}
 			return;
@@ -2988,7 +3813,7 @@ export async function wireConnectUi(
 			editor.setText("");
 			const arg = trimmed === "/sessions" ? "" : trimmed.slice("/sessions ".length).trim();
 			const wantsAll = /\b--?all\b/i.test(arg);
-			let sessions: SessionSummary[];
+			let sessions: SessionListRow[];
 			try {
 				const params: { agentId?: string; all?: boolean } = wantsAll
 					? { all: true }
@@ -3005,7 +3830,7 @@ export async function wireConnectUi(
 			} catch (err) {
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+						`  ${brand.error("✗")} ${brand.error(describeError(err))}`,
 						0,
 						0,
 					),
@@ -3039,7 +3864,19 @@ export async function wireConnectUi(
 					: undefined;
 				const friendly = named ? `${label} ${brand.white(`"${named}"`)}` : label;
 				const here = s.sessionKey === boundKey ? " " + brand.amber("← bound") : "";
-				return `  ${brand.white(s.agentId)}  ${friendly}  ${brand.dim(s.sessionKey)}${here}`;
+				// The server has always sent state / last-activity / model / usage on
+				// these rows; the TUI typed the response as a 3-field summary and threw
+				// the rest away, so the picker could not say which thread was RUNNING,
+				// when it last moved, or what it had cost.
+				const running = s.state && s.state !== "idle" ? " " + brand.amber("● running") : "";
+				const when = typeof s.updatedAt === "number" ? ` ${brand.dim(formatRelativeAge(s.updatedAt))}` : "";
+				const model = s.pinnedModel ?? s.model;
+				const modelTag = model ? ` ${brand.dim(`· ${model}${s.pinnedModel ? " (pinned)" : ""}`)}` : "";
+				const spend =
+					typeof s.estimatedCostUsd === "number" && s.estimatedCostUsd > 0
+						? ` ${brand.dim(`· ${formatUsd(s.estimatedCostUsd)}`)}`
+						: "";
+				return `  ${brand.white(s.agentId ?? "?")}  ${friendly}  ${brand.dim(s.sessionKey)}${here}${running}${when}${modelTag}${spend}`;
 			});
 			const scopeLine = wantsAll
 				? "live sessions (all agents):"
@@ -3338,7 +4175,7 @@ export async function wireConnectUi(
 			} catch (err) {
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+						`  ${brand.error("✗")} ${brand.error(describeError(err))}`,
 						0,
 						0,
 					),
@@ -3359,13 +4196,457 @@ export async function wireConnectUi(
 				insertBeforeEditor(new Text(`  ${brand.dim("usage: /reasoning <on|off>")}`, 0, 0));
 				return;
 			}
+			applyReasoningVisibility(showThinking);
+			return;
+		}
+
+		// /copy — put the last reply on the clipboard.
+		//
+		// OSC 52 rather than shelling out to pbcopy/clip.exe/wl-copy: the TERMINAL
+		// owns the clipboard, so this is the only mechanism that works over SSH
+		// and inside tmux, where a local binary would write to the REMOTE
+		// machine's clipboard.
+		if (trimmed === "/copy" || trimmed.startsWith("/copy ")) {
+			editor.setText("");
+			const arg = trimmed === "/copy" ? "" : trimmed.slice("/copy ".length).trim().toLowerCase();
+			const wantCode = arg === "code" || arg === "block";
+			const source = wantCode ? lastCodeBlock(lastReplyText) : lastReplyText;
+			if (!source || !source.trim()) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(wantCode ? "no code block in the last reply" : "nothing to copy yet")}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
+			const { sequence, bytes, truncated } = buildOsc52(source);
+			try {
+				process.stdout.write(sequence);
+			} catch {
+				/* a closed tty must not take down the session over a copy */
+			}
+			// Confirm explicitly: a terminal WITHOUT OSC 52 support discards the
+			// sequence silently, so success can never be assumed.
 			insertBeforeEditor(
 				new Text(
-					`  ${brand.dim(showThinking ? "reasoning: on  (model thinking will render before each reply)" : "reasoning: off")}`,
+					`  ${brand.dim(
+						`copied ${wantCode ? "code block" : "reply"} (${bytes.toLocaleString()} bytes)${truncated ? " — truncated to fit" : ""}` +
+							" · needs OSC 52 support (tmux: set-clipboard on)",
+					)}`,
 					0,
 					0,
 				),
 			);
+			tui.requestRender();
+			return;
+		}
+
+		// /expand — recover a tool result the chip truncated.
+		//
+		// Previews are capped at 120 chars (800 for errors) and the remainder used
+		// to be discarded on arrival, so a long command output, a diff, or a
+		// web-search result's citations were gone the moment they rendered. The
+		// full text is now retained per tool call; this is how you read it.
+		if (trimmed === "/expand" || trimmed.startsWith("/expand ")) {
+			editor.setText("");
+			const withResults = [...toolCallInfo.entries()].filter(([, v]) => (v.result ?? "").trim().length > 0);
+			if (withResults.length === 0) {
+				insertBeforeEditor(new Text(`  ${brand.dim("no tool results to expand yet")}`, 0, 0));
+				return;
+			}
+			// Newest first, so `/expand` with no argument means "the one I just saw".
+			const newestFirst = withResults.reverse();
+			const arg = trimmed === "/expand" ? "" : trimmed.slice("/expand ".length).trim();
+			const idx = arg ? Number.parseInt(arg, 10) : 1;
+			if (!Number.isFinite(idx) || idx < 1 || idx > newestFirst.length) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(`usage: /expand [1-${newestFirst.length}] — 1 is the most recent`)}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
+			const entry = newestFirst[idx - 1]!;
+			const info = entry[1];
+			const head = `${info.isError ? brand.error("✗") : brand.tool("✓")} ${brand.tool(info.name)}${info.args ? ` ${brand.dim(info.args)}` : ""}`;
+			insertBeforeEditor(new Text(`  ${head}`, 1, 0));
+			// Scrubbed: a tool result is the most directly attacker-influenceable
+			// text the TUI renders, and here it bypasses the preview's truncation.
+			const body = scrubRenderable(info.result ?? "");
+			const isDiff = looksLikeUnifiedDiff(body);
+			// Cap the widget count. `insertBeforeEditor` splices a component per
+			// line and pi-tui re-renders every child per frame, so expanding a
+			// 20k-line build log would create 20k widgets via 20k splices and hang
+			// the TUI. The preview exists to show what was cut, not to be a pager.
+			const EXPAND_MAX_LINES = 500;
+			const allLines = body.split("\n");
+			const shownLines = allLines.slice(0, EXPAND_MAX_LINES);
+			for (const line of shownLines) {
+				if (!isDiff) {
+					insertBeforeEditor(new Text(`      ${brand.dim(line)}`, 0, 0));
+					continue;
+				}
+				// Colour by change kind so an edit reads as an edit. `brand.tool` is
+				// the ✓ colour; the palette has no dedicated green.
+				const kind = classifyDiffLine(line);
+				const paint =
+					kind === "add"
+						? brand.tool
+						: kind === "remove"
+							? brand.error
+							: kind === "hunk"
+								? brand.amber
+								: brand.dim;
+				insertBeforeEditor(new Text(`      ${paint(line)}`, 0, 0));
+			}
+			if (allLines.length > EXPAND_MAX_LINES) {
+				insertBeforeEditor(
+					new Text(
+						`      ${brand.dim(`… ${(allLines.length - EXPAND_MAX_LINES).toLocaleString()} more lines not shown`)}`,
+						0,
+						0,
+					),
+				);
+			}
+			tui.requestRender();
+			return;
+		}
+
+		// /steer — redirect the turn that is already running.
+		//
+		// A bare mid-turn Enter steers too (the submit handler routes it), but the
+		// explicit command is what the help line has always advertised, and it is
+		// unambiguous when the operator is unsure whether a turn is still live.
+		// /rewind — go back to an earlier point in the conversation.
+		//
+		// CONVERSATION ONLY. Files are named, never reverted. Every reported
+		// failure in this space across the field is a file-restore failure —
+		// `git clean -fd` deleting a gigabyte of files an agent had only READ
+		// being the worst of them — and two projects (Codex, Amp) shipped file
+		// rollback and then removed it, both now pointing users at git.
+		if (trimmed === "/rewind" || trimmed.startsWith("/rewind ")) {
+			editor.setText("");
+			const arg = trimmed === "/rewind" ? "" : trimmed.slice("/rewind ".length).trim();
+			try {
+				// No argument → list. Nothing is mutated by the picker call.
+				const listed = (await client.request(
+					"sessions.rewind",
+					withBinding({}),
+				)) as SessionRewindResult;
+
+				if (listed.blocked) {
+					insertBeforeEditor(
+						new Text(`  ${brand.error("✗")} ${brand.error(`cannot rewind: ${listed.blocked}`)}`, 0, 0),
+					);
+					tui.requestRender();
+					return;
+				}
+				const targets = listed.targets ?? [];
+				if (targets.length === 0) {
+					insertBeforeEditor(
+						new Text(`  ${brand.dim("nothing to rewind to yet — send a message first")}`, 0, 0),
+					);
+					tui.requestRender();
+					return;
+				}
+
+				if (!arg) {
+					insertBeforeEditor(
+						new Text(`  ${brand.dim("rewind to which message?  /rewind <n>")}`, 0, 0),
+					);
+					for (const t of targets) {
+						insertBeforeEditor(
+							new Text(
+								`  ${brand.dim(`#${t.ordinal}`)}  ${brand.dim(scrubRenderable(t.preview))}`,
+								0,
+								0,
+							),
+						);
+					}
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.dim("↳ the conversation moves; your files are NOT reverted — use git for those")}`,
+							0,
+							0,
+						),
+					);
+					tui.requestRender();
+					return;
+				}
+
+				const n = Number.parseInt(arg, 10);
+				const chosen = targets.find((t) => t.ordinal === n);
+				if (!chosen) {
+					insertBeforeEditor(
+						new Text(`  ${brand.dim(`no message #${arg} — /rewind to see the list`)}`, 0, 0),
+					);
+					tui.requestRender();
+					return;
+				}
+
+				const done = (await client.request(
+					"sessions.rewind",
+					withBinding({ entryId: chosen.entryId }),
+				)) as SessionRewindResult;
+
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.amber("✓")} ${brand.dim(`rewound to #${chosen.ordinal} — ${done.abandoned ?? 0} entries are no longer on the active path (nothing was deleted)`)}`,
+						0,
+						0,
+					),
+				);
+				// NAME the files, do not pretend to revert them. This is the honest
+				// half of the contract and the reason the feature is safe to ship.
+				const files = done.files ?? [];
+				if (files.length > 0) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.amber("!")} ${brand.dim(`${files.length} file${files.length === 1 ? " was" : "s were"} written after that point and ${files.length === 1 ? "is" : "are"} NOT reverted:`)}`,
+							0,
+							0,
+						),
+					);
+					for (const f of files.slice(0, 20)) {
+						insertBeforeEditor(new Text(`     ${brand.dim(scrubRenderable(f))}`, 0, 0));
+					}
+					if (files.length > 20) {
+						insertBeforeEditor(new Text(`     ${brand.dim(`… and ${files.length - 20} more`)}`, 0, 0));
+					}
+					insertBeforeEditor(
+						new Text(`  ${brand.dim("↳ review them with `git diff`")}`, 0, 0),
+					);
+				}
+				// Put the message back in the editor, so the operator can edit and
+				// resend it — the affordance every harness with a picker provides.
+				// Scrubbed again at the boundary. `previewOf` strips control bytes at
+				// the source, but this string goes into the LIVE editor buffer, which
+				// pi-tui re-emits every frame — the one place a miss repaints forever.
+				editor.setText(scrubRenderable(chosen.preview));
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(`rewind failed: ${msg}`)}`, 0, 0));
+			}
+			tui.requestRender();
+			return;
+		}
+
+		// /search — find text in this conversation.
+		//
+		// There is deliberately no "jump to match": Brigade appends into the
+		// terminal's own scrollback rather than owning a viewport, so there is no
+		// cursor address for "eleven messages ago", and re-printing to fake one
+		// would duplicate the conversation. Showing the matching lines is both
+		// achievable and, for "what was that path", the more useful answer.
+		if (trimmed === "/search" || trimmed.startsWith("/search ")) {
+			editor.setText("");
+			const q = trimmed === "/search" ? "" : trimmed.slice("/search ".length).trim();
+			if (!q) {
+				insertBeforeEditor(new Text(`  ${brand.dim("usage: /search <text>")}`, 0, 0));
+				tui.requestRender();
+				return;
+			}
+			try {
+				const snap = await client.resume(withBinding());
+				const messages = (snap?.messages ?? []) as WireMessage[];
+				const { hits, truncated } = searchTranscript(messages, q);
+				// A search that silently sees only a window is a false negative
+				// dressed as an answer, so the scope is always stated.
+				const windowed = messages.length >= RESUME_TRANSCRIPT_WINDOW;
+				const scope = windowed
+					? `the most recent ${messages.length} messages (earlier history not searched)`
+					: `${messages.length} messages`;
+				if (hits.length === 0) {
+					insertBeforeEditor(
+						new Text(`  ${brand.dim(`no matches for "${q}" in ${scope}`)}`, 0, 0),
+					);
+					tui.requestRender();
+					return;
+				}
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(`${hits.length}${truncated ? "+" : ""} match${hits.length === 1 ? "" : "es"} for "${q}"`)}`,
+						0,
+						0,
+					),
+				);
+				for (const h of hits) {
+					// Position in the conversation, so a hit can be located by eye in
+					// the scrollback above.
+					const where =
+						h.where === "text"
+							? h.role
+							: h.where === "tool-call"
+								? `→ ${h.toolName ?? "tool"}`
+								: `← ${h.toolName ?? "tool"}`;
+					const before = h.snippet.slice(0, h.matchStart);
+					const hit = h.snippet.slice(h.matchStart, h.matchEnd);
+					const after = h.snippet.slice(h.matchEnd);
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.dim(`#${h.index + 1} ${where}`)}  ${brand.dim(scrubRenderable(before))}${brand.amber(scrubRenderable(hit))}${brand.dim(scrubRenderable(after))}`,
+							0,
+							0,
+						),
+					);
+				}
+				if (truncated) {
+					insertBeforeEditor(
+						new Text(`  ${brand.dim("↳ more matches were found; narrow the search to see them")}`, 0, 0),
+					);
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(`search failed: ${msg}`)}`, 0, 0));
+			}
+			tui.requestRender();
+			return;
+		}
+
+		// /export — write the conversation to a file.
+		//
+		// Read-only and client-side: the transcript comes from `resume`, which the
+		// TUI already calls on connect, so there is no new RPC and no server state.
+		// The file is REDACTED on the way out, because an export is a thing people
+		// attach to bug reports and it is built out of raw tool output.
+		if (trimmed === "/export" || trimmed.startsWith("/export ")) {
+			editor.setText("");
+			const arg = trimmed === "/export" ? "" : trimmed.slice("/export ".length).trim();
+			const full = arg === "full";
+			if (arg && !full) {
+				insertBeforeEditor(new Text(`  ${brand.dim("usage: /export [full]")}`, 0, 0));
+				tui.requestRender();
+				return;
+			}
+			try {
+				const snap = await client.resume(withBinding());
+				const messages = (snap?.messages ?? []) as WireMessage[];
+				if (messages.length === 0) {
+					insertBeforeEditor(
+						new Text(`  ${brand.dim("nothing to export — this session has no messages yet")}`, 0, 0),
+					);
+					tui.requestRender();
+					return;
+				}
+				const at = new Date();
+				const home = os.homedir();
+				const rendered = renderTranscriptMarkdown(messages, {
+					full,
+					sessionKey: boundSessionKey,
+					now: () => at,
+					// Per-block redaction BEFORE truncation. A PEM key clipped at 2000
+					// chars loses its END marker, and the rule that catches it stops
+					// matching — so the default export leaked key material while the
+					// banner said "no secrets matched". The whole-document pass below
+					// still runs, for the count and as defence in depth.
+					redact: (t) => redactForExport(t, { homeDir: home }).text,
+				});
+				const { text, counts, total } = redactForExport(rendered, { homeDir: home });
+				const dir = nodePath.join(resolveStateDir(), "exports");
+				// 0700 — the filenames embed session keys, so the directory listing is
+				// itself information. Matches the convention used for other sensitive
+				// dirs in this repo.
+				await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+				const file = nodePath.join(dir, exportFileName(boundSessionKey, at));
+				// 0600 — it is a conversation transcript, not world-readable content.
+				await fs.promises.writeFile(file, text, { encoding: "utf8", mode: 0o600 });
+
+				insertBeforeEditor(
+					new Text(`  ${brand.amber("✓")} ${brand.dim(`exported ${messages.length} messages → ${file}`)}`, 0, 0),
+				);
+				// SAY SO WHEN THE WINDOW CLIPPED THE HEAD. `resume` returns at most
+				// RESUME_TRANSCRIPT_MAX messages, so a long session exports a PARTIAL
+				// transcript that otherwise reads as complete — attached to a bug
+				// report, that is a misleading artifact.
+				if (messages.length >= RESUME_TRANSCRIPT_WINDOW) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.amber("!")} ${brand.dim(`this is the most recent ${RESUME_TRANSCRIPT_WINDOW} messages — earlier history is not in the file`)}`,
+							0,
+							0,
+						),
+					);
+				}
+				// SAY WHAT WAS REDACTED, and say what that does not cover. A redactor
+				// people over-trust is worse than one they check behind.
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(
+							total > 0
+								? `↳ redacted ${total} secret${total === 1 ? "" : "s"} (${describeRedactions(counts)}) — pattern matching, so read it before sharing`
+								: "↳ no secrets matched — pattern matching only, so read it before sharing",
+						)}`,
+						0,
+						0,
+					),
+				);
+				if (!full) {
+					insertBeforeEditor(
+						new Text(`  ${brand.dim("↳ tool output was truncated; /export full keeps it whole")}`, 0, 0),
+					);
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(`export failed: ${msg}`)}`, 0, 0));
+			}
+			tui.requestRender();
+			return;
+		}
+
+		// /flush — the universal form of the empty-draft Ctrl+Enter gesture, for
+		// terminals that cannot encode the modifier at all (Terminal.app sends a
+		// bare `\r` for Ctrl+Enter, indistinguishable from Enter).
+		if (trimmed === "/flush") {
+			editor.setText("");
+			if (!isAgentRunning) {
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("nothing is running — there is no turn to flush into")}`, 0, 0),
+				);
+				tui.requestRender();
+				return;
+			}
+			await flushQueuedMessages();
+			return;
+		}
+
+		if (trimmed === "/steer" || trimmed.startsWith("/steer ")) {
+			editor.setText("");
+			const text = trimmed === "/steer" ? "" : trimmed.slice("/steer ".length).trim();
+			if (!text) {
+				insertBeforeEditor(new Text(`  ${brand.dim("usage: /steer <text>")}`, 0, 0));
+				return;
+			}
+			if (!isAgentRunning) {
+				// Steering an idle session would silently vanish — the gateway has no
+				// turn to inject into. Say so rather than swallowing the message.
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("nothing is running — send it as a normal message instead")}`, 0, 0),
+				);
+				return;
+			}
+			try {
+				// EXPLICIT steer. `/steer` is the universal path for terminals that
+				// cannot encode Ctrl+Enter — Terminal.app and friends send a bare
+				// `\r` for it, indistinguishable from Enter — so this command must
+				// genuinely interrupt, not queue like a plain Enter now does.
+				await client.request("steer", withBinding({ text, deliverAs: "steer" as const }));
+				insertBeforeEditor(new Markdown(`${brand.user("you")}  ${text}`, 1, 0, markdownTheme));
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.amber("↳")} ${brand.dim("steering — the model sees this mid-turn, after the current tool finishes")}`,
+						0,
+						0,
+					),
+				);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(new Text(`  ${brand.dim(`steer failed: ${msg}`)}`, 0, 0));
+			}
+			tui.requestRender();
 			return;
 		}
 
@@ -3382,16 +4663,37 @@ export async function wireConnectUi(
 			const tokenIn = snap.totalTokensIn.toLocaleString();
 			const tokenOut = snap.totalTokensOut.toLocaleString();
 			const tokenTotal = (snap.totalTokensIn + snap.totalTokensOut).toLocaleString();
-			const costStr = snap.totalCostUsd > 0 ? `$${snap.totalCostUsd.toFixed(4)}` : "$0.0000";
-			const ctxStr = snap.contextUsagePercent != null ? `${Math.round(snap.contextUsagePercent)}%` : "—";
+			// Honest cost. `$0.0000` was printed for four different situations —
+			// a cheap metered turn, a subscription with no marginal cost, local
+			// inference, and an unpriced model that IS costing money.
+			const costStr =
+				formatCostSegment({
+					billing: snap.billing,
+					costUsd: snap.totalCostUsd,
+					...(snap.costComplete !== undefined ? { costComplete: snap.costComplete } : {}),
+				}) ?? "—";
+			// Context as the pair, not a bare percent: "34k / 200k (17%)" answers
+			// "how much room is left", which a percentage alone cannot.
+			const ctxStr =
+				snap.contextTokens != null && snap.contextWindow != null && snap.contextWindow > 0
+					? `${formatTokens(snap.contextTokens)} / ${formatTokens(snap.contextWindow)}` +
+						` (${Math.round((snap.contextTokens / snap.contextWindow) * 100)}%)`
+					: snap.contextUsagePercent != null
+						? `${Math.round(snap.contextUsagePercent)}%`
+						: "—";
+			const reasoningStrUsage = formatReasoningLine({ state: snap.reasoning });
 			insertBeforeEditor(
 				new Markdown(
 					`${brand.dim("usage")}\n` +
 						`- ${chalk.bold("model:")}    ${snap.provider ?? "?"} · ${snap.modelId ?? "?"}\n` +
-						`- ${chalk.bold("turns:")}    ${snap.messageCount}\n` +
+						// `messageCount` counts user + assistant + toolResult messages,
+						// so labelling it "turns" over-reported a 5-turn conversation
+						// with tool use as ~40.
+						`- ${chalk.bold("messages:")} ${snap.messageCount}\n` +
 						`- ${chalk.bold("tokens:")}   ${tokenIn} in · ${tokenOut} out · ${tokenTotal} total\n` +
 						`- ${chalk.bold("cost:")}     ${costStr}\n` +
-						`- ${chalk.bold("context:")}  ${ctxStr} used\n` +
+						`- ${chalk.bold("context:")}  ${ctxStr}\n` +
+						(reasoningStrUsage ? `- ${chalk.bold("reasoning:")} ${reasoningStrUsage}\n` : "") +
 						`- ${chalk.bold("thinking:")} ${snap.thinkingLevel}` +
 						(snap.supportsThinking
 							? brand.dim(` (available: ${snap.availableThinkingLevels.join(", ")})`)
@@ -3486,10 +4788,25 @@ export async function wireConnectUi(
 			return;
 		}
 
-		// Mid-turn submit → STEER. The gateway has the same Pi semantics; queueing
-		// the message lets the model see it on the next iteration without abort.
+		// Mid-turn submit → QUEUE by default, STEER only on the deliberate gesture.
+		//
+		// ─────────────────────────────────────────────────────────────────────────
+		// WHY ENTER QUEUES
+		// ─────────────────────────────────────────────────────────────────────────
+		// Steering injects text into a turn already in flight, changing a plan the
+		// model is halfway through executing. A follow-up waits for a turn
+		// boundary. One is recoverable, the other is not — so the irreversible one
+		// does not go on the key the operator hits by reflex.
+		//
+		// Claude Code drains its queue "at the next LLM pause", which lands user
+		// text in the middle of a plan; it has five open steering issues and a
+		// documented docs-vs-behaviour bug from that ambiguity. Codex puts steer on
+		// Enter and queue on Tab — the same two operations with the dangerous one
+		// under the reflex finger. DeepSeek's harness splits them the way this
+		// does.
 		if (isAgentRunning) {
 			editor.setText("");
+			const deliverAs: "steer" | "followUp" = steerThisSubmit ? "steer" : "followUp";
 			// A steer injects TEXT into a turn that is already running — there is no
 			// place in that mechanism for a file. Staged attachments therefore stay
 			// staged, and we SAY so. Saying so is the whole point: silently carrying
@@ -3507,17 +4824,43 @@ export async function wireConnectUi(
 				);
 			}
 			try {
-				await client.request("steer", withBinding({ text: trimmed }));
+				await client.request("steer", withBinding({ text: trimmed, deliverAs }));
 				insertBeforeEditor(
 					new Markdown(`${brand.user("you")}  ${trimmed}`, 1, 0, markdownTheme),
 				);
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.dim("↳ queued — the model will see this on its next turn")}`,
+						deliverAs === "steer"
+							? `  ${brand.amber("↳")} ${brand.dim("steering — the model sees this mid-turn, after the current tool finishes")}`
+							: `  ${brand.dim("↳ queued — the model will see this when the current turn finishes")}`,
 						0,
 						0,
 					),
 				);
+				// FIRST-TOUCH HINT. Shown once per session, the first time a message
+				// is queued mid-turn — the moment the operator is actually wondering
+				// what just happened. Hermes does the same thing and it is the
+				// cheapest good idea in this whole area: teach the split instead of
+				// blocking the key or burying it in `/help`.
+				//
+				// It tells the truth about THIS terminal. `ctrl+enter` only resolves
+				// through the kitty keyboard protocol or xterm modifyOtherKeys; in
+				// Terminal.app it is byte-identical to Enter, so advertising the
+				// keystroke there would send the operator chasing a key that cannot
+				// work.
+				if (!midTurnHintShown && deliverAs === "followUp") {
+					midTurnHintShown = true;
+					const kitty = isKittyProtocolActive();
+					const steerGesture = kitty ? "Ctrl+Enter" : "/steer <text>";
+					const flushGesture = kitty ? "Ctrl+Enter on an empty line" : "/flush";
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.dim(`↳ tip: Enter queues. ${steerGesture} interrupts the model mid-task; ${flushGesture} sends everything queued so far.`)}`,
+							0,
+							0,
+						),
+					);
+				}
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				if (msg.includes("nothing to steer")) {
@@ -3785,7 +5128,7 @@ export async function wireConnectUi(
 			} catch (err) {
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+						`  ${brand.error("✗")} ${brand.error(describeError(err))}`,
 						0,
 						0,
 					),
@@ -3880,7 +5223,7 @@ export async function wireConnectUi(
 			} catch (err) {
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+						`  ${brand.error("✗")} ${brand.error(describeError(err))}`,
 						0,
 						0,
 					),
@@ -4036,7 +5379,7 @@ export async function wireConnectUi(
 			try {
 				switchModels = await client.request("list-models");
 			} catch (err) {
-				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`, 0, 0));
+				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(describeError(err))}`, 0, 0));
 				return;
 			}
 			const switchMatches = switchModels.filter((m) => m.id === arg);
@@ -4061,7 +5404,7 @@ export async function wireConnectUi(
 					new Text(`  ${brand.amber("✓")} ${brand.dim("Carrow handoff →")} ${brand.white(`${switchTarget.provider} · ${switchTarget.id}`)}`, 0, 0),
 				);
 			} catch (err) {
-				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`, 0, 0));
+				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(describeError(err))}`, 0, 0));
 			}
 			return;
 		}
@@ -4111,6 +5454,7 @@ export async function wireConnectUi(
 			isAgentRunning = false;
 			agentStartedAt = null;
 			editor.disableSubmit = false;
+			clearAllPendingToolArgs();
 			if (activeLoader) {
 				removeChild(activeLoader);
 				activeLoader = null;

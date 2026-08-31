@@ -23,6 +23,7 @@
  */
 
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { isText, isThinking, isToolCall } from "./pi-dialect.js";
 
 import { detectSlop } from "./quality/slop-detector.js";
 
@@ -81,15 +82,10 @@ export function detectContentIssue(
 	if (!Array.isArray(content) || content.length === 0) return "empty";
 
 	const textBlocks = content.filter(
-		(b) => b && typeof b === "object" && (b as { type?: unknown }).type === "text"
-			&& typeof (b as { text?: unknown }).text === "string",
+		(b) => isText(b) && typeof b.text === "string",
 	);
-	const thinkingBlocks = content.filter(
-		(b) => b && typeof b === "object" && (b as { type?: unknown }).type === "thinking",
-	);
-	const toolCallBlocks = content.filter(
-		(b) => b && typeof b === "object" && (b as { type?: unknown }).type === "toolCall",
-	);
+	const thinkingBlocks = content.filter(isThinking);
+	const toolCallBlocks = content.filter(isToolCall);
 
 	const totalText = textBlocks
 		.map((b) => (b as { text: string }).text)

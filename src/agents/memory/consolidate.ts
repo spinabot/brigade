@@ -20,7 +20,12 @@ import * as path from "node:path";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { cosine } from "./embedder.js";
-import { balancedObjects, makeIsolatedLlm, type MakeExtractionLlmArgs } from "./extract.js";
+import {
+	balancedObjects,
+	makeIsolatedLlm,
+	type IsolatedLlmUsage,
+	type MakeExtractionLlmArgs,
+} from "./extract.js";
 import {
 	compareRichness,
 	contentSimilarity,
@@ -304,6 +309,9 @@ export function markConsolidationRun(workspaceDir: string, now: number = Date.no
 }
 
 /** The consolidation distiller — `makeIsolatedLlm` with CONSOLIDATION_PROMPT pinned. */
-export function makeConsolidationLlm(args: MakeExtractionLlmArgs): ConsolidationLlm {
-	return makeIsolatedLlm(CONSOLIDATION_PROMPT, args);
+export function makeConsolidationLlm(
+	args: MakeExtractionLlmArgs,
+	onUsage?: (usage: IsolatedLlmUsage) => void,
+): ConsolidationLlm {
+	return makeIsolatedLlm(CONSOLIDATION_PROMPT, args, undefined, onUsage);
 }
