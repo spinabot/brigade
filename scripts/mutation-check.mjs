@@ -347,6 +347,22 @@ const MUTATIONS = [
 
   // ── iMessage self-thread ──
   {
+    claim: "a refused send is not reported as delivered",
+    file: "src/agents/channels/imessage/send.ts",
+    find: "\t\tif (explicitFailure) {",
+    replace: "\t\tif (false) {",
+    tests: "src/agents/channels/imessage/send.test.ts",
+  },
+  {
+    claim: "an all-scaffolding reply is never sent raw to the recipient",
+    file: "src/agents/channels/imessage/format.ts",
+    find: "\treturn cleaned.trim();",
+    replace: "\tconst t = cleaned.trim();\n\treturn t.length > 0 ? t : text.trim();",
+    tests: "src/agents/channels/imessage/format.test.ts",
+  },
+
+
+  {
     claim: "a name is never converted into a phone number",
     file: "src/agents/channels/imessage/targets.ts",
     find: "\tif (/[a-z]/i.test(stripped)) return \"\";",

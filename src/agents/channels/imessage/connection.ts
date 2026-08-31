@@ -124,6 +124,15 @@ export interface ConnectIMessageArgs {
 export interface IMessageConnection {
 	isConnected(): boolean;
 	connectedAt(): number | null;
+	/**
+	 * The last error the WATCH reported, if any.
+	 *
+	 * Distinct from a transport close: the subprocess is alive and the socket is
+	 * fine, but the thing that reads chat.db has failed — so `isConnected()` is
+	 * true while no message will ever arrive again. Exposed so `health()` can
+	 * say that instead of reporting ok.
+	 */
+	lastWatchError(): string | undefined;
 	/** Send text; returns the bridge message id when available. */
 	sendText(conversationId: string, text: string, opts?: OutboundSendOptions): Promise<{ messageId?: string }>;
 	/** Send media; returns the bridge message id when available. */
@@ -165,6 +174,7 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 	let client: IMessageRpcLike | null = null;
 	let connected = false;
 	let connectedAtMs: number | null = null;
+	let lastWatchError: string | undefined;
 	let closed = false;
 	let attempt = 0;
 
@@ -198,7 +208,21 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 				// Sanitize before logging — the payload is attacker-influenced (a
 				// crafted row / remote bridge could smuggle ANSI escapes or a huge
 				// blob). Keep only a finite code + a stripped/truncated message.
-				args.log("imessage watch error", { error: sanitizeIMessageWatchErrorPayload(msg.params) });
+				const sanitized = sanitizeIMessageWatchErrorPayload(msg.params);
+				args.log("imessage watch error", { error: sanitized });
+				// A DEAD WATCH MUST NOT REPORT HEALTHY.
+				//
+				// This was logged and nothing else: `connected` stayed true and
+				// `health()` kept returning ok, so a watch that had died — chat.db
+				// unreadable, Full Disk Access revoked mid-run, the watcher thread
+				// gone — presented as a working channel that simply never received
+				// anything. Silence is the one symptom an operator cannot
+				// distinguish from "nobody messaged me".
+				//
+				// Recorded so `health()` can degrade and say what happened. The
+				// supervise loop owns reconnection; this makes the state visible
+				// rather than pretending it away.
+				lastWatchError = sanitized.message ?? "the imsg watch reported an error";
 				return;
 			}
 			if (msg.method !== "message") return;
@@ -427,6 +451,7 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 
 	return {
 		isConnected: () => connected,
+		lastWatchError: () => lastWatchError,
 		connectedAt: () => connectedAtMs,
 		async sendText(conversationId, text, opts): Promise<{ messageId?: string }> {
 			const result = await sendFn(conversationId, text, {

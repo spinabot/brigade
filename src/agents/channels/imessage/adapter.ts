@@ -192,7 +192,37 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 
 		health(): ChannelHealth {
 			if (!connection) {
+				// SURFACE THE REASON WE ALREADY CAPTURED.
+				//
+				// `start()` records the real failure into `closedReason` —
+				// "authorization denied" when Full Disk Access is off,
+				// "imsg: command not found" when the bridge is missing — and this
+				// branch threw it away and said "not started yet", which reads as
+				// a transient boot state rather than a permission wall the
+				// operator has to go and fix. That is why a denied FDA presented
+				// as the channel simply never answering.
+				if (closedReason) {
+					return {
+						ok: false,
+						kind: "disconnected",
+						reason: `iMessage failed to start — ${closedReason}.`,
+						remediation:
+							"Check that the imsg CLI is installed and that Terminal has Full Disk Access, then restart the gateway.",
+					};
+				}
 				return { ok: false, kind: "starting", reason: "iMessage adapter is not started yet." };
+			}
+			// A watch error means the socket is fine and the reader is dead — no
+			// message will arrive again, yet every liveness signal says ok.
+			const watchErr = connection.lastWatchError?.();
+			if (watchErr) {
+				return {
+					ok: false,
+					kind: "disconnected",
+					reason: `iMessage is connected but its watch failed — ${watchErr}. Incoming messages are not being read.`,
+					remediation:
+						"Check Full Disk Access for Terminal and that Messages.app is signed in, then restart the channel.",
+				};
 			}
 			if (!connected || !connection.isConnected()) {
 				return {
@@ -221,6 +251,7 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 			}
 			let first = true;
 			let lastMessageId: string | undefined;
+			let sentAny = false;
 			for (const chunk of chunks) {
 				const body = markdownToIMessageText(chunk);
 				if (body.trim().length === 0) continue;
@@ -228,7 +259,21 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 				const replyOpt = first && opts?.replyToId ? { replyToId: opts.replyToId } : {};
 				const sent = await connection.sendText(conversationId, body, { ...replyOpt });
 				if (sent.messageId) lastMessageId = sent.messageId;
+				sentAny = true;
 				first = false;
+			}
+			// NOTHING WENT OUT — SAY SO.
+			//
+			// Every chunk can be skipped: an empty reply, whitespace, or a body
+			// that was entirely internal scaffolding (the outbound sanitizer now
+			// correctly returns "" for that rather than leaking it). This used to
+			// return `undefined`, which `plugin.ts` reports as `{ok:true}` — so a
+			// message that was never sent was reported delivered, and the operator
+			// had no way to know their reply vanished.
+			if (!sentAny) {
+				throw new Error(
+					"iMessage: nothing to send — the reply was empty after formatting (all chunks were blank or internal-only)",
+				);
 			}
 			return lastMessageId ? { messageId: lastMessageId } : undefined;
 		},

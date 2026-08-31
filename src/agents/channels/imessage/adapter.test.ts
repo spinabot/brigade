@@ -14,6 +14,7 @@ function fakeConnection(): IMessageConnection & { sentText: Array<{ to: string; 
 	return {
 		sentText,
 		isConnected: () => true,
+	lastWatchError: () => undefined,
 		connectedAt: () => Date.now(),
 		async sendText(conversationId, text): Promise<{ messageId?: string }> {
 			sentText.push({ to: conversationId, text });

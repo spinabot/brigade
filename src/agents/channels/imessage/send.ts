@@ -148,8 +148,41 @@ export async function sendMessageIMessage(
 			...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
 		});
 		const resolvedId = resolveMessageId(result);
+		// A SEND IS NOT SUCCESSFUL BECAUSE IT RETURNED.
+		//
+		// The transport rejects on a JSON-RPC `error` member, so this code only
+		// ever sees a 200-shaped answer — but the bridge reports a refused send
+		// INSIDE the result: `{ok:false, error:"no such handle"}`. That fell
+		// through to `messageId:"unknown"`, which every caller reads as success,
+		// so an undeliverable message was reported delivered. The operator is
+		// then told their reply went out and it never did.
+		//
+		// Absence of evidence is treated as failure here rather than success:
+		// no id and no positive acknowledgement means nothing confirmed the send,
+		// and claiming delivery on that basis is the failure mode this whole
+		// codebase keeps finding.
+		const record = (result ?? {}) as Record<string, unknown>;
+		const explicitFailure =
+			record.ok === false ||
+			(typeof record.error === "string" && record.error.trim() !== "") ||
+			(typeof record.ok === "string" && record.ok.trim().toLowerCase() === "false");
+		if (explicitFailure) {
+			const detail =
+				typeof record.error === "string" && record.error.trim() !== ""
+					? record.error.trim()
+					: "the bridge refused the send without saying why";
+			throw new Error(`iMessage send failed: ${detail}`);
+		}
+		const acknowledged =
+			record.ok === true ||
+			(typeof record.ok === "string" && record.ok.trim() !== "" && record.ok.trim().toLowerCase() !== "false");
+		if (!resolvedId && !acknowledged) {
+			throw new Error(
+				"iMessage send was not confirmed — the bridge returned no message id and no acknowledgement",
+			);
+		}
 		return {
-			messageId: resolvedId ?? (result && (result as { ok?: string }).ok ? "ok" : "unknown"),
+			messageId: resolvedId ?? "ok",
 			sentText: message,
 		};
 	} finally {
