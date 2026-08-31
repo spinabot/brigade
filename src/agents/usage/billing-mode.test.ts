@@ -113,3 +113,40 @@ test("every mode has a human explanation for the missing-cost case", () => {
 		assert.ok(describeBillingMode(mode).length > 0);
 	}
 });
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * A catalog entry with no `billing` field must fall through, not return
+ * `undefined`.
+ *
+ * The check was `entry.billing !== "unknown"`, which is TRUE when the field is
+ * absent — so it returned `undefined`, not a member of `BillingMode`. Every
+ * shipped entry sets it, so nothing broke; the first new provider added
+ * without it silently disabled cost rendering, because
+ * `shouldRenderCost(undefined)` is false. Found reviewing exactly such a PR,
+ * on a metered gateway where that would have hidden real spend.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+test("an entry with no billing field falls through to the price card", () => {
+	const mode = classifyBillingMode({
+		provider: "definitely-not-in-the-catalog",
+		cost: { input: 3, output: 15 },
+	});
+	assert.equal(mode, "metered", "a real price card decides when the catalog is silent");
+});
+
+test("no billing field and no price card is UNKNOWN, never undefined", () => {
+	const mode = classifyBillingMode({ provider: "definitely-not-in-the-catalog" });
+	assert.equal(mode, "unknown");
+	assert.notEqual(mode, undefined, "undefined is not a BillingMode and breaks every consumer");
+});
+
+test("every shipped catalog entry declares a billing mode", () => {
+	// The guard that stops this recurring: a new provider without `billing`
+	// renders no cost at all, which on a metered gateway hides real money.
+	const missing = PROVIDERS.filter((p) => p.billing === undefined).map((p) => p.id);
+	assert.deepEqual(
+		missing,
+		[],
+		`these providers have no \`billing\` and will not render cost: ${missing.join(", ")}`,
+	);
+});
