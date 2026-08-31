@@ -17,6 +17,8 @@ const EXPECTED: Record<string, ReturnType<typeof classifyBillingMode>> = {
 	openai: "metered",
 	google: "metered",
 	openrouter: "metered",
+	// BYOK gateway — passes each provider's published rate through.
+	orcarouter: "metered",
 	groq: "metered",
 	cerebras: "metered",
 	xai: "metered",
