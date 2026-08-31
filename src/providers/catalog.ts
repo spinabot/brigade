@@ -157,6 +157,18 @@ export const PROVIDERS: ProviderInfo[] = [
 		envVar: "OPENROUTER_API_KEY",
 	},
 	{
+		id: "orcarouter",
+		name: "OrcaRouter",
+		description: "Multi-model AI gateway with routing, failover, guardrails",
+		keyUrl: "https://www.orcarouter.ai",
+		envVar: "ORCAROUTER_API_KEY",
+		envVarFallbacks: ["ORCA_API_KEY"],
+		custom: true,
+		liveModels: true, // models fetched live from /v1/models at onboarding
+		api: "openai-completions",
+		baseUrl: "https://api.orcarouter.ai/v1",
+	},
+	{
 		id: "groq",
 		name: "Groq",
 		description: "Very fast inference (Llama, Qwen, Kimi)",
