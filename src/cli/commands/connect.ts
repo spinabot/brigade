@@ -4818,9 +4818,26 @@ export async function wireConnectUi(
 		if (trimmed === "/export" || trimmed.startsWith("/export ")) {
 			editor.setText("");
 			const arg = trimmed === "/export" ? "" : trimmed.slice("/export ".length).trim();
-			const full = arg === "full";
-			if (arg && !full) {
-				insertBeforeEditor(new Text(`  ${brand.dim("usage: /export [full]")}`, 0, 0));
+			const words = arg ? arg.split(/\s+/) : [];
+			const full = words.includes("full");
+			// REASONING IS OPT-IN, AND UNTIL NOW IT WAS UNREACHABLE.
+			//
+			// The renderer has supported `includeThinking` since it was written,
+			// and nothing ever passed it — so the only way to see reasoning was to
+			// catch it live as it streamed. Miss it, or run with `/reasoning off`,
+			// and it was gone: there is no expand affordance in the TUI either.
+			//
+			// It stays opt-in rather than becoming the default. Reasoning is the
+			// largest single thing in a transcript, and it is the part most likely
+			// to contain something the operator would not choose to publish —
+			// which is exactly why the exporter excluded it by default to begin
+			// with. Asking for it is one word.
+			const includeThinking = words.includes("thinking");
+			const unknown = words.filter((w) => w !== "full" && w !== "thinking");
+			if (unknown.length > 0) {
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("usage: /export [full] [thinking]")}`, 0, 0),
+				);
 				tui.requestRender();
 				return;
 			}
