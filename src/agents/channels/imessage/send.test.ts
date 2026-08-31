@@ -39,6 +39,31 @@ describe("sendMessageIMessage", () => {
 		assert.equal(client.stopped, false);
 	});
 
+	// THE CASE THE ORIGINAL PREFIX TEST MISSED.
+	//
+	// The test below passes no `opts.service`, so the old
+	// `opts.service ?? target.service` fell through to the prefix and looked
+	// right. Production ALWAYS passes `opts.service` — `account.service` is a
+	// required field that `coerceIMessageService` defaults to "auto" — so the
+	// left side never fell through and every prefix was silently discarded.
+	it("a service prefix beats the account default", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("sms:+15551234567", "hi", { client, service: "imessage" });
+		assert.equal(client.lastParams?.service, "sms");
+	});
+
+	it("an explicit auto: prefix beats an account pinned to sms", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("auto:+15551234567", "hi", { client, service: "sms" });
+		assert.equal(client.lastParams?.service, "auto");
+	});
+
+	it("a bare handle still takes the account default", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("+15551234567", "hi", { client, service: "sms" });
+		assert.equal(client.lastParams?.service, "sms");
+	});
+
 	it("inherits the service from a service-prefixed handle", async () => {
 		const client = new FakeRpcClient();
 		await sendMessageIMessage("sms:+15551234567", "hi", { client });

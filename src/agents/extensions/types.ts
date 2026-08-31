@@ -127,6 +127,24 @@ export interface InboundMessage {
 	 * alias.
 	 */
 	senderLid?: string;
+	/**
+	 * Further identities this message may be allow-listed under, beyond `from`
+	 * and `senderLid`.
+	 *
+	 * The allow-list is matched by EXACT STRING EQUALITY, deliberately — a
+	 * fuzzy match on an access-control list is how someone gets admitted who
+	 * should not be. That is safe only when both sides are spelled the same
+	 * way, and on some channels they are not: iMessage delivers whatever the
+	 * chat database stores (`+1 (555) 123-4567`, `User@Example.com`) while the
+	 * operator types the form the setup wizard showed them. A channel supplies
+	 * the canonical spellings of the SAME sender here; the config side is
+	 * canonicalized by the adapter's `normalizeAclEntry`. Matching stays exact.
+	 *
+	 * This is also how a conversation-scoped entry works — iMessage's wizard
+	 * documents `chat_id:123`, which is a property of the thread rather than of
+	 * the sender and so could never equal `from`.
+	 */
+	senderAliases?: ReadonlyArray<string>;
 	/** Plain text of the message (may be empty when media has no caption). */
 	text: string;
 	/** Optional display name of the sender. */
@@ -497,6 +515,23 @@ export interface ChannelAdapter {
 	 * `undefined` before the first successful connection.
 	 */
 	selfId?(): string | undefined;
+	/**
+	 * Canonicalize one configured allow-list entry into the spelling this
+	 * channel's `InboundMessage.senderAliases` use.
+	 *
+	 * Allow-list matching is exact equality on both sides. That is only correct
+	 * when both sides agree on spelling, and an operator typing into a setup
+	 * wizard does not know how the channel's backing store punctuates a phone
+	 * number or cases an email. This canonicalizes the operator's side; the
+	 * channel canonicalizes its own via `senderAliases`.
+	 *
+	 * MUST pass `*` through unchanged — it is the wildcard, not an identity —
+	 * and MUST NOT map two genuinely different identities onto one string, which
+	 * would silently widen the allow-list. Channels whose ids are already
+	 * canonical (WhatsApp JIDs, Telegram numeric ids) leave this undefined and
+	 * keep verbatim matching.
+	 */
+	normalizeAclEntry?(entry: string): string;
 	/**
 	 * Epoch-ms of the channel's most recent successful connection. The manager
 	 * uses this with `InboundMessage.messageTimestampMs` to detect "queued

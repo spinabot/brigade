@@ -646,9 +646,21 @@ export async function runChannelInboundPipeline(
 		// file via the path resolver's default branch.
 		const aclAccountId = msg.accountId?.trim() || undefined;
 		const storeAllow = dmPolicy === "allowlist" ? [] : readAllowFrom(adapter.id, aclAccountId);
-		const allowFrom = [...new Set([...storeAllow, ...configIds(cfgEntry.allowFrom)])];
+		// Canonicalize the operator's side to the spelling the channel reports.
+		// Both sides are still compared by exact equality — see
+		// `ChannelAdapter.normalizeAclEntry`. Adapters without the hook are
+		// untouched, so JID/numeric-id channels keep verbatim matching.
+		const normAcl = (entry: string): string =>
+			entry === "*" ? entry : (adapter.normalizeAclEntry?.(entry) ?? entry);
+		const allowFrom = [
+			...new Set([...storeAllow, ...configIds(cfgEntry.allowFrom)].map(normAcl)),
+		];
 		const groupAllowFrom = [
-			...new Set([...readGroupAllowFrom(adapter.id, aclAccountId), ...configIds(cfgEntry.groupAllowFrom)]),
+			...new Set(
+				[...readGroupAllowFrom(adapter.id, aclAccountId), ...configIds(cfgEntry.groupAllowFrom)].map(
+					normAcl,
+				),
+			),
 		];
 		// Per-group full-trust list (respond untagged in these groups). Config-only.
 		const groupAllowJids = configIds(cfgEntry.groupAllowJids);
@@ -684,6 +696,7 @@ export async function runChannelInboundPipeline(
 					groupPolicy,
 					senderId: msg.from,
 					...(msg.senderLid !== undefined ? { senderLid: msg.senderLid } : {}),
+					...(msg.senderAliases !== undefined ? { senderAliases: msg.senderAliases } : {}),
 					selfId,
 					allowFrom,
 					groupAllowFrom,
