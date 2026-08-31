@@ -5557,7 +5557,29 @@ export async function wireConnectUi(
 				);
 				return;
 			}
-			const upd = lastSnapshot?.updateAvailable;
+			// ASK NOW — do not trust the gateway's cached answer.
+			//
+			// `lastSnapshot.updateAvailable` is set by the gateway's AMBIENT check:
+			// once at boot, then on an interval, and behind a 6h disk cache. A
+			// daemon that has been up since before the release being asked about
+			// therefore answers "You're on the latest published version" about a
+			// version that is not the latest — observed with npm at 1.35.3 and
+			// the machine on 1.35.2.
+			//
+			// An operator typing `/update` has asked a question. Run the same
+			// forced check `brigade update` runs, and fall back to the snapshot
+			// only if the registry cannot be reached.
+			insertBeforeEditor(new Text(`  ${brand.dim("checking for a newer Brigade…")}`, 0, 0));
+			tui.requestRender();
+			let upd = lastSnapshot?.updateAvailable;
+			try {
+				const { checkForUpdate } = await import("../../core/update-check.js");
+				const fresh = await checkForUpdate({ force: true });
+				upd = fresh ?? undefined;
+			} catch {
+				// Offline, or the registry is unreachable. Keep whatever the
+				// gateway last knew rather than claiming to be current.
+			}
 			if (!upd) {
 				insertBeforeEditor(
 					new Text(`  ${brand.dim("You're on the latest published version.")}`, 0, 0),

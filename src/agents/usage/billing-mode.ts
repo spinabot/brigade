@@ -64,7 +64,17 @@ export function classifyBillingMode(input: {
 	// the only step needed to classify it. `unknown` in the catalog is not a
 	// verdict — it means "ask the price card", which is what `custom` needs.
 	const entry = provider ? PROVIDERS.find((p) => p.id.toLowerCase() === provider) : undefined;
-	if (entry && entry.billing !== "unknown") return entry.billing;
+	// An ABSENT `billing` is not a verdict either — treat it exactly like the
+	// explicit `"unknown"` and fall through to the price card.
+	//
+	// This read `entry.billing !== "unknown"`, which is TRUE when the field is
+	// missing, so it returned `undefined` — not a member of `BillingMode` at
+	// all. Every current catalog entry sets it, so nothing broke; the first new
+	// provider added without it silently disabled cost rendering for that
+	// provider, because `shouldRenderCost(undefined)` is false. Found while
+	// reviewing exactly such a PR, where the omitted field would have hidden
+	// real spend on a metered gateway.
+	if (entry && entry.billing !== undefined && entry.billing !== "unknown") return entry.billing;
 
 	if (isRealPrice(input.cost?.input) || isRealPrice(input.cost?.output)) return "metered";
 	// A transport that reported a real figure is metered even when the catalog
