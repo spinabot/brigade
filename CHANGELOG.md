@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.34.0](https://github.com/spinabot/brigade/compare/brigade-v1.33.0...brigade-v1.34.0) (2026-08-31)
+
+
+### Features
+
+* mid-turn compaction, transcript tooling, and a typed Pi dialect boundary ([960c9ed](https://github.com/spinabot/brigade/commit/960c9edd95686b301c8ba27bdfbe00fe82357a8a))
+* mid-turn compaction, transcript tooling, and a typed Pi dialect boundary ([f4b6c6b](https://github.com/spinabot/brigade/commit/f4b6c6bca9b905aec1a60f90747b490de1251463))
+
+
+### Bug Fixes
+
+* **documents:** PDF generation fails whenever the Unicode font is used ([3232a1f](https://github.com/spinabot/brigade/commit/3232a1ffea7a1df0d487a41a14199f9cbf447a91))
+
 ## [1.33.0](https://github.com/spinabot/brigade/compare/brigade-v1.32.1...brigade-v1.33.0) (2026-08-27)
 
 
