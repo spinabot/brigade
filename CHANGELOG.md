@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.36.1](https://github.com/spinabot/brigade/compare/brigade-v1.36.0...brigade-v1.36.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* **connect:** nine slash commands were unusable mid-turn ([04b1cc8](https://github.com/spinabot/brigade/commit/04b1cc82a753154dad9192291f50ee9cb9348502))
+* **connect:** nine slash commands were unusable mid-turn ([9b5b92f](https://github.com/spinabot/brigade/commit/9b5b92f8a424ef8e38258214561dac2f71f40b91))
+
 ## [1.36.0](https://github.com/spinabot/brigade/compare/brigade-v1.35.3...brigade-v1.36.0) (2026-08-31)
 
 
