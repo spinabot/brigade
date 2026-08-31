@@ -9,6 +9,7 @@ import {
 	detectReflectedContent,
 	findCodeRegions,
 	isInsideCode,
+	normalizeHandle,
 	normalizeIMessageMessage,
 	parseIMessageNotification,
 	stripLengthPrefixedText,
@@ -324,5 +325,51 @@ describe("decideInbound — self-thread with no destination_caller_id", () => {
 		});
 		assert.equal(d.kind, "drop");
 		assert.match((d as { reason: string }).reason, /from me/);
+	});
+});
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * The echo scope must agree across inbound and outbound, or Brigade
+ * re-ingests its own message.
+ *
+ * Inbound takes the handle from the Messages DB; outbound from whatever the
+ * caller addressed. The two spell the same person differently routinely —
+ * casing on an Apple ID, punctuation on a phone number — and an unnormalised
+ * key means the echo is never found. That is a live loop risk, not cosmetic:
+ * the self-thread path now DISPATCHES anything the cache does not recognise.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+describe("normalizeHandle / echoScope agreement", () => {
+	it("an Apple ID matches regardless of casing", () => {
+		assert.equal(normalizeHandle("Bhasvanth02@Gmail.com"), normalizeHandle("bhasvanth02@gmail.com"));
+	});
+
+	it("a phone number matches regardless of punctuation", () => {
+		const canonical = normalizeHandle("+16464201739");
+		assert.equal(normalizeHandle("+1 (646) 420-1739"), canonical);
+		assert.equal(normalizeHandle("+1-646-420-1739"), canonical);
+		assert.equal(normalizeHandle(" +1 646 420 1739 "), canonical);
+	});
+
+	it("the inbound scope matches an outbound scope built from the same handle", () => {
+		// The exact pairing the echo suppression depends on.
+		const inbound = echoScope("default", { sender: "Bhasvanth02@Gmail.com" });
+		const outbound = `default:imessage:${normalizeHandle("bhasvanth02@gmail.com")}`;
+		assert.equal(inbound, outbound);
+	});
+
+	it("different people never collide", () => {
+		assert.notEqual(normalizeHandle("a@example.com"), normalizeHandle("b@example.com"));
+		assert.notEqual(normalizeHandle("+16464201739"), normalizeHandle("+16464201730"));
+	});
+
+	it("an unrecognised address is passed through, not mangled", () => {
+		assert.equal(normalizeHandle("  Some.Odd_Handle  "), "some.odd_handle");
+		assert.equal(normalizeHandle(""), "");
+		assert.equal(normalizeHandle(undefined), "");
+	});
+
+	it("a group chat still keys on chat_id, not the handle", () => {
+		assert.equal(echoScope("default", { chat_id: 21, sender: "whoever" }), "default:chat_id:21");
 	});
 });

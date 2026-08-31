@@ -32,6 +32,7 @@ import {
 	createMonitorState,
 	decideInbound,
 	echoScope,
+	normalizeHandle,
 	normalizeIMessageMessage,
 	parseIMessageNotification,
 	type MonitorState,
@@ -406,7 +407,9 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 		const numericChat = conversationId.startsWith("chat:") ? Number.parseInt(conversationId.slice(5), 10) : NaN;
 		const scope = Number.isFinite(numericChat)
 			? echoScope(account.accountId, { chat_id: numericChat })
-			: `${account.accountId}:imessage:${conversationId}`;
+			// Normalised the SAME way the inbound scope is, or the two disagree
+			// on casing/phone punctuation and the echo is never suppressed.
+			: `${account.accountId}:imessage:${normalizeHandle(conversationId)}`;
 		state.sentMessageCache.remember(scope, { text: sent.sentText, messageId: sent.messageId });
 	};
 

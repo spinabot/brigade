@@ -480,9 +480,36 @@ export function createMonitorState(): MonitorState {
 }
 
 /** Build the echo/rate-limit scope for a payload. */
+/**
+ * Canonical form of an iMessage handle, for keys that must agree across the
+ * inbound and outbound paths.
+ *
+ * The echo cache is keyed by scope, and the scope embeds the handle. Inbound
+ * takes it from the Messages DB (`sender`), outbound from whatever the caller
+ * addressed (`conversationId`) — and the two spell the same person differently
+ * all the time: `Name@Example.com` vs `name@example.com`, `+1 (646) 420-1739`
+ * vs `+16464201739`. An unnormalised key means the scopes disagree, the echo is
+ * never found, and Brigade re-ingests its own message.
+ *
+ * Lower-cases, and for anything phone-shaped keeps only digits and a leading
+ * `+`. Deliberately conservative: an address it does not recognise is passed
+ * through trimmed and lower-cased rather than mangled.
+ */
+export function normalizeHandle(raw: string | undefined | null): string {
+	const t = (raw ?? "").trim();
+	if (!t) return "";
+	// Phone-shaped: digits, spaces, and the usual punctuation. Emails always
+	// contain `@`, so they can never match this.
+	if (/^\+?[\d\s().-]+$/.test(t)) {
+		const digits = t.replace(/[^\d]/g, "");
+		return digits ? `${t.trimStart().startsWith("+") ? "+" : ""}${digits}` : t.toLowerCase();
+	}
+	return t.toLowerCase();
+}
+
 export function echoScope(accountId: string, payload: IMessagePayload): string {
 	if (typeof payload.chat_id === "number") return `${accountId}:chat_id:${payload.chat_id}`;
-	return `${accountId}:imessage:${(payload.sender ?? "").trim()}`;
+	return `${accountId}:imessage:${normalizeHandle(payload.sender)}`;
 }
 
 /** The decision returned by {@link decideInbound}. */
