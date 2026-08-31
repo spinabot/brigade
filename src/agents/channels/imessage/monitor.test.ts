@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import {
 	createMonitorState,
 	decideInbound,
+	echoScope,
 	detectIMessageMentions,
 	detectReflectedContent,
 	findCodeRegions,
@@ -238,5 +239,90 @@ describe("decideInbound", () => {
 		const d = decideInbound(state, "acct", { sender: "+1555", text: "a real new message" });
 		assert.equal(d.kind, "drop");
 		if (d.kind === "drop") assert.equal(d.reason, "loop rate-limited");
+	});
+});
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Messaging your own Apple ID is the most obvious way to try this channel,
+ * and it was the one that silently did not work.
+ *
+ * In a self-thread EVERY row is `is_from_me=true` — the operator's replies
+ * included — and the Messages DB frequently leaves `destination_caller_id`
+ * empty. The "ambiguous self" branch then dropped unconditionally, so a reply
+ * typed in Messages.app was discarded before it reached the agent. The
+ * operator sees it delivered and read, and Brigade never answers.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+describe("decideInbound — self-thread with no destination_caller_id", () => {
+	const selfChatPayload = (text: string) => ({
+		id: 1,
+		guid: `guid-${text}`,
+		sender: "me@example.com",
+		chat_identifier: "me@example.com",
+		// The case that broke it: the DB did not populate this.
+		destination_caller_id: undefined,
+		is_from_me: true,
+		is_group: false,
+		text,
+		created_at: new Date().toISOString(),
+	});
+
+	it("dispatches the operator's own reply instead of dropping it", () => {
+		const state = createMonitorState();
+		const d = decideInbound(state, "default", selfChatPayload("hey are you there"));
+		assert.equal(d.kind, "dispatch", `expected dispatch, got ${d.kind}: ${(d as { reason?: string }).reason}`);
+	});
+
+	it("still drops Brigade's OWN send, via the echo cache", () => {
+		// The discriminator that makes the above safe: what Brigade sent is in
+		// the sent cache; what the operator typed is not.
+		const state = createMonitorState();
+		const text = "Hey — Brigade here, iMessage channel is live.";
+		const payload = selfChatPayload(text);
+		state.sentMessageCache.remember(echoScope("default", payload), { text, messageId: "1" });
+		const d = decideInbound(state, "default", payload);
+		assert.equal(d.kind, "drop");
+		assert.match((d as { reason: string }).reason, /echo/);
+	});
+
+	it("a configured selfHandle resolves the ambiguity outright", () => {
+		// With the bot's own handle known, the thread is a DEFINITE self-chat
+		// and no longer depends on the DB populating a field it often omits.
+		const state = createMonitorState();
+		const d = decideInbound(state, "default", selfChatPayload("ping"), "me@example.com");
+		assert.equal(d.kind, "dispatch");
+	});
+
+	it("a normal inbound DM from someone else is unaffected", () => {
+		const state = createMonitorState();
+		const d = decideInbound(state, "default", {
+			id: 2,
+			guid: "guid-other",
+			sender: "friend@example.com",
+			chat_identifier: "friend@example.com",
+			is_from_me: false,
+			is_group: false,
+			text: "hello",
+			created_at: new Date().toISOString(),
+		});
+		assert.equal(d.kind, "dispatch");
+	});
+
+	it("an outbound message to SOMEONE ELSE is still dropped as from-me", () => {
+		// The guard that must not be weakened: Brigade replying to a friend must
+		// not be re-ingested as if the friend had said it.
+		const state = createMonitorState();
+		const d = decideInbound(state, "default", {
+			id: 3,
+			guid: "guid-out",
+			sender: "me@example.com",
+			chat_identifier: "friend@example.com",
+			is_from_me: true,
+			is_group: false,
+			text: "sent by the agent",
+			created_at: new Date().toISOString(),
+		});
+		assert.equal(d.kind, "drop");
+		assert.match((d as { reason: string }).reason, /from me/);
 	});
 });

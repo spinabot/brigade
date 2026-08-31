@@ -519,18 +519,41 @@ export function decideInbound(
 	const senderNorm = sender.toLowerCase();
 	const chatIdentNorm = (payload.chat_identifier ?? "").trim().toLowerCase();
 	const destNorm = (payload.destination_caller_id ?? "").trim().toLowerCase();
-	const isSelfChat = !payload.is_group && senderNorm !== "" && senderNorm === chatIdentNorm && destNorm === senderNorm;
-	const isAmbiguousSelf =
-		!payload.is_group && senderNorm !== "" && senderNorm === chatIdentNorm && destNorm === "";
+	// The bot's OWN handle, when the operator configured one. It is the only
+	// signal that identifies a self-thread without depending on the Messages DB
+	// populating `destination_caller_id` — which it frequently does not.
+	const selfNorm = (selfHandle ?? "").trim().toLowerCase();
+	const looksSelfAddressed = !payload.is_group && senderNorm !== "" && senderNorm === chatIdentNorm;
+	const isSelfChat =
+		looksSelfAddressed && (destNorm === senderNorm || (selfNorm !== "" && senderNorm === selfNorm));
+	const isAmbiguousSelf = looksSelfAddressed && destNorm === "" && !isSelfChat;
 
 	let skipSelfChatHasCheck = false;
 	if (payload.is_from_me === true) {
 		if (isAmbiguousSelf) {
+			// AN AMBIGUOUS SELF-THREAD IS STILL A SELF-THREAD.
+			//
+			// This dropped unconditionally, and that silently disabled the whole
+			// channel for the most obvious way to try it: message your own Apple
+			// ID. In a self-thread EVERY message is `is_from_me=true` — the
+			// operator's replies included — and `destination_caller_id` is often
+			// empty in the Messages DB, so the definite-self branch below never
+			// fired and every genuine reply was discarded as "from me". The
+			// operator sees their message delivered and Brigade never answers.
+			//
+			// The echo cache is exactly the discriminator this needs, and the
+			// definite-self branch already trusts it: a message Brigade sent is in
+			// the sent cache, a message the operator typed is not. Treating the
+			// ambiguous case the same way makes the channel work while keeping the
+			// loop guard, with the rate limiter as the backstop it already was.
 			state.selfChatCache.remember(scope, text, payload.created_at ? Date.parse(payload.created_at) : undefined);
-			state.loopRateLimiter.record(rateKey);
-			return { kind: "drop", reason: "from me" };
-		}
-		if (isSelfChat) {
+			const echo = state.sentMessageCache.has(scope, { text, messageId: inboundIds[0] }, !hasGuid);
+			if (echo) {
+				state.loopRateLimiter.record(rateKey);
+				return { kind: "drop", reason: "agent echo in self-chat" };
+			}
+			skipSelfChatHasCheck = true;
+		} else if (isSelfChat) {
 			state.selfChatCache.remember(scope, text, payload.created_at ? Date.parse(payload.created_at) : undefined);
 			const echo = state.sentMessageCache.has(scope, { text, messageId: inboundIds[0] }, !hasGuid);
 			if (echo) {

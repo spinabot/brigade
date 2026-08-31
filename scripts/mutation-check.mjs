@@ -345,6 +345,15 @@ const MUTATIONS = [
     tests: "src/agents/source-is-text.test.ts",
   },
 
+  // ── iMessage self-thread ──
+  {
+    claim: "a reply in a self-thread reaches the agent",
+    file: "src/agents/channels/imessage/monitor.ts",
+    find: "\t\t\tskipSelfChatHasCheck = true;\n\t\t} else if (isSelfChat) {",
+    replace: "\t\t\treturn { kind: \"drop\", reason: \"from me\" };\n\t\t} else if (isSelfChat) {",
+    tests: "src/agents/channels/imessage/monitor.test.ts",
+  },
+
   // ── Manual compaction ──
   {
     claim: "an explicit /compact is honoured exactly once",
