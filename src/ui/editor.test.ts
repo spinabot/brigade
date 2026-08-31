@@ -7,7 +7,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import type { TUI } from "@earendil-works/pi-tui";
+import { CombinedAutocompleteProvider, type TUI } from "@earendil-works/pi-tui";
 
 import { BrigadeEditor, NO_REQUIRED_ARG_FOR_TEST } from "./editor.js";
 import { editorTheme } from "./theme.js";
@@ -115,20 +115,82 @@ describe("BrigadeEditor — reasoning toggle key", () => {
 });
 
 describe("slash aliases", () => {
-	it("every live alias submits on one Enter", () => {
 	// The bug: `clip` was dropped from NO_REQUIRED_ARG while `/clip` remained a
 	// live alias of `/clipboard`. The popup shows for any PREFIX of an
 	// advertised command, so Enter was translated to Tab — the operator's text
 	// silently became `/clipboard` and needed a second Enter.
 	//
-	// Aliases are invisible in `SLASH_COMMANDS`, which is exactly why they get
-	// forgotten here.
-	for (const alias of ["clip", "cancel", "switch"]) {
-		assert.ok(
-			NO_REQUIRED_ARG_FOR_TEST.has(alias),
-			`/${alias} is a live alias taking no required argument — it must submit on one Enter`,
-		);
+	// The previous version of this test asserted `NO_REQUIRED_ARG_FOR_TEST.has(
+	// "clip")` — set membership, which is the same statement as the production
+	// line it was checking, restated. It could not tell whether the SET is even
+	// consulted, whether the popup gate matches, or what the operator's line
+	// ends up containing. So these press the key instead.
+
+	/** The advertised commands that matter here, as `connect.ts` registers them. */
+	const COMMANDS = [
+		{ name: "clipboard", description: "diagnose clipboard support" },
+		{ name: "search", description: "search the transcript" },
+		{ name: "compact", description: "summarize older turns" },
+	];
+
+	/** A real editor with the real pi-tui slash-command popup behind it. */
+	function slashHarness(): { ed: BrigadeEditor; submitted: string[] } {
+		const ed = new BrigadeEditor(tui, editorTheme);
+		ed.setAutocompleteProvider(new CombinedAutocompleteProvider(COMMANDS, process.cwd()));
+		const submitted: string[] = [];
+		ed.onSubmit = (v: string) => {
+			submitted.push(v);
+		};
+		return { ed, submitted };
 	}
+
+	/** Type, then let the (async) autocomplete request settle so the popup is up. */
+	async function typeAndOpenPopup(ed: BrigadeEditor, text: string): Promise<void> {
+		type(ed, text);
+		for (let i = 0; i < 5 && !ed.isShowingAutocomplete(); i += 1) {
+			await new Promise((r) => setTimeout(r, 5));
+		}
+		assert.ok(ed.isShowingAutocomplete(), `the popup must be showing for "${text}"`);
+	}
+
+	it("/clip — a live alias that is also a PREFIX — submits on one Enter", async () => {
+		const { ed, submitted } = slashHarness();
+		await typeAndOpenPopup(ed, "/clip");
+		ed.handleInput("\r");
+		// Pi's own popup-Enter accepts the highlighted completion AND submits, so
+		// what goes out is `/clipboard` — the point is that it goes out at ALL, on
+		// the FIRST Enter. Dropping `clip` from the set turns this Enter into a
+		// Tab: nothing is submitted and the operator has to press Enter again.
+		assert.equal(submitted.length, 1, "one Enter must send the command");
+		assert.match(submitted[0]!, /^\/clip(board)?$/, "and it must be the clipboard command");
+		assert.equal(ed.getText(), "", "the line is consumed, not left waiting for a second Enter");
+	});
+
+	it("a command with a REQUIRED argument still completes instead of submitting", async () => {
+		// The control. If Enter submitted here, `/search` would be sent with an
+		// empty query — which is why the set is a set and not "always submit".
+		const { ed, submitted } = slashHarness();
+		await typeAndOpenPopup(ed, "/search");
+		ed.handleInput("\r");
+		assert.deepEqual(submitted, [], "an empty search must never be sent");
+		assert.match(ed.getText(), /^\/search\s*$/, "Enter accepted the completion and waits for the query");
+	});
+
+	it("aliases that are not a prefix of anything advertised still submit on one Enter", () => {
+		// `/cancel` and `/switch` open no popup today, so they take the ordinary
+		// submit path. They are listed in NO_REQUIRED_ARG anyway, so that adding a
+		// `cancel-*` / `switch-*` command later cannot quietly reintroduce the
+		// two-Enter bug — assert both facts, the behaviour and the guard.
+		for (const alias of ["cancel", "switch"]) {
+			const { ed, submitted } = slashHarness();
+			type(ed, `/${alias}`);
+			ed.handleInput("\r");
+			assert.deepEqual(submitted, [`/${alias}`], `/${alias} must send on one Enter`);
+			assert.ok(
+				NO_REQUIRED_ARG_FOR_TEST.has(alias),
+				`/${alias} must stay listed, or a future /${alias}-* command reintroduces the bug`,
+			);
+		}
 	});
 });
 

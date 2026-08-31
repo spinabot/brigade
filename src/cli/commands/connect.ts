@@ -20,6 +20,8 @@
  */
 
 import { COPILOT_AUTO_MODEL_ID } from "../../agents/github-copilot-transport.js";
+import { describeReasoningVisibility } from "../../agents/reasoning/visibility.js";
+import type { ProviderLimitWindow } from "../../agents/usage/limits.js";
 import { PI_TOOL_CALL, PI_TOOL_RESULT } from "../../agents/pi-dialect.js";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
@@ -1444,15 +1446,28 @@ export async function wireConnectUi(
 		const contentText = contentParts.join("").trim();
 
 		const parts: string[] = [];
+		const vis = lastSnapshot?.reasoning?.visibility;
 		if (showThinking && thinkingText) {
 			// Label what this actually IS. A literal "[thinking]" over an
 			// Anthropic / OpenAI / Grok response is wrong: those return a summary
 			// written by a DIFFERENT model, not the model's own chain of thought.
 			// The visibility rides the state snapshot precisely so the renderer
 			// never has to hardcode provider knowledge.
-			const vis = lastSnapshot?.reasoning?.visibility;
 			const label = vis === "summary" ? "[reasoning summary]" : "[reasoning]";
 			parts.push(`${brand.dim(label)}\n${brand.dim(thinkingText)}`);
+		} else if (showThinking && !thinkingText && (vis === "hidden" || vis === "redacted")) {
+			// REASONING IS ON, THE MODEL REASONED, AND THERE IS NOTHING TO SHOW.
+			//
+			// Rendering nothing here is the worst of the three options: the
+			// operator explicitly asked to see reasoning, the model demonstrably
+			// produced some (the footer is showing a duration and a billed token
+			// count), and the pane stays empty — which reads as "the toggle is
+			// broken" or "it didn't think". Neither is true.
+			//
+			// `hidden` is the DEFAULT on the current Claude generation: the text
+			// is omitted by provider policy and billed anyway. Say that once, in
+			// the operator's words, so an empty pane becomes an explanation.
+			parts.push(brand.dim(`[${describeReasoningVisibility(vis)}]`));
 		}
 		if (contentText) parts.push(contentText);
 		return parts.join("\n\n");
@@ -3480,6 +3495,12 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
 						`- ${chalk.bold("/copy [code]")} — copy the last reply (or just its code block)\n` +
 						`- ${chalk.bold("/expand [n]")} — show a truncated tool result in full (1 = most recent)\n` +
+						`- ${chalk.bold("/search <query>")} — search this conversation, including tool results\n` +
+						`- ${chalk.bold("/search --regex <pattern>")} — same, treating the query as a regular expression\n` +
+						`- ${chalk.bold("/export [full]")} — write this transcript to a Markdown file (secrets redacted; \`full\` keeps whole tool results)\n` +
+						`- ${chalk.bold("/rewind [n]")} — go back to one of your earlier messages (no arg = list; conversation only, never files)\n` +
+						`- ${chalk.bold("/flush")} — send everything you queued to the running turn right now\n` +
+						`- ${chalk.bold("/context")} — where this thread's context window is going\n` +
 						`- ${chalk.bold("/steer <text>")} — redirect the running turn (or just type mid-turn)\n` +
 						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's reasoning, or press ctrl+t (default: on, remembered)\n` +
 						`- ${chalk.bold("/new")} — start a fresh thread (new session, clean screen, no prior context)\n` +
@@ -4653,6 +4674,91 @@ export async function wireConnectUi(
 		// /usage — render the cumulative usage block from the latest state
 		// snapshot. All fields come from the server's SessionStateSnapshot
 		// — no extra RPC needed.
+		/**
+		 * Provider consumption windows, one line each.
+		 *
+		 * Renders nothing at all when the provider reported none — "unknown" and
+		 * "none left" are opposites, and a bar drawn from absent data claims a
+		 * measurement that was never taken. Counts are shown only when present
+		 * for the same reason: a missing `remaining` must not render as 0.
+		 */
+		const formatLimitLines = (windows: readonly ProviderLimitWindow[] | undefined): string[] => {
+			if (!windows || windows.length === 0) return [];
+			const out: string[] = [];
+			for (const w of windows) {
+				const parts: string[] = [];
+				if (typeof w.remaining === "number" && typeof w.limit === "number") {
+					parts.push(`${formatTokens(w.remaining)} of ${formatTokens(w.limit)} left`);
+				} else if (typeof w.remaining === "number") {
+					parts.push(`${formatTokens(w.remaining)} left`);
+				}
+				if (typeof w.usedFraction === "number") {
+					parts.push(`${Math.round(w.usedFraction * 100)}% used`);
+				}
+				if (typeof w.resetsAt === "number") {
+					const ms = w.resetsAt - Date.now();
+					if (ms > 0) parts.push(`resets in ${formatElapsed(ms)}`);
+				}
+				const body = parts.length > 0 ? parts.join(" · ") : "reported, no counts";
+				// `exhausted` is the one state a UI must never soften.
+				const label = w.label || w.kind;
+                const line = `${label}: ${body}`;
+				out.push(w.status === "exhausted" ? brand.amber(`${line} — EXHAUSTED`) : brand.dim(line));
+			}
+			return out;
+		};
+
+		if (trimmed === "/context") {
+			editor.setText("");
+			const snap = lastSnapshot;
+			if (!snap) {
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("no snapshot yet — the server hasn't reported state")}`, 0, 0),
+				);
+				return;
+			}
+			// WHERE THE WINDOW IS GOING.
+			//
+			// Deliberately reports only what is actually MEASURED. A per-category
+			// split (system prompt / tools / history) would be a better answer,
+			// but the gateway does not measure those separately today and
+			// inventing the split would be worse than admitting its absence —
+			// this whole subsystem exists because confident wrong numbers are the
+			// failure mode.
+			const lines: string[] = [];
+			if (snap.contextTokens != null && snap.contextWindow != null && snap.contextWindow > 0) {
+				const used = snap.contextTokens;
+				const win = snap.contextWindow;
+				const pct = Math.round((used / win) * 100);
+				const left = Math.max(0, win - used);
+				// A 24-cell bar. Coarse on purpose: this answers "am I close?",
+				// and a finer bar would imply a precision the estimate lacks.
+				const filled = Math.max(0, Math.min(24, Math.round((used / win) * 24)));
+				const bar = `${"█".repeat(filled)}${"░".repeat(24 - filled)}`;
+				const colored = pct >= 75 ? brand.amber(bar) : brand.dim(bar);
+				lines.push(`- ${chalk.bold("window:")}   ${colored} ${pct}%`);
+				lines.push(
+					`- ${chalk.bold("used:")}     ${formatTokens(used)} of ${formatTokens(win)} · ${formatTokens(left)} left`,
+				);
+			} else {
+				lines.push(`- ${chalk.bold("window:")}   ${brand.dim("not reported yet — send a message first")}`);
+			}
+			lines.push(`- ${chalk.bold("messages:")} ${snap.messageCount} ${brand.dim("(user + assistant + tool results)")}`);
+			const reasoningCtx = formatReasoningLine({ state: snap.reasoning });
+			if (reasoningCtx) lines.push(`- ${chalk.bold("reasoning:")} ${reasoningCtx}`);
+			lines.push(`- ${chalk.bold("compaction:")} ${brand.dim("automatic — older turns are summarized before the window fills")}`);
+			const limitLines = formatLimitLines(snap.limits);
+			if (limitLines.length > 0) {
+				lines.push(`- ${chalk.bold("provider limits:")}`);
+				for (const l of limitLines) lines.push(`    ${l}`);
+			}
+			lines.push(
+				`  ${brand.dim("context is what the NEXT request sends; /usage shows all-time billing for this thread")}`,
+			);
+			insertBeforeEditor(new Markdown(`${brand.dim("context")}\n${lines.join("\n")}`, 0, 0, markdownTheme));
+			return;
+		}
+
 		if (trimmed === "/usage") {
 			editor.setText("");
 			const snap = lastSnapshot;
@@ -4690,9 +4796,23 @@ export async function wireConnectUi(
 						// so labelling it "turns" over-reported a 5-turn conversation
 						// with tool use as ~40.
 						`- ${chalk.bold("messages:")} ${snap.messageCount}\n` +
-						`- ${chalk.bold("tokens:")}   ${tokenIn} in · ${tokenOut} out · ${tokenTotal} total\n` +
+						// TWO DIFFERENT MEASUREMENTS, AND THEY LOOK CONTRADICTORY.
+						//
+						// `billed` is CUMULATIVE over the whole session, and `in`
+						// counts input + cache reads + cache writes. Every turn
+						// re-sends the entire history, so after 30 messages the sum
+						// is several times the context window — while `context`
+						// reports only what the NEXT request will send.
+						//
+						// Rendered unlabelled ("282,932 in … context: 68k") this
+						// reads as a contradiction, and an operator reasonably
+						// concludes one of the numbers is broken. Neither is. Say
+						// which question each answers, in the line itself.
+						`- ${chalk.bold("billed:")}   ${tokenTotal} tokens all-time this thread\n` +
+						`  ${brand.dim(`${tokenIn} in (incl. cache reads) · ${tokenOut} out · every turn re-sends the history`)}\n` +
 						`- ${chalk.bold("cost:")}     ${costStr}\n` +
 						`- ${chalk.bold("context:")}  ${ctxStr}\n` +
+						`  ${brand.dim("what the NEXT request sends — this is the one that can run out")}\n` +
 						(reasoningStrUsage ? `- ${chalk.bold("reasoning:")} ${reasoningStrUsage}\n` : "") +
 						`- ${chalk.bold("thinking:")} ${snap.thinkingLevel}` +
 						(snap.supportsThinking

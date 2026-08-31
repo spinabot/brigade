@@ -339,7 +339,28 @@ export class UsageLedger {
 		return this.entries.size;
 	}
 
-	/** Drop a session's ledger (session deleted). */
+	/**
+	 * Drop a session's ledger (session deleted).
+	 *
+	 * NOT a leak fix — `evict()` already bounds this map LRU-style, so nothing
+	 * grows without limit whether or not anyone calls this. It is a CORRECTNESS
+	 * fix, and it is currently unwired.
+	 *
+	 * The bug it closes: the ledger is keyed by `(agentId, sessionKey)`, and
+	 * `/new` rolls a fresh sessionId under the SAME sessionKey. A deleted
+	 * session's spend therefore survives the delete and is inherited by the next
+	 * conversation created under that key — the operator's brand-new thread opens
+	 * already showing someone else's cost total.
+	 *
+	 * The seam is built and waiting: `handleSessionsDelete` calls
+	 * `deps.forgetSessionState?.(agentId, sessionKey)`
+	 * (server-methods/sessions.ts), and `ReasoningTracker.forget` has the same
+	 * shape and the same gap. What is missing is one line at the gateway's
+	 * handler registration, where both instances are in scope, supplying that
+	 * dep. Kept rather than deleted for exactly that reason: removing it would
+	 * strand a half-built cleanup path and leave the inherited-cost bug with no
+	 * way to close.
+	 */
 	forget(agentId: string, sessionKey: string): void {
 		this.entries.delete(this.key(agentId, sessionKey));
 	}

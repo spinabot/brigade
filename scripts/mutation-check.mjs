@@ -329,6 +329,15 @@ const MUTATIONS = [
     tests: "src/agents/tools/make-document-tool.test.ts",
   },
 
+  // ── Delta streaming ──
+  {
+    claim: "the delta strip keeps the client's render key",
+    file: "src/core/delta-mode.ts",
+    find: "\tconst { content: _omitted, ...msgWithoutContent } = msg;",
+    replace: "\tconst { content: _omitted, role: _r, timestamp: _t, ...msgWithoutContent } = msg;",
+    tests: "src/core/delta-stream.test.ts",
+  },
+
   // ── Pi/Anthropic dialect boundary ──
   {
     claim: "the Pi and Anthropic tool dialects stay distinct",
@@ -389,6 +398,46 @@ const MUTATIONS = [
     find: "\t\ttimestamp: compaction.at,",
     replace: "",
     tests: "src/agents/compaction/mid-turn.test.ts",
+  },
+  {
+    // The `_signal` underscore was the tell: accepted, named as unused, dropped.
+    // Every layer ABOVE this one threaded the signal correctly, so the abort
+    // path looked wired from any single file — and Ctrl+C still left a billed
+    // summarization of a full context window running against the provider.
+    claim: "an aborted turn cancels the compaction summarizer's billed LLM call",
+    file: "src/agents/compaction/summarizer.ts",
+    find: "build(priorSummary ?? args.priorSummary)(wrapTranscriptForSummary(transcript), signal)",
+    replace: "build(priorSummary ?? args.priorSummary)(wrapTranscriptForSummary(transcript))",
+    tests: "src/agents/compaction/mid-turn-wiring.test.ts",
+  },
+  {
+    // Pi's prompt() takes no signal, so the ONLY cancellation handle is
+    // session.abort(). Remove the bridge and the isolated session keeps
+    // streaming after the operator has been told the turn was cancelled.
+    claim: "the isolated LLM call honours the caller's signal at all",
+    file: "src/agents/memory/extract.ts",
+    find: "\t\tif (signal?.aborted) throw new IsolatedLlmAbortError();",
+    replace: "",
+    tests: "src/agents/memory/extract.test.ts src/agents/compaction/mid-turn-wiring.test.ts",
+  },
+  {
+    // Both directions are expensive. Read as an error, a Ctrl+C disables the
+    // compactor for the turn AND truncates history nobody asked to lose; read
+    // as a cancellation, a real failure is retried on every request in the loop.
+    claim: "an abort is classified as a cancellation, not a failed summarization",
+    file: "src/agents/compaction/mid-turn-runner.ts",
+    find: "\tif (e.name === \"AbortError\" || e.code === \"ABORT_ERR\" || e.code === 20) return true;",
+    replace: "",
+    tests: "src/agents/compaction/mid-turn-runner.test.ts src/agents/compaction/mid-turn-wiring.test.ts",
+  },
+  {
+    // `noteCompaction` counts BEFORE the call, so an interrupt that is not given
+    // back lets an operator close their own guard by pressing Ctrl+C twice.
+    claim: "a cancelled compaction is given back to the breaker's budget",
+    file: "src/agents/smart-compaction.ts",
+    find: "\t\tif (next > 0) this.consecutive.set(sessionKey, next);",
+    replace: "\t\tthis.consecutive.set(sessionKey, current);",
+    tests: "src/agents/smart-compaction.breaker.test.ts",
   },
   {
     claim: "tool-call arguments reach the summarizer",

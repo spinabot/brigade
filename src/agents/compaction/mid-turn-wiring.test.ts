@@ -15,6 +15,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { buildBrigadeTransformContext } from "../payload-mutators.js";
 import { createMidTurnCompactor } from "./mid-turn-runner.js";
+import { createCompactionSummarizer } from "./summarizer.js";
 
 const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] }) as AgentMessage;
 const asst = (text: string) =>
@@ -129,4 +130,72 @@ test("the free tool-result shrink runs BEFORE the paid summarization", async () 
 		sawTokens < before,
 		`compactor saw ${sawTokens} chars, chain received ${before} — the shrink must run first`,
 	);
+});
+
+test("Ctrl+C reaches the summarizer's own LLM call, not just the runner's wait", async () => {
+	// THE HOP THAT WAS DEAD. Every layer above this one threaded the signal —
+	// Pi hands it to `transformContext`, the chain forwards it to the compactor,
+	// the runner races it against the summarization — and then the summarizer
+	// accepted it as `_signal` and dropped it on the floor. The visible effect
+	// was a lie: Ctrl+C stopped Brigade WAITING for the summary while the
+	// isolated session underneath kept streaming a full context window to the
+	// provider and kept billing for it. Compaction is one of the largest single
+	// calls Brigade makes, so the one call an operator most wants to cancel was
+	// the only one they could not.
+	//
+	// The proof has to run against the REAL summarizer and the REAL isolated-LLM
+	// factory, because the defect lived precisely in the wiring between them —
+	// a test that stubbed either end would have passed the whole time it was
+	// broken. The workspace, registry and model below are deliberate junk: an
+	// aborted signal must short-circuit BEFORE any of them is touched, so the
+	// call cannot reach a provider. Drop the signal again and this same junk
+	// blows up with a TypeError instead of an AbortError, which is exactly the
+	// assertion below.
+	const summarize = createCompactionSummarizer({
+		workspaceDir: "/nonexistent-brigade-abort-probe",
+		agentDir: "/nonexistent-brigade-abort-probe",
+		authStorage: {},
+		modelRegistry: {},
+		model: { id: "probe" },
+	});
+	assert.ok(summarize, "a summarizer is built when a model and registry are present");
+
+	const controller = new AbortController();
+	controller.abort();
+	await assert.rejects(
+		summarize("some transcript to summarize", controller.signal),
+		(err: Error) =>
+			// Shaped as a DOM AbortError so `retry-policy.ts` never mistakes a
+			// cancellation for a transient fault and re-bills the call.
+			err.name === "AbortError" &&
+			(err as Error & { code?: string }).code === "ABORT_ERR",
+		"an aborted turn cancels the summarization instead of paying for it",
+	);
+});
+
+test("an aborted summarization is a cancellation, never a compaction failure", async () => {
+	// The whole chain, end to end: an abort raised inside the summarizer must
+	// surface through the runner as `aborted` — the ONE outcome that neither
+	// truncates history nor disables the compactor for the rest of the turn.
+	// Read as an error instead, a Ctrl+C would silently drop the older half of
+	// the conversation from every remaining request in the turn.
+	const outcomes: string[] = [];
+	const abortError = Object.assign(new Error("isolated LLM call was cancelled by the caller"), {
+		name: "AbortError",
+		code: "ABORT_ERR",
+	});
+	const transform = buildBrigadeTransformContext({
+		midTurnCompactor: createMidTurnCompactor({
+			contextWindowTokens: WINDOW,
+			summarize: async () => {
+				throw abortError;
+			},
+			onEnd: (o) => outcomes.push(o.reason),
+		}),
+	});
+	const messages = bigConversation();
+	const out = await transform(messages);
+
+	assert.equal(outcomes.at(-1), "aborted", "not `error`, and not `fallback-truncated`");
+	assert.equal(out.length, messages.length, "an interrupted turn keeps its history intact");
 });

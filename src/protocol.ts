@@ -20,6 +20,8 @@
  */
 
 import type { Model, ToolCall as PiToolCall } from "@earendil-works/pi-ai";
+import type { ProviderLimitWindow } from "./agents/usage/limits.js";
+export type { ProviderLimitWindow };
 import type {
 	CronAddParamsV2,
 	CronAddResultV2,
@@ -1235,6 +1237,16 @@ export interface SessionStateSnapshot {
 	 * capable of. Absent on a gateway older than this field.
 	 */
 	reasoning?: SessionReasoningState;
+	/**
+	 * Provider consumption windows — "how much have I got left?".
+	 *
+	 * Absent when the backend has not reported any, which is NOT the same as
+	 * "none left": a provider that sends no rate-limit headers simply cannot be
+	 * asked, and a UI must render that as unknown rather than as a full or an
+	 * empty bar. Populated for whichever provider is serving this session, so a
+	 * client never has to know which header dialect that provider speaks.
+	 */
+	limits?: ProviderLimitWindow[];
 	contextUsagePercent: number | null;
 	/**
 	 * Estimated tokens currently in the context window, and the window's size.

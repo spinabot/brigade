@@ -96,6 +96,13 @@ export function createCompactionSummarizer(
 	// command results — is attacker-influenceable, and a summary is re-injected
 	// into the model's context on every later turn, so an injection that lands
 	// here is persistent. Of every harness surveyed, only Gemini CLI guards it.
-	return (transcript: string, _signal?: AbortSignal, priorSummary?: string) =>
-		build(priorSummary ?? args.priorSummary)(wrapTranscriptForSummary(transcript));
+	//
+	// FORWARD THE SIGNAL. This parameter used to be spelt `_signal` and dropped,
+	// which made the whole abort path decorative: the runner would stop WAITING
+	// on a cancelled summarization, but the isolated session underneath kept
+	// streaming a full context window to the provider and kept billing for it.
+	// Compaction is one of the largest single calls Brigade makes, so the one
+	// call an operator most wants to cancel was the one call they could not.
+	return (transcript: string, signal?: AbortSignal, priorSummary?: string) =>
+		build(priorSummary ?? args.priorSummary)(wrapTranscriptForSummary(transcript), signal);
 }
