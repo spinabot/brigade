@@ -11,7 +11,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { connectIMessage } from "./connection.js";
+import { connectIMessage, isTypingPermanentlyUnavailable } from "./connection.js";
 import type { IMessageRpcLike, IMessageRpcNotification } from "./client.js";
 import type { ResolvedIMessageAccount } from "./account-config.js";
 import type { BrigadeConfig } from "../sdk.js";
@@ -561,6 +561,97 @@ describe("connectIMessage — dmHistoryLimit", () => {
 		notify?.(dmNotification("second"));
 		await new Promise<void>((r) => setImmediate(r));
 		assert.deepEqual(seen, [undefined, undefined]);
+		await conn.close();
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Typing indicators go through IMCore, which a stock Mac (SIP enabled) does
+// not allow. That must cost nothing: never fail a turn, and never log twice.
+// ─────────────────────────────────────────────────────────────────────────
+describe("isTypingPermanentlyUnavailable", () => {
+	it("recognises the bridge's own unavailability wording", () => {
+		assert.equal(
+			isTypingPermanentlyUnavailable(
+				"Typing indicator failed: Failed to connect to imagent (Messages daemon) for IMCore typing indicators.",
+			),
+			true,
+		);
+		assert.equal(isTypingPermanentlyUnavailable("Method not found"), true);
+		assert.equal(isTypingPermanentlyUnavailable("Messages.app blocked it via library validation"), true);
+	});
+
+	it("treats anything else as transient, so a blip does not cost the feature", () => {
+		assert.equal(isTypingPermanentlyUnavailable("request timed out"), false);
+		assert.equal(isTypingPermanentlyUnavailable("socket hang up"), false);
+	});
+});
+
+describe("connectIMessage — setTyping", () => {
+	class TypingClient implements IMessageRpcLike {
+		calls: Array<Record<string, unknown>> = [];
+		constructor(private readonly fail?: string) {}
+		async start(): Promise<void> {}
+		async stop(): Promise<void> {}
+		async request<T = unknown>(method: string, params?: unknown): Promise<T> {
+			if (method === "typing") {
+				this.calls.push((params ?? {}) as Record<string, unknown>);
+				if (this.fail) throw new Error(this.fail);
+			}
+			return {} as T;
+		}
+		waitForClose(): Promise<void> {
+			return new Promise<void>(() => {});
+		}
+	}
+
+	const connect = async (client: IMessageRpcLike, logs: string[]) =>
+		connectIMessage({
+			account: account(),
+			loadConfig: () => ({}) as unknown as BrigadeConfig,
+			log: (m) => logs.push(m),
+			onMessage: () => {},
+			clientFactory: async () => client,
+			probeImpl: async () => ({ ok: true, elapsedMs: 0 }),
+			sleepImpl: async () => {},
+		});
+
+	it("uses the same conversation-id mapping the sender does", async () => {
+		const client = new TypingClient();
+		const conn = await connect(client, []);
+		await conn.setTyping("chat:7", true);
+		await conn.setTyping("+15551234567", false);
+		assert.equal(client.calls[0]?.chat_id, 7);
+		assert.equal(client.calls[0]?.stop, undefined, "starting typing sends no stop flag");
+		assert.equal(client.calls[1]?.to, "+15551234567");
+		assert.equal(client.calls[1]?.stop, true);
+		await conn.close();
+	});
+
+	it("never throws, and stops asking once the Mac says it cannot", async () => {
+		const logs: string[] = [];
+		const client = new TypingClient(
+			"Typing indicator failed: Failed to connect to imagent (Messages daemon) for IMCore typing indicators.",
+		);
+		const conn = await connect(client, logs);
+		await assert.doesNotReject(() => conn.setTyping("chat:7", true));
+		await conn.setTyping("chat:7", false);
+		await conn.setTyping("chat:7", true);
+		assert.equal(client.calls.length, 1, "latched off after the first refusal");
+		assert.equal(
+			logs.filter((l) => l.includes("typing indicators unavailable")).length,
+			1,
+			"said so exactly once",
+		);
+		await conn.close();
+	});
+
+	it("keeps trying after a transient failure", async () => {
+		const client = new TypingClient("socket hang up");
+		const conn = await connect(client, []);
+		await conn.setTyping("chat:7", true);
+		await conn.setTyping("chat:7", true);
+		assert.equal(client.calls.length, 2, "a blip does not disable the feature");
 		await conn.close();
 	});
 });

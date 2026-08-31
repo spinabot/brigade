@@ -328,6 +328,21 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 		// iMessage senders are phone numbers / emails on the operator's own device;
 		// the bot runs AS the operator (Messages.app), so the pairing card uses the
 		// "account" label and ownership is NOT bootstrapped from a separate bot.
+		/**
+		 * Typing indicator while the agent thinks.
+		 *
+		 * iMessage was the only channel without one — Discord, Telegram, Slack,
+		 * WhatsApp and BlueBubbles all implement this slot, so a conversation on
+		 * iMessage simply sat silent until the reply landed. The bridge supports
+		 * it through IMCore, which not every Mac allows; the connection treats it
+		 * as strictly cosmetic and never throws, so a Mac that cannot show the
+		 * bubble behaves exactly as it does today.
+		 */
+		async setComposing(conversationId: string, state: "composing" | "paused"): Promise<void> {
+			if (!connection) return;
+			await connection.setTyping(conversationId, state === "composing");
+		},
+
 		pairing: { idLabel: "account" as const },
 
 		/**

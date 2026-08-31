@@ -46,6 +46,7 @@ import {
 	type ReadFileLike,
 } from "./remote-attachments.js";
 import { sendMessageIMessage, type IMessageSendResult } from "./send.js";
+import { parseIMessageTarget } from "./targets.js";
 import { sanitizeIMessageWatchErrorPayload } from "./watch-error.js";
 import type { BrigadeConfig } from "../sdk.js";
 import type { OutboundMedia, OutboundSendOptions, InboundMediaAttachment } from "../sdk.js";
@@ -121,6 +122,28 @@ export interface ConnectIMessageArgs {
 }
 
 /** The live connection handle the adapter drives. */
+/**
+ * Does a typing failure mean this Mac cannot do typing indicators AT ALL, as
+ * opposed to a one-off hiccup?
+ *
+ * Matched on the bridge's own wording — it names `imagent`, IMCore and library
+ * validation when the private path is closed to it. A method the bridge does
+ * not expose is the same conclusion: stop asking. Anything else is treated as
+ * transient, because latching off on a blip would silently cost the feature for
+ * the rest of the process's life.
+ */
+export function isTypingPermanentlyUnavailable(message: string): boolean {
+	const m = message.toLowerCase();
+	return (
+		m.includes("imagent") ||
+		m.includes("imcore") ||
+		m.includes("library validation") ||
+		m.includes("method not found") ||
+		m.includes("not supported") ||
+		m.includes("entitlement")
+	);
+}
+
 export interface IMessageConnection {
 	isConnected(): boolean;
 	connectedAt(): number | null;
@@ -135,6 +158,11 @@ export interface IMessageConnection {
 	lastWatchError(): string | undefined;
 	/** Send text; returns the bridge message id when available. */
 	sendText(conversationId: string, text: string, opts?: OutboundSendOptions): Promise<{ messageId?: string }>;
+	/**
+	 * Show or clear the "typing…" bubble in Messages.app. Best-effort — see
+	 * `setTyping` in the implementation for why this can never throw.
+	 */
+	setTyping(conversationId: string, on: boolean): Promise<void>;
 	/** Send media; returns the bridge message id when available. */
 	sendMedia(conversationId: string, media: OutboundMedia): Promise<{ messageId?: string }>;
 	/** Tear down the subprocess + stop reconnecting. */
@@ -465,6 +493,15 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 		else args.signal.addEventListener("abort", () => void close(), { once: true });
 	}
 
+	/**
+	 * Does this error mean the IMCore typing path is unavailable on this machine,
+	 * as opposed to a one-off failure?
+	 *
+	 * Matched on the bridge's own wording. A method the bridge does not expose at
+	 * all ("method not found") is the same conclusion: stop asking.
+	 */
+	let typingUnavailable = false;
+
 	const remember = (conversationId: string, sent: IMessageSendResult): void => {
 		// Build the same scope the inbound poll keys on so the echo is suppressed.
 		const numericChat = conversationId.startsWith("chat:") ? Number.parseInt(conversationId.slice(5), 10) : NaN;
@@ -492,6 +529,59 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 		isConnected: () => connected,
 		lastWatchError: () => lastWatchError,
 		connectedAt: () => connectedAtMs,
+		/**
+		 * Typing indicator.
+		 *
+		 * ─────────────────────────────────────────────────────────────────────
+		 * WHY THIS IS BEST-EFFORT, AND WHY IT GOES QUIET
+		 * ─────────────────────────────────────────────────────────────────────
+		 * Every other channel Brigade speaks shows a typing indicator while the
+		 * agent thinks; iMessage was the only one that did not, because the
+		 * adapter never implemented `setComposing`. The bridge does support it —
+		 * `imsg`'s `typing` RPC — but ONLY through IMCore, which needs SIP
+		 * disabled and Messages launched with `imsg launch`. On a stock Mac it
+		 * fails every time:
+		 *
+		 *   "Failed to connect to imagent (Messages daemon) … imagent can reject
+		 *    third-party clients without Apple-private entitlements"
+		 *
+		 * So two rules. It NEVER throws — a cosmetic bubble must not be able to
+		 * fail a turn that is otherwise fine. And it LATCHES OFF after the first
+		 * unavailability, logging once with the remedy, because the alternative
+		 * is two failures per turn forever in the operator's log, which trains
+		 * people to ignore the log. A transient failure does not latch — only
+		 * the answer that means "this Mac cannot do this at all".
+		 */
+		async setTyping(conversationId, on): Promise<void> {
+			if (typingUnavailable || !connected) return;
+			const c = client;
+			if (!c) return;
+			try {
+				const params: Record<string, unknown> = { service: account.service || "auto" };
+				// Same conversation-id → wire-param mapping the sender uses, so a
+				// thread that can be sent to can always be typed into.
+				const target = parseIMessageTarget(conversationId);
+				if (target.kind === "chat_id") params.chat_id = target.chatId;
+				else if (target.kind === "chat_guid") params.chat_guid = target.chatGuid;
+				else if (target.kind === "chat_identifier") params.chat_identifier = target.chatIdentifier;
+				else params.to = target.to;
+				if (!on) params.stop = true;
+				await c.request("typing", params, { timeoutMs: account.probeTimeoutMs });
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				if (isTypingPermanentlyUnavailable(msg)) {
+					typingUnavailable = true;
+					args.log(
+						"imessage: typing indicators unavailable on this Mac — they need IMCore " +
+							"(SIP disabled + `imsg launch`). Everything else is unaffected; not retrying.",
+					);
+					return;
+				}
+				// Transient — stay enabled, and keep it at debug volume.
+				if (account.verbose) args.log(`imessage: typing indicator failed (transient): ${msg}`);
+			}
+		},
+
 		async sendText(conversationId, text, opts): Promise<{ messageId?: string }> {
 			const result = await sendFn(conversationId, text, {
 				cliPath: account.cliPath,
