@@ -186,13 +186,20 @@ export const PROVIDERS: ProviderInfo[] = [
 		id: "orcarouter",
 		name: "OrcaRouter",
 		description: "Multi-model AI gateway with routing, failover, guardrails",
-		keyUrl: "https://www.orcarouter.ai",
+		// The console keys page, matching every sibling — onboarding opens this
+		// URL, and the site root does not get an operator to a key.
+		keyUrl: "https://www.orcarouter.ai/console/keys",
 		envVar: "ORCAROUTER_API_KEY",
 		envVarFallbacks: ["ORCA_API_KEY"],
 		custom: true,
 		liveModels: true, // models fetched live from /v1/models at onboarding
 		api: "openai-completions",
 		baseUrl: "https://api.orcarouter.ai/v1",
+		// BYOK gateway: it passes each provider's published rate through, so a
+		// turn costs real money and the cost must render. `ProviderInfo` requires
+		// this field; the entry landed without it because the contributing branch
+		// predated it, which is what broke the build.
+		billing: "metered",
 	},
 	{
 		id: "groq",
