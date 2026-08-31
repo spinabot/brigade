@@ -27,8 +27,18 @@ const suiteDir = pinned || mkdtempSync(join(tmpdir(), "brigade-suite-statedir-")
 // drained (see scripts/test-keepalive.mjs). Cleared after all tests settle.
 const keepAlive = pathToFileURL(join(import.meta.dirname, "test-keepalive.mjs")).href;
 
+// QUOTE THE GLOB. `shell: true` means a shell sees this argv first, and
+// `/bin/sh` (macOS/Linux default) has no `globstar`: it expands `**` as a plain
+// `*`, so `src/**/*.test.ts` matched only depth-2 files — 151 of 496. The other
+// 345 test files, every one nested a level deeper (src/agents/compaction/,
+// src/agents/memory/, src/storage/convex/ …), silently never ran, and `npm test`
+// reported a confident green over 70% of the suite untouched.
+//
+// Double quotes stop the shell expanding it on POSIX and are stripped by cmd.exe
+// on Windows, so in both cases Node's own test runner receives the pattern and
+// does the globbing itself — and Node's globber does understand `**`.
 const extra = process.argv.slice(2);
-const res = spawnSync("npx", ["tsx", "--import", keepAlive, "--test", "src/**/*.test.ts", ...extra], {
+const res = spawnSync("npx", ["tsx", "--import", keepAlive, "--test", '"src/**/*.test.ts"', ...extra], {
   stdio: "inherit",
   shell: true, // resolves npx.cmd on Windows
   env: { ...process.env, BRIGADE_STATE_DIR: suiteDir },

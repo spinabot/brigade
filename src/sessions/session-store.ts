@@ -287,6 +287,28 @@ export interface SessionEntry {
    * since the store is a plain JSON file an operator can hand-edit.
    */
   name?: string;
+  /**
+   * The transcript entry this session is currently branched at — its LEAF.
+   *
+   * ─────────────────────────────────────────────────────────────────────────
+   * WHY BRIGADE HAS TO OWN THIS
+   * ─────────────────────────────────────────────────────────────────────────
+   * Pi's `SessionManager.branch(id)` moves the leaf IN MEMORY only, and
+   * `_buildIndex()` recomputes it on load as "the last entry in the file"
+   * (`session-manager.js:585-594`); Brigade's Convex factory replicates the
+   * same rule (`session-manager-factory.ts:158-164`). The transcript is
+   * append-only, so a rewind writes nothing — which means rewind, exit, resume
+   * lands you back on the branch you abandoned, silently.
+   *
+   * Appending a marker cannot fix it either: `_buildIndex` makes ANY appended
+   * entry the leaf, so the marker would become the leaf itself. So the pointer
+   * lives here, in the store Brigade already persists per session, and is
+   * re-applied with `branch()` after the manager is opened.
+   *
+   * Absent means "follow the file" — the pre-rewind behaviour, and correct for
+   * every session that has never been rewound.
+   */
+  leafEntryId?: string;
   [key: string]: unknown;
 }
 

@@ -21,6 +21,7 @@
  */
 
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
+import { PI_THINKING, PI_TOOL_RESULT } from "../../pi-dialect.js";
 
 export const SESSIONS_HISTORY_MAX_BYTES = 80 * 1024;
 export const SESSIONS_HISTORY_TEXT_MAX_CHARS = 4_000;
@@ -140,7 +141,7 @@ export function sanitizeHistoryContentBlock(block: unknown): {
 		truncated ||= res.truncated;
 		redacted ||= res.redacted;
 	}
-	if (type === "thinking") {
+	if (type === PI_THINKING) {
 		if (typeof entry.thinking === "string") {
 			const res = truncateHistoryText(entry.thinking);
 			entry.thinking = res.text;
@@ -214,7 +215,7 @@ export function stripToolMessages(messages: readonly unknown[]): unknown[] {
 	return messages.filter((msg) => {
 		if (!msg || typeof msg !== "object") return true;
 		const role = (msg as { role?: unknown }).role;
-		return role !== "toolResult" && role !== "tool";
+		return role !== PI_TOOL_RESULT && role !== "tool";
 	});
 }
 

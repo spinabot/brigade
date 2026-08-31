@@ -40,7 +40,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { guardedFetch, SsrfBlockedError } from "../../infra/net/fetch-guard.js";
-import { validateOutboundMediaPath } from "../../security/media-path-guard.js";
+import { rootSpellings, validateOutboundMediaPath } from "../../security/media-path-guard.js";
 import {
 	resolveCacheDir,
 	resolveOsCacheDir,
@@ -79,13 +79,13 @@ export function formatFromExtension(p: string): DocFormat | undefined {
  */
 export function allowedDocRoots(opts: { workspaceDir?: string; cwd?: string }): string[] {
 	const roots = new Set<string>();
+	// Both spellings of each root. `resolveOutputPath` compares the REALPATH of
+	// the target's nearest existing ancestor, so a root reached through a symlink
+	// (macOS `os.tmpdir()` → `/private/var/…`) must be present in realpathed form
+	// or nothing under it can ever match.
 	const add = (p?: string) => {
 		if (!p) return;
-		try {
-			roots.add(path.resolve(p));
-		} catch {
-			/* ignore */
-		}
+		for (const spelling of rootSpellings(p)) roots.add(spelling);
 	};
 	add(opts.workspaceDir);
 	add(opts.cwd);

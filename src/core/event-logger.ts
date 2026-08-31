@@ -217,7 +217,13 @@ function rotateIfTooLarge(filePath: string): void {
  *   - For tool_execution_*: full args/result (this is what we want to debug)
  *   - For agent_*, turn_*, compaction_*, auto_retry_*: keep all fields
  */
-function serializeForLog(event: AgentSessionEvent): Record<string, unknown> {
+/**
+ * Exported for tests. The JSONL log is Brigade's audit trail — the record an
+ * operator reconciles a bill against or reads to explain a stall — so what it
+ * keeps per event type is behaviour worth asserting, not an implementation
+ * detail. Mid-turn compaction was landing in it as nothing but its own name.
+ */
+export function serializeForLog(event: AgentSessionEvent): Record<string, unknown> {
 	const ts = new Date().toISOString();
 	const ev = event as any;
 
@@ -255,7 +261,37 @@ function serializeForLog(event: AgentSessionEvent): Record<string, unknown> {
 		case "auto_retry_end":
 			return { ...base, success: ev.success, attempt: ev.attempt, finalError: ev.finalError };
 		case "compaction_end":
-			return { ...base, aborted: ev.aborted, willRetry: ev.willRetry, errorMessage: ev.errorMessage };
+			// `outcome` is Brigade's own before/after measurement, attached by the
+			// gateway. Without it the log records that a compaction happened and
+			// nothing about whether it achieved anything — which is exactly how a
+			// no-progress loop kept reporting success.
+			return {
+				...base,
+				aborted: ev.aborted,
+				willRetry: ev.willRetry,
+				errorMessage: ev.errorMessage,
+				outcome: ev.outcome,
+			};
+		case "mid_turn_compaction_start":
+			return { ...base, messagesBefore: ev.messagesBefore, tokensBefore: ev.tokensBefore };
+		case "mid_turn_compaction_end":
+			// The JSONL log is the audit trail. A compaction that freed 90k tokens
+			// and cost real money must not be recorded as nothing but its name —
+			// `reason` and `usage` are the two fields an operator reconciling a
+			// bill or explaining a stall actually needs.
+			return {
+				...base,
+				applied: ev.applied,
+				reason: ev.reason,
+				tokensBefore: ev.tokensBefore,
+				tokensAfter: ev.tokensAfter,
+				freedTokens: ev.freedTokens,
+				messagesBefore: ev.messagesBefore,
+				messagesAfter: ev.messagesAfter,
+				durationMs: ev.durationMs,
+				errorMessage: ev.errorMessage,
+				usage: ev.usage,
+			};
 		case "agent_end":
 			// Don't dump every message — just count.
 			return { ...base, messageCount: Array.isArray(ev.messages) ? ev.messages.length : 0 };

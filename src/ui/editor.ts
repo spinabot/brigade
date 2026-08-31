@@ -67,8 +67,39 @@ const NO_REQUIRED_ARG = new Set([
 	"attach", // [<path>] — optional (no arg lists what's staged)
 	"detach", // [<n>|all] — optional (no arg detaches everything)
 	"clipboard", // no arg — diagnose
-	"clip", // alias
+	// ALIASES BELONG HERE TOO, even though they are not in `SLASH_COMMANDS`.
+	//
+	// This set is consulted whenever the autocomplete popup is showing, and the
+	// popup shows for any PREFIX of an advertised command. `/clip` is a live
+	// alias of `/clipboard` and its prefix, so dropping it from this set turned
+	// Enter into Tab: the operator's text silently became `/clipboard` and they
+	// had to press Enter a second time. `/cancel` and `/switch` are not prefixes
+	// of anything advertised today and so are unaffected — but they are listed
+	// so that adding a command named `cancel-*` or `switch-*` later cannot
+	// quietly reintroduce the same bug.
+	"export", // [full] — optional
+	"rewind", // [n] — optional (no arg lists the points)
+	// NOTE: "search" is NOT here — it takes a REQUIRED argument, so Enter on the
+	// bare command must insert it and wait rather than submitting an empty search.
+	"flush", // no arg — promote the queue into the running turn
+	"clip", // alias of /clipboard — no arg
+	"cancel", // alias of /abort — no arg
+	"switch", // [<agent>] — optional
+	"copy", // [code] — optional (no arg copies the whole reply)
+	"expand", // [<n>] — optional (no arg expands the most recent)
+	"memory", // no arg
+	"update", // no arg
+	"new", // no arg — the primary "start over" gesture
+	"rename", // [<name>] — optional
+	"org", // no arg
 ]);
+
+/**
+ * Exported for tests. Aliases live in this set but NOT in `SLASH_COMMANDS`, so
+ * nothing else in the codebase can cross-check the two lists — which is exactly
+ * how `/clip` regressed into needing two Enters.
+ */
+export const NO_REQUIRED_ARG_FOR_TEST: ReadonlySet<string> = NO_REQUIRED_ARG;
 
 export class BrigadeEditor extends Editor {
 	/**
@@ -89,6 +120,17 @@ export class BrigadeEditor extends Editor {
 	 * this is a bonus for terminals that do forward the key.
 	 */
 	onImagePaste?: () => void;
+
+	/**
+	 * Fired on Ctrl+T — "show/hide the model's reasoning".
+	 *
+	 * Ctrl+T rather than the Ctrl+E other harnesses use, because pi-tui already
+	 * binds `ctrl+e` to `tui.editor.cursorLineEnd` (keybindings.js) and taking it
+	 * would break end-of-line for anyone using emacs keys. Ctrl+T is unbound in
+	 * pi-tui's defaults, and `T` for Thinking is the mnemonic Claude Code uses
+	 * for the same toggle.
+	 */
+	onToggleReasoning?: () => void;
 
 	/**
 	 * Fired whenever the editor's text CHANGES, by any means.
@@ -151,6 +193,41 @@ export class BrigadeEditor extends Editor {
 	 */
 	onInterrupt?: () => void;
 
+	/**
+	 * Fired on Ctrl+Enter / Cmd+Enter — "STEER the running turn", as opposed to
+	 * a plain Enter, which queues.
+	 *
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * WHY THE MODIFIER CARRIES THE DESTRUCTIVE ACTION
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * Steering injects text into a turn already in flight, changing a plan the
+	 * model is halfway through. Queueing waits for a turn boundary. One of those
+	 * is recoverable and one is not, so the irreversible one must not be the key
+	 * your fingers press by reflex.
+	 *
+	 * Codex puts them the other way round (Enter steers, Tab queues) and Claude
+	 * Code has five open steering issues plus a documented docs-vs-behaviour bug
+	 * from exactly this ambiguity. DeepSeek's harness splits them the way this
+	 * does, and that is the one worth copying.
+	 *
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * NOT EVERY TERMINAL CAN REPORT THIS
+	 * ─────────────────────────────────────────────────────────────────────────
+	 * `ctrl+enter` resolves only through the kitty keyboard protocol or xterm's
+	 * `modifyOtherKeys` (`pi-tui/keys.js`). In Terminal.app and other basic
+	 * terminals, Ctrl+Enter is byte-identical to Enter and this hook can never
+	 * fire. That is why `/steer <text>` exists as the universal path, and why
+	 * the host's hint checks `isKittyProtocolActive()` before advertising a
+	 * keystroke the operator's terminal cannot send.
+	 * Returns TRUE to proceed with a normal submit (the host has armed steering),
+	 * FALSE to swallow the keystroke — an empty buffer, say. The editor does the
+	 * submitting rather than the host, because `submitValue()` is private to
+	 * pi-tui and reaching around it would fork the submit path; routing through
+	 * `super.handleInput("\r")` keeps steering and ordinary Enter on exactly one
+	 * code path, so they cannot drift.
+	 */
+	onSteerSubmit?: () => boolean;
+
 	override handleInput(data: string): void {
 		// `BRIGADE_DEBUG_INPUT=1` appends every raw input chunk to a trace file.
 		//
@@ -170,6 +247,30 @@ export class BrigadeEditor extends Editor {
 		// Kitty encoding (`ESC[99;5u`) alike.
 		if (this.onInterrupt && matchesKey(data, "ctrl+c")) {
 			this.onInterrupt();
+			return;
+		}
+
+		// Ctrl+Enter / Cmd+Enter — steer the running turn instead of queueing.
+		// Checked BEFORE the autocomplete branch and before Pi's submit, because
+		// both would otherwise treat it as a plain Enter. Only fires where the
+		// terminal can actually report the modifier; elsewhere the byte is a bare
+		// `\r` and this is unreachable by construction.
+		if (
+			this.onSteerSubmit &&
+			(matchesKey(data, "ctrl+enter") || matchesKey(data, "super+enter"))
+		) {
+			// The host arms steering and says whether to submit at all. Submitting
+			// via `super.handleInput("\r")` keeps this on the SAME path as an
+			// ordinary Enter — attachment handling, the echo, the stale-busy-flag
+			// recovery — so the two can never drift apart.
+			if (this.onSteerSubmit()) super.handleInput("\r");
+			return;
+		}
+
+		// Ctrl+T toggles reasoning visibility. Unbound in pi-tui's defaults, so
+		// nothing is being taken away — unlike Ctrl+E, which is cursorLineEnd.
+		if (this.onToggleReasoning && matchesKey(data, "ctrl+t")) {
+			this.onToggleReasoning();
 			return;
 		}
 

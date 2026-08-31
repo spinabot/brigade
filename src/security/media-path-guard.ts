@@ -138,3 +138,42 @@ export function validateOutboundMediaPath(rawPath: string): MediaPathVerdict {
 	}
 	return { ok: true };
 }
+
+/* ─────────────────────── allowed-root spelling ─────────────────────── */
+
+/**
+ * Every spelling of `p` that must be treated as the same allowed root.
+ *
+ * Containment checks resolve the CANDIDATE with `fs.realpathSync` so a
+ * symlinked parent cannot redirect a write outside the allowed roots. That
+ * makes the comparison asymmetric unless the ROOTS are realpathed too: on macOS
+ * `os.tmpdir()` is `/var/folders/…`, a symlink to `/private/var/folders/…`, so
+ * a realpathed candidate under the temp dir was compared against the `/var/…`
+ * spelling and never matched. Every document-tool write into a temp dir was
+ * refused as "outside the allowed roots". Linux `/tmp` is not symlinked, so CI
+ * stayed green while every macOS checkout saw the failure.
+ *
+ * Returns the resolved spelling always, plus the realpathed spelling when the
+ * path exists and differs. Keeping BOTH is safe and is not a widening: the
+ * candidate side is always realpathed first, so on a symlinked system the
+ * non-physical spelling simply never matches. It is retained only so a caller
+ * that compares WITHOUT realpathing keeps its existing behaviour.
+ */
+export function rootSpellings(p: string): string[] {
+	if (!p) return [];
+	let resolved: string;
+	try {
+		resolved = path.resolve(p);
+	} catch {
+		return [];
+	}
+	const out = [resolved];
+	try {
+		const real = fs.realpathSync(resolved);
+		if (real && real !== resolved) out.push(real);
+	} catch {
+		// Root does not exist yet (a state subtree created on first use). The
+		// resolved spelling still stands on its own.
+	}
+	return out;
+}

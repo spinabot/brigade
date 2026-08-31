@@ -3,6 +3,8 @@ import { EventEmitter } from "node:events";
 import { test } from "node:test";
 
 import { createClaudeCliStreamFn, serializeConversationPrompt } from "./stream.js";
+import { getLimits, resetLimitsForTest } from "../usage/limits.js";
+import { resolveClaudeCliEffort } from "./catalog.js";
 import { stampClaudeCliToolPlane } from "./tool-plane.js";
 
 /* ─────────────────────────── fake subprocess ─────────────────────────── */
@@ -268,11 +270,103 @@ test("usage.input is the FIRST step's prompt, not the binary's cumulative total"
 	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
 	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
 
-	assert.equal(message.usage.input, 78000, "first step's prompt (40000 + 38000 cached)");
-	assert.notEqual(message.usage.input, 1_756_936, "must NOT be the run's cumulative total");
+	// The prompt legs are reported SPLIT so a caller can see what was cached.
+	// They sum to the same 78000 the folded convention produced.
+	assert.equal(message.usage.input, 40000, "first step's FRESH prompt");
+	assert.equal(message.usage.cacheRead, 38000, "first step's cached prompt, no longer hidden inside input");
+	assert.equal(message.usage.cacheWrite, 0);
+	assert.equal(message.usage.input + message.usage.cacheRead, 78000, "legs still sum to the first step's prompt");
 	assert.equal(message.usage.output, 12941);
-	// 78k of a 200k window is 39% — the honest figure. The bug reported 889%.
-	assert.ok(message.usage.input / 200_000 < 0.5, "a healthy session must not look overfull");
+
+	// `totalTokens` is the field Pi's `calculateContextTokens` actually reads, so
+	// it — not `input` — is what the compaction threshold sees. It must be
+	// identical to the pre-split value (78000 + 12941), or splitting the legs
+	// would have silently re-opened the inflation this test exists to prevent.
+	assert.equal(message.usage.totalTokens, 90941, "context size is unchanged by reporting the legs separately");
+	assert.notEqual(message.usage.totalTokens, 1_756_936, "must NOT be the run's cumulative total");
+	// 90941 of a 200k window is 45% — the honest figure. The bug reported 889%.
+	assert.ok(message.usage.totalTokens / 200_000 < 0.5, "a healthy session must not look overfull");
+});
+
+test("total_cost_usd from the result frame becomes the turn's cost", async () => {
+	// The binary reports the turn's real equivalent spend. It was parsed into a
+	// typed field and never read, so every claude-cli turn reported $0.0000 no
+	// matter what it consumed — across 591 real assistant messages on a live
+	// install, not one carried a non-zero cost.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":1000,"cache_creation_input_tokens":500}}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}',
+		'{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":42}}}',
+		'{"type":"result","subtype":"success","result":"hi","total_cost_usd":0.0731,"usage":{"input_tokens":1000,"output_tokens":42}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.usage.cost.total, 0.0731, "the binary's own figure, not a computed price");
+	assert.equal(message.usage.cacheWrite, 500, "cache-write leg is reported, not folded away");
+	assert.equal(
+		(message.usage as unknown as { costKnown?: boolean }).costKnown,
+		true,
+		"a reported cost is distinguishable from an absent one",
+	);
+});
+
+test("a turn with no reported cost is marked unknown, not free", async () => {
+	// `cost.total === 0` alone cannot tell "this turn was genuinely free" from
+	// "we have no cost signal". A renderer that cannot tell them apart shows a
+	// confident $0.0000 for a turn that may have cost real money.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":10}}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}',
+		'{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":10,"output_tokens":2}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.usage.cost.total, 0);
+	assert.equal((message.usage as unknown as { costKnown?: boolean }).costKnown, false, "absent cost is not $0");
+});
+
+test("a rate_limit_event frame reaches the plan-limit store", async () => {
+	// End-to-end through the real frame loop, not just the store in isolation:
+	// this frame type used to fall through to `// no-op`, so the one backend
+	// with no cost signal also had no quota signal.
+	resetLimitsForTest();
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","status":"allowed","resetsAt":1800000000,"isUsingOverage":false}}',
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":10}}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}',
+		'{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":10,"output_tokens":2}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	await drain(fn(MODEL, CTX, undefined) as never);
+
+	const windows = getLimits();
+	assert.equal(windows.length, 1, "the frame must not be dropped");
+	assert.equal(windows[0]?.kind, "five_hour");
+	assert.equal(windows[0]?.label, "5-hour window");
+	assert.equal(windows[0]?.status, "ok");
+	assert.equal(windows[0]?.provider, "claude-cli", "normalized onto the neutral provider-keyed shape");
+	assert.equal(windows[0]?.resetsAt, 1_800_000_000_000, "seconds converted to ms");
+	resetLimitsForTest();
+});
+
+test("stop_reason max_tokens maps to length so the continuation loop can fire", async () => {
+	// `stopReason` was initialized to "stop" and never reassigned, so a response
+	// truncated at the output cap was reported as a clean finish. The agent
+	// loop's auto-continuation is gated on "length", so it was dead for this
+	// backend only — the same prompt on `anthropic` or `ollama` auto-continued.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":10}}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"cut off mid-"}}}',
+		'{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}}',
+		'{"type":"result","subtype":"success","result":"cut off mid-","usage":{"input_tokens":10,"output_tokens":4096}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.stopReason, "length", "truncation must be visible to the continuation loop");
 });
 
 test("usage.output is the streamed value, NOT the result frame's cumulative total", async () => {
@@ -293,6 +387,7 @@ test("usage.output is the streamed value, NOT the result frame's cumulative tota
 	assert.equal(message.usage.input, 40000, "first step's prompt");
 	assert.equal(message.usage.output, 300, "the streamed per-step value, not 90000");
 	assert.notEqual(message.usage.output, 90000, "the run's cumulative generation must not become our context");
+	assert.equal(message.usage.totalTokens, 40300, "context size is the first step's prompt plus streamed output");
 });
 
 test("text_start and text_end agree on contentIndex even when thinking arrives later", async () => {
@@ -482,4 +577,100 @@ test("tool-plane: an UNSTAMPED distiller prompt still falls back to the text sni
 	const ctx = { systemPrompt: 'Distill. Return STRICT JSON only: {"facts":[]}', messages: [] };
 	await drain(fn(MODEL, ctx as never, undefined) as never);
 	assert.ok(!captured.args?.includes("--mcp-config"));
+});
+
+/* ─────────────────────────── reasoning flags ─────────────────────────── */
+
+test("the operator's thinking level reaches the binary as --effort", async () => {
+	// It did not before: BuildArgsInput had no thinking field, so `/thinking` was
+	// decorative on 100% of claude-cli traffic while the catalog advertised
+	// `reasoning: true` for every Opus/Sonnet/Fable entry.
+	const captured: { args?: string[] } = {};
+	const fn = createClaudeCliStreamFn({
+		spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }),
+	});
+	await drain(fn(MODEL, CTX, { reasoning: "high" } as never) as never);
+
+	const args = captured.args ?? [];
+	const i = args.indexOf("--effort");
+	assert.ok(i >= 0, "--effort must be sent");
+	assert.equal(args[i + 1], "high");
+});
+
+test("requesting thinking also asks the binary to stop redacting it", async () => {
+	// `showThinkingSummaries` defaults to false in the binary, and while false the
+	// CLI asks the API to redact reasoning. That default is why a real 591-message
+	// transcript history contained ZERO thinking blocks — the reasoning never
+	// arrived, so no renderer could have shown it.
+	const captured: { args?: string[] } = {};
+	const fn = createClaudeCliStreamFn({
+		spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }),
+	});
+	await drain(fn(MODEL, CTX, { reasoning: "medium" } as never) as never);
+
+	const args = captured.args ?? [];
+	const i = args.indexOf("--settings");
+	assert.ok(i >= 0, "--settings must be sent");
+	assert.deepEqual(JSON.parse(args[i + 1] as string), { showThinkingSummaries: true });
+});
+
+test("thinking OFF sends neither reasoning flag", async () => {
+	// Silence means the binary keeps its own behaviour. Inventing a lowest effort
+	// would spend tokens the operator declined.
+	const captured: { args?: string[] } = {};
+	const fn = createClaudeCliStreamFn({
+		spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }),
+	});
+	await drain(fn(MODEL, CTX, { reasoning: "off" } as never) as never);
+
+	const args = captured.args ?? [];
+	assert.equal(args.includes("--effort"), false);
+	assert.equal(args.includes("--settings"), false);
+});
+
+test("a turn with no reasoning option is unchanged", async () => {
+	const captured: { args?: string[] } = {};
+	const fn = createClaudeCliStreamFn({
+		spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }),
+	});
+	await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal((captured.args ?? []).includes("--effort"), false);
+});
+
+test("Pi's thinking vocabulary maps onto the binary's effort vocabulary", () => {
+	// The two differ at both ends: Pi's `minimal` floors to the CLI's `low`, and
+	// the CLI's `max` has no Pi equivalent.
+	assert.equal(resolveClaudeCliEffort("minimal"), "low");
+	assert.equal(resolveClaudeCliEffort("low"), "low");
+	assert.equal(resolveClaudeCliEffort("medium"), "medium");
+	assert.equal(resolveClaudeCliEffort("high"), "high");
+	assert.equal(resolveClaudeCliEffort("xhigh"), "xhigh");
+	assert.equal(resolveClaudeCliEffort("off"), undefined);
+	assert.equal(resolveClaudeCliEffort(undefined), undefined);
+	assert.equal(resolveClaudeCliEffort("nonsense"), undefined, "an unknown level is not guessed at");
+});
+
+test("reasoning tokens are read from the relayed API frames when present", async () => {
+	// Pi folds reasoning into `output` and exposes no breakdown, and `--betas` is
+	// API-key-only so the CLI's own thinking-token beta is unreachable on a
+	// subscription. But these frames are the RAW Anthropic events the binary
+	// relays, so the field arrives whenever the API sends it.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":100}}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}',
+		'{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":900,"output_tokens_details":{"thinking_tokens":740}}}}',
+		'{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":100,"output_tokens":900}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal((message.usage as { reasoningTokens?: number }).reasoningTokens, 740);
+	assert.equal(message.usage.output, 900, "output still carries the full generation");
+});
+
+test("a turn with no reasoning breakdown reports absent, not zero", async () => {
+	// `0 reasoning tokens` would assert a measurement we do not have.
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal((message.usage as { reasoningTokens?: number }).reasoningTokens, undefined);
 });

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
-import { validateOutboundMediaPath } from "./media-path-guard.js";
+import { rootSpellings, validateOutboundMediaPath } from "./media-path-guard.js";
 
 describe("validateOutboundMediaPath", () => {
 	let dir: string;
@@ -101,5 +101,57 @@ describe("validateOutboundMediaPath", () => {
 
 	it("rejects an empty path", () => {
 		assert.equal(validateOutboundMediaPath("").ok, false);
+	});
+});
+
+/* ─────────────────────── allowed-root spelling ─────────────────────── */
+
+describe("rootSpellings", () => {
+
+
+	it("rootSpellings returns the realpathed spelling of a symlinked root", () => {
+		// The bug this pins: allowed roots were built with `path.resolve` only, while
+		// containment compared a `fs.realpathSync`'d candidate. On macOS
+		// `os.tmpdir()` is `/var/folders/…` symlinked to `/private/var/folders/…`,
+		// so a realpathed candidate under the temp dir was compared against the
+		// `/var/…` spelling and never matched — refusing every document-tool write
+		// into a temp dir with "outside the allowed roots". 40 tests failed on every
+		// macOS checkout while Linux CI stayed green, because `/tmp` is not a symlink
+		// there.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-rootspelling-"));
+		try {
+			const spellings = rootSpellings(dir);
+			const real = fs.realpathSync(dir);
+			assert.ok(spellings.includes(path.resolve(dir)), "keeps the resolved spelling");
+			assert.ok(spellings.includes(real), "adds the realpathed spelling");
+			// A candidate realpathed the way the guards do must land inside a root.
+			assert.ok(
+				spellings.some((root) => {
+					const rel = path.relative(root, path.join(real, "out.docx"));
+					return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+				}),
+				"a realpathed candidate is contained by one of the spellings",
+			);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rootSpellings deduplicates when a root is not symlinked", () => {
+		const spellings = rootSpellings(process.cwd());
+		assert.equal(new Set(spellings).size, spellings.length, "no duplicate spellings");
+		assert.ok(spellings.length >= 1);
+	});
+
+	it("rootSpellings tolerates a root that does not exist yet", () => {
+		// State subtrees are created on first use; a missing root must still yield
+		// its resolved spelling rather than dropping out of the allow-list.
+		const missing = path.join(os.tmpdir(), "brigade-does-not-exist-", String(Date.now()));
+		const spellings = rootSpellings(missing);
+		assert.deepEqual(spellings, [path.resolve(missing)]);
+	});
+
+	it("rootSpellings ignores an empty path", () => {
+		assert.deepEqual(rootSpellings(""), []);
 	});
 });

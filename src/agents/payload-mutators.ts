@@ -21,10 +21,12 @@
 // attribution-header injection.
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { PI_TOOL_CALL, PI_TOOL_RESULT, WIRE_TOOL_RESULT } from "./pi-dialect.js";
 import type { Api, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { sanitizeMessages } from "./sanitize-surrogates.js";
+import { smartCompactToolResults } from "./smart-compaction.js";
 import { sanitizeToolUseResultPairing } from "../sessions/transcript-repair.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -50,7 +52,7 @@ export function pruneProcessedHistoryImages<M extends AgentMessage>(messages: M[
     if (i >= pruneBeforeIndex) return m;
     if (!m) return m;
     const role = (m as { role?: string }).role;
-    if (role !== "user" && role !== "toolResult") return m;
+    if (role !== "user" && role !== PI_TOOL_RESULT) return m;
     const content = (m as { content?: unknown }).content;
     if (!Array.isArray(content)) return m;
     let blockMutated = false;
@@ -221,6 +223,30 @@ export function scrubRefusalSentinelInTranscript<M extends AgentMessage>(message
 // on any unexpected failure rather than letting the turn explode.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Share of the window at which tool-result shrinking engages. Below this the
+ *  chain is a pass-through so the prompt prefix stays byte-stable for caching. */
+const TOOL_RESULT_TRIGGER_RATIO = 0.7;
+/** Same chars-per-token convention the compaction trigger uses, so the two
+ *  agree about when the transcript is "large". */
+const APPROX_CHARS_PER_TOKEN = 4;
+
+/** Rough token estimate over a message array. Cheap, deterministic, no I/O. */
+function estimateMessagesTokens(messages: AgentMessage[]): number {
+  let chars = 0;
+  for (const m of messages) {
+    const content = (m as { content?: unknown })?.content;
+    if (typeof content === "string") chars += content.length;
+    else if (Array.isArray(content)) {
+      for (const block of content) {
+        const b = block as { text?: unknown; thinking?: unknown };
+        if (typeof b?.text === "string") chars += b.text.length;
+        if (typeof b?.thinking === "string") chars += b.thinking.length;
+      }
+    }
+  }
+  return Math.ceil(chars / APPROX_CHARS_PER_TOKEN);
+}
+
 export interface BrigadeTransformContextOptions {
   // True when the active model is on Anthropic; controls whether the
   // cache_control sweep runs. Defaults to true because the sweep is a
@@ -236,6 +262,47 @@ export interface BrigadeTransformContextOptions {
   // so non-matching providers stay untouched. When undefined the quirks
   // run defensively (strip-everything mode) — safe but more aggressive.
   activeModel?: Model<any>;
+  /**
+   * Shrink oversized TOOL RESULTS once the transcript approaches the context
+   * window. Off unless a context window is supplied.
+   *
+   * This is the cheapest compaction there is. A coding transcript is dominated
+   * by tool output — file reads, command logs, search results — not by prose,
+   * and truncating an old 40 KB `read` costs nothing semantically while
+   * reclaiming more context than summarizing the entire conversation would.
+   * `smartCompactToolResults` (two-pass, keeps the tail of anything that looks
+   * like an error so stack traces survive) has existed and been unwired.
+   *
+   * GATED ON THRESHOLD, deliberately. Running it on every request would
+   * re-shrink older results as newer ones consume the aggregate budget, so the
+   * prompt prefix would differ turn to turn and invalidate prompt caching — on
+   * Anthropic that trades a 10%-of-input cache read for a 125% cache write,
+   * every turn. Below the threshold this is a pass-through and the prefix is
+   * byte-stable; above it, we were about to pay for a summarization anyway and
+   * the cache is lost regardless.
+   */
+  toolResultContextWindow?: number;
+  /** Fraction of the window at which tool-result shrinking engages. */
+  toolResultTriggerRatio?: number;
+  /**
+   * MID-TURN COMPACTION — pause, compact, continue.
+   *
+   * Built by `createMidTurnCompactor` and supplied by the caller, which owns
+   * the model/auth plumbing the summarization needs. Absent by default: a turn
+   * with no compactor behaves exactly as it did before.
+   *
+   * Runs AFTER the tool-result shrink, deliberately. Truncating an old 40 KB
+   * `read` is free and often enough on its own; a summarization costs a model
+   * call and several seconds. Cheapest reduction first, and the summarizer
+   * only sees history the free pass could not fix.
+   *
+   * It never throws and never returns fewer messages than it was given on any
+   * failure path, so the worst case is the behaviour without it.
+   */
+  midTurnCompactor?: (
+    messages: AgentMessage[],
+    signal?: AbortSignal,
+  ) => Promise<AgentMessage[]>;
 }
 
 export interface BrigadeTransformContextHooks {
@@ -255,7 +322,10 @@ export function buildBrigadeTransformContext(
 ): (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]> {
   const applyAnthropicSweep = options.applyAnthropicSweep ?? true;
   const pruneOldImages = options.pruneOldImages ?? true;
-  return async (messages: AgentMessage[]): Promise<AgentMessage[]> => {
+  // The signal is Pi's per-request AbortSignal. It was declared in the return
+  // type and then dropped on the floor; mid-turn compaction is the first pass
+  // that can BLOCK, so it is the first one that has to honour a Ctrl+C.
+  return async (messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> => {
     let working = messages;
     try {
       working = scrubRefusalSentinelInTranscript(working);
@@ -305,6 +375,40 @@ export function buildBrigadeTransformContext(
     //   - downgradeOpenAIResponsesReasoningPairs: drop thinking from any
     //     assistant message that ALSO carries a toolCall, when active model
     //     uses OpenAI's Responses API.
+    // Tool-result shrink, BEFORE the provider quirks so their passes see the
+    // already-reduced payload. Engages only near the window (see the option's
+    // comment on prompt-cache stability).
+    const trWindow = options.toolResultContextWindow;
+    if (typeof trWindow === "number" && Number.isFinite(trWindow) && trWindow > 0) {
+      try {
+        const ratio = options.toolResultTriggerRatio ?? TOOL_RESULT_TRIGGER_RATIO;
+        const approxTokens = estimateMessagesTokens(working);
+        if (approxTokens >= trWindow * ratio) {
+          const shrunk = smartCompactToolResults(working, { contextWindowTokens: trWindow });
+          if (shrunk.stats.totalSavedChars > 0) working = shrunk.messages;
+        }
+      } catch {
+        // safe fallback per Pi contract
+      }
+    }
+    // MID-TURN COMPACTION. The free reduction above has already run; if the
+    // transcript is STILL over the trigger, summarize the older prefix and
+    // continue the turn rather than sending a request we know will be rejected.
+    //
+    // This is the only pass here that can block, and it blocks at most once per
+    // turn — the compactor caches its result and reuses it for the rest of the
+    // tool loop. Wrapped like every other pass: on any failure `working` is
+    // untouched and the turn proceeds exactly as it would have.
+    if (options.midTurnCompactor) {
+      try {
+        const reduced = await options.midTurnCompactor(working, signal);
+        if (Array.isArray(reduced) && reduced.length > 0) working = reduced;
+      } catch {
+        // safe fallback per Pi contract — the compactor is not supposed to
+        // throw, but a transform that takes down the turn is the one outcome
+        // worse than not compacting.
+      }
+    }
     try {
       working = dropAnthropicThinkingBlocks(working, options.activeModel);
     } catch {
@@ -414,16 +518,50 @@ export function dropAnthropicThinkingBlocks(
   // Only preserve the latest assistant's thinking when the active model is
   // Anthropic-flavored (cache continuity matters). For any other model
   // — including no model at all — strip every thinking block.
-  const preserveLatestIdx = isAnthropicLikeModel(activeModel)
-    ? findLastAssistantIndex(messages)
-    : -1;
+  const anthropicLike = isAnthropicLikeModel(activeModel);
+  const preserveLatestIdx = anthropicLike ? findLastAssistantIndex(messages) : -1;
 
   let touched = false;
   const out = messages.map((msg, i) => {
     const m = msg as any;
     if (m?.role !== "assistant" || !Array.isArray(m.content)) return msg;
     if (i === preserveLatestIdx) return msg; // preserve the last one for Anthropic cache
-    const filtered = m.content.filter((b: any) => b?.type !== "thinking");
+    // KEEP SIGNED THINKING FOR THE SAME PROVIDER, wherever it sits.
+    //
+    // Anthropic's interleaved-thinking beta is ON by default in Pi
+    // (`anthropic.js:326`, `options?.interleavedThinking ?? true`) and requires
+    // thinking blocks to be passed back across every step of a tool loop. Pi's
+    // own converter honours that — it keeps any block carrying a
+    // `thinkingSignature` for the same model, "needed for replay"
+    // (`transform-messages.js:75-78`) — and a `redacted` block stores its
+    // opaque payload in the same field for multi-turn continuity.
+    //
+    // Stripping everything but the LAST assistant therefore diverged from Pi
+    // the moment this chain went live: a 3-iteration tool loop went out with
+    // the first two turns' signed thinking removed. Unsigned blocks are still
+    // dropped — they carry no replay value and other providers reject them.
+    const filtered = m.content.filter((b: any) => {
+      if (b?.type !== "thinking") return true;
+      // A SIGNED block is kept for EVERY provider, not just Anthropic.
+      //
+      // The signature is the provider's own replay handle and Pi knows what to
+      // do with each: OpenAI Responses parses it back into the `{type:
+      // "reasoning", encrypted_content}` item the API requires alongside a
+      // `function_call`; openai-completions replays it as `reasoning_content`;
+      // cross-model, Pi converts thinking to plain text so the reasoning
+      // survives as prose. Pi's `transformMessages` runs AFTER this chain, so
+      // stripping here destroys information it was about to use correctly.
+      //
+      // This pass previously dropped every thinking block on every
+      // non-Anthropic provider. That was harmless only because the chain never
+      // executed; making it live turned it into a real regression — on the
+      // Responses API a `function_call` whose paired reasoning item is missing
+      // is the "provided without its required following item" class of 400.
+      //
+      // Unsigned blocks are still dropped: they carry no replay value, and a
+      // provider that does not understand `{type:"thinking"}` rejects them.
+      return typeof b.thinkingSignature === "string" && b.thinkingSignature !== "";
+    });
     if (filtered.length === m.content.length) return msg; // nothing changed
     touched = true;
     // Anthropic rejects an assistant message with EMPTY content too.
@@ -495,7 +633,7 @@ export function sanitizeMistralToolCallIds(messages: AgentMessage[]): AgentMessa
     const m = msg as any;
 
     // toolResult messages carry the id at the message level.
-    if (m?.role === "toolResult" && typeof m.toolCallId === "string" && !valid.test(m.toolCallId)) {
+    if (m?.role === PI_TOOL_RESULT && typeof m.toolCallId === "string" && !valid.test(m.toolCallId)) {
       touched = true;
       return { ...m, toolCallId: mapId(m.toolCallId) };
     }
@@ -504,7 +642,7 @@ export function sanitizeMistralToolCallIds(messages: AgentMessage[]): AgentMessa
     if (m?.role === "assistant" && Array.isArray(m.content)) {
       let blockTouched = false;
       const newContent = m.content.map((block: any) => {
-        if (block?.type === "toolCall" && typeof block.id === "string" && !valid.test(block.id)) {
+        if (block?.type === PI_TOOL_CALL && typeof block.id === "string" && !valid.test(block.id)) {
           blockTouched = true;
           return { ...block, id: mapId(block.id) };
         }
@@ -552,7 +690,7 @@ export function downgradeOpenAIResponsesReasoningPairs(messages: AgentMessage[])
     const m = msg as any;
     if (m?.role !== "assistant" || !Array.isArray(m.content)) return msg;
     const hasThinking = m.content.some((b: any) => b?.type === "thinking");
-    const hasToolCall = m.content.some((b: any) => b?.type === "toolCall");
+    const hasToolCall = m.content.some((b: any) => b?.type === PI_TOOL_CALL);
     if (!hasThinking || !hasToolCall) return msg;
     touched = true;
     const filtered = m.content.filter((b: any) => b?.type !== "thinking");
@@ -803,7 +941,7 @@ function applyCacheToLastUserMessage(payload: any, cacheMarker: { type: "ephemer
         typeof block === "object" &&
         (block.type === "text" ||
           block.type === "image" ||
-          block.type === "tool_result") &&
+          block.type === WIRE_TOOL_RESULT) &&
         block.cache_control !== undefined
       ) {
         delete block.cache_control;
@@ -821,7 +959,7 @@ function applyCacheToLastUserMessage(payload: any, cacheMarker: { type: "ephemer
       typeof lastBlock === "object" &&
       (lastBlock.type === "text" ||
         lastBlock.type === "image" ||
-        lastBlock.type === "tool_result")
+        lastBlock.type === WIRE_TOOL_RESULT)
     ) {
       if (lastBlock.cache_control === undefined) {
         lastBlock.cache_control = cacheMarker;
@@ -1076,3 +1214,91 @@ type StreamFn = (
     headers?: Record<string, string>;
   } & Record<string, unknown>,
 ) => unknown;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INSTALLING the transform chain onto Pi's Agent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Wire Brigade's `transformContext` chain into a live Pi session.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY THIS EXISTS
+ * ─────────────────────────────────────────────────────────────────────────
+ * Brigade used to pass `transformContext` to `createAgentSession(...)`.
+ * `createAgentSession` does not accept it. It reads exactly sixteen options —
+ * `cwd, agentDir, authStorage, modelRegistry, settingsManager, sessionManager,
+ * model, thinkingLevel, tools, noTools, excludeTools, scopedModels,
+ * customTools, resourceLoader, sessionStartEvent, settingsManager` — and
+ * installs a `transformContext` of its OWN that forwards to the extension
+ * runner (`pi-coding-agent/dist/core/sdk.js:219-224`). The property Brigade
+ * passed was silently dropped, and an `as never` cast on the options object
+ * meant the compiler never said so.
+ *
+ * The whole chain was therefore dead in production: the tool-result shrink, the
+ * surrogate sanitizer, the transcript pairing repair, the Anthropic
+ * thinking-strip, the Mistral tool-id rewrite, the cache-control sweep and
+ * mid-turn compaction. Every one of them had passing unit tests, because the
+ * tests called `buildBrigadeTransformContext` directly and asserted that the
+ * function does what it says — never that Pi calls it.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY ASSIGNING AFTER CONSTRUCTION IS SOUND
+ * ─────────────────────────────────────────────────────────────────────────
+ * `Agent.transformContext` is a public, mutable field (`pi-agent-core`
+ * `agent.d.ts:36`), and `createLoopConfig()` re-reads `this.transformContext`
+ * on EVERY run (`agent.js:294`, called from `runPromptMessages` and
+ * `runContinuation`). So an assignment made once, here, applies to every
+ * subsequent prompt and every tool-loop iteration within them.
+ *
+ * COMPOSE, never replace: Pi's own transform is what runs extension `context`
+ * hooks, and overwriting it would silently disable every extension. Pi's runs
+ * FIRST so Brigade's chain sees the final message array — an extension that
+ * adds content must not be able to grow a request after we reduced it.
+ */
+export function installBrigadeTransformContext(
+  session: AgentSession,
+  transform: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>,
+): void {
+  const agent = (session as unknown as {
+    agent?: {
+      transformContext?: (
+        messages: AgentMessage[],
+        signal?: AbortSignal,
+      ) => Promise<AgentMessage[]>;
+    };
+  }).agent;
+  if (!agent) return;
+
+  const piOwn = agent.transformContext;
+  agent.transformContext = async (
+    messages: AgentMessage[],
+    signal?: AbortSignal,
+  ): Promise<AgentMessage[]> => {
+    let working = messages;
+    // Pi's extension hook first. It is not ours and may throw; a failing
+    // extension must not take down the turn, and must not skip OUR passes —
+    // the pairing repair and surrogate sanitizer are what keep malformed
+    // history from 400-ing the provider.
+    if (piOwn) {
+      try {
+        const afterExtensions = await piOwn(messages, signal);
+        if (Array.isArray(afterExtensions) && afterExtensions.length > 0) {
+          working = afterExtensions;
+        }
+      } catch {
+        /* extension failure falls back to the untransformed array */
+      }
+    }
+    try {
+      const out = await transform(working, signal);
+      // Pi does not guard this call site at all (`agent-loop.js:175-177`): a
+      // throw becomes a failed turn, and an empty array becomes a
+      // zero-message provider request and a 400. Both are ours to prevent.
+      if (Array.isArray(out) && out.length > 0) return out;
+      return working;
+    } catch {
+      return working;
+    }
+  };
+}

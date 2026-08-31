@@ -130,6 +130,20 @@ export interface SessionsListHandlerDeps {
 	 */
 	enrichRow?: (record: LiveSessionRecord) => SessionListRow;
 	/**
+	 * Per-session usage, from the gateway's ledger.
+	 *
+	 * `SessionListRow` has declared `totalTokens` and `estimatedCostUsd` since it
+	 * was written, and nothing ever set them — every row returned them
+	 * `undefined`, so a caller could not tell which thread had cost anything.
+	 * Optional: an in-process caller without a ledger simply omits it and the
+	 * fields stay absent (which is honest — absent is not zero).
+	 */
+	usageFor?: (agentId: string | undefined, sessionKey: string) => {
+		totalTokens: number;
+		costUsd: number;
+		costComplete: boolean;
+	} | undefined;
+	/**
 	 * Wave O0.5 access guard. When set, every candidate row is checked
 	 * before inclusion; refused rows are dropped (NOT an error — list is
 	 * filter-shaped). Omitted by trusted in-process callers.
@@ -215,6 +229,7 @@ export async function handleSessionsList(
 				// would show a UI the wrong model for exactly that thread.
 				...(pinOf(agentId, sessionKey) ?? {}),
 				...(sanitizeSessionName(entry.name) ? { displayName: sanitizeSessionName(entry.name) } : {}),
+				...usageFields(deps, agentId, sessionKey),
 			});
 		}
 	}
@@ -257,6 +272,32 @@ function applyFilters(rows: LiveSessionRecord[], params: SessionsListParams): Li
 	return filtered;
 }
 
+/**
+ * Usage columns for a row, or nothing.
+ *
+ * Only emits a figure that was actually measured. A session with no ledger
+ * entry, or a zero total, contributes no fields at all — rendering `$0.00` for
+ * "we never measured this" is the confusion the billing work exists to prevent.
+ */
+function usageFields(
+	deps: SessionsListHandlerDeps,
+	agentId: string | undefined,
+	sessionKey: string,
+): { totalTokens?: number; estimatedCostUsd?: number } {
+	if (!deps.usageFor) return {};
+	let u: { totalTokens: number; costUsd: number; costComplete: boolean } | undefined;
+	try {
+		u = deps.usageFor(agentId, sessionKey);
+	} catch {
+		return {};
+	}
+	if (!u) return {};
+	return {
+		...(u.totalTokens > 0 ? { totalTokens: u.totalTokens } : {}),
+		...(u.costUsd > 0 ? { estimatedCostUsd: u.costUsd } : {}),
+	};
+}
+
 function buildRow(entry: LiveSessionRecord, deps: SessionsListHandlerDeps): SessionListRow {
 	const base: SessionListRow = deps.enrichRow
 		? deps.enrichRow(entry)
@@ -266,6 +307,7 @@ function buildRow(entry: LiveSessionRecord, deps: SessionsListHandlerDeps): Sess
 				state: entry.state,
 				startedAt: entry.createdAt,
 				updatedAt: entry.lastActivityAt,
+				...usageFields(deps, entry.agentId, entry.sessionKey),
 			};
 	// Wave O0.7 - surface spawn lineage from the persisted session store
 	// so a `sessions_list` caller can see parent/depth without a separate
@@ -491,6 +533,18 @@ export interface SessionsDeleteHandlerDeps {
 	isLive?: (sessionKey: string) => boolean;
 	/** Injectable for tests; defaults to the boot runtime context's store. */
 	store?: { messages?: { deleteTranscript?: (agentId: string, sessionId: string) => Promise<unknown> } };
+	/**
+	 * Drop the gateway's in-memory per-session state for this key.
+	 *
+	 * The usage ledger and the reasoning tracker are keyed by
+	 * `(agentId, sessionKey)` and both expose a `forget`, but nothing called
+	 * either — so a deleted session's spend stayed in the ledger for the life of
+	 * the process and reappeared on the next session created under the same key.
+	 * That is the common path, not an edge case: `/new` rolls a fresh sessionId
+	 * under the SAME sessionKey, so a brand-new conversation inherited the old
+	 * one's cost total permanently.
+	 */
+	forgetSessionState?: (agentId: string, sessionKey: string) => void;
 }
 
 /**
@@ -588,6 +642,16 @@ export async function handleSessionsDelete(
 		} catch {
 			transcriptRemoved = false;
 		}
+	}
+	// The gateway's in-memory accounting for this key is now stale. Nothing
+	// called `UsageLedger.forget` / `ReasoningTracker.forget` before, so a
+	// deleted session's spend stayed in the ledger for the life of the process
+	// — and, because `/new` rolls a fresh sessionId under the SAME sessionKey,
+	// a brand-new conversation inherited the old one's cost total permanently.
+	try {
+		deps.forgetSessionState?.(agentId, sessionKey);
+	} catch {
+		/* accounting cleanup must never fail a delete that already succeeded */
 	}
 	return { ok: true, sessionKey, agentId, transcriptRemoved };
 }

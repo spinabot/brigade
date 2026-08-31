@@ -39,7 +39,9 @@ import {
 } from "../config/paths.js";
 import {
   defaultSessionKey,
+  readSessionStore,
   resolveOrCreateSession,
+  updateSessionEntry,
 } from "../sessions/session-store.js";
 import {
   awaitTranscriptFlush,
@@ -119,7 +121,10 @@ import {
 // re-resolve it live (honouring a mid-run manage_access change) with the
 // exact same derivation this build uses.
 import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
-import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
+import {
+  installBrigadeTransformContext,
+  wrapStreamFnWithPayloadMutations,
+} from "./payload-mutators.js";
 import { CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catalog.js";
 import { ensureClaudeCliApiRegistered } from "./claude-cli/register.js";
 import { stampClaudeCliToolPlane } from "./claude-cli/tool-plane.js";
@@ -144,7 +149,17 @@ import { getSubagentDepthFromSessionKey } from "./subagent-policy.js";
 import { getSpawnedKeysForSession } from "./subagent-registry.js";
 import { emitAgentEvent } from "./agent-event-bus.js";
 import { randomUUID } from "node:crypto";
-import { evaluateCompactionDecision } from "./smart-compaction.js";
+import { buildCompactionFocus } from "./compaction/summarizer-prompt.js";
+import { buildMidTurnEnvelope } from "./compaction/mid-turn-envelope.js";
+import { installBrigadeBeforeToolCall } from "./pi-hooks.js";
+import { createMidTurnCompactor } from "./compaction/mid-turn-runner.js";
+import { createCompactionSummarizer } from "./compaction/summarizer.js";
+import {
+  CompactionBreaker,
+  describeCompactionOutcome,
+  evaluateCompactionDecision,
+  summarizeCompactionOutcome,
+} from "./smart-compaction.js";
 import { resolveToolSummary } from "./tool-summaries.js";
 import {
   runWithModelFallback,
@@ -694,17 +709,172 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // filenames. Convex mode: an inMemory() manager pre-seeded from the
   // sessionTranscriptRecords table whose appends flush to Convex — the
   // factory owns that dispatch (src/sessions/session-manager-factory.ts).
+  // APPLY A PERSISTED REWIND before the turn runs.
+  //
+  // `branch()` moves Pi's leaf in memory only, and `_buildIndex()` recomputes
+  // it on load as "the last entry in the file" — so a rewind writes nothing and
+  // would silently un-do itself on the next resume. Brigade persists the leaf
+  // in its own session store (`SessionEntry.leafEntryId`) and re-applies it
+  // here, which is the whole reason rewind survives a restart.
+  //
+  // Best-effort: an entry id that no longer resolves (a transcript rewritten
+  // underneath us) must not fail the turn — falling back to the file's own leaf
+  // is the pre-rewind behaviour and is always safe.
   const sessionManager = await openSessionManagerForAgent({
     agentId,
     sessionId: resolved.sessionId,
     transcriptPath: resolved.transcriptPath,
   });
+  const persistedLeaf = readSessionStore(agentId).sessions?.[resolved.sessionKey]?.leafEntryId;
+  if (typeof persistedLeaf === "string" && persistedLeaf) {
+    try {
+      (sessionManager as unknown as { branch: (id: string) => void }).branch(persistedLeaf);
+      // CONSUME THE PIN. It is a ONE-SHOT instruction — "start this next turn
+      // from here" — not a permanent setting.
+      //
+      // Left in place it re-applied on every subsequent turn, so a session
+      // never recovered from a rewind: turn N+1 branched correctly and appended
+      // its work, then turn N+2 branched back to the same point and dropped it,
+      // for ever. The operator saw a complete transcript (`resume` reads every
+      // entry, not the active path) and a model with amnesia, with no error
+      // anywhere.
+      //
+      // Once this turn appends, the file's own last entry IS the correct leaf,
+      // which is exactly what Pi recomputes on the next open.
+      updateSessionEntry(agentId, resolved.sessionKey, { leafEntryId: undefined });
+    } catch {
+      // The entry is gone (transcript rewritten, or a stale pin from a session
+      // that was reset). Fall through to the file's own leaf — the pre-rewind
+      // behaviour, and always safe. Clear the pin so a dangling id cannot keep
+      // failing on every future turn.
+      try {
+        updateSessionEntry(agentId, resolved.sessionKey, { leafEntryId: undefined });
+      } catch {
+        /* store write failures must never fail a turn */
+      }
+    }
+  }
 
   // Anthropic models are the only family today that enforce a hard
   // cache_control breakpoint cap (Anthropic accepts ≤4). Run the sweep
   // unconditionally — it's a safe no-op for non-Anthropic providers because
   // their messages don't carry cache_control blocks. The scrubber pass
   // (refusal sentinel) always runs.
+  // MID-TURN COMPACTION — pause, compact, continue.
+  //
+  // Brigade compacts BEFORE a turn (`maybeTriggerCompaction`). A turn that
+  // fills the window mid-flight — a long tool loop reading files, a build log,
+  // a research fan-out — therefore ran until the provider rejected it, and the
+  // operator paid a failed request plus a retry for a condition that was
+  // predictable a step earlier.
+  //
+  // Built PER TURN, deliberately: the compactor caches its summary for the rest
+  // of the turn (one model call, and a byte-stable prefix across the tool
+  // loop), and a process-wide instance would carry one conversation's summary
+  // into another.
+  //
+  // Off when the model reports no context window, or when the pieces needed for
+  // a model call are missing — in both cases the turn behaves exactly as before.
+  //
+  // The hooks below need the same event envelope the Pi forwarder uses, and
+  // that envelope needs `runId`, which is minted further down. A mutable holder
+  // rather than hoisting `runId`: the hooks can only fire from inside a
+  // provider request, which is strictly after the forwarder is installed, so
+  // the holder is always populated by the time anything calls it. If it somehow
+  // is not, the optional call degrades to logging only.
+  let emitMidTurnEvent: ((piEvent: unknown) => void) | undefined;
+  const midTurnContextWindow = (model as { contextWindow?: number })?.contextWindow;
+  // The summarization's own cost, captured from the isolated session that ran
+  // it and attached to the `mid_turn_compaction_end` event below. Compaction on
+  // a full window is one of the largest single model calls Brigade makes;
+  // recording it as unpriceable degraded the operator's whole session total to
+  // `≥$X` for a call we can in fact price exactly.
+  let midTurnUsage: import("./memory/extract.js").IsolatedLlmUsage | undefined;
+  const midTurnSummarize = midTurnContextWindow
+    ? createCompactionSummarizer({
+        workspaceDir,
+        agentDir,
+        authStorage,
+        modelRegistry,
+        model,
+        onUsage: (u) => {
+          midTurnUsage = u;
+        },
+      })
+    : undefined;
+  const midTurnCompactor =
+    midTurnContextWindow && midTurnSummarize
+      ? createMidTurnCompactor({
+          contextWindowTokens: midTurnContextWindow,
+          // FORWARD EVERY ARGUMENT. A one-parameter arrow here silently dropped
+          // both the abort signal and the prior summary — so an operator's
+          // Ctrl+C never reached the summarizer, and the rolling-summary design
+          // (fold the previous summary forward instead of paraphrasing a
+          // paraphrase) was inert while its unit tests passed. Exactly the
+          // silent-unbinding failure `pi-hooks.ts` exists to prevent.
+          summarize: (transcript, signal, priorSummary) =>
+            midTurnSummarize(transcript, signal, priorSummary),
+          onStart: (info) => {
+            // The operator is mid-turn and about to wait on a full
+            // summarization. Say so — an unexplained stall reads as a hang.
+            emitMidTurnEvent?.({
+              type: "mid_turn_compaction_start",
+              messagesBefore: info.messagesBefore,
+              tokensBefore: info.tokensBefore,
+            });
+            log.info("mid-turn compaction starting", {
+              agentId,
+              sessionId: resolved.sessionId,
+              messages: info.messagesBefore,
+              estimatedTokens: info.tokensBefore,
+              contextWindow: midTurnContextWindow,
+            });
+          },
+          onEnd: (outcome) => {
+            // A cache hit is the steady state inside a tool loop — logging one
+            // per request would drown the turn.
+            if (outcome.reason === "cache-hit") return;
+            emitMidTurnEvent?.({
+              type: "mid_turn_compaction_end",
+              applied: outcome.applied,
+              reason: outcome.reason,
+              tokensBefore: outcome.tokensBefore,
+              tokensAfter: outcome.tokensAfter,
+              freedTokens: outcome.freedTokens,
+              messagesBefore: outcome.messagesBefore,
+              messagesAfter: outcome.messagesAfter,
+              ...(outcome.durationMs === undefined ? {} : { durationMs: outcome.durationMs }),
+              ...(outcome.errorMessage === undefined
+                ? {}
+                : { errorMessage: outcome.errorMessage }),
+              // Only when a summarization actually ran this attempt. A cache hit
+              // or a declined compaction spent nothing, and attaching a stale
+              // figure would double-bill the one call that did happen.
+              ...(midTurnUsage ? { usage: midTurnUsage } : {}),
+            });
+            midTurnUsage = undefined;
+            if (outcome.applied) {
+              log.info("mid-turn compaction applied", {
+                agentId,
+                sessionId: resolved.sessionId,
+                freedTokens: outcome.freedTokens,
+                messagesBefore: outcome.messagesBefore,
+                messagesAfter: outcome.messagesAfter,
+                durationMs: outcome.durationMs,
+              });
+            } else {
+              log.warn("mid-turn compaction did not apply", {
+                agentId,
+                sessionId: resolved.sessionId,
+                reason: outcome.reason,
+                ...(outcome.errorMessage ? { error: outcome.errorMessage } : {}),
+                hint: "the request proceeds unreduced; the tool-result shrink has already run",
+              });
+            }
+          },
+        })
+      : undefined;
+
   const transformContext = buildBrigadeTransformContext(
     {
       applyAnthropicSweep:
@@ -716,6 +886,18 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       // quirks run in strip-everything defensive mode (safe for the wrap
       // chain but more aggressive).
       ...(model ? { activeModel: model as never } : {}),
+      // Shrink oversized tool results once the transcript nears the window.
+      // A coding transcript is mostly tool OUTPUT, not prose, so truncating an
+      // old 40 KB `read` reclaims more context than summarizing the whole
+      // conversation — at zero model cost and with the error tail preserved.
+      // Gated near the threshold so the prompt prefix stays cache-stable in
+      // the common case; see the option's comment.
+      ...((model as { contextWindow?: number })?.contextWindow
+        ? { toolResultContextWindow: (model as { contextWindow?: number }).contextWindow }
+        : {}),
+      // Runs after the tool-result shrink: the free reduction first, a paid
+      // summarization only if the transcript is still over the trigger.
+      ...(midTurnCompactor ? { midTurnCompactor } : {}),
     },
     {
       onTranscriptRepaired: (info) => {
@@ -1124,7 +1306,14 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     customTools: brigadeCustomTools,
     sessionManager,
     resourceLoader: brigadeResourceLoader,
-    transformContext,
+    // NOTE: `transformContext` is NOT passed here. `createAgentSession` does
+    // not accept it — it reads a fixed option list and installs a
+    // `transformContext` of its own for the extension runner
+    // (pi-coding-agent/dist/core/sdk.js:219-224). Passing it looked correct,
+    // compiled clean because of the `as never` cast below, and was silently
+    // discarded, leaving the entire Brigade transform chain dead in
+    // production. It is installed on the Agent after construction instead —
+    // see `installBrigadeTransformContext`.
   } as never);
 
   if (!session) {
@@ -1138,6 +1327,20 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // existing auth-aware streamFn so credentials still flow; never replaces
   // it. Safe to call once per session — guards on the original being a fn.
   wrapStreamFnWithPayloadMutations(session);
+
+  // Install the MESSAGE-level transform chain, for the same reason the streamFn
+  // wrap exists directly above: the option Brigade used to pass to
+  // `createAgentSession` was never read, so this had to be attached to the live
+  // Agent instead. `Agent.transformContext` is a public mutable field that
+  // `createLoopConfig()` re-reads on every run, so one assignment here covers
+  // every prompt and every tool-loop iteration inside them.
+  //
+  // Until this landed the whole chain was inert: the transcript pairing repair,
+  // the surrogate sanitizer, the Anthropic cache-control sweep and
+  // thinking-strip, the Mistral tool-id rewrite, the tool-result shrink and
+  // mid-turn compaction. All of them had green unit tests, because those tests
+  // called the chain directly and never asserted that Pi calls it.
+  installBrigadeTransformContext(session, transformContext);
 
   // Install the composed beforeToolCall guard. Three layers run in order:
   //
@@ -1195,7 +1398,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       gateCtxRef,
       displayCwd: cwd,
     });
-    sessionWithBeforeHook.agent.beforeToolCall = brigadeGuard;
+    // COMPOSE, never assign. A bare assignment here silently unbound Pi's
+    // extension `tool_call` bridge (`agent-session.js:185-206`) — the same
+    // shape of defect that left the whole transformContext chain dead. See
+    // `pi-hooks.ts` for why the guard runs FIRST here and Pi runs first there.
+    installBrigadeBeforeToolCall(sessionWithBeforeHook as never, brigadeGuard);
   }
 
   // Compose stream-fn wrappers around Pi's auth-aware streamFn. Order
@@ -1669,6 +1876,14 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
             runId,
             agentId,
             sessionId: resolved.sessionId,
+            // `spawnedBy` is the immediate parent's session key (see
+            // SubagentSessionMetadata). Carrying it lets the gateway deliver
+            // child frames to whoever is watching the parent thread instead of
+            // falling back to the agent-wide rule, which leaked every other
+            // session of that agent into the operator's view.
+            ...(args.subagentMetadata?.spawnedBy
+              ? { parentSessionKey: args.subagentMetadata.spawnedBy }
+              : {}),
             piEvent,
             // Primitive #6: tag sub-agent depth so the gateway can indent
             // child events in the connect-mode TUI without re-deriving from
@@ -1677,6 +1892,33 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
           }),
         )
       : () => {};
+  // Mid-turn compaction rides the SAME envelope as Pi's own events — same
+  // runId, same session, same parent/depth routing — so the gateway's
+  // subscription filter delivers it to exactly the watchers that would see the
+  // turn it belongs to, and a sub-agent's compaction never surfaces in the
+  // parent's view as if it were the parent's.
+  emitMidTurnEvent = (piEvent: unknown): void => {
+    try {
+      emitAgentEvent(
+        buildMidTurnEnvelope({
+          runId,
+          agentId,
+          // The ROUTING key, never `resolved.sessionId` (a randomUUID). See
+          // `mid-turn-envelope.ts` for what a UUID here silently deleted.
+          sessionKey: resolved.sessionKey,
+          ...(args.subagentMetadata?.spawnedBy
+            ? { parentSessionKey: args.subagentMetadata.spawnedBy }
+            : {}),
+          ...(callerSubagentDepth > 0 ? { subagentDepth: callerSubagentDepth } : {}),
+          piEvent,
+        }) as never,
+      );
+    } catch {
+      // Telemetry must never take down a turn. The log lines beside each call
+      // site still record what happened.
+    }
+  };
+
   // Idempotent detach. Called in two places: the success path emits
   // turn-settled then detaches; the error path's finally block detaches
   // unconditionally. Both routes converge here without double-detaching.
@@ -1775,6 +2017,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     model: { contextWindow: effectiveContextWindow },
     agentId,
     sessionId: resolved.sessionId,
+    sessionKey: resolved.sessionKey,
     // The pinned persona prompt — empty string when the workspace is empty
     // (the assembler returns "" and applyPersonaOverrideToSession is skipped),
     // which contributes 0 to the estimate.
@@ -2096,6 +2339,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       ? joinAssistantTextFrom(session as AgentSession, messageCountBeforeTurn)
       : extractLastAssistantText(session as AgentSession);
 
+  // The turn produced a real assistant reply — we are past
+  // `assertNoProviderErrorStop`, so this is not an error masquerading as a
+  // result. That reply is what refreshes the context figure the compaction
+  // trigger reasons about, so the compact-loop guard resets here and ONLY
+  // here. A compaction "succeeding" is not progress; a reply is.
+  compactionBreaker.noteReply(resolved.sessionId);
+
   // Reconcile whatever the harness recorded out-of-band into the in-memory
   // context. AFTER `reply` so the synthetic messages (which carry no text) cannot
   // affect what the operator sees, and after streaming has stopped — mutating
@@ -2414,11 +2664,26 @@ function buildAuthStorage(
     storage = Storage.inMemory(credentials);
   } else if (typeof Storage.fromStorage === "function") {
     // Fallback path for Pi minors that removed inMemory.
+    //
+    // BOTH halves of `AuthStorageBackend` are required, not just `withLock`
+    // (pi-coding-agent `auth-storage.d.ts:28-31`). The async half is what the
+    // OAuth refresh path calls (`auth-storage.js:348`), so a backend carrying
+    // only the sync one would throw "withLockAsync is not a function" the first
+    // time a token needed refreshing — i.e. precisely when this fallback is
+    // load-bearing. The object is untyped here, so nothing but this comment and
+    // the code below enforces the contract.
+    const snapshot = () => JSON.stringify(credentials, null, 2);
     storage = Storage.fromStorage({
       withLock<T>(
         update: (current: string) => { result: T; next?: string },
       ): T {
-        const { result } = update(JSON.stringify(credentials, null, 2));
+        const { result } = update(snapshot());
+        return result;
+      },
+      async withLockAsync<T>(
+        update: (current: string) => Promise<{ result: T; next?: string }>,
+      ): Promise<T> {
+        const { result } = await update(snapshot());
         return result;
       },
     });
@@ -2993,11 +3258,27 @@ export async function runResilientTurn(args: RunResilientTurnArgs): Promise<RunS
 
 const APPROX_CHARS_PER_TOKEN = 4;
 
+/**
+ * Guards against the compaction loop: a turn that keeps failing re-enters
+ * `maybeTriggerCompaction` on every attempt, and the context figure it reasons
+ * about only refreshes on a SUCCESSFUL reply — so a provider outage produced an
+ * unbounded compact/fail/compact cycle, each iteration a paid summarization
+ * call. Process-wide because the loop is per session, not per turn.
+ */
+const compactionBreaker = new CompactionBreaker();
+
+/** A successful assistant reply refreshes the context figure — reset the guard. */
+export function noteCompactionProgress(sessionId: string): void {
+  compactionBreaker.noteReply(sessionId);
+}
+
 async function maybeTriggerCompaction(args: {
   session: AgentSession;
   model: { contextWindow?: number } | unknown;
   agentId: string;
   sessionId: string;
+  /** Routing key of this session, for attributing sweep spend. */
+  sessionKey?: string;
   /** Turn's memory origin — when set, the about-to-be-compacted history is distilled
    *  first (pre-compaction extraction). Undefined for an unidentified peer → skip. */
   origin?: MemoryRecordOrigin;
@@ -3010,6 +3291,19 @@ async function maybeTriggerCompaction(args: {
    *  check), folded in so the estimate reflects the true pre-prompt fill. */
   incomingMessage?: string;
 }): Promise<void> {
+  // WHY THIS TRIGGER MUST NOT USE PROVIDER-REPORTED USAGE.
+  //
+  // Mid-turn compaction reduces what is SENT without touching the transcript,
+  // so the provider's reported input count drops while `session.messages` keeps
+  // growing. Pi's own `_checkCompaction` reads that reported figure
+  // (agent-session.js:1478) and therefore goes quiet once mid-turn compaction
+  // is doing its job — Brigade's ladder depends on this trigger covering it.
+  //
+  // `estimateUsageTokens` counts the real message array, so it stays honest
+  // about the transcript regardless of what the provider was sent. That gives
+  // three tiers: mid-turn reduces a request in flight, this compacts the
+  // transcript for real between turns, and Pi's overflow recovery is the
+  // backstop when a request is rejected anyway.
   const contextWindow = (args.model as { contextWindow?: number })?.contextWindow;
   if (!contextWindow || !Number.isFinite(contextWindow) || contextWindow <= 0) {
     // No context window metadata — skip; Pi's auto-compaction is the
@@ -3041,6 +3335,21 @@ async function maybeTriggerCompaction(args: {
     });
     return;
   }
+  // Refuse to compact again if we have already compacted this session without
+  // a successful reply in between. Compaction cannot fix a connection error,
+  // and repeating it burns a summarization call per attempt.
+  if (!compactionBreaker.allow(args.sessionId)) {
+    log.warn("compaction suppressed — no successful reply since the last one", {
+      agentId: args.agentId,
+      sessionId: args.sessionId,
+      consecutive: compactionBreaker.count(args.sessionId),
+      estimatedTokens,
+      contextWindow,
+      hint: "the context figure only refreshes on a successful reply; a failing provider would otherwise loop here",
+    });
+    return;
+  }
+  compactionBreaker.noteCompaction(args.sessionId);
   log.info("triggering pre-emptive compaction", {
     agentId: args.agentId,
     sessionId: args.sessionId,
@@ -3067,15 +3376,66 @@ async function maybeTriggerCompaction(args: {
       runPreCompactionExtraction({
         agentId: args.agentId,
         sessionId: args.sessionId,
+        // The routing key, so the sweep's spend can be billed to the thread that
+        // caused it rather than to an unparseable UUID.
+        ...(args.sessionKey ? { sessionKey: args.sessionKey } : {}),
         messages: [...args.session.messages],
         origin: args.origin,
       });
     }
-    await compactor.call(args.session);
-    log.info("pre-emptive compaction completed", {
-      agentId: args.agentId,
-      sessionId: args.sessionId,
+    const messagesBefore = args.session.messages.length;
+    // Pass Brigade's focus text. Pi appends it to its own prompt AFTER the
+    // conversation, so it is the last instruction the model reads — the right
+    // place for an injection defence — and it adds the schema Pi's prose prompt
+    // lacks. Appending rather than replacing keeps Pi's rolling-summary handling
+    // intact across SDK bumps.
+    await compactor.call(args.session, buildCompactionFocus());
+    // MEASURE what it actually achieved. Pi's `CompactionResult` reports
+    // `tokensBefore` but no usage and no after-figure, and the context number
+    // the operator sees does not refresh until the next SUCCESSFUL reply — so
+    // without measuring here, "compacted" is an unfalsifiable claim. That is
+    // precisely how a compaction that reclaimed nothing kept reporting success
+    // while the loop ran.
+    // COMPARE LIKE WITH LIKE. `estimatedTokens` folds in the pinned system
+    // prompt and the about-to-be-sent user message; both are still present
+    // after compaction, so the after-figure must include them too. Leaving them
+    // out made every compaction look as though it freed exactly the size of the
+    // persona — which, with a 20 KB persona on a 90k-token session, is 5.3% and
+    // clears the 5% "made progress" bar on its own. The no-progress guard was
+    // therefore defeated precisely when the system prompt is large, which is
+    // Brigade's normal state.
+    const prePromptTokens = Math.ceil(prePromptChars / APPROX_CHARS_PER_TOKEN);
+    const outcome = summarizeCompactionOutcome({
+      tokensBefore: estimatedTokens,
+      tokensAfter: estimateUsageTokens(args.session.messages) + prePromptTokens,
+      messagesBefore,
+      messagesAfter: args.session.messages.length,
+      contextWindowTokens: contextWindow,
     });
+    if (outcome.madeProgress) {
+      log.info("pre-emptive compaction completed", {
+        agentId: args.agentId,
+        sessionId: args.sessionId,
+        outcome: describeCompactionOutcome(outcome),
+        freedTokens: outcome.freedTokens,
+        ...(outcome.wasOverWindow ? { wasOverWindow: true } : {}),
+      });
+    } else {
+      // Reclaimed nothing. Trying again cannot help, so open the guard now
+      // rather than burning another summarization call to learn the same thing.
+      compactionBreaker.trip(args.sessionId);
+      log.warn("compaction reclaimed nothing — suppressing further attempts", {
+        agentId: args.agentId,
+        sessionId: args.sessionId,
+        outcome: describeCompactionOutcome(outcome),
+        ...(outcome.wasOverWindow
+          ? {
+              wasOverWindow: true,
+              hint: "an estimate above the context window is stale or inflated, not a measurement",
+            }
+          : {}),
+      });
+    }
   } catch (err) {
     // Compaction failure isn't fatal — Pi's auto-compaction gets a chance
     // to run during the prompt, and worst case the request fails with a
@@ -3136,9 +3496,35 @@ function approxMessageChars(message: unknown): number {
       continue;
     }
     if (!block || typeof block !== "object") continue;
-    const b = block as { text?: unknown; content?: unknown; input?: unknown };
+    const b = block as {
+      text?: unknown;
+      content?: unknown;
+      thinking?: unknown;
+      arguments?: unknown;
+      input?: unknown;
+    };
     if (typeof b.text === "string") total += b.text.length;
     if (typeof b.content === "string") total += b.content.length;
+    // THINKING and tool-call ARGUMENTS both count.
+    //
+    // Pi's `ToolCall` spells its payload `arguments` (pi-ai `types.d.ts`);
+    // reading only `input` meant a write- or edit-heavy transcript estimated at
+    // a few tokens instead of a hundred thousand, so `evaluateCompactionDecision`
+    // never recommended and Pi's `compact()` never ran — the entire between-turn
+    // tier was dead on exactly the sessions that need it, leaving mid-turn
+    // compaction and Pi's overflow recovery to carry the whole ladder.
+    //
+    // `thinking` is likewise real payload on a reasoning model. Both figures also
+    // feed `summarizeCompactionOutcome`, so under-reading here biased
+    // `madeProgress` and therefore the no-progress breaker.
+    if (typeof b.thinking === "string") total += b.thinking.length;
+    if (b.arguments !== undefined) {
+      try {
+        total += JSON.stringify(b.arguments)?.length ?? 0;
+      } catch {
+        /* circular or unserialisable — contributes nothing */
+      }
+    }
     if (b.input !== undefined) {
       try {
         total += JSON.stringify(b.input).length;

@@ -19,7 +19,7 @@
  * Compatible with: any WebSocket client speaking this JSON shape.
  */
 
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, ToolCall as PiToolCall } from "@earendil-works/pi-ai";
 import type {
 	CronAddParamsV2,
 	CronAddResultV2,
@@ -114,6 +114,21 @@ export type RequestMethod =
 	| "abort"
 	/** Mid-turn user message — queued for the next iteration. Reply: void. */
 	| "steer"
+	/**
+	 * Promote everything queued for the running turn into IMMEDIATE steering.
+	 *
+	 * The operator queued messages while the model worked and has now decided
+	 * the model should see them without waiting for the turn to end. Reply:
+	 * `{ promoted, sessionKey }`.
+	 */
+	| "flush-queue"
+	/**
+	 * Rewind the conversation to an earlier point, or list the points available.
+	 *
+	 * CONVERSATION ONLY — files on disk are never touched. Reply:
+	 * `SessionRewindResult`.
+	 */
+	| "sessions.rewind"
 	/** Switch to a different model. Reply: void. */
 	| "set-model"
 	/** Drop a session's model pin so it follows its agent again. */
@@ -306,6 +321,8 @@ export const REQUEST_METHODS = [
 	"prompt",
 	"abort",
 	"steer",
+	"flush-queue",
+	"sessions.rewind",
 	"set-model",
 	"clear-session-model",
 	"switch-model-mid-turn",
@@ -374,6 +391,8 @@ export const PI_EVENT_TYPES = [
 	"queue_update",
 	"compaction_start",
 	"compaction_end",
+	"mid_turn_compaction_start",
+	"mid_turn_compaction_end",
 	"auto_retry_start",
 	"auto_retry_end",
 	"session_info_changed",
@@ -400,7 +419,7 @@ export type PiEvent =
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: WireMessage; toolResults?: WireMessage[] }
 	| { type: "message_start"; message: WireMessage }
-	| { type: "message_update"; message: WireMessage }
+	| { type: "message_update"; message: WireMessage; assistantMessageEvent?: PiAssistantMessageEvent }
 	| { type: "message_end"; message: WireMessage }
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args?: unknown }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args?: unknown; partialResult?: unknown }
@@ -408,11 +427,141 @@ export type PiEvent =
 	| { type: "agent_end"; messages?: WireMessage[]; willRetry?: boolean }
 	| { type: "queue_update"; steering: readonly string[]; followUp: readonly string[] }
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
-	| { type: "compaction_end"; reason?: string; aborted?: boolean; willRetry?: boolean; errorMessage?: string }
+	| {
+			type: "compaction_end";
+			reason?: string;
+			aborted?: boolean;
+			willRetry?: boolean;
+			errorMessage?: string;
+			/** Provider-side result. `tokensBefore` was already on the wire and
+			 *  undeclared, so no client could report what compaction achieved. */
+			result?: { summary?: string; tokensBefore?: number; firstKeptEntryId?: string };
+			/**
+			 * Brigade's own before/after measurement, attached by the gateway.
+			 *
+			 * Without it "✓ compacted" is an unfalsifiable claim: the context
+			 * percentage does not refresh until the next SUCCESSFUL reply, so a
+			 * compaction that reclaimed nothing looked exactly like one that
+			 * reclaimed everything. Even when the compaction's own COST cannot be
+			 * priced, what it FREED can always be measured.
+			 */
+			outcome?: {
+				tokensBefore: number;
+				tokensAfter: number;
+				freedTokens: number;
+				messagesBefore: number;
+				messagesAfter: number;
+				madeProgress: boolean;
+			};
+		}
+	/**
+	 * MID-TURN compaction — distinct from `compaction_start`/`compaction_end`,
+	 * and deliberately not folded into them.
+	 *
+	 * Pi's compaction REPLACES `session.messages`, which is how the gateway
+	 * measures its outcome (count before, count after). Mid-turn compaction
+	 * changes nothing in the session: it reduces the view sent on ONE request
+	 * and leaves the transcript whole. Reusing the same events would make the
+	 * gateway measure an unchanged session and report "reclaimed nothing" on a
+	 * compaction that in fact freed most of the window.
+	 *
+	 * So these carry their own numbers, measured where the reduction actually
+	 * happened.
+	 */
+	| { type: "mid_turn_compaction_start"; messagesBefore: number; tokensBefore: number }
+	| {
+			type: "mid_turn_compaction_end";
+			/** Did the request actually go out reduced? */
+			applied: boolean;
+			/** Why not, when it did not — surfaced so a silent no-op is impossible. */
+			reason: string;
+			tokensBefore: number;
+			tokensAfter: number;
+			freedTokens: number;
+			messagesBefore: number;
+			messagesAfter: number;
+			durationMs?: number;
+			errorMessage?: string;
+			/**
+			 * What the summarization itself cost.
+			 *
+			 * A compaction on a full window is one of the largest single model
+			 * calls a harness makes, and every surveyed harness either folds it
+			 * silently into session totals or drops it entirely. Brigade runs the
+			 * call on its own isolated session, so Pi's own accounting for that
+			 * session gives a real figure — reported here rather than recorded as
+			 * spend that could not be priced.
+			 */
+			usage?: {
+				input: number;
+				output: number;
+				cacheRead: number;
+				cacheWrite: number;
+				cost: number;
+				/** False when the provider established no price; totals render `≥$X`. */
+				costKnown: boolean;
+			};
+		}
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage?: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "session_info_changed"; name?: string }
 	| { type: "thinking_level_changed"; level: string }
+	| { type: string; [field: string]: unknown };
+
+/**
+ * The INNER streaming event carried on every `message_update`.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY THIS EXISTS
+ * ─────────────────────────────────────────────────────────────────────────
+ * `message_update.message` is the full CUMULATIVE assistant message — the whole
+ * reply so far, resent on every token. That is what makes resume idempotent
+ * (apply-by-replace can never duplicate), and it is also why a 8k-token answer
+ * costs ~125 MiB on the wire and why a renderer repaints rather than types.
+ *
+ * Alongside it, the provider emits a precise DELTA describing what actually
+ * changed. Brigade has always forwarded it — the gateway broadcasts the Pi event
+ * object verbatim — but the protocol never declared it, so no client knew it was
+ * there and every renderer fell back to the expensive snapshot path.
+ *
+ * Declaring it is purely additive: `message` keeps its meaning and stays the
+ * reconciliation path, while a client that understands `assistantMessageEvent`
+ * can append deltas instead of replacing, render reasoning as a live phase, and
+ * show a tool's arguments as the model writes them.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * THE THREE STREAMS
+ * ─────────────────────────────────────────────────────────────────────────
+ *   text_*      the visible reply.
+ *   thinking_*  the model's reasoning. NOT universally raw text — see the note
+ *               on reasoning shapes below. Providers differ enough that a UI
+ *               must not assume `delta` is always readable chain-of-thought.
+ *   toolcall_*  the tool invocation, including `toolcall_delta` carrying the
+ *               arguments AS THEY GENERATE. This is the affordance that makes a
+ *               coding agent feel live: the edit target appears while the model
+ *               is still writing the diff.
+ *
+ * `contentIndex` identifies which content block of the message the event
+ * belongs to, so interleaved reasoning and text stay separable.
+ *
+ * Mirrors pi-ai's `AssistantMessageEvent`. Keep in sync when bumping the SDK;
+ * the trailing open member keeps an unknown future variant from breaking a
+ * client.
+ */
+export type PiAssistantMessageEvent =
+	| { type: "start" }
+	| { type: "text_start"; contentIndex: number }
+	| { type: "text_delta"; contentIndex: number; delta: string }
+	| { type: "text_end"; contentIndex: number; content: string }
+	| { type: "thinking_start"; contentIndex: number }
+	| { type: "thinking_delta"; contentIndex: number; delta: string }
+	| { type: "thinking_end"; contentIndex: number; content: string }
+	| { type: "toolcall_start"; contentIndex: number }
+	/** Incremental tool-call ARGUMENTS as the model writes them (partial JSON). */
+	| { type: "toolcall_delta"; contentIndex: number; delta: string }
+	| { type: "toolcall_end"; contentIndex: number; toolCall?: unknown }
+	| { type: "done"; reason: "stop" | "length" | "toolUse" }
+	| { type: "error"; reason: "error" | "aborted" }
 	| { type: string; [field: string]: unknown };
 
 /* ───────────────────────── wire message shapes ───────────────────────── */
@@ -424,11 +573,52 @@ export interface WireContentBlock {
 	text?: string;
 	/** Present on `thinking` blocks. */
 	thinking?: string;
+	/**
+	 * Opaque provider payload authenticating a `thinking` block, and the ONLY
+	 * carrier of a redacted block's content.
+	 *
+	 * A client that rebuilds a transcript from these blocks and sends it back to
+	 * the model MUST echo this verbatim: providers that sign reasoning reject or
+	 * silently degrade a turn whose thinking blocks were altered or stripped.
+	 * Dropping it is a correctness bug, not a cosmetic one — which is why it is
+	 * on the wire even though the reference TUI never re-sends a transcript (the
+	 * gateway owns it).
+	 */
+	thinkingSignature?: string;
+	/**
+	 * True when the provider's safety filter redacted this thinking block. There
+	 * is no readable `thinking` text in that case — the encrypted payload lives
+	 * in `thinkingSignature`. A renderer must show "reasoning redacted by the
+	 * provider" rather than an empty thought bubble, and must still round-trip
+	 * the signature for multi-turn continuity.
+	 */
+	redacted?: boolean;
 	/** Present on `toolCall` blocks — the stable tool call id used to key the
 	 *  tool's render block + correlate its `toolResult`. */
 	id?: string;
 	/** Tool name, on `toolCall` blocks. */
 	name?: string;
+	/**
+	 * Tool arguments, on `toolCall` blocks.
+	 *
+	 * SPELLED `arguments`, AND TIED TO PI'S TYPE ON PURPOSE.
+	 *
+	 * This field was previously not declared at all — it was served by the index
+	 * signature below, which types every unknown key as `unknown`. That meant
+	 * `block.arguments` and `block.input` (the Anthropic WIRE spelling for the
+	 * same thing) both compiled and both returned `unknown`, so reaching for the
+	 * wrong dialect was invisible to the compiler. `renderTranscript` did exactly
+	 * that and rendered every tool call with empty arguments; `approxMessageChars`
+	 * did the same and estimated a 153,000-token transcript at 5 tokens, silently
+	 * disabling tier-2 compaction.
+	 *
+	 * Declaring it explicitly restores the type. Sourcing it from `PiToolCall`
+	 * rather than restating `Record<string, unknown>` means the wire contract and
+	 * Pi's in-memory shape cannot drift apart silently: if Pi renames the field,
+	 * this line fails to compile instead of serialising `undefined` to every
+	 * connected client. See `src/agents/pi-dialect.ts` for the full account.
+	 */
+	arguments?: PiToolCall["arguments"];
 	[field: string]: unknown;
 }
 
@@ -440,6 +630,18 @@ export interface WireContentBlock {
  */
 export interface WireMessage {
 	role: "user" | "assistant" | "toolResult" | string;
+	/**
+	 * Stable identity of this message in the transcript, when the store has one.
+	 *
+	 * Pi's records form an `id` / `parentId` TREE — the structure edit, rewind
+	 * and branch all need — and it previously stopped at the storage layer, so a
+	 * client could not address a message to act on it. Render keys are still
+	 * `role + timestamp` (see below) and are unchanged by this; the id is
+	 * additive, and present only on messages read back from a transcript.
+	 */
+	messageId?: string;
+	/** Parent in the transcript tree — the branch point a rewind would fork from. */
+	parentMessageId?: string;
 	/** Creation timestamp (ms) — stable across a message's streaming updates;
 	 *  the identity key a renderer uses for the assistant block. */
 	timestamp?: number;
@@ -487,6 +689,45 @@ export interface PromptAttachment {
 	fileName?: string;
 }
 
+/**
+ * Result of a rewind, or of listing the points one could rewind to.
+ *
+ * `files` is the honest half of the contract: rewind moves the conversation
+ * pointer and NAMES the files written after that point, without pretending to
+ * revert them. Every reported failure in this space across the field is a
+ * file-restore failure, and `git` already solves files with a tool the operator
+ * already trusts.
+ */
+export interface SessionRewindResult {
+	/** The points available — the operator's own messages, oldest first. */
+	targets: {
+		entryId: string;
+		/** 1-based position, stable as the session grows. */
+		ordinal: number;
+		preview: string;
+		timestamp?: number;
+	}[];
+	/** True when a rewind actually happened (an `entryId` was supplied). */
+	rewound: boolean;
+	/** The entry now at the leaf, when `rewound`. */
+	entryId?: string;
+	/** How many transcript entries are no longer on the active path. */
+	abandoned?: number;
+	/**
+	 * Files written after the rewind point. NOT reverted — reported so the
+	 * operator can reconcile them with `git`.
+	 */
+	files?: string[];
+	/**
+	 * Set when the transcript contains a compaction entry with no parent link.
+	 *
+	 * That shape severs the tree and makes pre-compaction history unreachable —
+	 * the defect behind Claude Code's rewind losing multi-day sessions. Brigade
+	 * refuses rather than silently showing a truncated conversation.
+	 */
+	blocked?: string;
+}
+
 /** Params for each request method. `void` = no params required. */
 export interface RequestParams {
 	prompt: {
@@ -513,6 +754,39 @@ export interface RequestParams {
 		/** Session key whose in-flight turn receives the steer; defaults to boot session. */
 		sessionKey?: string;
 		/** Agent id whose default session is steered when `sessionKey` is omitted. */
+		agentId?: string;
+		/**
+		 * WHEN the running turn sees this message.
+		 *
+		 *   • `"steer"` (default) — injected into the turn in progress. Pi delivers
+		 *     it at the next loop iteration, so the model can change course
+		 *     mid-task. Powerful and irreversible: it alters a plan the model is
+		 *     halfway through executing.
+		 *
+		 *   • `"followUp"` — held until the turn has no more tool calls and no
+		 *     pending steering, i.e. a real TURN BOUNDARY. This is what "queue my
+		 *     message" should mean, and it is the safe thing to put on the key a
+		 *     user hits by reflex.
+		 *
+		 * Defaults to `"steer"` so existing clients calling a method NAMED steer
+		 * keep getting steering. Brigade's own TUI passes `"followUp"` for a plain
+		 * Enter and `"steer"` only for the deliberate Ctrl/Cmd+Enter gesture.
+		 */
+		deliverAs?: "steer" | "followUp";
+	};
+	"sessions.rewind": {
+		sessionKey?: string;
+		agentId?: string;
+		/**
+		 * Transcript entry to branch from. Omit to LIST the available points
+		 * without changing anything — the picker call.
+		 */
+		entryId?: string;
+	};
+	"flush-queue": {
+		/** Session whose queue is promoted; defaults to the caller's binding. */
+		sessionKey?: string;
+		/** Agent id whose default session is used when `sessionKey` is omitted. */
 		agentId?: string;
 	};
 	"set-model": {
@@ -647,6 +921,51 @@ export interface RequestParams {
 		agentId?: string;
 		/** Subscribe to events tagged with this sessionId. */
 		sessionId?: string;
+		/**
+		 * Full-snapshot opt-OUT. Delta streaming is the DEFAULT.
+		 *
+		 * By default every `message_update` carries the full cumulative assistant
+		 * message — the whole reply so far, resent per token. That is what makes
+		 * `resume` trivially idempotent (apply-by-replace can never duplicate),
+		 * and it is also why an 8k-token answer costs ~125 MiB on the wire.
+		 *
+		 * By default the gateway omits `message.content` from `message_update`
+		 * frames THAT CARRY A DELTA, and the client reconstructs the text by
+		 * appending `assistantMessageEvent.delta`. `role`, `timestamp` and `usage`
+		 * are KEPT — the timestamp is the render key, so a delta with no way to
+		 * identify its block would be unusable, and `usage` drives the live token
+		 * counter. The full content still arrives on `message_start` and
+		 * `message_end`, so every message ends reconciled against the
+		 * authoritative snapshot and any drift self-corrects within one message.
+		 * `resume` is unaffected.
+		 *
+		 * OPT-IN. Leave unset (or `false`) and you get the full cumulative
+		 * `message.content` on every update, byte-identical to the pre-delta
+		 * protocol. Set `true` only if the client appends deltas — it is roughly
+		 * an 18x reduction in bytes on a long answer, but a client that does not
+		 * reconstruct sees empty text until `message_end`.
+		 *
+		 * Advertised as the `subscribe.deltas` capability in `hello-ok`.
+		 */
+		deltas?: boolean;
+		/**
+		 * How broadly frames are delivered for an agent you have named a session on.
+		 *
+		 *   • `"session"` (default) — naming a session scopes delivery to that
+		 *     session and its children. This is the cross-session-bleed fix:
+		 *     without it, the agent's other threads (cron runs, channel traffic,
+		 *     a second chat) arrive in the same stream.
+		 *
+		 *   • `"agent"` — the pre-narrowing breadth. For a client that names a
+		 *     session for some OTHER reason and still wants the agent's whole
+		 *     stream; Brigade's desktop client does exactly that, because its
+		 *     snapshot push is gated on the session id.
+		 *
+		 * An opt-out rather than a version bump: the fix is the default, because
+		 * the clients that never update are the ones that need the bleed fixed.
+		 * Advertised as the `subscribe.scope` capability in `hello-ok`.
+		 */
+		scope?: "session" | "agent";
 	};
 	unsubscribe: {
 		/** Drop a prior agentId subscription. */
@@ -691,6 +1010,13 @@ export interface RequestParams {
 export interface ResponseFor {
 	prompt: void;
 	abort: void;
+	"sessions.rewind": SessionRewindResult;
+	"flush-queue": {
+		/** How many queued messages were promoted into the running turn. */
+		promoted: number;
+		/** The session that was flushed, resolved from the params. */
+		sessionKey: string;
+	};
 	steer: void;
 	"set-model": void;
 	/** `cleared: false` means the session existed but had no pin — a no-op the
@@ -837,6 +1163,54 @@ export interface EventPayload {
 /* ─────────────────────────── domain types ─────────────────────────── */
 
 /**
+ * What a provider actually EXPOSES of a model's reasoning.
+ *
+ * Reasoning is not one thing across providers, and a UI that assumes it is will
+ * lie to the operator. The four shapes a harness has to represent:
+ *
+ *   - `raw`      the actual reasoning text streams and can be shown verbatim.
+ *   - `summary`  the provider streams a SUMMARY it wrote, not the model's own
+ *                chain of thought. Rendering it as "the model's thinking" is a
+ *                misrepresentation, so a client must label it as a summary.
+ *   - `redacted` a safety filter removed the text. Only an opaque payload
+ *                remains (see `WireContentBlock.thinkingSignature`), which must
+ *                still be round-tripped for multi-turn continuity.
+ *   - `hidden`   the model reasons and is billed for it, but exposes nothing.
+ *                The honest UI is "thinking…" with a token count and no text.
+ *   - `none`     this model does not reason.
+ *
+ * Kept on the wire so a client renders the truth for whatever backend is
+ * serving the turn, without hardcoding provider knowledge of its own.
+ */
+export type ReasoningVisibility = "raw" | "summary" | "redacted" | "hidden" | "none";
+
+/** Live reasoning state for one session. */
+export interface SessionReasoningState {
+	/** True while the model is in a reasoning phase RIGHT NOW. */
+	active: boolean;
+	/** What this backend exposes — drives whether text may be shown at all. */
+	visibility: ReasoningVisibility;
+	/** Epoch ms the current reasoning phase began. Absent when not active. */
+	startedAt?: number;
+	/** Characters of reasoning text produced in the current turn, when readable. */
+	chars?: number;
+	/**
+	 * Duration of the most recently COMPLETED reasoning phase, in ms.
+	 *
+	 * Server-stamped, so "Thought for 12s" survives a reconnect — two of the
+	 * harnesses surveyed seed their timer from component mount and lose the
+	 * figure on reload.
+	 */
+	durationMs?: number;
+	/**
+	 * Reasoning tokens billed for this turn, when the provider reports them
+	 * separately. Most bill reasoning as output tokens without breaking them
+	 * out, so this is frequently absent — and absent must not render as zero.
+	 */
+	tokens?: number;
+}
+
+/**
  * Snapshot of the small set of fields the TUI renders. Sent on every
  * state mutation so the client always has consistent state without
  * having to mirror the full Pi session.
@@ -855,7 +1229,46 @@ export interface SessionStateSnapshot {
 	 */
 	supportsVision?: boolean;
 	availableThinkingLevels: string[];
+	/**
+	 * Live reasoning state for THIS session — what the model is doing right now,
+	 * as opposed to `thinkingLevel`/`supportsThinking` which describe what it is
+	 * capable of. Absent on a gateway older than this field.
+	 */
+	reasoning?: SessionReasoningState;
 	contextUsagePercent: number | null;
+	/**
+	 * Estimated tokens currently in the context window, and the window's size.
+	 *
+	 * Both are computed on every agent event and were discarded — only the
+	 * derived percentage survived, and the TUI rendered even that solely above
+	 * 50%, so for most of a session's life the operator saw nothing. The raw
+	 * pair is what lets a client show "34k / 200k" and compute headroom before
+	 * compaction. `contextTokens` is null right after a compaction, when Pi
+	 * deliberately reports unknown rather than a stale figure.
+	 */
+	contextTokens?: number | null;
+	contextWindow?: number | null;
+	/**
+	 * How this backend CHARGES — what a cost figure means here, or why there
+	 * isn't one.
+	 *
+	 *   `metered`      per-token pricing; the dollar figure is the signal.
+	 *   `subscription` a plan/seat. Marginal cost really is zero, so a `$0.00`
+	 *                  is true but useless — the PLAN WINDOW is the signal.
+	 *   `local`        runs on the operator's hardware; nothing to meter.
+	 *   `unknown`      no pricing on record. MUST render as an absence, never
+	 *                  as `$0`, or an unmeasured turn reads as a free one.
+	 *
+	 * Without this a client cannot tell those four apart, and every one of them
+	 * previously rendered as the same `$0.0000`.
+	 */
+	billing?: "metered" | "subscription" | "local" | "unknown";
+	/**
+	 * False once any contribution to `totalCostUsd` arrived with no cost signal,
+	 * making the total a FLOOR rather than the truth. A renderer should show it
+	 * as `≥ $0.42` in that case.
+	 */
+	costComplete?: boolean;
 	totalTokensIn: number;
 	totalTokensOut: number;
 	totalCostUsd: number;

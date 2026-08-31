@@ -89,6 +89,8 @@ export function resolveToolResultMaxChars(args: ResolveToolResultLimitArgs): num
 export interface TruncateToolResultArgs {
   text: string;
   maxChars: number;
+  /** Tool that produced this output, so the marker can name what to re-run. */
+  toolName?: string;
 }
 
 export interface TruncationOutcome {
@@ -98,14 +100,14 @@ export interface TruncationOutcome {
 }
 
 export function truncateToolResultText(args: TruncateToolResultArgs): TruncationOutcome {
-  const { text, maxChars } = args;
+  const { text, maxChars, toolName } = args;
   if (typeof text !== "string" || text.length <= maxChars) {
     return { text, truncated: false, droppedChars: 0 };
   }
 
   // Reserve room for the truncation suffix so the suffix itself doesn't push
   // us back over the limit.
-  const suffixSample = formatTruncationSuffix(text.length); // worst-case length
+  const suffixSample = formatTruncationSuffix(text.length, toolName); // worst-case length
   const budget = Math.max(MIN_KEEP_CHARS, maxChars - suffixSample.length);
 
   if (hasImportantTail(text)) {
@@ -117,7 +119,7 @@ export function truncateToolResultText(args: TruncateToolResultArgs): Truncation
     const head = text.slice(0, headBudget);
     const tail = text.slice(text.length - tailBudget);
     const droppedChars = text.length - head.length - tail.length;
-    const out = head + HEAD_TAIL_OMISSION_MARKER + tail + formatTruncationSuffix(droppedChars);
+    const out = head + HEAD_TAIL_OMISSION_MARKER + tail + formatTruncationSuffix(droppedChars, toolName);
     return { text: out, truncated: true, droppedChars };
   }
 
@@ -125,15 +127,63 @@ export function truncateToolResultText(args: TruncateToolResultArgs): Truncation
   const head = text.slice(0, budget);
   const droppedChars = text.length - head.length;
   return {
-    text: head + formatTruncationSuffix(droppedChars),
+    text: head + formatTruncationSuffix(droppedChars, toolName),
     truncated: true,
     droppedChars,
   };
 }
 
-export function formatTruncationSuffix(droppedChars: number): string {
+/**
+ * The marker left in place of dropped tool output.
+ *
+ * Names the TOOL when we know it, so the elision is a reference rather than a
+ * hole: the model can re-run `read` or `bash` to recover what was cut instead
+ * of only learning that something is missing. This is the difference between
+ * compaction (reversible — the content is reconstructible from a handle we
+ * kept) and summarization (irreversible), and it is the property that makes
+ * evicting tool output the cheap first tier: nothing is truly lost, because
+ * the command that produced it is still in the transcript above.
+ *
+ * Without a handle a truncation marker just tells the model to distrust its own
+ * context, which is worse than useless — it invites a re-read it cannot aim.
+ */
+/**
+ * Longest tool name we will echo into a model-facing marker.
+ *
+ * Real tool names are short. A long one is either a bug or an attack, and the
+ * marker must never become a vehicle for either.
+ */
+const MAX_TOOL_NAME_CHARS = 64;
+
+/**
+ * Make a tool name safe to embed in prompt text.
+ *
+ * The name is NOT trusted input. For an MCP tool it is supplied by the MCP
+ * server; for a hallucinated call it is supplied by the model. Echoed raw, a
+ * name containing a backtick closes the code span the marker puts it in, and
+ * everything after it — a `##` heading, an instruction — lands as ordinary
+ * model-facing prompt text inside what is supposed to be an inert notice.
+ *
+ * Unbounded, it is also an amplifier: a 50 KB name turned a 20 KB tool result
+ * into a 52 KB one while the compactor reported a successful truncation.
+ *
+ * So: identifier characters only, hard length cap.
+ */
+function safeToolName(toolName?: string): string {
+  const trimmed = toolName?.trim();
+  if (!trimmed) return "";
+  return trimmed.replace(/[^\w.:-]/g, "").slice(0, MAX_TOOL_NAME_CHARS);
+}
+
+export function formatTruncationSuffix(droppedChars: number, toolName?: string): string {
+  // Plain integer, never `toLocaleString()`: this string is MODEL-facing and
+  // goes into the prompt, so a locale-dependent separator would make the same
+  // transcript render differently on different machines — non-reproducible,
+  // and a prompt-cache miss for no benefit.
   const n = Math.max(1, Math.floor(droppedChars));
-  return `\n\n[… ${n} more characters truncated …]`;
+  const safe = safeToolName(toolName);
+  const how = safe ? ` — re-run \`${safe}\` for the full output` : "";
+  return `\n\n[… ${n} more characters truncated${how} …]`;
 }
 
 function hasImportantTail(text: string): boolean {
@@ -231,6 +281,7 @@ export function evaluateCompactionDecision(args: CompactionDecisionArgs): Compac
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { BrigadeConfig } from "../config/io.js";
+import { PI_TEXT, PI_TOOL_RESULT } from "./pi-dialect.js";
 import type { BrigadeExtensionRegistry } from "./extensions/registry.js";
 
 export interface CompactWithSlotResolutionArgs {
@@ -327,6 +378,47 @@ export interface CompactionStats {
 const DEFAULT_OVERSIZED_CAP = 16_000;
 const DEFAULT_AGGREGATE_CAP = 64_000;
 const CHARS_PER_TOKEN_ROUGH = 4;
+
+/**
+ * Minimum reclaim before Pass 2 rewrites anything.
+ *
+ * Shrinking an old tool result changes the prompt PREFIX, which invalidates the
+ * provider's cache — on Anthropic, trading a 10%-of-input cache read for a 125%
+ * cache write. Doing that to reclaim a few hundred characters is a bad trade
+ * every time. Below this threshold the transcript is left alone and allowed to
+ * grow until the reclaim is worth one invalidation.
+ *
+ * This is what makes oldest-first eviction affordable. Cline reached the same
+ * number independently (`DEFAULT_MIN_OUTDATED_REWRITE_BYTES = 65_536`,
+ * "batch stale-read rewrites to avoid breaking provider prefix caches on every
+ * re-read"); Hermes expresses it in tokens (`proactive_prune_min_reclaim_tokens
+ * = 4096`, "to avoid breaking the provider prompt-cache prefix on every turn").
+ */
+const MIN_AGGREGATE_RECLAIM_CHARS = 16_000;
+
+/**
+ * Aggregate ceiling as a LADDER over the context window, not a constant.
+ *
+ * The old flat 64 KB meant the `ctxChars * 0.5` branch only ever bound below
+ * ~32k tokens of context; at or above that the ceiling won and the budget was
+ * frozen forever. On a 1M-token model the formula wanted ~2 MB and we clamped
+ * to 64 KB — 3.2% of it — so past the trigger the pass was effectively "delete
+ * all tool output" on exactly the models with the most room to spare.
+ *
+ * The ladder follows OpenClaw's shape (16K/32K/64K by window) extended upward,
+ * and keeps a hard ceiling so a huge window cannot produce an unbounded
+ * re-sent payload: a naive `0.5 × window` on 1M would put ~2 MB of tool output
+ * on the wire every turn, which costs real money and hurts time-to-first-token
+ * long before the model runs out of room. Cline's 6 MB aggregate is the other
+ * extreme and is over-generous for the same reason.
+ */
+function aggregateCapForContext(ctxTokens: number): number {
+  if (!Number.isFinite(ctxTokens) || ctxTokens <= 0) return DEFAULT_AGGREGATE_CAP;
+  if (ctxTokens >= 500_000) return 512_000;
+  if (ctxTokens >= 200_000) return 192_000;
+  if (ctxTokens >= 100_000) return 128_000;
+  return DEFAULT_AGGREGATE_CAP;
+}
 /**
  * Sane FLOORS so the per-result and aggregate budgets never collapse to
  * effectively-zero on tiny-context models (Cerebras 8K, Groq Llama-3.1-8B
@@ -393,10 +485,14 @@ export function smartCompactToolResults(
   const maxCharsPerResult =
     options.maxCharsPerResult ??
     Math.max(MIN_OVERSIZED_CAP, Math.min(Math.floor(ctxChars * 0.3), DEFAULT_OVERSIZED_CAP));
-  // Aggregate: 50% of context, capped + floored.
+  // Aggregate: 50% of context, floored, and ceilinged by a ladder that scales
+  // with the window instead of freezing at 64 KB above ~32k tokens.
   const aggregateBudget =
     options.aggregateBudgetChars ??
-    Math.max(MIN_AGGREGATE_CAP, Math.min(Math.floor(ctxChars * 0.5), DEFAULT_AGGREGATE_CAP));
+    Math.max(
+      MIN_AGGREGATE_CAP,
+      Math.min(Math.floor(ctxChars * 0.5), aggregateCapForContext(ctxTokens)),
+    );
   // minKeep clamped so it can never EXCEED maxCharsPerResult — that would
   // cause Pass 2 to try to shrink a result BELOW its already-applied cap,
   // hitting an infinite "no progress" loop or, worse, growing it back.
@@ -409,10 +505,10 @@ export function smartCompactToolResults(
   const slots: Slot[] = [];
   for (let mi = 0; mi < messages.length; mi++) {
     const m = messages[mi] as any;
-    if (m?.role !== "toolResult" || !Array.isArray(m.content)) continue;
+    if (m?.role !== PI_TOOL_RESULT || !Array.isArray(m.content)) continue;
     for (let bi = 0; bi < m.content.length; bi++) {
       const block = m.content[bi];
-      if (block?.type === "text" && typeof block.text === "string") {
+      if (block?.type === PI_TEXT && typeof block.text === "string") {
         slots.push({ mi, bi, len: block.text.length });
       }
     }
@@ -435,16 +531,42 @@ export function smartCompactToolResults(
     }
   }
 
-  // PASS 2 — aggregate. If the SUM (using post-pass-1 lengths) still
-  // exceeds the aggregate budget, shrink starting from NEWEST to OLDEST
-  // (newer = higher mi) by the amount needed, with a minKeep floor.
+  // PASS 2 — aggregate. If the SUM (using post-pass-1 lengths) still exceeds
+  // the aggregate budget, shrink OLDEST FIRST, protecting the most recent
+  // results.
+  //
+  // ─────────────────────────────────────────────────────────────────────────
+  // WHY OLDEST-FIRST, HAVING PREVIOUSLY BEEN NEWEST-FIRST
+  // ─────────────────────────────────────────────────────────────────────────
+  // Newest-first was chosen for prompt-cache stability: mutating an OLD result
+  // changes the prefix and invalidates the provider's cache, while mutating
+  // the tail does not. That reasoning is sound, but the accounting is wrong —
+  // it pays a GUARANTEED comprehension cost on every turn (the model reasons
+  // over a shredded copy of the output it just asked for, while output from the
+  // top of the session survives verbatim) to avoid an OCCASIONAL cache miss.
+  //
+  // Every other harness surveyed — opencode, Cline, Hermes, OpenClaw, Gemini
+  // CLI, DeepSeek's harness — evicts oldest-first and protects the newest.
+  // Brigade was alone.
+  //
+  // The cache concern is handled where it belongs, by AMORTISING: see
+  // `MIN_AGGREGATE_RECLAIM_CHARS` below. Cline and Hermes independently
+  // arrived at the same answer (~64 KB and ~4k tokens respectively) — eat one
+  // invalidation per batch of reclaimed bytes rather than one per turn.
   const lengthAfterPass1 = (s: Slot): number => targetLength.get(slotKey(s)) ?? s.len;
   let aggregate = slots.reduce((sum, s) => sum + lengthAfterPass1(s), 0);
   const aggregateReducibleChars = Math.max(0, aggregate - aggregateBudget);
 
-  if (aggregate > aggregateBudget) {
-    // Sort newest-first (higher message index first).
-    const ordered = [...slots].sort((a, b) => b.mi - a.mi || b.bi - a.bi);
+  // AMORTISE THE CACHE INVALIDATION. Shrinking an old result rewrites the
+  // prompt prefix, so doing it for a trivial saving buys nothing and costs a
+  // full cache miss. Below this threshold, leave the transcript alone and let
+  // it grow until the reclaim is worth paying for.
+  const worthReclaiming = aggregateReducibleChars >= MIN_AGGREGATE_RECLAIM_CHARS;
+
+  if (aggregate > aggregateBudget && worthReclaiming) {
+    // Oldest first (lower message index first), so the newest tool output —
+    // the output the model is about to reason about — is the last thing cut.
+    const ordered = [...slots].sort((a, b) => a.mi - b.mi || a.bi - b.bi);
     for (const s of ordered) {
       if (aggregate <= aggregateBudget) break;
       const current = lengthAfterPass1(s);
@@ -473,12 +595,14 @@ export function smartCompactToolResults(
     const newContent = m.content.map((block: any, bi: number) => {
       const target = targetLength.get(`${mi}:${bi}`);
       if (target === undefined) return block;
-      if (block?.type !== "text" || typeof block.text !== "string") return block;
+      if (block?.type !== PI_TEXT || typeof block.text !== "string") return block;
       if (block.text.length <= target) return block;
       const original = block.text;
+      // Name the tool in the marker so the elision stays recoverable.
+      const producedBy = typeof m.toolName === "string" ? m.toolName : undefined;
       const truncated = preserveTail && hasErrorPattern(original)
-        ? headAndTail(original, target)
-        : headOnly(original, target);
+        ? headAndTail(original, target, producedBy)
+        : headOnly(original, target, producedBy);
       totalSaved += original.length - truncated.length;
       return { ...block, text: truncated };
     });
@@ -499,19 +623,309 @@ function hasErrorPattern(text: string): boolean {
   return ERROR_TAIL_PATTERNS.some((p) => p.test(slice));
 }
 
-function headOnly(text: string, targetLen: number): string {
-  const marker = "\n\n⚠️ [...truncated...]\n";
-  const head = Math.max(0, targetLen - marker.length);
-  const cut = text.length - head;
-  return `${text.slice(0, head)}${marker} (${cut} chars removed)`;
+/** How to re-obtain what was cut, when we know which tool produced it. */
+function recoveryHint(toolName?: string): string {
+  const safe = safeToolName(toolName);
+  return safe ? ` — re-run \`${safe}\` for the full output` : "";
 }
 
-function headAndTail(text: string, targetLen: number): string {
-  const marker = "\n\n⚠️ [...middle truncated, tail preserved...]\n\n";
-  // 60% head, 40% tail (after marker overhead).
-  const usable = Math.max(0, targetLen - marker.length);
+/**
+ * Never return something LONGER than what it replaces.
+ *
+ * A "truncation" that grows the payload is not a truncation, and the aggregate
+ * `totalSavedChars` guard cannot catch it per-result — one inflated result
+ * inside a batch that nets positive is still applied.
+ *
+ * UNREACHABLE UNDER CURRENT LIMITS, deliberately kept. Reaching it needs the
+ * constructed output to exceed the ORIGINAL, i.e. `original.length` below the
+ * marker's ~79 chars while simultaneously above `targetLen` — and `targetLen`
+ * is floored at 200 by `resolveToolResultMaxChars`. The one input that used to
+ * reach it, a 50 KB tool name inflating a 20 KB result to 52 KB, is now cut off
+ * upstream by `safeToolName`'s 64-char cap.
+ *
+ * A mutation test cannot kill this line, and that is the point: it is a
+ * last-resort assertion of an invariant the callers are supposed to maintain,
+ * not a load-bearing branch. If a future caller lowers the floor or grows the
+ * marker, this is what stops a silent 2.6x payload amplification from shipping
+ * again. Treat it as a guard rail, and do not build behaviour on top of it.
+ */
+function neverGrow(original: string, truncated: string, targetLen: number): string {
+  if (truncated.length <= original.length) return truncated;
+  return original.slice(0, Math.max(0, Math.min(targetLen, original.length)));
+}
+
+function headOnly(text: string, targetLen: number, toolName?: string): string {
+  const hint = recoveryHint(toolName);
+  const marker = `\n\n⚠️ [...truncated${hint}...]\n`;
+  // The suffix " (N chars removed)" is part of the output and must be paid for
+  // out of the budget too, or the result overshoots `targetLen` every time —
+  // which is why pass 2's aggregate target was never actually met.
+  const cutNote = (n: number) => ` (${n} chars removed)`;
+  const overhead = marker.length + cutNote(text.length).length;
+  const head = Math.max(0, targetLen - overhead);
+  const cut = text.length - head;
+  return neverGrow(text, `${text.slice(0, head)}${marker}${cutNote(cut)}`, targetLen);
+}
+
+function headAndTail(text: string, targetLen: number, toolName?: string): string {
+  const hint = recoveryHint(toolName);
+  const marker = `\n\n⚠️ [...middle truncated, tail preserved${hint}...]\n\n`;
+  // 60% head, 40% tail (after marker overhead). The "(N chars removed)" note
+  // and its blank lines are output too, so they come out of the budget — not
+  // doing so overshot `targetLen` on every call and left pass 2's aggregate
+  // target unmet.
+  const cutNote = (n: number) => `(${n} chars removed)\n\n`;
+  const overhead = marker.length + cutNote(text.length).length;
+  const usable = Math.max(0, targetLen - overhead);
   const headLen = Math.floor(usable * 0.6);
   const tailLen = Math.max(0, usable - headLen);
   const cut = text.length - headLen - tailLen;
-  return `${text.slice(0, headLen)}${marker}(${cut} chars removed)\n\n${text.slice(text.length - tailLen)}`;
+  const out = `${text.slice(0, headLen)}${marker}${cutNote(cut)}${text.slice(text.length - tailLen)}`;
+  return neverGrow(text, out, targetLen);
+}
+
+/* ───────────────────── compaction circuit breaker ───────────────────── */
+
+/**
+ * Stops a failing turn from compacting over and over.
+ *
+ * THE LOOP THIS BREAKS (observed in 1.33):
+ *
+ *   retrying (1/3, 2/3, 3/3) · Connection error.
+ *   ✗ gave up after 3 attempts
+ *   ⚡ compacting context (was 161%)…
+ *   ✓ compacted · usage refreshes on the next reply
+ *   ⚡ compacting context (was 161%)…          ← forever
+ *
+ * Two things combine. `maybeTriggerCompaction` runs once per turn attempt,
+ * BEFORE the prompt — so every retry of a failing turn compacts again. And the
+ * displayed percentage never moves, because the context figure is derived from
+ * the last assistant `usage`, which only refreshes on a SUCCESSFUL reply. With
+ * the provider unreachable there is no successful reply, so the trigger sees
+ * the same over-threshold estimate every time and fires again.
+ *
+ * Each compaction is a real summarization call against the provider — money and
+ * latency — so an unbounded loop is not merely cosmetic.
+ *
+ * The rule: a session may compact a bounded number of times WITHOUT a
+ * successful assistant reply in between. A reply proves the context actually
+ * changed and resets the budget. Beyond the bound, refuse and let the turn fail
+ * honestly — a connection error is not a context-overflow problem, and no
+ * amount of compaction fixes a network.
+ */
+export const MAX_COMPACTIONS_WITHOUT_REPLY = 2;
+
+/**
+ * How long a closed guard stays closed with nothing else changing.
+ *
+ * The guard exists to stop a tight compact/fail/compact loop, and that loop
+ * turns over in seconds. A session still blocked minutes later is no longer in
+ * that loop — the provider outage that caused it has had time to end — and
+ * refusing forever would leave the session permanently unable to compact.
+ *
+ * Chosen so the cost of a wrong re-open is bounded — the budget of
+ * `MAX_COMPACTIONS_WITHOUT_REPLY` attempts, i.e. two summarization calls, per
+ * cooldown window — while the cost of never re-opening is a session that can
+ * never compact again. The second is far worse.
+ */
+export const COMPACTION_BREAKER_COOLDOWN_MS = 5 * 60_000;
+
+export class CompactionBreaker {
+	private readonly consecutive = new Map<string, number>();
+	/** When each session's guard last closed, for the cooldown. */
+	private readonly closedAt = new Map<string, number>();
+
+	constructor(
+		private readonly max = MAX_COMPACTIONS_WITHOUT_REPLY,
+		private readonly cooldownMs = COMPACTION_BREAKER_COOLDOWN_MS,
+		private readonly now: () => number = () => Date.now(),
+		private readonly maxSessions = 2048,
+	) {}
+
+	/** May this session compact right now? */
+	allow(sessionKey: string): boolean {
+		if ((this.consecutive.get(sessionKey) ?? 0) < this.max) return true;
+		// COOLDOWN. Without one the guard can only be cleared by the thing it is
+		// blocking: `trip()` closes it mid-turn, that turn then fails (the context
+		// is still over), so no successful reply ever lands, so `noteReply` is
+		// never called — and the session can never compact again for the lifetime
+		// of the process. A guard whose only exit is the action it forbids is a
+		// deadlock, not a circuit breaker.
+		const since = this.closedAt.get(sessionKey);
+		if (since !== undefined && this.now() - since >= this.cooldownMs) {
+			this.consecutive.delete(sessionKey);
+			this.closedAt.delete(sessionKey);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Bound on retained sessions, oldest-touched evicted first.
+	 *
+	 * Entries clear on a successful reply or once the cooldown elapses — but the
+	 * cooldown is only checked inside `allow()`, which is never called again for
+	 * a session that has died. A long-lived gateway would therefore accumulate
+	 * one entry per abandoned session for the life of the process. Evicting the
+	 * oldest is safe: losing a suppression record only means the next compaction
+	 * for that session is allowed, which is the correct default anyway.
+	 */
+	private evictIfNeeded(): void {
+		while (this.consecutive.size > this.maxSessions) {
+			const oldest = this.consecutive.keys().next().value as string | undefined;
+			if (oldest === undefined) break;
+			this.consecutive.delete(oldest);
+			this.closedAt.delete(oldest);
+		}
+	}
+
+	/** Record that a compaction ran. */
+	noteCompaction(sessionKey: string): void {
+		const next = (this.consecutive.get(sessionKey) ?? 0) + 1;
+		// delete+set so the map stays in touch order and eviction drops the
+		// least-recently-used session, not the first one ever seen.
+		this.consecutive.delete(sessionKey);
+		this.consecutive.set(sessionKey, next);
+		if (next >= this.max) this.closedAt.set(sessionKey, this.now());
+		this.evictIfNeeded();
+	}
+
+	/**
+	 * A successful assistant reply landed — the context figure will refresh, so
+	 * the budget resets. This is the ONLY thing that resets it: a compaction
+	 * "succeeding" proves nothing, since that is exactly what the loop did.
+	 */
+	noteReply(sessionKey: string): void {
+		this.consecutive.delete(sessionKey);
+		this.closedAt.delete(sessionKey);
+	}
+
+	/** How many compactions have run without an intervening reply. */
+	count(sessionKey: string): number {
+		return this.consecutive.get(sessionKey) ?? 0;
+	}
+
+	/**
+	 * Open the guard immediately, without waiting out the attempt budget.
+	 *
+	 * Used when a compaction demonstrably reclaimed nothing: a second attempt
+	 * cannot do better, so spending another summarization call to prove it is
+	 * pure waste.
+	 */
+	trip(sessionKey: string): void {
+		// delete+set, like `noteCompaction`. A bare `set` on an existing key
+		// PRESERVES insertion order in a JS Map, so a tripped session kept its
+		// stale LRU position and was evicted first — losing the suppression on
+		// precisely the session we most wanted suppressed. Eviction is tolerable
+		// for a counting guard; it is not for a `trip()`, which exists because a
+		// retry is known to be useless.
+		this.consecutive.delete(sessionKey);
+		this.consecutive.set(sessionKey, this.max);
+		this.closedAt.set(sessionKey, this.now());
+		this.evictIfNeeded();
+	}
+
+	/** Drop a session's state (session deleted / gateway shutdown). */
+	forget(sessionKey: string): void {
+		this.consecutive.delete(sessionKey);
+		this.closedAt.delete(sessionKey);
+	}
+
+	get size(): number {
+		return this.consecutive.size;
+	}
+}
+
+/**
+ * Rough context-token estimate over a message array (chars / 4).
+ *
+ * Shared so the compaction TRIGGER, the tool-result tier and the gateway's
+ * after-measurement all use one convention — three different estimators would
+ * disagree about whether a compaction helped, which is exactly the ambiguity
+ * that let a no-progress loop keep reporting success.
+ */
+export function estimateContextTokensFromMessages(messages: readonly unknown[]): number {
+	if (!Array.isArray(messages)) return 0;
+	let chars = 0;
+	for (const m of messages) {
+		const content = (m as { content?: unknown })?.content;
+		if (typeof content === "string") chars += content.length;
+		else if (Array.isArray(content)) {
+			for (const block of content) {
+				const b = block as { text?: unknown; thinking?: unknown };
+				if (typeof b?.text === "string") chars += b.text.length;
+				if (typeof b?.thinking === "string") chars += b.thinking.length;
+			}
+		}
+	}
+	return Math.ceil(chars / 4);
+}
+
+/* ─────────────────────── compaction outcome ─────────────────────── */
+
+/** What a compaction actually achieved. */
+export interface CompactionOutcome {
+	tokensBefore: number;
+	tokensAfter: number;
+	/** Tokens reclaimed. Never negative — a compaction that grew the context
+	 *  reports 0 freed and `madeProgress: false`. */
+	freedTokens: number;
+	messagesBefore: number;
+	messagesAfter: number;
+	/** Share of the context reclaimed, 0..1. */
+	freedRatio: number;
+	/**
+	 * Did this compaction meaningfully reduce the context?
+	 *
+	 * This is the honest answer to "should we try again". A compaction that
+	 * reclaimed nothing has no reason to succeed on a second attempt, and
+	 * repeating it is what turned a provider outage into an unbounded, paid
+	 * compact/fail/compact cycle.
+	 */
+	madeProgress: boolean;
+	/**
+	 * True when the pre-compaction estimate EXCEEDED the context window — i.e.
+	 * a figure above 100%. That is not a normal state: it means the estimate is
+	 * stale or inflated (a cumulative usage figure being read as a context
+	 * size), and it is worth saying out loud rather than rendering "161%" as if
+	 * it were a measurement.
+	 */
+	wasOverWindow: boolean;
+}
+
+/** Below this share reclaimed, a compaction has not meaningfully helped. */
+export const MIN_USEFUL_FREED_RATIO = 0.05;
+
+export function summarizeCompactionOutcome(args: {
+	tokensBefore: number;
+	tokensAfter: number;
+	messagesBefore: number;
+	messagesAfter: number;
+	contextWindowTokens?: number;
+}): CompactionOutcome {
+	const before = Math.max(0, Number.isFinite(args.tokensBefore) ? args.tokensBefore : 0);
+	const after = Math.max(0, Number.isFinite(args.tokensAfter) ? args.tokensAfter : 0);
+	const freedTokens = Math.max(0, before - after);
+	const freedRatio = before > 0 ? freedTokens / before : 0;
+	const window = args.contextWindowTokens;
+	return {
+		tokensBefore: before,
+		tokensAfter: after,
+		freedTokens,
+		messagesBefore: args.messagesBefore,
+		messagesAfter: args.messagesAfter,
+		freedRatio,
+		madeProgress: freedRatio >= MIN_USEFUL_FREED_RATIO,
+		wasOverWindow: typeof window === "number" && window > 0 && before > window,
+	};
+}
+
+/** `142 → 12 messages · freed 118k tokens (79%)`, for a log or a UI row. */
+export function describeCompactionOutcome(o: CompactionOutcome): string {
+	const freed =
+		o.freedTokens >= 1000 ? `${(o.freedTokens / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(o.freedTokens);
+	const pct = Math.round(o.freedRatio * 100);
+	const core = `${o.messagesBefore} → ${o.messagesAfter} messages · freed ${freed} tokens (${pct}%)`;
+	if (!o.madeProgress) return `${core} — no meaningful reduction`;
+	return core;
 }

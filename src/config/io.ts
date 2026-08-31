@@ -61,7 +61,39 @@ export interface BrigadeConfig {
   // `lints.ts`, and `validate.ts`. NO existing runtime path reads this
   // field at Stage A.
   org?: BrigadeOrgConfig;
+  /** Chat-surface preferences (the connect-mode TUI). Absent on every legacy
+   *  config; each field carries its own default so absence never changes
+   *  behaviour unexpectedly. */
+  chat?: BrigadeChatConfig;
   [key: string]: unknown;
+}
+
+/**
+ * Preferences for the chat surface.
+ *
+ * These are OPERATOR preferences, not runtime state — they belong in the config
+ * so a choice survives the next launch. Before this existed, `/reasoning on`
+ * was a local variable in the TUI: the operator had to retype it every single
+ * time they started `brigade chat`, which is most of why the feature read as
+ * missing rather than merely off.
+ */
+export interface BrigadeChatConfig {
+  /**
+   * Render the model's reasoning inline with its reply. Default `true`.
+   *
+   * The one-line reasoning STATE in the header is always shown; this controls
+   * only the inline text body. Toggled at runtime by `/reasoning on|off`,
+   * which persists the choice here.
+   */
+  showReasoning?: boolean;
+  /**
+   * Ring the terminal (and raise a desktop notification where the terminal
+   * supports OSC 9) when a LONG turn finishes. Default `true`.
+   *
+   * Short turns stay silent — see `NOTIFY_MIN_TURN_MS` — so this is a signal
+   * that you can stop waiting, not a ping on every message.
+   */
+  notifyOnComplete?: boolean;
 }
 
 // Stage-A inert declaration of the org config block. This type is the

@@ -25,7 +25,13 @@
  * (same as extraction / skill-review). The reviewer is INJECTED.
  */
 
-import { makeIsolatedLlm, parseExtractedFacts, type ExtractedFact, type MakeExtractionLlmArgs } from "./extract.js";
+import {
+	makeIsolatedLlm,
+	parseExtractedFacts,
+	type ExtractedFact,
+	type IsolatedLlmUsage,
+	type MakeExtractionLlmArgs,
+} from "./extract.js";
 import { MEMORY_SEGMENTS } from "./records.js";
 import type { MemoryRecord, MemoryRecordOrigin, MemorySegment, NewFact } from "./records.js";
 
@@ -146,7 +152,12 @@ export async function runBehaviorReview(args: {
  * pinned, its reply parsed with the shared {@link parseExtractedFacts}. One extra
  * model call per behavioral-review fire (cadence-gated), never per turn.
  */
-export function makeBehaviorReviewer(args: MakeExtractionLlmArgs): BehaviorReviewer {
-	const llm = makeIsolatedLlm(BEHAVIOR_REVIEW_PROMPT, args);
+export function makeBehaviorReviewer(
+	args: MakeExtractionLlmArgs,
+	onUsage?: (usage: IsolatedLlmUsage) => void,
+): BehaviorReviewer {
+	// `onUsage` is what stops this sweep being silently free. Without it every
+	// behaviour review Brigade has ever run cost real money and appeared nowhere.
+	const llm = makeIsolatedLlm(BEHAVIOR_REVIEW_PROMPT, args, undefined, onUsage);
 	return async (transcript: string): Promise<ExtractedFact[]> => parseExtractedFacts(await llm(transcript));
 }
