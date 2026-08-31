@@ -347,6 +347,24 @@ const MUTATIONS = [
 
   // ── iMessage self-thread ──
   {
+    claim: "a name is never converted into a phone number",
+    file: "src/agents/channels/imessage/targets.ts",
+    find: "\tif (/[a-z]/i.test(stripped)) return \"\";",
+    replace: "\tif (false) return \"\";",
+    tests: "src/agents/channels/imessage/targets.test.ts",
+  },
+  {
+    claim: "an agent echo in a self-thread does not mute the conversation",
+    file: "src/agents/channels/imessage/monitor.ts",
+    find: "\t\t\t\treturn { kind: \"drop\", reason: \"agent echo in self-chat\" };",
+    replace: "\t\t\t\tstate.loopRateLimiter.record(rateKey);\n\t\t\t\treturn { kind: \"drop\", reason: \"agent echo in self-chat\" };",
+    tests: "src/agents/channels/imessage/monitor.test.ts",
+    expectMissed: true,
+    reason: "the mute needs five hits across two exchanges to manifest; the unit tests decide one message at a time. Verified by hand with a five-turn simulation against the built module.",
+  },
+
+
+  {
     claim: "a reply in a self-thread reaches the agent",
     file: "src/agents/channels/imessage/monitor.ts",
     find: "\t\t\tskipSelfChatHasCheck = true;\n\t\t} else if (isSelfChat) {",

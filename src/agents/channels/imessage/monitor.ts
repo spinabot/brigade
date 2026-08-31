@@ -543,53 +543,72 @@ export function decideInbound(
 	const hasGuid = Boolean(payload.guid);
 
 	// Self-chat detection (DM only).
-	const senderNorm = sender.toLowerCase();
-	const chatIdentNorm = (payload.chat_identifier ?? "").trim().toLowerCase();
-	const destNorm = (payload.destination_caller_id ?? "").trim().toLowerCase();
-	// The bot's OWN handle, when the operator configured one. It is the only
-	// signal that identifies a self-thread without depending on the Messages DB
-	// populating `destination_caller_id` — which it frequently does not.
-	const selfNorm = (selfHandle ?? "").trim().toLowerCase();
-	const looksSelfAddressed = !payload.is_group && senderNorm !== "" && senderNorm === chatIdentNorm;
-	const isSelfChat =
-		looksSelfAddressed && (destNorm === senderNorm || (selfNorm !== "" && senderNorm === selfNorm));
-	const isAmbiguousSelf = looksSelfAddressed && destNorm === "" && !isSelfChat;
+	// SELF-ADDRESSED IS SELF-ADDRESSED. `destination_caller_id` only CONFIRMS.
+	//
+	// The first version of this keyed on that field and dropped when it was
+	// empty. The fix covered the empty case and still missed the other half of
+	// the input space: a Mac signed in with an Apple ID reports the EMAIL as
+	// `destination_caller_id` while `sender`/`chat_identifier` are the PHONE, so
+	// the field is populated but different — neither "definitely self" nor
+	// "ambiguous" — and the operator's reply was dropped as "from me" exactly as
+	// before.
+	//
+	// The reliable signal is the one that does not depend on the DB's choice of
+	// alias: a DM whose sender IS the thread it arrived in can only be a thread
+	// with yourself. `destination_caller_id` and `selfHandle` are corroboration,
+	// never a requirement.
+	//
+	// All three handles go through `normalizeHandle`, because the DB spells the
+	// same person differently across fields — `+1 (646) 420-1739` in one and
+	// `+16464201739` in another — and a bare `toLowerCase()` made a configured
+	// PHONE `selfHandle` unable to ever match (`resolveIMessageSelfHandle`
+	// stores it digits-only).
+	const senderNorm = normalizeHandle(sender);
+	const chatIdentNorm = normalizeHandle(payload.chat_identifier);
+	const destNorm = normalizeHandle(payload.destination_caller_id);
+	const selfNorm = normalizeHandle(selfHandle);
+	const isSelfThread =
+		!payload.is_group &&
+		senderNorm !== "" &&
+		(senderNorm === chatIdentNorm ||
+			(selfNorm !== "" && senderNorm === selfNorm && chatIdentNorm === selfNorm) ||
+			(destNorm !== "" && destNorm === senderNorm && destNorm === chatIdentNorm));
 
 	let skipSelfChatHasCheck = false;
 	if (payload.is_from_me === true) {
-		if (isAmbiguousSelf) {
-			// AN AMBIGUOUS SELF-THREAD IS STILL A SELF-THREAD.
-			//
-			// This dropped unconditionally, and that silently disabled the whole
-			// channel for the most obvious way to try it: message your own Apple
-			// ID. In a self-thread EVERY message is `is_from_me=true` — the
-			// operator's replies included — and `destination_caller_id` is often
-			// empty in the Messages DB, so the definite-self branch below never
-			// fired and every genuine reply was discarded as "from me". The
-			// operator sees their message delivered and Brigade never answers.
-			//
-			// The echo cache is exactly the discriminator this needs, and the
-			// definite-self branch already trusts it: a message Brigade sent is in
-			// the sent cache, a message the operator typed is not. Treating the
-			// ambiguous case the same way makes the channel work while keeping the
-			// loop guard, with the rate limiter as the backstop it already was.
+		if (isSelfThread) {
+			// In a self-thread EVERY row is `is_from_me` — the operator's replies
+			// included — so the only way to tell "Brigade sent this" from "the
+			// operator typed this" is the sent-message cache.
 			state.selfChatCache.remember(scope, text, payload.created_at ? Date.parse(payload.created_at) : undefined);
-			const echo = state.sentMessageCache.has(scope, { text, messageId: inboundIds[0] }, !hasGuid);
+			// MATCH ON TEXT, NOT ID — the ids are different namespaces here.
+			//
+			// The send returns the bridge's own message id; the watch reports the
+			// chat.db row's id/guid. They never correspond, and the cache's
+			// id-backed guard then REJECTS an exact text match ("a send that had
+			// an id must be matched by id"). In an ordinary DM that costs nothing,
+			// because `is_from_me` drops the echo anyway. In a self-thread it is
+			// the difference between suppressing Brigade's own message and
+			// answering it — a loop, and one this branch newly makes reachable by
+			// dispatching what it cannot recognise.
+			//
+			// `skipIdShortCircuit` exists for exactly this: fall through to the
+			// text window when the id cannot be trusted to correspond.
+			const echo = state.sentMessageCache.has(scope, { text, messageId: inboundIds[0] }, true);
 			if (echo) {
-				state.loopRateLimiter.record(rateKey);
-				return { kind: "drop", reason: "agent echo in self-chat" };
-			}
-			skipSelfChatHasCheck = true;
-		} else if (isSelfChat) {
-			state.selfChatCache.remember(scope, text, payload.created_at ? Date.parse(payload.created_at) : undefined);
-			const echo = state.sentMessageCache.has(scope, { text, messageId: inboundIds[0] }, !hasGuid);
-			if (echo) {
-				state.loopRateLimiter.record(rateKey);
+				// NOT a loop hit. Seeing your own send come back is the normal,
+				// expected steady state of a self-thread — one echo per turn — and
+				// counting it drove the limiter to its 5-hit ceiling after two
+				// exchanges, muting the conversation on the operator's THIRD
+				// message. The limiter exists for repeats nothing explains.
 				return { kind: "drop", reason: "agent echo in self-chat" };
 			}
 			skipSelfChatHasCheck = true;
 		} else {
-			state.loopRateLimiter.record(rateKey);
+			// Brigade's own outbound to someone else, reflected back. Also the
+			// normal steady state, and also not loop evidence: a chunked reply is
+			// one row per line, so five lines in a group used to exhaust the
+			// limiter on the SAME key real messages use and mute the room.
 			return { kind: "drop", reason: "from me" };
 		}
 	}
