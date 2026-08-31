@@ -244,3 +244,50 @@ client.on("resync", recover);      // backfill after a mid-stream gap
 
 That is the whole contract: **subscribe → resume → apply live by identity →
 resume again on any gap.** In order, nothing missing, nothing misplaced.
+
+## Cursor replay for synthetic frames
+
+The ordered stream was gap-*detectable* everywhere and gap-*repairable* only
+where the JSONL transcript could rebuild it. **Synthetic** frames — the tool
+events Brigade mints for a `claude-cli` turn, whose tools run inside the
+binary's own loop — are in no transcript at all, yet they carry the routing
+session key, so `resume` can find them again.
+
+`FrameRing` (`src/core/frame-ring.ts`) retains them per session — bounded by
+count, bytes, and distinct sessions — so `resume({ sinceSeq })` returns
+`replayedFrames`: the exact bytes originally broadcast, applied after the
+transcript and deduped by the same identity keys as a live frame. The TUI sends
+the cursor from its `resync` handler, where the last-seen seq is already in
+hand.
+
+Top-level `message_update` frames are deliberately **not** retained: they are
+cumulative, so buffering a long reply would cost O(n²) memory to redeliver what
+the transcript already returns better.
+
+`replayComplete` is the load-bearing part of the contract. It is `false` when
+retention was trimmed past the cursor, meaning some frames are gone for good
+and the client should treat that span as lost rather than assume it was empty.
+It answers only "is the oldest frame I still hold the next one this cursor
+expects?" — never "are there interior gaps?", since the frames that create
+those are precisely the ones the transcript rebuilds better.
+
+### Why sub-agent frames are still unsequenced
+
+They look like the same case and are not. A sub-agent frame is tagged with the
+**child's Pi session UUID**, while `resume` is called with an `agent:…` session
+**key**. Retaining under one namespace and replaying from the other means the
+replay can never fire — so sequencing them would rest on a guarantee that does
+not exist, which is exactly what the "never sequence what you cannot replay"
+rule forbids.
+
+Sequencing them also has costs that promise was meant to justify: every
+`spawn_agent` mints a new per-session counter, and that map evicts in creation
+order, so the operator's own long-lived session — created first — is evicted
+first, restarting its counter and repainting the transcript on every connected
+client. A terminal `agent_end` frame also carries the child's entire
+transcript, which the ring's oversize carve-out would retain permanently on a
+session that never receives another frame.
+
+Making sub-agent replay real means teaching `resume` the child namespace. Until
+then they stay unsequenced: a gap in them is undetectable-but-honest rather
+than detectable-but-unrepairable.

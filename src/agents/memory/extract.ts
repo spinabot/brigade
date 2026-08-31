@@ -636,6 +636,24 @@ export class MemoryLlmTimeoutError extends Error {
 }
 
 /**
+ * Marker thrown when the CALLER cancelled an isolated LLM call.
+ *
+ * Deliberately shaped like a DOM `AbortError` — `name: "AbortError"`,
+ * `code: "ABORT_ERR"` — because that is the exact pair `retry-policy.ts` and
+ * `model-fallback.ts` classify aborts by. A cancellation that escapes this
+ * module wearing any other shape would be read as a transient provider fault
+ * and RETRIED, which re-bills the call the operator just cancelled: the precise
+ * outcome the cancellation exists to prevent.
+ */
+export class IsolatedLlmAbortError extends Error {
+	readonly code = "ABORT_ERR" as const;
+	constructor() {
+		super("isolated LLM call was cancelled by the caller");
+		this.name = "AbortError";
+	}
+}
+
+/**
  * Build an ISOLATED, tool-less subagent runner: a one-shot LLM call with
  * `systemPrompt` pinned, run against a throwaway transcript (deleted after) so
  * it never pollutes the real session. Reuses the resolved model/auth (inherits
@@ -673,8 +691,24 @@ export function makeIsolatedLlm(
 	 * Fires after a SUCCESSFUL call. Never throws into the caller.
 	 */
 	onUsage?: (usage: IsolatedLlmUsage) => void,
-): (input: string) => Promise<string> {
-	return async (input: string): Promise<string> => {
+): (input: string, signal?: AbortSignal) => Promise<string> {
+	/**
+	 * `signal` is the CALLER'S cancellation — for mid-turn compaction it is the
+	 * turn's own AbortSignal, i.e. the operator's Ctrl+C.
+	 *
+	 * Pi's `prompt()` accepts no signal (`pi-agent-core` agent.d.ts:104-105); the
+	 * only cancellation handle an `AgentSession` exposes is `abort()`, which is
+	 * what the timeout path below already uses. So the signal is BRIDGED onto
+	 * that. Without the bridge an interrupted turn left a summarization of a full
+	 * context window running to completion against the provider — real, billed
+	 * spend on an answer nobody would ever read, and the operator had already
+	 * been told the turn was cancelled.
+	 */
+	return async (input: string, signal?: AbortSignal): Promise<string> => {
+		// CHECK BEFORE SPENDING ANYTHING. A call cancelled while it was queued must
+		// not build a session, resolve auth, or reach a provider — the last of
+		// those is billed, and the first two are work with no possible consumer.
+		if (signal?.aborted) throw new IsolatedLlmAbortError();
 		// The isolated extraction sweep can itself run on an Ollama model. Re-assert
 		// the native transport before each run: `ModelRegistry.refresh()` calls
 		// `resetApiProviders()`, which wipes our dynamic `api: "ollama"` registration,
@@ -739,10 +773,39 @@ export function makeIsolatedLlm(
 				}, timeoutMs);
 				timer.unref?.();
 			});
+			// Bridge the caller's cancellation onto the session, the same way the
+			// timeout above does. Whichever fires first wins the race below; both
+			// stop the in-flight provider stream rather than merely stopping US
+			// from waiting for it.
+			let onAbort: (() => void) | undefined;
+			const abortPromise = new Promise<never>((_, reject) => {
+				if (!signal) return;
+				onAbort = () => {
+					// Best-effort, like the timeout path: Pi's abort() is documented
+					// never to throw, but the rejection below is what must surface.
+					void (session as AgentSession).abort?.().catch(() => {});
+					reject(new IsolatedLlmAbortError());
+				};
+				// Aborted in the window between the pre-flight check and here.
+				if (signal.aborted) {
+					onAbort();
+					return;
+				}
+				signal.addEventListener("abort", onAbort, { once: true });
+			});
 			try {
-				await Promise.race([(session as AgentSession).prompt(input), timeoutPromise]);
+				await Promise.race([
+					(session as AgentSession).prompt(input),
+					timeoutPromise,
+					abortPromise,
+				]);
 			} finally {
 				if (timer) clearTimeout(timer);
+				// The signal OUTLIVES this call — it belongs to the turn, and a turn
+				// can run several isolated calls. An unremoved listener would keep
+				// this finished session, and the whole transcript it closed over,
+				// reachable until the turn ended.
+				if (onAbort && signal) signal.removeEventListener("abort", onAbort);
 			}
 			// Read the meter BEFORE returning. The session is thrown away on the
 			// next line, and with it the only record that this call happened.

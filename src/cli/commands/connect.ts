@@ -20,6 +20,8 @@
  */
 
 import { COPILOT_AUTO_MODEL_ID } from "../../agents/github-copilot-transport.js";
+import { describeReasoningVisibility } from "../../agents/reasoning/visibility.js";
+import type { ProviderLimitWindow } from "../../agents/usage/limits.js";
 import { PI_TOOL_CALL, PI_TOOL_RESULT } from "../../agents/pi-dialect.js";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
@@ -1155,6 +1157,7 @@ export async function wireConnectUi(
 			argumentHint: "[n]",
 		},
 		{ name: "usage", description: "show token totals + estimated cost so far" },
+		{ name: "context", description: "where this thread's context window is going" },
 		{ name: "compact", description: "summarize older turns to free context" },
 		{
 			name: "attach",
@@ -1396,7 +1399,7 @@ export async function wireConnectUi(
 	 * Extract the renderable text for an assistant message — mirrors
 	 * chat.ts's `extractAssistantText`. See chat.ts for the full rationale.
 	 */
-	const extractAssistantText = (message: any): string => {
+	const extractAssistantText = (message: any, opts?: { live?: boolean }): string => {
 		if (!message || !Array.isArray(message.content)) return "";
 
 		const thinkingParts: string[] = [];
@@ -1444,15 +1447,42 @@ export async function wireConnectUi(
 		const contentText = contentParts.join("").trim();
 
 		const parts: string[] = [];
+		const vis = lastSnapshot?.reasoning?.visibility;
 		if (showThinking && thinkingText) {
 			// Label what this actually IS. A literal "[thinking]" over an
 			// Anthropic / OpenAI / Grok response is wrong: those return a summary
 			// written by a DIFFERENT model, not the model's own chain of thought.
 			// The visibility rides the state snapshot precisely so the renderer
 			// never has to hardcode provider knowledge.
-			const vis = lastSnapshot?.reasoning?.visibility;
 			const label = vis === "summary" ? "[reasoning summary]" : "[reasoning]";
 			parts.push(`${brand.dim(label)}\n${brand.dim(thinkingText)}`);
+		} else if (
+			opts?.live === true &&
+			showThinking &&
+			!thinkingText &&
+			(vis === "hidden" || vis === "redacted")
+		) {
+			// REASONING IS ON, THE MODEL REASONED, AND THERE IS NOTHING TO SHOW.
+			//
+			// LIVE FRAMES ONLY. `visibility` describes the CURRENT turn, but this
+			// function also renders every historical message on resume — so
+			// without the gate, one hidden-reasoning turn stamped this note onto
+			// the whole thread: messages produced with thinking off, messages from
+			// a different model, and tool-only assistant messages that previously
+			// rendered no block at all (empty text is skipped by the caller; a
+			// note makes it non-empty). It would fabricate a billing claim about
+			// messages the snapshot says nothing about.
+			//
+			// Rendering nothing here is the worst of the three options: the
+			// operator explicitly asked to see reasoning, the model demonstrably
+			// produced some (the footer is showing a duration and a billed token
+			// count), and the pane stays empty — which reads as "the toggle is
+			// broken" or "it didn't think". Neither is true.
+			//
+			// `hidden` is the DEFAULT on the current Claude generation: the text
+			// is omitted by provider policy and billed anyway. Say that once, in
+			// the operator's words, so an empty pane becomes an explanation.
+			parts.push(brand.dim(`[${describeReasoningVisibility(vis)}]`));
 		}
 		if (contentText) parts.push(contentText);
 		return parts.join("\n\n");
@@ -1669,7 +1699,19 @@ export async function wireConnectUi(
 	// empty thread), never a blanked view of a thread that's secretly full.
 	// The replay is BOUNDED server-side — the `resume` RPC caps how many
 	// transcript messages it ships — so a 10k-message thread stays snappy.
-	const doResume = async (): Promise<void> => {
+	/**
+	 * The live `pi` frame handler, forward-declared.
+	 *
+	 * `doResume` (above) needs it to apply replayed frames, and it is registered
+	 * further down where the rest of the stream wiring lives. A forward
+	 * reference keeps the replay path going through the EXACT handler the live
+	 * stream uses — a second, parallel apply path would drift from it, and
+	 * drifting is how a replayed frame ends up rendering differently from the
+	 * live one it is standing in for.
+	 */
+	let handlePiFrame: ((payload: unknown) => void) | undefined;
+
+	const doResume = async (sinceSeq?: number): Promise<void> => {
 		if (resumeInFlight) {
 			resumePending = true;
 			return;
@@ -1678,7 +1720,14 @@ export async function wireConnectUi(
 		try {
 			let snap: Awaited<ReturnType<typeof client.resume>> | undefined;
 			try {
-				snap = await client.resume(withBinding());
+				// Pass the cursor when a gap was detected. The transcript rebuilds
+				// everything it holds; `sinceSeq` additionally asks for the frames
+				// it CANNOT hold (the synthetic tool events Brigade mints for a
+				// claude-cli turn, which are in no JSONL). Without this the server
+				// retained those frames and nothing ever asked for them.
+				snap = await client.resume(
+					sinceSeq === undefined ? withBinding() : withBinding({ sinceSeq }),
+				);
 			} catch {
 				return;
 			}
@@ -1686,6 +1735,36 @@ export async function wireConnectUi(
 			clearTranscriptRegion();
 			const messages = Array.isArray(snap.messages) ? snap.messages : [];
 			for (const m of messages) renderTranscriptMessage(m);
+			// REPLAYED FRAMES, applied AFTER the transcript.
+			//
+			// These are the frames no transcript can rebuild. They are the exact
+			// bytes originally broadcast, so they go back through the same handler
+			// the live stream uses and dedupe on the same identity keys.
+			//
+			// `replayComplete === false` means retention was trimmed past the
+			// cursor and some frames are gone for good. Say so once rather than
+			// leaving the operator to assume the gap was empty — a silent partial
+			// recovery is the failure this whole path exists to avoid.
+			const replayed = Array.isArray(snap.replayedFrames) ? snap.replayedFrames : [];
+			for (const raw of replayed) {
+				try {
+					const parsed = JSON.parse(raw) as { event?: string; payload?: unknown };
+					if (parsed?.event === "pi" && parsed.payload !== undefined) {
+						handlePiFrame?.(parsed.payload as never);
+					}
+				} catch {
+					/* a malformed retained frame must never break the rebuild */
+				}
+			}
+			if (snap.replayComplete === false && replayed.length === 0) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim("some stream updates could not be recovered — the transcript above is complete, but tool activity in that gap is lost")}`,
+						0,
+						0,
+					),
+				);
+			}
 			// Recover the non-transcript events too ("nothing lost"): recent
 			// system-event notices, then any tool-approval prompts STILL pending
 			// on this session — re-rendered answerable so a prompt that arrived or
@@ -1898,7 +1977,12 @@ export async function wireConnectUi(
 	// mutations. Primitive #6: when `subagentDepth > 0`, indent child events
 	// by `2 * depth` spaces so nested sub-agent activity is visually distinct
 	// from the parent's stream.
-	client.on("pi", (payload: { event: any; subagentDepth?: number; agentId?: string; sessionId?: string }) => {
+	const onPiFrame = (payload: {
+		event: any;
+		subagentDepth?: number;
+		agentId?: string;
+		sessionId?: string;
+	}): void => {
 		const { event, subagentDepth } = payload;
 		// Wave N3 (bug #3) — defensive lane drop. The gateway already
 		// filters via subscribe; this catches the gap between an /agent or
@@ -2030,7 +2114,7 @@ export async function wireConnectUi(
 				const text = hasFullContent
 					? (() => {
 							// Authoritative snapshot — reconcile the accumulator to it.
-							const full = extractAssistantText(msg);
+							const full = extractAssistantText(msg, { live: true });
 							if (event.type === "message_end" && depth === 0 && full.trim()) lastReplyText = full;
 							deltaText.set(deltaKey, full);
 							// The snapshot already contains the reasoning block, so the
@@ -2673,7 +2757,9 @@ export async function wireConnectUi(
 				break;
 			}
 		}
-	});
+	};
+	client.on("pi", onPiFrame);
+	handlePiFrame = onPiFrame as (payload: unknown) => void;
 
 	// Reconnect notifications — let the user know what just happened so a
 	// dropped/restored gateway doesn't look like phantom output.
@@ -2711,8 +2797,11 @@ export async function wireConnectUi(
 	// reordered, or the gateway restarted and reset its counters. Resume to
 	// rebuild from the transcript so the live view self-heals with no missing or
 	// misplaced messages and WITHOUT waiting for a reconnect or a manual refresh.
-	client.on("resync", () => {
-		void doResume();
+	client.on("resync", ({ lastSeq }) => {
+		// `lastSeq` is the last seq we actually saw, which is exactly the cursor
+		// the server needs to replay forward from. Discarding it (as this handler
+		// used to) is what left the whole retention path unreachable.
+		void doResume(typeof lastSeq === "number" ? lastSeq : undefined);
 	});
 
 	// Switch the live session onto a CONFIGURED provider by reusing the same
@@ -3480,6 +3569,12 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
 						`- ${chalk.bold("/copy [code]")} — copy the last reply (or just its code block)\n` +
 						`- ${chalk.bold("/expand [n]")} — show a truncated tool result in full (1 = most recent)\n` +
+						`- ${chalk.bold("/search <query>")} — search this conversation, including tool results\n` +
+						`- ${chalk.bold("/search --regex <pattern>")} — same, treating the query as a regular expression\n` +
+						`- ${chalk.bold("/export [full]")} — write this transcript to a Markdown file (secrets redacted; \`full\` keeps whole tool results)\n` +
+						`- ${chalk.bold("/rewind [n]")} — go back to one of your earlier messages (no arg = list; conversation only, never files)\n` +
+						`- ${chalk.bold("/flush")} — send everything you queued to the running turn right now\n` +
+						`- ${chalk.bold("/context")} — where this thread's context window is going\n` +
 						`- ${chalk.bold("/steer <text>")} — redirect the running turn (or just type mid-turn)\n` +
 						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's reasoning, or press ctrl+t (default: on, remembered)\n` +
 						`- ${chalk.bold("/new")} — start a fresh thread (new session, clean screen, no prior context)\n` +
@@ -4653,6 +4748,101 @@ export async function wireConnectUi(
 		// /usage — render the cumulative usage block from the latest state
 		// snapshot. All fields come from the server's SessionStateSnapshot
 		// — no extra RPC needed.
+		/**
+		 * Provider consumption windows, one line each.
+		 *
+		 * Renders nothing at all when the provider reported none — "unknown" and
+		 * "none left" are opposites, and a bar drawn from absent data claims a
+		 * measurement that was never taken. Counts are shown only when present
+		 * for the same reason: a missing `remaining` must not render as 0.
+		 */
+		const formatLimitLines = (windows: readonly ProviderLimitWindow[] | undefined): string[] => {
+			if (!windows || windows.length === 0) return [];
+			const out: string[] = [];
+			// AGE STALE WINDOWS OUT.
+			//
+			// `observedAt` was recorded and never read, so a window that reported
+			// `exhausted` once stayed exhausted on screen forever — the only thing
+			// that refreshes it is another call to that provider, which is exactly
+			// what an operator who just hit a limit has stopped doing. A stale
+			// reading is worse than none: it is a confident wrong answer.
+			const STALE_AFTER_MS = 15 * 60_000;
+			const now = Date.now();
+			for (const w of windows) {
+				if (typeof w.observedAt === "number" && now - w.observedAt > STALE_AFTER_MS) continue;
+				const parts: string[] = [];
+				if (typeof w.remaining === "number" && typeof w.limit === "number") {
+					parts.push(`${formatTokens(w.remaining)} of ${formatTokens(w.limit)} left`);
+				} else if (typeof w.remaining === "number") {
+					parts.push(`${formatTokens(w.remaining)} left`);
+				}
+				if (typeof w.usedFraction === "number") {
+					parts.push(`${Math.round(w.usedFraction * 100)}% used`);
+				}
+				if (typeof w.resetsAt === "number") {
+					const ms = w.resetsAt - Date.now();
+					if (ms > 0) parts.push(`resets in ${formatElapsed(ms)}`);
+				}
+				const body = parts.length > 0 ? parts.join(" · ") : "reported, no counts";
+				// `exhausted` is the one state a UI must never soften.
+				const label = w.label || w.kind;
+				const line = `${label}: ${body}`;
+				out.push(w.status === "exhausted" ? brand.amber(`${line} — EXHAUSTED`) : brand.dim(line));
+			}
+			return out;
+		};
+
+		if (trimmed === "/context") {
+			editor.setText("");
+			const snap = lastSnapshot;
+			if (!snap) {
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("no snapshot yet — the server hasn't reported state")}`, 0, 0),
+				);
+				return;
+			}
+			// WHERE THE WINDOW IS GOING.
+			//
+			// Deliberately reports only what is actually MEASURED. A per-category
+			// split (system prompt / tools / history) would be a better answer,
+			// but the gateway does not measure those separately today and
+			// inventing the split would be worse than admitting its absence —
+			// this whole subsystem exists because confident wrong numbers are the
+			// failure mode.
+			const lines: string[] = [];
+			if (snap.contextTokens != null && snap.contextWindow != null && snap.contextWindow > 0) {
+				const used = snap.contextTokens;
+				const win = snap.contextWindow;
+				const pct = Math.round((used / win) * 100);
+				const left = Math.max(0, win - used);
+				// A 24-cell bar. Coarse on purpose: this answers "am I close?",
+				// and a finer bar would imply a precision the estimate lacks.
+				const filled = Math.max(0, Math.min(24, Math.round((used / win) * 24)));
+				const bar = `${"█".repeat(filled)}${"░".repeat(24 - filled)}`;
+				const colored = pct >= 75 ? brand.amber(bar) : brand.dim(bar);
+				lines.push(`- ${chalk.bold("window:")}   ${colored} ${pct}%`);
+				lines.push(
+					`- ${chalk.bold("used:")}     ${formatTokens(used)} of ${formatTokens(win)} · ${formatTokens(left)} left`,
+				);
+			} else {
+				lines.push(`- ${chalk.bold("window:")}   ${brand.dim("not reported yet — send a message first")}`);
+			}
+			lines.push(`- ${chalk.bold("messages:")} ${snap.messageCount} ${brand.dim("(user + assistant + tool results)")}`);
+			const reasoningCtx = formatReasoningLine({ state: snap.reasoning });
+			if (reasoningCtx) lines.push(`- ${chalk.bold("reasoning:")} ${reasoningCtx}`);
+			lines.push(`- ${chalk.bold("compaction:")} ${brand.dim("automatic — older turns are summarized before the window fills")}`);
+			const limitLines = formatLimitLines(snap.limits);
+			if (limitLines.length > 0) {
+				lines.push(`- ${chalk.bold("provider limits:")}`);
+				for (const l of limitLines) lines.push(`    ${l}`);
+			}
+			lines.push(
+				`  ${brand.dim("context is what the NEXT request sends; /usage shows all-time billing for this thread")}`,
+			);
+			insertBeforeEditor(new Markdown(`${brand.dim("context")}\n${lines.join("\n")}`, 0, 0, markdownTheme));
+			return;
+		}
+
 		if (trimmed === "/usage") {
 			editor.setText("");
 			const snap = lastSnapshot;
@@ -4690,10 +4880,29 @@ export async function wireConnectUi(
 						// so labelling it "turns" over-reported a 5-turn conversation
 						// with tool use as ~40.
 						`- ${chalk.bold("messages:")} ${snap.messageCount}\n` +
-						`- ${chalk.bold("tokens:")}   ${tokenIn} in · ${tokenOut} out · ${tokenTotal} total\n` +
+						// TWO DIFFERENT MEASUREMENTS, AND THEY LOOK CONTRADICTORY.
+						//
+						// `billed` is CUMULATIVE over the whole session, and `in`
+						// counts input + cache reads + cache writes. Every turn
+						// re-sends the entire history, so after 30 messages the sum
+						// is several times the context window — while `context`
+						// reports only what the NEXT request will send.
+						//
+						// Rendered unlabelled ("282,932 in … context: 68k") this
+						// reads as a contradiction, and an operator reasonably
+						// concludes one of the numbers is broken. Neither is. Say
+						// which question each answers, in the line itself.
+						`- ${chalk.bold("billed:")}   ${tokenTotal} tokens all-time this thread\n` +
+						`  ${brand.dim(`${tokenIn} in (incl. cache reads) · ${tokenOut} out · every turn re-sends the history`)}\n` +
 						`- ${chalk.bold("cost:")}     ${costStr}\n` +
 						`- ${chalk.bold("context:")}  ${ctxStr}\n` +
+						`  ${brand.dim("what the NEXT request sends — this is the one that can run out")}\n` +
 						(reasoningStrUsage ? `- ${chalk.bold("reasoning:")} ${reasoningStrUsage}\n` : "") +
+						// The command named for consumption should answer "how much
+						// have I got left?", not just "how much have I spent?".
+						(formatLimitLines(snap.limits).length > 0
+							? `- ${chalk.bold("limits:")}   ${formatLimitLines(snap.limits).join("\n             ")}\n`
+							: "") +
 						`- ${chalk.bold("thinking:")} ${snap.thinkingLevel}` +
 						(snap.supportsThinking
 							? brand.dim(` (available: ${snap.availableThinkingLevels.join(", ")})`)

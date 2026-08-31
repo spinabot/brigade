@@ -22,7 +22,8 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { PI_TOOL_CALL, PI_TOOL_RESULT, WIRE_TOOL_RESULT } from "./pi-dialect.js";
-import type { Api, Model, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { Api, Model, ProviderResponse, ThinkingLevel } from "@earendil-works/pi-ai";
+import { recordLimitsFromHeaders } from "./usage/limits.js";
 
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { sanitizeMessages } from "./sanitize-surrogates.js";
@@ -1174,6 +1175,7 @@ export function wrapStreamFnWithPayloadMutations(session: AgentSession): void {
 
   const wrapped: StreamFn = (model, context, options) => {
     const userOnPayload = options?.onPayload;
+    const userOnResponse = options?.onResponse;
     // OpenRouter app attribution: when (and only when) this request routes
     // through OpenRouter, merge Brigade's HTTP-Referer / X-OpenRouter-Title
     // headers into Pi's `SimpleStreamOptions.headers`. Caller-supplied headers
@@ -1198,6 +1200,45 @@ export function wrapStreamFnWithPayloadMutations(session: AgentSession): void {
         applyAllPayloadMutations(next, m);
         return next;
       },
+      // RATE-LIMIT HEADERS, WHEREVER THE PROVIDER SENDS THEM.
+      //
+      // Pi hands back `ProviderResponse { status, headers }` via `onResponse`,
+      // and observing here — rather than in any single provider's adapter —
+      // means one seam covers every backend that reports limits at all.
+      //
+      // NOT universal, and the difference matters. Verified in pi-ai: the
+      // Anthropic, OpenAI-completions, OpenAI-responses, Azure, Codex and
+      // Bedrock providers all invoke `onResponse` on the STREAMING path. The
+      // Google, Vertex, Mistral and Cloudflare providers never invoke it, and
+      // Brigade's own transports (`transport-dispatch.ts`) intercept before
+      // Pi's provider path — so `claude-cli` and `ollama-native` do not arrive
+      // here either. `claude-cli` is covered separately by `plan-limits.ts`,
+      // which reads the binary's own `rate_limit_event` frames.
+      //
+      // A backend that reports nothing simply records nothing, and the UI omits
+      // the block rather than drawing an empty bar: "unknown" and "none left"
+      // must never render the same way.
+      //
+      // `recordLimitsFromHeaders` already reads both conventions in use
+      // (`anthropic-ratelimit-*` and `x-ratelimit-*`) and skips absent families
+      // rather than recording them as zero, because "no data" and "none left"
+      // are opposites and a UI must never confuse them.
+      //
+      // Strictly an observer: it reads headers, records, and returns. It never
+      // alters the response, and it is wrapped so a malformed header can never
+      // take down a turn — telemetry must not be able to break the request it
+      // is describing.
+      onResponse: async (response: ProviderResponse, m: Model<Api>) => {
+        try {
+          if (response && typeof response === "object" && response.headers) {
+            const provider = typeof m?.provider === "string" ? m.provider : "unknown";
+            recordLimitsFromHeaders(provider, response.headers);
+          }
+        } catch {
+          /* telemetry is never allowed to fail a turn */
+        }
+        if (userOnResponse) await userOnResponse(response, m);
+      },
     };
     return original(model, context, augmented);
   };
@@ -1211,6 +1252,7 @@ type StreamFn = (
   context: unknown,
   options?: {
     onPayload?: (payload: unknown, m: Model<any>) => unknown | Promise<unknown>;
+    onResponse?: (response: ProviderResponse, m: Model<any>) => void | Promise<void>;
     headers?: Record<string, string>;
   } & Record<string, unknown>,
 ) => unknown;

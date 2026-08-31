@@ -163,3 +163,216 @@ test("a new turn clears the previous phase's duration", () => {
 	t.beginTurn(A, S);
 	assert.equal(t.snapshot(A, S), undefined, "a fresh turn has nothing to report yet");
 });
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * A summary that never arrived is not a summary.
+ *
+ * Reported from a live session: the footer read
+ *
+ *     Thought for 15s · 400 reasoning tokens · provider summary
+ *
+ * with `/reasoning on` and NOTHING rendered in the conversation. The model
+ * reasoned and was billed for it; the "provider summary" label came from the
+ * static provider map, not from anything the turn actually returned. It sent
+ * the operator looking for text that does not exist.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+test("reasoning with tokens but ZERO text is reported as hidden, not summary", () => {
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary"); // the static guess for this provider
+	t.start("a", "s", "summary");
+	t.setTokens("a", "s", 400); // billed…
+	// …and not one character of reasoning text ever arrives.
+	t.end("a", "s");
+
+	const snap = t.snapshot("a", "s");
+	assert.equal(snap?.visibility, "hidden");
+	assert.equal(snap?.tokens, 400);
+	assert.equal(snap?.chars, undefined);
+});
+
+test("a real summary keeps its label — the downgrade is not indiscriminate", () => {
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	t.delta("a", "s", "the model explained itself here");
+	t.setTokens("a", "s", 400);
+	t.end("a", "s");
+
+	assert.equal(t.snapshot("a", "s")?.visibility, "summary");
+});
+
+test("a redacted phase is NOT downgraded — it is already block-proven", () => {
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "redacted");
+	t.start("a", "s", "redacted");
+	t.setTokens("a", "s", 120);
+	t.end("a", "s");
+
+	assert.equal(t.snapshot("a", "s")?.visibility, "redacted");
+});
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * The regressions an adversarial review reproduced against the real class.
+ *
+ * `end()` fires once per model ROUNDTRIP, not per logical turn, and `start()`
+ * used to reset `chars` per PHASE. Together those made the "no text arrived"
+ * downgrade fire on turns that had streamed a real summary, and latch for the
+ * rest of the turn once it did.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+test("a second EMPTY reasoning item does not erase a real summary", () => {
+	// OpenAI's o-series / GPT-5 open one reasoning item per `output_item.added`
+	// and routinely emit several per response, many with empty summaries.
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	t.delta("a", "s", "x".repeat(600)); // a real summary
+	t.end("a", "s");
+	t.start("a", "s", "summary"); // second item, no text at all
+	t.end("a", "s");
+
+	const snap = t.snapshot("a", "s");
+	assert.equal(snap?.visibility, "summary", "600 chars of summary did arrive");
+	assert.equal(snap?.chars, 600, "chars counts the whole turn, not the last phase");
+});
+
+test("late reasoning text corrects an early empty phase", () => {
+	// Roundtrip 1 opens an empty phase; roundtrip 2 streams a genuine summary.
+	// The old code latched `hidden` on the first and never re-evaluated, so the
+	// real summary rendered under a label saying it was never exposed.
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	t.end("a", "s");
+	assert.equal(t.snapshot("a", "s")?.visibility, "hidden", "nothing seen yet");
+
+	t.start("a", "s", "summary");
+	t.delta("a", "s", "y".repeat(900));
+	t.end("a", "s");
+	assert.equal(
+		t.snapshot("a", "s")?.visibility,
+		"summary",
+		"the downgrade must not latch — it is derived, not stored",
+	);
+});
+
+test("an ACTIVE phase is never downgraded — text may not have arrived yet", () => {
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	assert.equal(t.snapshot("a", "s")?.visibility, "summary");
+});
+
+test("a new turn re-evaluates from scratch", () => {
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	t.end("a", "s");
+	assert.equal(t.snapshot("a", "s")?.visibility, "hidden");
+
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	t.delta("a", "s", "fresh reasoning");
+	t.end("a", "s");
+	assert.equal(t.snapshot("a", "s")?.visibility, "summary");
+});
+
+test("start() defaults to summary, never raw", () => {
+	// Understating fidelity is a smaller error than claiming a paraphrase is
+	// the model's own chain of thought (see visibility.ts).
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.start("a", "s");
+	t.delta("a", "s", "some text");
+	t.end("a", "s");
+	assert.equal(t.snapshot("a", "s")?.visibility, "summary");
+});
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * The PRODUCTION wiring, not the tracker in isolation.
+ *
+ * Every test above seeds `setVisibility(...,"summary")` right after
+ * `beginTurn`, which is exactly the step the gateway does NOT do per block.
+ * The gateway instead refines per thinking block:
+ *
+ *     prev = <read current>;  setVisibility(refine(prev, block))
+ *
+ * A reviewer showed that reading the DERIVED value there wrote the no-text
+ * downgrade back into storage, where `refineReasoningVisibility` — which never
+ * widens fidelity — made it permanent. These reproduce that loop.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/** Exactly what `server.ts` does for each `thinking` block on a message. */
+function refineLikeGateway(
+	t: ReasoningTracker,
+	block: { thinking?: string; thinkingSignature?: string; redacted?: boolean },
+): void {
+	t.noteThinkingBlock("a", "s", block);
+}
+
+test("an empty reasoning item does not permanently pin the turn to hidden", () => {
+	// OpenAI's o-series / GPT-5 emit one reasoning item per `output_item.added`,
+	// many of them empty, each settling as empty-text + signature.
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+
+	// Item 1: empty, but signed — legitimately refines to `hidden`.
+	t.start("a", "s", "summary");
+	refineLikeGateway(t, { thinking: "", thinkingSignature: "sig-1" });
+	t.end("a", "s");
+
+	// Item 2: a genuine 900-character summary.
+	t.start("a", "s", "summary");
+	t.delta("a", "s", "y".repeat(900));
+	refineLikeGateway(t, { thinking: "y".repeat(900), thinkingSignature: "sig-2" });
+	t.end("a", "s");
+
+	const snap = t.snapshot("a", "s");
+	assert.equal(snap?.chars, 900, "the summary did arrive");
+	assert.notEqual(
+		snap?.visibility,
+		"hidden",
+		"900 chars of summary must not render as 'not exposed by this model'",
+	);
+});
+
+test("the derived downgrade is never written back into storage", () => {
+	// The mechanism itself: after a settled empty turn the REPORTED value is
+	// `hidden`, but the STORED value must still be `summary` — otherwise the
+	// next refine reads `hidden` as its floor and can never climb back.
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	t.end("a", "s");
+
+	assert.equal(t.snapshot("a", "s")?.visibility, "hidden", "reported: nothing arrived");
+	assert.equal(t.declaredVisibility("a", "s"), "summary", "stored: what the backend can return");
+
+	// An empty block records nothing at all now — `chars` already knows whether
+	// text arrived, so there is no value to write back and therefore nothing
+	// that can latch.
+	refineLikeGateway(t, { thinking: "" });
+	assert.equal(t.declaredVisibility("a", "s"), "summary");
+});
+
+test("a genuinely redacted phase still refines to redacted", () => {
+	// The guard must not block real downgrades — only the derived one.
+	const t = new ReasoningTracker();
+	t.beginTurn("a", "s");
+	t.setVisibility("a", "s", "summary");
+	t.start("a", "s", "summary");
+	refineLikeGateway(t, { redacted: true, thinkingSignature: "sig" });
+	t.end("a", "s");
+	assert.equal(t.snapshot("a", "s")?.visibility, "redacted");
+});

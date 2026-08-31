@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-a
 
 import type { BrigadeConfig } from "../../config/io.js";
 import type { AnyBrigadeTool } from "../tools/types.js";
+import { warnUnhandledPiDroppedFields } from "../tools/pi-tool-boundary.js";
 import { type BrigadeHookName, createHookRunner, type HookFireResult } from "./hook-runner.js";
 import type { ChannelMessagingAdapter, ChannelSecurityAdapter } from "../channels/types.adapters.js";
 import type {
@@ -646,6 +647,11 @@ export class BrigadeExtensionRegistry {
 				// all match. Cast bridges the nominal gap without changing authoring.
 				const built = t.tool ?? t.factory?.create(factoryCtx);
 				if (!built) continue;
+				// Extension tools are the ones the conformance test structurally
+				// cannot see: a third-party module builds them at runtime, so an
+				// extra field on one never meets Brigade's compiler. This line is
+				// the last point before Pi's wrapper drops it in silence.
+				warnUnhandledPiDroppedFields([built], "extension");
 				pi.registerTool(built as never);
 			}
 			// Pi has no native hook priority — handlers fire in registration order — so
