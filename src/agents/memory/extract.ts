@@ -54,6 +54,20 @@ const log = createSubsystemLogger("memory/extract");
 export interface PreCompactionExtractionArgs {
 	agentId: string;
 	sessionId: string;
+	/**
+	 * The ROUTING key (`agent:<id>:<thread>`) of the session whose compaction
+	 * triggered this sweep.
+	 *
+	 * `sessionId` is a `randomUUID()` and cannot be attributed to anything — the
+	 * usage ledger, the header and the subscription filter are all keyed on the
+	 * session KEY. Billing a distiller call to a UUID lands the spend on a row
+	 * nobody reads, which is how compaction cost was lost once already.
+	 *
+	 * Optional so existing callers (tests, sub-agents) compile unchanged; when
+	 * absent the spend is recorded against the agent's maintenance bucket rather
+	 * than invented onto a session.
+	 */
+	sessionKey?: string;
 	/** Snapshot of the session messages about to be compacted away. */
 	messages: unknown[];
 	/** The turn's memory origin (owner vs channel) — preserves Tideline isolation. */
@@ -564,12 +578,78 @@ function getMemoryLlmTimeoutMs(): number {
 	return Number.isFinite(parsed) && parsed >= 5_000 ? parsed : MEMORY_LLM_TIMEOUT_MS_DEFAULT;
 }
 
+/**
+ * What one isolated-LLM call cost, as Pi's own session accounting reports it.
+ *
+ * `costKnown` is separate from a zero cost on purpose: a local Ollama model
+ * genuinely costs nothing, while a provider that reported no price is unknown,
+ * and collapsing those two into `0` is how a total quietly understates itself.
+ */
+export interface IsolatedLlmUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	/** Dollars, when the provider priced it. */
+	cost: number;
+	/** False when no price could be established — the total must render `≥$X`. */
+	costKnown: boolean;
+}
+
+/**
+ * Turn Pi's session stats into a usage record, deciding whether the price is
+ * KNOWN.
+ *
+ * The distinction is the whole point. A local Ollama run genuinely costs
+ * nothing; a provider that returned no pricing costs an unknown amount. Both
+ * arrive here as `cost: 0`, and reporting the second as free is how a session
+ * total ends up confidently short. So: zero cost is only believed when zero
+ * tokens were spent. Otherwise the price is unknown and the operator's total
+ * renders `≥$X` — vague, but never wrong.
+ */
+export function deriveIsolatedUsage(stats: {
+	tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+	cost?: number;
+}): IsolatedLlmUsage | undefined {
+	const tokens = stats?.tokens;
+	if (!tokens) return undefined;
+	const input = tokens.input ?? 0;
+	const output = tokens.output ?? 0;
+	const cost = typeof stats.cost === "number" && Number.isFinite(stats.cost) ? stats.cost : 0;
+	return {
+		input,
+		output,
+		cacheRead: tokens.cacheRead ?? 0,
+		cacheWrite: tokens.cacheWrite ?? 0,
+		cost,
+		costKnown: cost > 0 || input + output === 0,
+	};
+}
+
 /** Marker thrown when a memory sweep LLM call exceeds its wall-clock cap. */
 export class MemoryLlmTimeoutError extends Error {
 	readonly code = "memory-llm:timeout" as const;
 	constructor(timeoutMs: number) {
 		super(`memory LLM call exceeded ${timeoutMs}ms timeout`);
 		this.name = "MemoryLlmTimeoutError";
+	}
+}
+
+/**
+ * Marker thrown when the CALLER cancelled an isolated LLM call.
+ *
+ * Deliberately shaped like a DOM `AbortError` — `name: "AbortError"`,
+ * `code: "ABORT_ERR"` — because that is the exact pair `retry-policy.ts` and
+ * `model-fallback.ts` classify aborts by. A cancellation that escapes this
+ * module wearing any other shape would be read as a transient provider fault
+ * and RETRIED, which re-bills the call the operator just cancelled: the precise
+ * outcome the cancellation exists to prevent.
+ */
+export class IsolatedLlmAbortError extends Error {
+	readonly code = "ABORT_ERR" as const;
+	constructor() {
+		super("isolated LLM call was cancelled by the caller");
+		this.name = "AbortError";
 	}
 }
 
@@ -588,8 +668,47 @@ export class MemoryLlmTimeoutError extends Error {
 export function makeIsolatedLlm(
 	systemPrompt: string,
 	args: MakeExtractionLlmArgs,
-): (input: string) => Promise<string> {
-	return async (input: string): Promise<string> => {
+	/**
+	 * Wall-clock cap for THIS runner, overriding the memory-sweep default.
+	 *
+	 * The 60s default is tuned for distillation prompts that return a few
+	 * hundred tokens off a bounded input. Mid-turn compaction summarizes an
+	 * entire context window and legitimately runs longer — Claude Code's own
+	 * transcripts show compactions past 100 seconds — so it passes its own
+	 * bound rather than inheriting one sized for a different job.
+	 */
+	timeoutOverrideMs?: number,
+	/**
+	 * Reports what the call actually cost, read from the isolated session.
+	 *
+	 * Every Brigade-owned model call — a memory sweep, a skill distillation, a
+	 * compaction summarization — is real spend that the main session's usage
+	 * stream cannot see, because it runs on a session of its own. Without this
+	 * the only honest thing to record was "there was spend we cannot price",
+	 * which degrades the operator's total to `≥$X` forever. Pi tracks the
+	 * numbers on the isolated session all along; they just were never read.
+	 *
+	 * Fires after a SUCCESSFUL call. Never throws into the caller.
+	 */
+	onUsage?: (usage: IsolatedLlmUsage) => void,
+): (input: string, signal?: AbortSignal) => Promise<string> {
+	/**
+	 * `signal` is the CALLER'S cancellation — for mid-turn compaction it is the
+	 * turn's own AbortSignal, i.e. the operator's Ctrl+C.
+	 *
+	 * Pi's `prompt()` accepts no signal (`pi-agent-core` agent.d.ts:104-105); the
+	 * only cancellation handle an `AgentSession` exposes is `abort()`, which is
+	 * what the timeout path below already uses. So the signal is BRIDGED onto
+	 * that. Without the bridge an interrupted turn left a summarization of a full
+	 * context window running to completion against the provider — real, billed
+	 * spend on an answer nobody would ever read, and the operator had already
+	 * been told the turn was cancelled.
+	 */
+	return async (input: string, signal?: AbortSignal): Promise<string> => {
+		// CHECK BEFORE SPENDING ANYTHING. A call cancelled while it was queued must
+		// not build a session, resolve auth, or reach a provider — the last of
+		// those is billed, and the first two are work with no possible consumer.
+		if (signal?.aborted) throw new IsolatedLlmAbortError();
 		// The isolated extraction sweep can itself run on an Ollama model. Re-assert
 		// the native transport before each run: `ModelRegistry.refresh()` calls
 		// `resetApiProviders()`, which wipes our dynamic `api: "ollama"` registration,
@@ -639,7 +758,10 @@ export function makeIsolatedLlm(
 			// call `session.abort()` (Pi cancels the in-flight stream) and
 			// reject so the caller's existing catch path triggers (cursor
 			// stays put, throttle stamp unchanged, next sweep retries).
-			const timeoutMs = getMemoryLlmTimeoutMs();
+			const timeoutMs =
+				Number.isFinite(timeoutOverrideMs) && (timeoutOverrideMs as number) >= 5_000
+					? (timeoutOverrideMs as number)
+					: getMemoryLlmTimeoutMs();
 			let timer: ReturnType<typeof setTimeout> | null = null;
 			const timeoutPromise = new Promise<never>((_, reject) => {
 				timer = setTimeout(() => {
@@ -651,10 +773,57 @@ export function makeIsolatedLlm(
 				}, timeoutMs);
 				timer.unref?.();
 			});
+			// Bridge the caller's cancellation onto the session, the same way the
+			// timeout above does. Whichever fires first wins the race below; both
+			// stop the in-flight provider stream rather than merely stopping US
+			// from waiting for it.
+			let onAbort: (() => void) | undefined;
+			const abortPromise = new Promise<never>((_, reject) => {
+				if (!signal) return;
+				onAbort = () => {
+					// Best-effort, like the timeout path: Pi's abort() is documented
+					// never to throw, but the rejection below is what must surface.
+					void (session as AgentSession).abort?.().catch(() => {});
+					reject(new IsolatedLlmAbortError());
+				};
+				// Aborted in the window between the pre-flight check and here.
+				if (signal.aborted) {
+					onAbort();
+					return;
+				}
+				signal.addEventListener("abort", onAbort, { once: true });
+			});
 			try {
-				await Promise.race([(session as AgentSession).prompt(input), timeoutPromise]);
+				await Promise.race([
+					(session as AgentSession).prompt(input),
+					timeoutPromise,
+					abortPromise,
+				]);
 			} finally {
 				if (timer) clearTimeout(timer);
+				// The signal OUTLIVES this call — it belongs to the turn, and a turn
+				// can run several isolated calls. An unremoved listener would keep
+				// this finished session, and the whole transcript it closed over,
+				// reachable until the turn ended.
+				if (onAbort && signal) signal.removeEventListener("abort", onAbort);
+			}
+			// Read the meter BEFORE returning. The session is thrown away on the
+			// next line, and with it the only record that this call happened.
+			if (onUsage) {
+				try {
+					const stats = (
+						session as AgentSession & { getSessionStats?: () => unknown }
+					).getSessionStats?.() as
+						| {
+								tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+								cost?: number;
+						  }
+						| undefined;
+					const usage = stats ? deriveIsolatedUsage(stats) : undefined;
+					if (usage) onUsage(usage);
+				} catch {
+					/* metering must never break the call it is measuring */
+				}
 			}
 			return lastAssistantText(session as AgentSession);
 		} finally {
@@ -667,8 +836,14 @@ export function makeIsolatedLlm(
 /**
  * The extraction distiller — `makeIsolatedLlm` with the EXTRACTION_PROMPT pinned.
  */
-export function makeExtractionLlm(args: MakeExtractionLlmArgs): ExtractionLlm {
-	return makeIsolatedLlm(EXTRACTION_PROMPT, args);
+export function makeExtractionLlm(
+	args: MakeExtractionLlmArgs,
+	onUsage?: (usage: IsolatedLlmUsage) => void,
+): ExtractionLlm {
+	// `onUsage` is what makes the sweep visible in the operator's totals. Without
+	// it every memory sweep Brigade has ever run was free as far as any figure
+	// could tell.
+	return makeIsolatedLlm(EXTRACTION_PROMPT, args, undefined, onUsage);
 }
 
 function lastAssistantText(session: AgentSession): string {

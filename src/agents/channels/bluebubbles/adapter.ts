@@ -49,6 +49,39 @@ import {
 	type ConnectBlueBubblesArgs,
 } from "./connection.js";
 import { isMacOSEditUnsupported, probeBlueBubbles } from "./probe.js";
+import { normalizeIMessageAclEntry, normalizeIMessageHandle } from "../imessage/targets.js";
+
+/**
+ * The identities one inbound message can be allow-listed under.
+ *
+ * BlueBubbles carries the SAME Apple handles as the iMessage channel — the
+ * server hands back whatever the chat database stores (`+1 (555) 123-4567`,
+ * `User@Example.com`) while the operator types the form the wizard showed
+ * them, and the allow-list is matched by exact equality. Same identity space,
+ * so the same canonicalisation; the shared helper keeps the two channels from
+ * drifting apart.
+ *
+ * The thread identity is BlueBubbles' `chatGuid` — this channel has no numeric
+ * `chat_id` — so a conversation-scoped entry is written `chat_guid:<guid>`.
+ */
+function blueBubblesSenderAliases(msg: { from: string; chatGuid?: string }): string[] {
+	const out = new Set<string>();
+	const handle = normalizeIMessageHandle(msg.from);
+	if (handle) out.add(handle);
+	const guid = msg.chatGuid?.trim();
+	if (guid) out.add(`chat_guid:${guid}`);
+	return [...out];
+}
+
+/** Canonicalize a configured entry to the spelling `blueBubblesSenderAliases` emits. */
+function normalizeBlueBubblesAclEntry(entry: string): string {
+	const trimmed = (entry ?? "").trim();
+	const guid = /^(chat_guid|chatguid|guid):\s*(.+)$/i.exec(trimmed);
+	// A chat guid is an opaque server identifier — case and punctuation are
+	// significant, so it is carried through verbatim rather than normalised.
+	if (guid?.[2]) return `chat_guid:${guid[2].trim()}`;
+	return normalizeIMessageAclEntry(trimmed);
+}
 
 /** Practical per-message text limit for chunked sends (before bubble-splitting). */
 const BLUEBUBBLES_TEXT_LIMIT = 10_000;
@@ -170,6 +203,7 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 							...(msg.messageGuid ? { messageId: msg.messageGuid } : {}),
 							...(msg.timestampMs !== undefined ? { messageTimestampMs: msg.timestampMs } : {}),
 							from: msg.from,
+							senderAliases: blueBubblesSenderAliases(msg),
 							...(msg.fromName !== undefined ? { fromName: msg.fromName } : {}),
 							text: msg.text,
 							chatType: msg.isGroup ? "group" : "direct",
@@ -296,6 +330,8 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 
 		// The BlueBubbles bot runs AS the operator's signed-in Messages.app, so the
 		// pairing card uses the "account" label.
+		normalizeAclEntry: normalizeBlueBubblesAclEntry,
+
 		pairing: { idLabel: "account" as const },
 
 		setup: {
@@ -327,7 +363,10 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 				{
 					key: "allowFrom",
 					prompt:
-						"Allowlist of senders for allowlist mode — handles or chat targets, comma-separated (e.g. +15555550123, user@example.com, chat_id:123). Leave blank for none.",
+						"Allowlist of senders for allowlist mode — handles or chat targets, comma-separated " +
+						// `chat_guid:`, NOT `chat_id:` — BlueBubbles threads have no numeric
+						// id, so the old example could never match anything an operator typed.
+						"(e.g. +15555550123, user@example.com, chat_guid:iMessage;-;+15555550123). Leave blank for none.",
 					secret: false,
 				},
 			],

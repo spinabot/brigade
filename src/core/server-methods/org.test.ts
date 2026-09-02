@@ -120,7 +120,7 @@ describe("org.snapshot RPC handler — cfg.org present (every chart format)", ()
 
       // Format-specific markers.
       // TUI: ANSI escape sequence (ESC [).
-      assert.match(tui, /\[/, "tui chart must include ANSI escape sequences");
+      assert.match(tui, /\x1b\[/, "tui chart must include ANSI escape sequences");
       // TUI: emoji glyphs (🦁 / 👑 / 🏛).
       assert.match(tui, /\u{1f981}/u);
       // Channel: triple-backtick wrapper for monospace rendering.
@@ -128,11 +128,11 @@ describe("org.snapshot RPC handler — cfg.org present (every chart format)", ()
       assert.match(channel, /```$/, "channel chart must end with triple backticks");
       // Channel: emoji on, ANSI off.
       assert.match(channel, /\u{1f981}/u, "channel chart must include emoji");
-      assert.doesNotMatch(channel, /\[/, "channel chart must not include ANSI escapes");
+      assert.doesNotMatch(channel, /\x1b\[/, "channel chart must not include ANSI escapes");
       // ASCII: no emoji, no ANSI — Pride tokens degrade to *, [TOP], [DEPT].
       assert.doesNotMatch(ascii, /\u{1f981}/u, "ascii chart must omit lion emoji");
       assert.doesNotMatch(ascii, /\u{1f451}/u, "ascii chart must omit crown emoji");
-      assert.doesNotMatch(ascii, /\[/, "ascii chart must omit ANSI escapes");
+      assert.doesNotMatch(ascii, /\x1b\[/, "ascii chart must omit ANSI escapes");
       assert.match(ascii, /\[TOP\]/, "ascii chart must mark topOrder with [TOP]");
       assert.match(ascii, /\[DEPT\]/, "ascii chart must mark departments with [DEPT]");
 

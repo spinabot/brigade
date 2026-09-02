@@ -240,7 +240,7 @@ export function hasBinary(name: string, env: NodeJS.ProcessEnv = process.env): b
 	// Key the cache on name + PATH: the answer depends on PATH, and the
 	// injectable `env` seam (tests, future multi-env) must not get a stale hit
 	// from a different PATH. In the normal single-env case the key is constant.
-	const cacheKey = `${name} ${pathValue}`;
+	const cacheKey = `${name}\x00${pathValue}`;
 	const cached = binaryCache.get(cacheKey);
 	if (cached !== undefined) return cached;
 

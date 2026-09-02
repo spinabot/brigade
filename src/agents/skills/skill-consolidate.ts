@@ -26,7 +26,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
-import { balancedObjects, makeIsolatedLlm, type MakeExtractionLlmArgs } from "../memory/extract.js";
+import {
+	balancedObjects,
+	makeIsolatedLlm,
+	type IsolatedLlmUsage,
+	type MakeExtractionLlmArgs,
+} from "../memory/extract.js";
 import { appendSkillSection } from "../tools/manage-skill-tool.js";
 import { archiveSkill, skillsSnapshotsRoot, snapshotSkillsRoot } from "./skill-curator.js";
 import { listCurationCandidates, recordSkillPatched } from "./skill-usage.js";
@@ -304,6 +309,9 @@ function writeConsolidationReport(
 }
 
 /** The consolidation distiller — `makeIsolatedLlm` with the prompt pinned. */
-export function makeSkillConsolidationLlm(args: MakeExtractionLlmArgs): SkillConsolidationLlm {
-	return makeIsolatedLlm(SKILL_CONSOLIDATION_PROMPT, args);
+export function makeSkillConsolidationLlm(
+	args: MakeExtractionLlmArgs,
+	onUsage?: (usage: IsolatedLlmUsage) => void,
+): SkillConsolidationLlm {
+	return makeIsolatedLlm(SKILL_CONSOLIDATION_PROMPT, args, undefined, onUsage);
 }

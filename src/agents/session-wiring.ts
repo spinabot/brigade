@@ -31,6 +31,7 @@ import { makePathWriteGuard } from "./path-write-guard.js";
 import type { SessionContext } from "./session-context.js";
 import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-guard.js";
 import { makeToolLoopDetector } from "./tool-loop-detector.js";
+import { warnUnhandledPiDroppedFields } from "./tools/pi-tool-boundary.js";
 import { wrapOwnerOnlyToolExecution, wrapToolExecutionTimeout } from "./tools/common.js";
 import { createBrigadeTools } from "./tools/registry.js";
 import type { AnyBrigadeTool } from "./tools/types.js";
@@ -322,6 +323,13 @@ export function assembleBrigadeToolset(opts: {
 		? allowedBuiltinNames
 		: allowedBuiltinNames.filter((n) => policyAllows(n));
 	const brigadeToolNames = customTools.map((t) => t.name);
+	// This array is about to become Pi's `customTools`, and Pi's tool wrapper
+	// copies a fixed field list onto the object its loop sees — everything else
+	// is dropped with no error and no type failure (see tools/pi-tool-boundary.ts).
+	// Reporting is deliberately one-way: an unmodelled field is a smell, not a
+	// reason to withhold a working tool, so the operator gets a line naming what
+	// vanished rather than a feature that quietly does nothing.
+	warnUnhandledPiDroppedFields(customTools, "session-wiring");
 	return {
 		builtinToolNames: builtinNames,
 		brigadeToolNames,

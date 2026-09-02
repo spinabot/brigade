@@ -1,3 +1,4 @@
+import { WIRE_TOOL_USE } from "../pi-dialect.js";
 // Wire types + a line parser for the Claude Code CLI's `--output-format
 // stream-json --include-partial-messages --verbose` protocol.
 //
@@ -56,6 +57,18 @@ export interface AnthropicUsage {
 	output_tokens?: number;
 	cache_read_input_tokens?: number;
 	cache_creation_input_tokens?: number;
+	/**
+	 * Per-kind breakdown of the output tokens. `thinking_tokens` is what the
+	 * model was billed for REASONING, which is deliberately not the same as the
+	 * reasoning text you can see — the vendor summarizes the real chain of
+	 * thought and bills the original.
+	 *
+	 * Read opportunistically. These frames are the raw Anthropic API events the
+	 * binary RELAYS, so the field is present whenever the API sends it,
+	 * regardless of what the CLI itself chooses to display. Absent stays absent —
+	 * it must never be rendered as zero.
+	 */
+	output_tokens_details?: { thinking_tokens?: number; [k: string]: unknown };
 	[k: string]: unknown;
 }
 
@@ -172,6 +185,71 @@ export function classifyResultFrame(frame: ResultFrame): "success" | "limit" | "
 		return "auth";
 	}
 	return isError ? "error" : "success";
+}
+
+/**
+ * Split an Anthropic usage block into its legs, UNFOLDED.
+ *
+ * `foldUsage` below collapses the cache legs into `input` because the context
+ * math only needs one number. This variant keeps them apart so the turn can
+ * REPORT how much of the prompt was cached — on a subscription backend that is
+ * routinely 80-90% of prompt volume, and folding it away made prompt caching
+ * invisible in every Brigade surface. `total` is identical to
+ * `foldUsage().input + foldUsage().output`, so the two agree by construction.
+ */
+export function splitUsage(usage: AnthropicUsage | undefined): {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	total: number;
+	/** Reasoning tokens, when the API reported them. `undefined` means "not
+	 *  reported" and must never be shown as zero. */
+	reasoning?: number;
+} {
+	const input = usage?.input_tokens ?? 0;
+	const output = usage?.output_tokens ?? 0;
+	const cacheRead = usage?.cache_read_input_tokens ?? 0;
+	const cacheWrite = usage?.cache_creation_input_tokens ?? 0;
+	const rawReasoning = usage?.output_tokens_details?.thinking_tokens;
+	const reasoning =
+		typeof rawReasoning === "number" && Number.isFinite(rawReasoning) && rawReasoning >= 0
+			? rawReasoning
+			: undefined;
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		total: input + output + cacheRead + cacheWrite,
+		...(reasoning !== undefined ? { reasoning } : {}),
+	};
+}
+
+/**
+ * Map the CLI's Anthropic-shaped stop reason onto Pi's `StopReason` vocabulary.
+ *
+ * Returns `undefined` for an absent or unrecognized value so the caller keeps
+ * whatever it already had, rather than clobbering a real reason with a guess.
+ *
+ * This matters more than it looks: `detectMaxTokensStop` in the agent loop
+ * matches `"length"`, and the auto-continuation machinery is gated on it. While
+ * this mapping was missing, a claude-cli answer that hit the output cap was
+ * delivered mid-sentence and reported as a clean finish — the continuation loop
+ * was dead for this backend only.
+ */
+export function mapStopReason(raw: string | null | undefined): "stop" | "length" | "toolUse" | undefined {
+	switch (raw) {
+		case "max_tokens":
+			return "length";
+		case WIRE_TOOL_USE:
+			return "toolUse";
+		case "end_turn":
+		case "stop_sequence":
+			return "stop";
+		default:
+			return undefined;
+	}
 }
 
 /** Sum an Anthropic usage block into {input,output} totals (cache folded into input). */

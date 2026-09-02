@@ -6,6 +6,12 @@ export declare const get: import("convex/server").RegisteredQuery<"public", {
     _creationTime: number;
     label?: string | undefined;
     model?: string | undefined;
+    outcome?: {
+        error?: string | undefined;
+        reason?: string | undefined;
+        text?: ArrayBuffer | undefined;
+        status: "timeout" | "error" | "ok" | "abort";
+    } | undefined;
     workspaceDir?: string | undefined;
     controllerSessionKey?: string | undefined;
     requesterOrigin?: ArrayBuffer | undefined;
@@ -15,12 +21,6 @@ export declare const get: import("convex/server").RegisteredQuery<"public", {
     sessionStartedAt?: number | undefined;
     accumulatedRuntimeMs?: number | undefined;
     endedAt?: number | undefined;
-    outcome?: {
-        error?: string | undefined;
-        reason?: string | undefined;
-        text?: ArrayBuffer | undefined;
-        status: "timeout" | "error" | "ok" | "abort";
-    } | undefined;
     archiveAtMs?: number | undefined;
     cleanupCompletedAt?: number | undefined;
     cleanupHandled?: boolean | undefined;
@@ -56,6 +56,12 @@ export declare const getByChildSessionKey: import("convex/server").RegisteredQue
     _creationTime: number;
     label?: string | undefined;
     model?: string | undefined;
+    outcome?: {
+        error?: string | undefined;
+        reason?: string | undefined;
+        text?: ArrayBuffer | undefined;
+        status: "timeout" | "error" | "ok" | "abort";
+    } | undefined;
     workspaceDir?: string | undefined;
     controllerSessionKey?: string | undefined;
     requesterOrigin?: ArrayBuffer | undefined;
@@ -65,12 +71,6 @@ export declare const getByChildSessionKey: import("convex/server").RegisteredQue
     sessionStartedAt?: number | undefined;
     accumulatedRuntimeMs?: number | undefined;
     endedAt?: number | undefined;
-    outcome?: {
-        error?: string | undefined;
-        reason?: string | undefined;
-        text?: ArrayBuffer | undefined;
-        status: "timeout" | "error" | "ok" | "abort";
-    } | undefined;
     archiveAtMs?: number | undefined;
     cleanupCompletedAt?: number | undefined;
     cleanupHandled?: boolean | undefined;
@@ -106,6 +106,12 @@ export declare const listByRequester: import("convex/server").RegisteredQuery<"p
     _creationTime: number;
     label?: string | undefined;
     model?: string | undefined;
+    outcome?: {
+        error?: string | undefined;
+        reason?: string | undefined;
+        text?: ArrayBuffer | undefined;
+        status: "timeout" | "error" | "ok" | "abort";
+    } | undefined;
     workspaceDir?: string | undefined;
     controllerSessionKey?: string | undefined;
     requesterOrigin?: ArrayBuffer | undefined;
@@ -115,12 +121,6 @@ export declare const listByRequester: import("convex/server").RegisteredQuery<"p
     sessionStartedAt?: number | undefined;
     accumulatedRuntimeMs?: number | undefined;
     endedAt?: number | undefined;
-    outcome?: {
-        error?: string | undefined;
-        reason?: string | undefined;
-        text?: ArrayBuffer | undefined;
-        status: "timeout" | "error" | "ok" | "abort";
-    } | undefined;
     archiveAtMs?: number | undefined;
     cleanupCompletedAt?: number | undefined;
     cleanupHandled?: boolean | undefined;
@@ -156,15 +156,21 @@ export declare const markCompleted: import("convex/server").RegisteredMutation<"
     error?: string | undefined;
     endedHookEmittedAt?: number | undefined;
     reason: string;
+    outcome: any;
     ownerId: string;
     runId: string;
     endedAt: number;
-    outcome: any;
 }, Promise<{
     _id: import("convex/values").GenericId<"subagentRuns">;
     _creationTime: number;
     label?: string | undefined;
     model?: string | undefined;
+    outcome?: {
+        error?: string | undefined;
+        reason?: string | undefined;
+        text?: ArrayBuffer | undefined;
+        status: "timeout" | "error" | "ok" | "abort";
+    } | undefined;
     workspaceDir?: string | undefined;
     controllerSessionKey?: string | undefined;
     requesterOrigin?: ArrayBuffer | undefined;
@@ -174,12 +180,6 @@ export declare const markCompleted: import("convex/server").RegisteredMutation<"
     sessionStartedAt?: number | undefined;
     accumulatedRuntimeMs?: number | undefined;
     endedAt?: number | undefined;
-    outcome?: {
-        error?: string | undefined;
-        reason?: string | undefined;
-        text?: ArrayBuffer | undefined;
-        status: "timeout" | "error" | "ok" | "abort";
-    } | undefined;
     archiveAtMs?: number | undefined;
     cleanupCompletedAt?: number | undefined;
     cleanupHandled?: boolean | undefined;

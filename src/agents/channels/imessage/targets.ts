@@ -29,7 +29,21 @@ export type IMessageTarget =
 	| { kind: "chat_id"; chatId: number }
 	| { kind: "chat_guid"; chatGuid: string }
 	| { kind: "chat_identifier"; chatIdentifier: string }
-	| { kind: "handle"; to: string; service: IMessageService };
+	| {
+			kind: "handle";
+			to: string;
+			service: IMessageService;
+			/**
+			 * True when the caller wrote the service prefix themselves.
+			 *
+			 * Needed because `auto` is BOTH the parse of an explicit `auto:` and
+			 * the value a bare handle gets, so `service` alone cannot say whether
+			 * anyone chose it. Senders use this to let a per-target prefix beat the
+			 * account default — including `auto:` beating an account pinned to
+			 * `sms`, which is otherwise unexpressible.
+			 */
+			serviceExplicit: boolean;
+	  };
 
 /** A parsed allow-list target (lenient — a bare handle string is the fallback). */
 export type IMessageAllowTarget =
@@ -56,15 +70,51 @@ function stripPrefix(value: string, prefix: string): string {
 }
 
 /**
- * Normalise a phone-ish string to E.164. Strips a leading `scheme:`, removes
- * everything but digits and `+`, and prepends `+` when missing.
+ * Normalise a phone-ish string to E.164, or return "" when it is not a phone
+ * number at all.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY THE "IS THIS EVEN A PHONE NUMBER" CHECK EXISTS
+ * ─────────────────────────────────────────────────────────────────────────
+ * This used to strip every non-digit and prepend `+` unconditionally, which
+ * means it did not decide whether the input WAS a phone number — it just made
+ * one. `"Line 2"` became `"+2"`. A contact-ish string with a stray digit was
+ * silently converted into a phone number and dialled, and the operator's
+ * message went to whoever answers at that number. Sending a private
+ * conversation to the wrong recipient is the worst outcome this channel has,
+ * and it took one plausible typo.
+ *
+ * So: letters disqualify. A string with any alphabetic character is not a
+ * phone number and gets "" back, which callers already treat as "not a phone,
+ * try the other handle shapes" (`normalizeIMessageHandle` falls through to the
+ * whitespace-stripped form).
+ *
+ * A minimum digit count is also required. Real E.164 numbers are 7-15 digits;
+ * anything shorter is a fragment, and a fragment prepended with `+` is a
+ * number belonging to someone else. Short codes exist, but they are not
+ * addressable over iMessage, so refusing them costs nothing real.
+ *
+ * NOT fixed here, and deliberately: a national-format number without a country
+ * code (`555-123-4567`) still gets a bare `+` and no region applied. The
+ * account's `region` is known only to the bridge, and stamping `+` here is
+ * what prevents the bridge from applying it. That needs the region threaded
+ * into this call, which is a wider change than this guard — but it now fails
+ * as a wrong number rather than as a wrong PERSON, because a name can no
+ * longer reach this path at all.
  */
+const MIN_E164_DIGITS = 7;
+const MAX_E164_DIGITS = 15;
+
 export function normalizeE164(raw: string): string {
-	let v = raw.trim().replace(/^[a-z][a-z0-9-]*:/i, "");
-	v = v.replace(/[^0-9+]/g, "");
+	const stripped = raw.trim().replace(/^[a-z][a-z0-9-]*:/i, "").trim();
+	if (!stripped) return "";
+	// Letters mean this is a name, an alias, or a handle — never a phone.
+	if (/[a-z]/i.test(stripped)) return "";
+	const v = stripped.replace(/[^0-9+]/g, "");
 	if (!v) return "";
-	if (v.startsWith("+")) return `+${v.slice(1).replace(/\+/g, "")}`;
-	return `+${v.replace(/\+/g, "")}`;
+	const digits = v.replace(/\D/g, "");
+	if (digits.length < MIN_E164_DIGITS || digits.length > MAX_E164_DIGITS) return "";
+	return `+${digits}`;
 }
 
 /**
@@ -161,12 +211,12 @@ export function parseIMessageTarget(raw: string): IMessageTarget {
 			if (!remainder) throw new Error(`${prefix} target is required`);
 			const chat = parseChatTargetStrict(remainder, remainder.toLowerCase());
 			if (chat) return chat;
-			return { kind: "handle", to: remainder, service };
+			return { kind: "handle", to: remainder, service, serviceExplicit: true };
 		}
 	}
 	const chat = parseChatTargetStrict(trimmed, lower);
 	if (chat) return chat;
-	return { kind: "handle", to: trimmed, service: "auto" };
+	return { kind: "handle", to: trimmed, service: "auto", serviceExplicit: false };
 }
 
 /** Parse an allow-list target (LENIENT). A bare/unparseable string is a normalized handle. */
@@ -247,4 +297,36 @@ export function isAllowedIMessageSender(params: {
 		}
 	}
 	return false;
+}
+
+/**
+ * Canonicalize one configured allow-list entry into the spelling
+ * `InboundMessage.senderAliases` uses for this channel.
+ *
+ * Allow-list matching is exact string equality and stays that way — a fuzzy
+ * comparison on an access-control list is how the wrong person gets admitted.
+ * This makes both sides agree on SPELLING first: iMessage delivers whatever the
+ * chat database stores (`+1 (555) 123-4567`, `User@Example.com`) while the
+ * operator types the form the setup wizard showed them.
+ *
+ * `chat_id:` / `chat_identifier:` keep their prefix — they identify the THREAD,
+ * not the sender, and are matched against the conversation. The wizard has
+ * always documented `chat_id:123` as a valid entry; before this it could never
+ * match anything, because `from` is a handle and never equals `chat_id:N`.
+ *
+ * Two genuinely different identities never map onto one string here, so the
+ * allow-list is not widened. `*` is the caller's responsibility to pass through
+ * — it is the wildcard, not an identity.
+ */
+export function normalizeIMessageAclEntry(entry: string): string {
+	const trimmed = (entry ?? "").trim();
+	if (!trimmed) return trimmed;
+	const chat = /^(chat_id|chatid|chat):\s*(\d+)$/i.exec(trimmed);
+	if (chat?.[2]) return `chat_id:${Number.parseInt(chat[2], 10)}`;
+	const ident = /^(chat_identifier|chatidentifier|chatident):\s*(.+)$/i.exec(trimmed);
+	if (ident?.[2]) {
+		const norm = normalizeIMessageHandle(ident[2]);
+		return norm ? `chat_identifier:${norm}` : trimmed;
+	}
+	return normalizeIMessageHandle(trimmed) || trimmed;
 }

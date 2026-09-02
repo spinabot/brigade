@@ -144,6 +144,8 @@ const KNOWN_GUARDED_SESSIONS_METHODS = new Set<string>([
 	"sessions.send",
 	"sessions.spawn",
 	"sessions.patch",
+	"sessions.rename",
+	"sessions.delete",
 	"agent",
 	"cron.add",
 	"cron.update",

@@ -25,6 +25,8 @@
  */
 
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
+import { extractReasoningTokens } from "../agents/usage/reasoning-tokens.js";
+import { requestForcedCompaction } from "../agents/compaction/force-request.js";
 import { createServer as createTcpServer } from "node:net";
 import { pathToFileURL } from "node:url";
 
@@ -55,7 +57,7 @@ import {
 	TICK_INTERVAL_MS,
 	type WireMessage,
 } from "../protocol.js";
-import { type HelloOk, PROTOCOL_VERSION } from "../protocol/handshake.js";
+import { type HelloOk, PROTOCOL_CAPABILITIES, PROTOCOL_VERSION } from "../protocol/handshake.js";
 import { nextSeq } from "../protocol/stream-seq.js";
 // Per-turn execution path (the single canonical runtime). The gateway no
 // longer holds a long-lived Pi session: every inbound `prompt` builds a
@@ -79,7 +81,21 @@ import { composeAttachmentTurn } from "./prompt-attachments.js";
 import { createMcpHttpRoute } from "../agents/mcp/http-route.js";
 import { createMcpTurnRegistry, setActiveMcpToolPlaneHost } from "../agents/mcp/tool-plane-host.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
-import { extractFrameTags, shouldDeliverFrame } from "./ws-subscription-filter.js";
+import { shouldSendDeltaFrame, stripCumulativeContent } from "./delta-mode.js";
+import { classifyFrame, FrameRing } from "./frame-ring.js";
+import {
+	abandonedByRewind,
+	filesTouchedAfter,
+	findOrphanedCompaction,
+	pathToRoot,
+	rewindTargets,
+	type RewindEntry,
+} from "../sessions/rewind.js";
+import { readTranscriptRecords } from "../sessions/transcript-reader.js";
+import { promoteQueue } from "./flush-queue.js";
+import { resolveSteerDelivery } from "./steer-delivery.js";
+import { sweepBillingKey } from "../agents/usage/maintenance-key.js";
+import { extractFrameTags, shouldDeliverFrame, type FrameTags } from "./ws-subscription-filter.js";
 import { setActiveChannelManager } from "../agents/channels/active-manager.js";
 import { sanitizeReplyForChannel } from "../agents/channels/reply-sanitizer.js";
 import { type ChannelManager, startChannels } from "../agents/channels/manager.js";
@@ -159,6 +175,18 @@ import { bootRuntimeContext, enableConfigLiveRefresh } from "../storage/boot.js"
 import { onConfigCachePrimed } from "../storage/config-cache.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import { UsageLedger } from "../agents/usage/ledger.js";
+import { SessionCaches } from "./session-caches.js";
+import { persistSessionUsage, readPersistedSessionUsage } from "../agents/usage/persist.js";
+import { ReasoningTracker } from "../agents/reasoning/reasoning-state.js";
+import { resolveAgentIdFromSessionKey } from "../agents/routing/session-key.js";
+import { initialReasoningVisibility, refineReasoningVisibility } from "../agents/reasoning/visibility.js";
+import { getLimitsForProvider } from "../agents/usage/limits.js";
+import { classifyBillingModeWithAuth } from "../agents/usage/billing-mode.js";
+import {
+	estimateContextTokensFromMessages,
+	summarizeCompactionOutcome,
+} from "../agents/smart-compaction.js";
 import { checkForUpdate } from "./update-check.js";
 import {
 	DEFAULT_AGENT_ID,
@@ -211,7 +239,9 @@ import type { SkillInstallSpec } from "../agents/skills/install-spec.js";
 import { applySkillUpdate } from "../agents/skills/update-config.js";
 import {
 	handleSessionsHistory,
+	handleSessionsDelete,
 	handleSessionsList,
+	handleSessionsRename,
 	handleSessionsPatch,
 	handleSessionsSend,
 	handleSessionsSpawn,
@@ -250,8 +280,16 @@ import {
 	getLaneQueueSize,
 	sessionLane,
 } from "../process/lanes.js";
-import { defaultSessionKey, readSessionStore } from "../sessions/session-store.js";
+import {
+	clearSessionModelPin,
+	defaultSessionKey,
+	pinSessionModel,
+	readSessionModelPin,
+	readSessionStore,
+	updateSessionEntry,
+} from "../sessions/session-store.js";
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
+import { planStateFanout } from "./state-fanout.js";
 import { resolveSessionTranscriptPath } from "../config/paths.js";
 import {
 	flattenConversation,
@@ -398,6 +436,73 @@ function isLocalhostBind(host: string): boolean {
  * the caller's `limit`. Defensive fallbacks on every error path so a
  * corrupt or missing file never crashes the gateway.
  */
+/**
+ * Read a session's transcript as raw ENTRIES — with `id`, `parentId` and
+ * `type` — rather than the projected messages `resume` returns.
+ *
+ * Rewind operates on the tree, not on the rendered conversation: it needs the
+ * parent links to walk a path and the entry ids to move the leaf. Mirrors
+ * `readSessionTranscriptMessages`' storage handling so both modes behave the
+ * same; returns `[]` on anything unreadable, because rewind is an operator
+ * convenience and must never be the thing that fails a session lookup.
+ */
+async function readSessionTranscriptEntries(sessionKey: string): Promise<RewindEntry[]> {
+	const key = (sessionKey ?? "").trim();
+	if (!key) return [];
+	const parsed = parseAgentSessionKey(key);
+	const agentId = parsed?.agentId ?? "main";
+	let sessionId: string | undefined;
+	try {
+		sessionId = readSessionStore(agentId).sessions?.[key]?.sessionId;
+	} catch {
+		return [];
+	}
+	if (!sessionId) return [];
+
+	const toEntry = (r: unknown): RewindEntry | undefined => {
+		const row = r as {
+			id?: unknown;
+			parentId?: unknown;
+			type?: unknown;
+			message?: { role?: unknown; content?: unknown; timestamp?: unknown; usage?: unknown };
+		};
+		if (typeof row?.id !== "string") return undefined;
+		return {
+			id: row.id,
+			...(typeof row.parentId === "string" ? { parentId: row.parentId } : { parentId: null }),
+			...(typeof row.type === "string" ? { type: row.type } : {}),
+			...(typeof row.message?.role === "string" ? { role: row.message.role } : {}),
+			...(row.message?.content !== undefined ? { content: row.message.content } : {}),
+			...(typeof row.message?.timestamp === "number"
+				? { timestamp: row.message.timestamp }
+				: {}),
+			// Carried so usage can be folded along the ACTIVE BRANCH. Rewind is
+			// non-destructive, so the file keeps abandoned entries; summing the
+			// whole file would price a thread by work its own model can no longer
+			// see.
+			...(row.message?.usage !== undefined ? { usage: row.message.usage } : {}),
+		};
+	};
+
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		try {
+			const records = await rctx.store.messages.readTranscript(agentId, sessionId);
+			return records.map(toEntry).filter((e): e is RewindEntry => e !== undefined);
+		} catch {
+			return [];
+		}
+	}
+	try {
+		const transcriptPath = resolveSessionTranscriptPath(agentId, sessionId);
+		return readTranscriptRecords(transcriptPath)
+			.map(toEntry)
+			.filter((e): e is RewindEntry => e !== undefined);
+	} catch {
+		return [];
+	}
+}
+
 async function readSessionTranscriptMessages(params: {
 	sessionKey: string;
 	limit?: number;
@@ -456,8 +561,28 @@ async function readSessionTranscriptMessages(params: {
 		const text = line.trim();
 		if (!text) continue;
 		try {
-			const parsedLine = JSON.parse(text) as { type?: string; message?: unknown };
+			const parsedLine = JSON.parse(text) as {
+				type?: string;
+				message?: unknown;
+				id?: unknown;
+				parentId?: unknown;
+			};
 			if (parsedLine?.type === "message" && parsedLine.message !== undefined) {
+				// Carry the transcript entry's identity onto the wire message.
+				//
+				// Pi's records already form an id/parentId TREE (session-manager.d.ts) —
+				// exactly the structure edit / rewind / branch need — and it stopped at
+				// the storage layer. `WireMessage` had no id at all, so a client could
+				// not address a message to edit it, and render keys had to fall back to
+				// `role + timestamp`, which collides when two messages share a
+				// millisecond. Additive: nothing reads these yet, and the render keys
+				// are unchanged, but a client can now identify a message and the
+				// migration cost stops growing.
+				const msg = parsedLine.message as Record<string, unknown>;
+				if (msg && typeof msg === "object") {
+					if (typeof parsedLine.id === "string") msg.messageId = parsedLine.id;
+					if (typeof parsedLine.parentId === "string") msg.parentMessageId = parsedLine.parentId;
+				}
 				messages.push(parsedLine.message);
 			}
 		} catch {
@@ -1305,7 +1430,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// post-turn path, with the turn's origin (isolation-preserving). Guarded against
 	// overlapping an in-flight sweep for the same agent (no cursor race), and a no-op
 	// once the server is stopped or extraction is disabled.
-	setPreCompactionExtractionHook(async ({ agentId, sessionId, messages, origin }) => {
+	setPreCompactionExtractionHook(async ({ agentId, sessionId, sessionKey, messages, origin }) => {
 		if (!memoryExtractEnabled || serverStopped) return;
 		if (extractingAgents.has(agentId)) return; // an in-flight sweep already covers this agent
 		extractingAgents.add(agentId);
@@ -1315,13 +1440,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			const agentDir = resolveAgentDir(agentId);
 			const agentAuth = getAuthStorageForAgent(agentId);
 			const agentModel = getAgentRuntime(agentId).model;
-			const llm = makeExtractionLlm({
-				workspaceDir,
-				agentDir,
-				authStorage: agentAuth,
-				modelRegistry,
-				model: agentModel,
-			});
+			const llm = makeExtractionLlm(
+				{
+					workspaceDir,
+					agentDir,
+					authStorage: agentAuth,
+					modelRegistry,
+					model: agentModel,
+				},
+				// Caused by a specific thread's compaction, so it bills that thread.
+				(u) => recordSweepUsage(agentId, "memory", u, sessionKey),
+			);
 			await runExtractionSweep({ workspaceDir, sessionId, messages, llm, origin });
 		} catch (err) {
 			opts.consoleStream?.info?.(
@@ -1344,13 +1473,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	setRelinkLlmFactory((targetAgentId: string) => {
 		if (serverStopped) return undefined;
 		try {
+			// Relationship relink — agent-scoped maintenance, priced like the rest.
 			return makeIsolatedLlm(RELINK_PROMPT, {
 				workspaceDir: resolveAgentWorkspaceDir(targetAgentId),
 				agentDir: resolveAgentDir(targetAgentId),
 				authStorage: getAuthStorageForAgent(targetAgentId),
 				modelRegistry,
 				model: getAgentRuntime(targetAgentId).model,
-			});
+			},
+			undefined,
+			(u) => recordSweepUsage(targetAgentId, "memory", u),
+			);
 		} catch {
 			return undefined;
 		}
@@ -1420,13 +1553,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					const agentDir = resolveAgentDir(targetAgentId);
 					const agentAuth = getAuthStorageForAgent(targetAgentId);
 					const agentModel = getAgentRuntime(targetAgentId).model;
-					const llm = makeExtractionLlm({
-						workspaceDir,
-						agentDir,
-						authStorage: agentAuth,
-						modelRegistry,
-						model: agentModel,
-					});
+					const llm = makeExtractionLlm(
+						{
+							workspaceDir,
+							agentDir,
+							authStorage: agentAuth,
+							modelRegistry,
+							model: agentModel,
+						},
+						// Agent-scoped: this sweep runs across every session, so no single
+						// thread caused it and none should be charged for it.
+						(u) => recordSweepUsage(targetAgentId, "memory", u),
+					);
 					for (const [sessionId, entry] of sessions) {
 						// Self-model half: distil the owner's durable preferences/corrections
 						// BEFORE extraction (which confines them) — owner-only, cadence-gated.
@@ -1524,13 +1662,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					const consolidateInterval =
 						Number.isFinite(envInterval) && envInterval >= 0 ? envInterval : undefined;
 					if (shouldRunConsolidation(workspaceDir, consolidateInterval)) {
-						const consolidateLlm = makeConsolidationLlm({
-							workspaceDir,
-							agentDir,
-							authStorage: agentAuth,
-							modelRegistry,
-							model: agentModel,
-						});
+						const consolidateLlm = makeConsolidationLlm(
+							{
+								workspaceDir,
+								agentDir,
+								authStorage: agentAuth,
+								modelRegistry,
+								model: agentModel,
+							},
+							(u) => recordSweepUsage(targetAgentId, "memory", u),
+						);
 						try {
 							await runConsolidation({ workspaceDir, llm: consolidateLlm });
 						} catch (mcErr) {
@@ -1639,21 +1780,73 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		armExtractTimer();
 	};
 
-	// Cumulative usage totals for the state snapshot. Pi reports per-turn
-	// usage on turn_end; we accumulate across turns.
-	let totalIn = 0;
-	let totalOut = 0;
-	let totalCost = 0;
+	// Usage accounting, keyed per (agent, session).
+	//
+	// This replaced three process-global scalars accumulated from `turn_end`.
+	// Brigade runs many agents, each with many sessions, so one counter meant an
+	// idle agent's header showed another agent's spend and `/usage`'s "for this
+	// session" was a process-wide figure. The ledger also tracks the streaming
+	// message (so the number moves DURING a turn rather than jumping at the end),
+	// seeds from the transcript (so a restart recovers real history instead of
+	// showing $0.00), and carries a completeness flag so an unpriced turn reads
+	// as unmeasured rather than free.
+	const usageLedger = new UsageLedger();
 
 	// Snapshot fields that can only be read from a LIVE Pi session
 	// (context usage %, message count, thinking capabilities). With no
 	// session between turns we cache the last-known values: seeded from the
 	// model at boot, refreshed from the in-flight session during each turn.
-	let lastContextUsagePercent: number | null = null;
+	// Per-session, NOT per-gateway. These were single variables written by every
+	// turn of every session, so one busy channel thread repainted the operator's
+	// header with its own context usage. See `core/session-caches.ts`.
+	const sessionCaches = new SessionCaches();
+	// Live reasoning phase, per (agent, session). Answers "is this model thinking
+	// RIGHT NOW" — which nothing on the wire could say before: `thinkingLevel`
+	// and `supportsThinking` are capabilities, not state.
+	const reasoningTracker = new ReasoningTracker();
+	/**
+	 * Transcript size captured at `compaction_start`, so `compaction_end` can
+	 * report what the compaction actually achieved. Cleared as it is consumed.
+	 *
+	 * BOTH figures are measured here, with Brigade's own estimator, so the
+	 * before/after comparison is like-for-like. Pi offers a `tokensBefore`
+	 * (`calculateContextTokens(usage)` — the provider's count of the WHOLE
+	 * prompt, including the system prompt, tool schemas and cache reads) and an
+	 * `estimatedTokensAfter` (plain chars/4 over message blocks). Subtracting
+	 * the second from the first overstates what was freed by everything the
+	 * second cannot see — biasing `madeProgress` toward true, which is exactly
+	 * the signal the no-progress circuit breaker depends on.
+	 */
+	const compactionMessagesBefore = new Map<string, { messages: number; tokens: number }>();
+	// Sub-agent ancestry: child session key -> its IMMEDIATE parent.
+	//
+	// `spawnedBy` names only the immediate parent, so a GRANDCHILD's frame
+	// carries a parent key that shares no prefix with the operator's session —
+	// and the subscription filter, quite correctly, dropped it. Recording each
+	// link as it streams lets the gateway walk up to the ROOT ancestor and tag
+	// the frame with that instead, so nesting works at any depth (the spawn
+	// policy allows 3). Bounded, and a cycle or a missing link simply stops the
+	// walk rather than looping.
+	const subagentParents = new Map<string, string>();
+	const SUBAGENT_ANCESTRY_MAX = 4096;
+	const rootAncestorOf = (sessionKey: string): string => {
+		let cur = sessionKey;
+		const seen: string[] = [cur];
+		for (let i = 0; i < 8; i += 1) {
+			const parent = subagentParents.get(cur);
+			if (!parent || seen.includes(parent)) break;
+			// Touch the link so walking a chain marks it recently-used and the
+			// eviction above cannot break it apart under pressure.
+			subagentParents.delete(cur);
+			subagentParents.set(cur, parent);
+			seen.push(parent);
+			cur = parent;
+		}
+		return cur;
+	};
 	// Filled once, in the background, shortly after listen. Rides every subsequent
 	// state snapshot so an attaching client can ASK the operator. Never acted on here.
 	let latestUpdate: { current: string; latest: string } | undefined;
-	let lastMessageCount = 0;
 	let cachedSupportsThinking = !!args.model.reasoning;
 	let cachedThinkingLevels: string[] = deriveThinkingLevels(args.model);
 
@@ -1661,9 +1854,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// every forwarded event during a turn so the snapshot tracks the live
 	// state, and once more as the turn settles so the between-turns snapshot
 	// reflects the final message count / context usage.
-	const refreshCachesFromSession = (s: AgentSession): void => {
+	const refreshCachesFromSession = (
+		s: AgentSession,
+		cacheAgentId: string,
+		cacheSessionKey: string,
+	): void => {
 		try {
-			lastMessageCount = s.messages.length;
+			sessionCaches.set(cacheAgentId, cacheSessionKey, { messageCount: s.messages.length });
 		} catch {
 			/* session torn down — keep last value */
 		}
@@ -1673,17 +1870,29 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// guard that only overwrote non-null values pinned the pre-compaction
 			// figure forever: a turn compacted at 889% then reported "usage now 889%".
 			// A stale number is worse than no number.
-			lastContextUsagePercent = s.getContextUsage()?.percent ?? null;
+			// Keep the WHOLE ContextUsage, not just the percentage. `tokens` and
+			// `contextWindow` were computed on every event and thrown away, so a
+			// client could never show "34k / 200k" or compute headroom before
+			// compaction — and the TUI rendered the derived percent only above 50%,
+			// so for most of a session's life the operator saw nothing at all.
+			const ctx = s.getContextUsage();
+			sessionCaches.set(cacheAgentId, cacheSessionKey, {
+				contextPercent: ctx?.percent ?? null,
+				contextTokens: ctx?.tokens ?? null,
+				contextWindow: typeof ctx?.contextWindow === "number" ? ctx.contextWindow : null,
+			});
 		} catch {
 			/* session torn down — keep last value */
 		}
 		try {
-			cachedSupportsThinking = s.supportsThinking();
+			sessionCaches.set(cacheAgentId, cacheSessionKey, { supportsThinking: s.supportsThinking() });
 		} catch {
 			/* ignore */
 		}
 		try {
-			cachedThinkingLevels = [...s.getAvailableThinkingLevels()];
+			sessionCaches.set(cacheAgentId, cacheSessionKey, {
+				thinkingLevels: [...s.getAvailableThinkingLevels()],
+			});
 		} catch {
 			/* ignore */
 		}
@@ -1699,8 +1908,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 * the workspace files are tiny + on local disk — turning it async would
 	 * complicate the buildSnapshot signature for sub-millisecond savings.
 	 */
-	const computeFirstRunBootstrap = (): boolean => {
-		if (lastMessageCount > 0) return false;
+	const computeFirstRunBootstrap = (messageCount: number): boolean => {
+		// PER SESSION, not gateway-wide. This read a single shared counter, so a
+		// cron fire or a channel message on ANY session made every agent look
+		// "already started" and silently suppressed the first-run bootstrap flow
+		// for one that had genuinely never run.
+		if (messageCount > 0) return false;
 		const wsDir = getBrigadeWorkspaceDir();
 		try {
 			if (!existsSync(joinPath(wsDir, "BOOTSTRAP.md"))) return false;
@@ -1737,7 +1950,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		}
 	};
 
-	const buildSnapshot = (snapshotAgentId?: string): SessionStateSnapshot => {
+	const buildSnapshot = (
+		snapshotAgentId?: string,
+		snapshotSessionKey?: string,
+	): SessionStateSnapshot => {
 		// Wave K — per-binding snapshot. When the caller supplies a
 		// `snapshotAgentId`, the snapshot reflects THAT agent's runtime entry
 		// + workspace-derived persona name + per-agent live-session count, so
@@ -1751,39 +1967,139 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// session-init + refreshed by boot-agent set-model). Non-boot
 		// snapshots derive on the fly from the agent's selected model — the
 		// derivation is pure + cheap (no I/O).
-		const supportsThinking = isBoot ? cachedSupportsThinking : !!rt.model?.reasoning;
-		const availableThinkingLevels = isBoot
-			? cachedThinkingLevels
-			: rt.model ? deriveThinkingLevels(rt.model) : [];
-		// Per-binding session targeting: the TUI bound to `targetAgentId`
-		// defaults to that agent's canonical session key when nothing else
-		// is bound. Falls back to the gateway's boot `sessionKey` for the
-		// boot agent to keep legacy unchanged.
-		const targetSessionKey = isBoot ? sessionKey : defaultSessionKey(targetAgentId);
+		// Per-binding session targeting happens BEFORE the capability derivation
+		// below, because a pinned session runs a different model from its agent
+		// and every capability shown in the header has to describe the model
+		// that will actually serve the next turn in THIS thread.
+		const targetSessionKey =
+			snapshotSessionKey?.trim() || (isBoot ? sessionKey : defaultSessionKey(targetAgentId));
+		// Same resolution the turn performs (see the `turnPin` block in the
+		// prompt path) — if these two ever disagree the header lies about which
+		// model answered.
+		// Usage for THIS binding: committed turns + the message currently
+		// streaming + spend from sub-agents / compaction / memory sweeps this
+		// session caused. A pure map read — no I/O — so it stays safe on the
+		// state-broadcast path.
+		const snapshotUsage = usageLedger.displayTotals(targetAgentId, targetSessionKey);
+		// Live-session-derived fields for THIS binding (context usage, message
+		// count, observed thinking caps). Absent until this session has run a
+		// turn in this process, which is honest: reporting another session's
+		// numbers is what this replaced.
+		const snapshotCache = sessionCaches.get(targetAgentId, targetSessionKey);
+		const pin = readSessionModelPin(targetAgentId, targetSessionKey);
+		// A pinned model is validated against the registry when it is set, but
+		// the registry can be refreshed/reseeded since; an unresolvable pin
+		// still shows its ids and simply reports conservative capabilities
+		// rather than borrowing the agent model's, which would be a lie.
+		const pinnedModel = pin ? modelRegistry.find(pin.provider, pin.modelId) : undefined;
+		const effectiveModel = pin ? pinnedModel : rt.model;
+		// Observed capabilities come from THIS session, falling back to the boot
+		// model. They used to be gateway-wide, so a turn on an agent running a
+		// non-reasoning model made a different agent's header claim its model
+		// could not reason and emptied `/thinking`'s level list.
+		const supportsThinking = pin
+			? !!pinnedModel?.reasoning
+			: isBoot
+				? (snapshotCache?.supportsThinking ?? cachedSupportsThinking)
+				: !!rt.model?.reasoning;
+		const availableThinkingLevels = pin
+			? pinnedModel ? deriveThinkingLevels(pinnedModel) : []
+			: isBoot
+				? (snapshotCache?.thinkingLevels ?? cachedThinkingLevels)
+				: rt.model ? deriveThinkingLevels(rt.model) : [];
+		// Computed once: the provider this snapshot actually reports (pin-aware),
+		// and the reasoning state (previously built twice per snapshot).
+		const snapshotProvider = pin?.provider ?? rt.provider;
+		const reasoningSnapshot = reasoningTracker.snapshot(targetAgentId, targetSessionKey);
 		return {
-			provider: rt.provider,
-			modelId: rt.modelId,
-			modelName: rt.model?.name,
+			provider: snapshotProvider,
+			modelId: pin?.modelId ?? rt.modelId,
+			modelName: effectiveModel?.name ?? pin?.modelId,
 			thinkingLevel: rt.thinkingLevel,
 			supportsThinking,
 			// Same derivation the turn itself uses (`resolveInboundImagePrompt` gates
 			// inline image blocks on exactly this), so the TUI's "this model can't see
 			// images" warning can never disagree with what the turn does with them.
-			supportsVision: modelSupportsImageInput(rt.model) === true,
+			supportsVision: modelSupportsImageInput(effectiveModel) === true,
 			availableThinkingLevels,
 			...(latestUpdate ? { updateAvailable: latestUpdate } : {}),
-			contextUsagePercent: lastContextUsagePercent,
-			totalTokensIn: totalIn,
-			totalTokensOut: totalOut,
-			totalCostUsd: totalCost,
+			// READ THIS BINDING'S CACHE, not a gateway-wide one. A busy channel
+			// thread at 91% used to repaint an idle operator thread sitting at 4%.
+			contextUsagePercent: snapshotCache?.contextPercent ?? null,
+			contextTokens: snapshotCache?.contextTokens ?? null,
+			contextWindow: snapshotCache?.contextWindow ?? null,
+			...(reasoningSnapshot ? { reasoning: reasoningSnapshot } : {}),
+			// PROVIDER CONSUMPTION WINDOWS.
+			//
+			// Recorded for every backend from the one `streamFn` all of them go
+			// through (`payload-mutators`' `onResponse`), so this is not an
+			// Anthropic-only feature. Scoped to the provider actually serving this
+			// binding — showing another provider's remaining quota next to this
+			// session's model would be worse than showing nothing.
+			//
+			// Omitted entirely when the provider reports no headers. "Unknown" and
+			// "exhausted" must never render the same way.
+			// Resolved from the SAME provider this snapshot reports, which honours
+			// the session's model pin. Reading the agent runtime directly showed
+			// the agent's provider limits beside a pinned model from a different
+			// provider — precisely the mismatch this block exists to avoid.
+			...(() => {
+				const windows = snapshotProvider ? getLimitsForProvider(snapshotProvider) : [];
+				return windows.length > 0 ? { limits: windows } : {};
+			})(),
+			// Per-binding, not process-wide: the snapshot already resolved which
+			// agent + session this client is bound to, and usage now honours that.
+			totalTokensIn: snapshotUsage.input + snapshotUsage.cacheRead + snapshotUsage.cacheWrite,
+			totalTokensOut: snapshotUsage.output,
+			totalCostUsd: snapshotUsage.costUsd,
+			// What a cost figure MEANS on this backend — the four cases that all
+			// used to render as an identical `$0.0000`. Uses the auth-aware
+			// classifier: onboarding stores a "Claude (browser OAuth)" credential
+			// under `anthropic`, so the provider id alone cannot tell a Pro/Max
+			// subscription turn from a metered API-key one; the credential's
+			// `type` can.
+			// PASS THE CREDENTIAL TYPE, WHICH IS THE WHOLE POINT OF THIS FUNCTION.
+			//
+			// `classifyBillingModeWithAuth` narrows metered → subscription only
+			// when `authType` says the credential is an OAuth/browser login — and
+			// no call site ever passed it, so this was a pure static catalog
+			// lookup. The catalog marks `anthropic` metered, so a Claude Pro/Max
+			// turn reported `metered`, `shouldRenderCost` returned true, and a
+			// confident dollar figure was printed for a subscription with no
+			// marginal cost. That is precisely the case this module exists to
+			// prevent, defeated by an unpassed argument.
+			//
+			// Resolved from the SAME provider and model this snapshot reports, so
+			// a session pinned to another provider is classified against the
+			// credential that will actually be charged.
+			billing: classifyBillingModeWithAuth({
+				provider: snapshotProvider,
+				...(() => {
+					try {
+						const store = getAuthStorageForAgent(targetAgentId) as unknown as {
+							get?: (p: string) => { type?: string } | undefined;
+						};
+						const t = snapshotProvider ? store.get?.(snapshotProvider)?.type : undefined;
+						return t === "oauth" || t === "token" || t === "api_key" ? { authType: t } : {};
+					} catch {
+						// Never let a credential read break a snapshot; an absent
+						// type simply leaves the static classification in place.
+						return {};
+					}
+				})(),
+				...(effectiveModel?.cost
+					? { cost: effectiveModel.cost as { input?: number; output?: number } }
+					: {}),
+			}),
+			costComplete: snapshotUsage.costComplete,
 			// Wave K — per-agent live-session count. Was process-wide before,
 			// which lit the boot-agent header as "running" while only a
 			// channel-routed turn on agent:ops was busy — leading the operator
 			// to route a fresh prompt through the mid-turn steer path which
 			// throws.
 			isAgentRunning: countActiveLiveSessionsForAgent(targetAgentId) > 0,
-			messageCount: lastMessageCount,
-			firstRunBootstrap: computeFirstRunBootstrap(),
+			messageCount: snapshotCache?.messageCount ?? 0,
+			firstRunBootstrap: computeFirstRunBootstrap(snapshotCache?.messageCount ?? 0),
 			agentName: computeAgentName(targetAgentId),
 			// Multi-agent visibility: surface the agent id + session key the
 			// TUI is bound to so the operator sees `agent main · agent:main:main`
@@ -1870,6 +2186,70 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 * subscribers can opt into per-session filtering on top.
 	 */
 	const clientConnIds = new WeakMap<WebSocket, string>();
+	/**
+	 * Connections that asked to KEEP the full cumulative snapshot on every
+	 * `message_update` (`subscribe { deltas: false }`).
+	 *
+	 * Delta streaming is the DEFAULT: `message_update` frames that carry a delta
+	 * omit `message.content`, which is where the ~125 MiB of an 8k-token answer
+	 * goes. `role`, `timestamp` and `usage` are kept — the timestamp is the
+	 * client's render key and `usage` drives the live token counter — and the
+	 * full content still arrives on `message_start` and `message_end`, so every
+	 * message ends reconciled against an authoritative snapshot.
+	 *
+	 * OPT-IN, not opt-out. A client must ask for deltas with
+	 * `subscribe { deltas: true }`; everyone else keeps byte-identical frames to
+	 * the pre-delta protocol.
+	 *
+	 * This is a wire contract with clients Brigade does not ship — the desktop
+	 * and watch apps, and third parties. Stripping `message.content` by default
+	 * meant any client that had never heard of deltas rendered EMPTY streaming
+	 * text until `message_end`, with `PROTOCOL_VERSION` still at 1 and nothing
+	 * to warn them. A silent breaking change to a published protocol is not a
+	 * default anyone can opt out of, because they do not know to.
+	 */
+	/**
+	 * Record what a Brigade-owned background model call cost.
+	 *
+	 * The memory and skill distillers run on isolated sessions the main usage
+	 * stream never sees, so every sweep was previously free as far as the operator
+	 * could tell. `sweepBillingKey` decides the row: the thread that caused the
+	 * work when one did, the agent's maintenance bucket otherwise.
+	 */
+	const recordSweepUsage = (
+		agentId: string,
+		kind: "memory" | "skills",
+		usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; costKnown: boolean },
+		causedBySessionKey?: string,
+	): void => {
+		try {
+			const billTo = sweepBillingKey(agentId, causedBySessionKey);
+			usageLedger.recordOutOfBand(agentId, billTo, kind, {
+				input: usage.input,
+				output: usage.output,
+				cacheRead: usage.cacheRead,
+				cacheWrite: usage.cacheWrite,
+				cost: { total: usage.cost },
+				costKnown: usage.costKnown,
+			} as never);
+		} catch {
+			/* metering must never break the sweep it is measuring */
+		}
+	};
+
+	const clientDeltaFrames = new Set<string>();
+	/**
+	 * Connections that asked for the PRE-NARROWING delivery breadth.
+	 *
+	 * Naming a session now scopes delivery to that session, which is the
+	 * cross-session-bleed fix. But a client can name a session for another
+	 * reason entirely — Brigade's own desktop app sends
+	 * `subscribe { agentId, sessionId }` because its snapshot push is gated on
+	 * the session, not because it wants a narrower stream. `scope: "agent"`
+	 * gives those clients the old breadth back without reverting the fix for
+	 * everyone, and without a version bump nothing reads.
+	 */
+	const clientBroadScope = new Set<string>();
 	const clientAgentSubs = new Map<string, Set<string>>();
 	const clientSessionSubs = new Map<string, Set<string>>();
 
@@ -1886,6 +2266,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 * invalidates its cursor.
 	 */
 	const seqCounters = new Map<string, number>();
+
+	/**
+	 * Replayable retention for the frames the TRANSCRIPT cannot rebuild.
+	 *
+	 * Sub-agent and synthetic frames were deliberately left unsequenced because
+	 * a seq you cannot replay turns every dropped decoration frame into an
+	 * unrepairable gap. This ring is the other half of that trade: retain the
+	 * bytes, and sequencing them becomes safe. See `frame-ring.ts`.
+	 */
+	const frameRing = new FrameRing();
 
 	/**
 	 * Bounded per-session tail of recent `system-event` notices (cron announces /
@@ -1966,24 +2356,74 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 * `ws-subscription-filter.ts` so the behaviour is exercised by a focused
 	 * unit test without spinning a live WS server.
 	 */
-	const connWantsFrame = (
-		connId: string,
-		frameAgentId: string | undefined,
-		frameSessionId: string | undefined,
-	): boolean =>
+	const connWantsFrame = (connId: string, tags: FrameTags): boolean =>
 		shouldDeliverFrame(
 			clientAgentSubs.get(connId),
 			clientSessionSubs.get(connId),
-			{ agentId: frameAgentId, sessionId: frameSessionId },
+			tags,
+			clientBroadScope.has(connId) ? "agent" : "session",
 		);
 
 	/** Send one event to all connected clients (or a filtered subset). */
+	/**
+	 * Per-socket send guards, shared by `broadcast` (one payload for everyone)
+	 * and `broadcastStateAllBindings` (a payload built per connection). Returns
+	 * null when the socket must be skipped, having already closed a slow
+	 * consumer; otherwise the connection's id, which may be undefined during
+	 * the open/assign race.
+	 */
+	const prepareClient = (ws: WebSocket): { connId: string | undefined } | null => {
+		if (ws.readyState !== ws.OPEN) return null;
+		// Slow-consumer backpressure. A client that keeps answering
+		// protocol-level PINGs (so the ping reaper never reaps it) but can't
+		// drain its receive side accumulates every broadcast in its send buffer
+		// without bound. Close it (1008 = policy violation) rather than grow
+		// gateway memory; the `close` handler drops it from `clients` + subs.
+		if (ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
+			try {
+				ws.close(1008, "slow consumer");
+			} catch {
+				/* best-effort — socket may already be closing */
+			}
+			return null;
+		}
+		return { connId: clientConnIds.get(ws) };
+	};
+	/**
+	 * `ws.send` is wrapped because the `readyState === OPEN` check above narrows
+	 * but does not fully eliminate the window — a socket can transition between
+	 * the check and the send. Most not-OPEN sends surface as an async `error`
+	 * event rather than a synchronous throw, so an escaping throw is unlikely,
+	 * but the swallow keeps a hot broadcast path from ever crashing on one bad
+	 * socket — matching the try-wrapped `ws.ping()` in the reaper.
+	 */
+	const sendIfWritable = (ws: WebSocket, json: string): void => {
+		try {
+			ws.send(json);
+		} catch {
+			/* best-effort — drop send to a transitioning socket */
+		}
+	};
+
 	const broadcast = <K extends EventName>(event: K, payload: EventPayload[K]): void => {
 		// Untagged payloads broadcast to everyone (state, error, basic log).
 		// Tagged payloads (pi, log with agent/session, approval-request,
 		// system-event with target) consult the subscription filter so the
 		// approval prompt for agent A doesn't pop on operator B's TUI.
-		const { agentId: frameAgentId, sessionId: frameSessionId } = extractFrameTags(payload);
+		// The FULL tags, `parentSessionKey` included.
+		//
+		// `broadcast` used to destructure only agentId and sessionId, so the
+		// filter's rule 3 — "a sub-agent frame goes to whoever is watching the
+		// session that SPAWNED it" — was unreachable in production while its unit
+		// tests passed, because those call `shouldDeliverFrame` directly.
+		//
+		// Harmless until session-scoped delivery landed; now load-bearing. With
+		// narrowing on, a session-bound client hits rule 4, fails the session
+		// match on the child's own key, and loses every sub-agent frame —
+		// including its `approval-request`, which means the prompt never renders
+		// and the turn hangs until the approval times out.
+		const frameTags = extractFrameTags(payload);
+		const { agentId: frameAgentId, sessionId: frameSessionId } = frameTags;
 		// Stamp a per-session monotonic seq on the ordered transcript stream
 		// (`pi`). This is the gap detector: a client that sees seq jump knows it
 		// missed a frame and issues `resume`. Only `pi` frames carry seq — they
@@ -2005,10 +2445,27 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		//  - `state` (self-healing cumulative snapshot), `error`, `log` (on disk).
 		const subDepth = event === "pi" ? Number((payload as { subagentDepth?: number }).subagentDepth) || 0 : 0;
 		const isSyntheticPi = event === "pi" && (payload as { synthetic?: boolean }).synthetic === true;
-		const isOrderedFrame =
-			(event === "pi" && subDepth === 0 && !isSyntheticPi) ||
-			event === "approval-request" ||
-			event === "system-event";
+		// Sub-agent and synthetic `pi` frames ARE now ordered. They were excluded
+		// for a sound reason — you cannot sequence a stream you cannot replay —
+		// and `frameRing` removes exactly that objection by retaining their bytes
+		// for `resume(sinceSeq)`.
+		//
+		// They are sequenced under their OWN session id, not the parent's. That
+		// keeps each stream independently gap-detectable: a client watching only
+		// the parent still sees an unbroken parent sequence, and a client that
+		// also watches the child (delivery rule 3, `parentSessionKey`) tracks the
+		// child's counter separately. Folding them into the parent's counter
+		// would make every unsubscribed child frame look like a parent gap and
+		// resync-thrash exactly the clients that opted out.
+		// The rule lives in `frame-ring.ts` so it is directly testable — inline,
+		// covering it meant booting a gateway, so the decision that determines
+		// what is recoverable had no test on the path where being wrong loses
+		// output silently.
+		const { ordered: isOrderedFrame, replayOnly: isReplayOnly } = classifyFrame({
+			event,
+			subagentDepth: subDepth,
+			synthetic: isSyntheticPi,
+		});
 		const seq = isOrderedFrame ? nextSeq(seqCounters, frameSessionId) : undefined;
 		// Retain a bounded per-session tail of system-events for `resume` recovery.
 		// delete+set moves this session to the end of the Map (LRU touch) so the
@@ -2028,74 +2485,145 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			seq !== undefined
 				? { type: "event", event, payload, seq }
 				: { type: "event", event, payload };
-		const json = JSON.stringify(frame);
+		// Built LAZILY. When every recipient is in delta mode — the common case,
+		// since the reference TUI always opts in — the full cumulative frame is
+		// serialized and thrown away, which is the entire O(n²) cost delta mode
+		// was meant to remove. It saved bytes on the wire; without this it saved
+		// no CPU at all. Also skips the work entirely when nobody is connected
+		// (a headless cron or channel turn).
+		let fullJson: string | undefined;
+		const json = (): string => (fullJson ??= JSON.stringify(frame));
+		// RETAIN ONLY WHAT THE TRANSCRIPT CANNOT REBUILD.
+		//
+		// Sub-agent and synthetic frames exist in no JSONL, so `resume` can only
+		// return them from here. Top-level `message_update`s are deliberately not
+		// retained: they are cumulative, so buffering a long reply would cost
+		// O(n^2) memory to redeliver what the transcript already returns better —
+		// the exact cost delta mode exists to remove.
+		//
+		// This forces serialization for these frames even when every recipient is
+		// in delta mode. That is the intended trade: they are a small minority of
+		// traffic, and un-replayable sub-agent output is the hole being closed.
+		if (isReplayOnly && seq !== undefined && frameSessionId) {
+			frameRing.retain(frameSessionId, seq, json());
+		}
+		// Delta variant, built ONLY when some connection asked for it and this
+		// frame actually carries a delta. One extra stringify per qualifying
+		// broadcast (measured at GiB/s — far cheaper than the bytes it removes),
+		// and none at all when nobody opted in.
+		// Lives in `delta-mode.ts` so a test can actually call it — see that
+		// function's header for why being inline here meant the producer side
+		// was untested while its test reported green.
+		const deltaJson = stripCumulativeContent(frame);
 		for (const ws of clients) {
-			if (ws.readyState !== ws.OPEN) continue;
-			// Slow-consumer backpressure. A client that keeps answering
-			// protocol-level PINGs (so the ping reaper never reaps it) but
-			// can't drain its receive side accumulates every broadcast in its
-			// send buffer without bound — `broadcast` fires on every Pi event
-			// mid-turn. When the buffered bytes exceed the cap, close the
-			// socket (1008 = policy violation) and drop the client instead of
-			// growing gateway memory. The `close` handler removes it from
-			// `clients` + the subscription maps.
-			if (ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
-				try {
-					ws.close(1008, "slow consumer");
-				} catch {
-					/* best-effort — socket may already be closing */
-				}
-				continue;
-			}
-			const connId = clientConnIds.get(ws);
+			const ready = prepareClient(ws);
+			if (!ready) continue;
 			// No connId yet (race between socket open + onConnection assign):
 			// best-effort send (matches old behaviour).
-			//
-			// `ws.send` is wrapped because the `readyState === OPEN` check
-			// above narrows but does not fully eliminate the window — a socket
-			// can transition state between the check and the send. Most
-			// not-OPEN sends surface as an async `'error'` event (handled by
-			// `ws.on("error")`) rather than a synchronous throw, so an escaping
-			// throw is unlikely, but the swallow keeps a hot broadcast path
-			// (Pi events, tick, cron) from ever crashing on one bad socket —
-			// matching the try-wrapped `ws.ping()` in the reaper below.
-			if (!connId) {
-				try {
-					ws.send(json);
-				} catch {
-					/* best-effort — drop send to a transitioning socket */
-				}
-				continue;
-			}
-			if (connWantsFrame(connId, frameAgentId, frameSessionId)) {
-				try {
-					ws.send(json);
-				} catch {
-					/* best-effort — drop send to a transitioning socket */
-				}
+			if (!ready.connId || connWantsFrame(ready.connId, frameTags)) {
+				// Full frames unless the client explicitly asked for deltas. A
+				// connection with no id yet (the race between socket open and
+				// onConnection assigning one) gets the full frame too — we cannot
+				// know what it supports, and the full frame is correct for everyone.
+				const wantsDelta = shouldSendDeltaFrame({
+					hasDeltaFrame: deltaJson !== undefined,
+					connId: ready.connId,
+					optedIn: !!ready.connId && clientDeltaFrames.has(ready.connId),
+				});
+				sendIfWritable(ws, wantsDelta ? deltaJson! : json());
 			}
 		}
 	};
 
 	/**
-	 * Wave K — fan out a state snapshot to every binding. Sends the boot-agent
-	 * snapshot (untagged → reaches legacy un-subscribed clients) PLUS one
-	 * tagged snapshot per distinct non-boot agentId any connected client is
-	 * subscribed to. The per-conn filter delivers each tagged frame only to
-	 * that agent's subscribers — so a TUI bound to `agent:ops` sees `ops`'s
-	 * header while an un-bound TUI keeps seeing the boot header.
+	 * Fan out a state snapshot to every binding.
+	 *
+	 * Built PER CONNECTION rather than once for everyone, because the model in
+	 * the snapshot now depends on the SESSION a connection is bound to, not
+	 * just its agent: a pinned thread runs a different model from its agent, so
+	 * a single shared payload cannot describe both. Two TUIs on the same agent
+	 * but different threads legitimately see different headers.
+	 *
+	 * Recipients are chosen explicitly here, so these frames bypass the tag
+	 * filter `broadcast()` applies. Fan-out per subscribed agent is preserved
+	 * exactly as before; the session is layered on top only where it is
+	 * unambiguous.
 	 */
 	const broadcastStateAllBindings = (): void => {
-		const seen = new Set<string>();
-		for (const subs of clientAgentSubs.values()) {
-			for (const id of subs) {
-				if (id && id !== agentId) seen.add(id);
+		// One connection per open socket, but many share a binding — build each
+		// distinct (agent, session) payload once.
+		const frames = new Map<string, string>();
+		const frameFor = (a: string | undefined, sk: string | undefined): string => {
+			const cacheKey = `${a ?? ""}\u0000${sk ?? ""}`;
+			let json = frames.get(cacheKey);
+			if (json === undefined) {
+				json = JSON.stringify({
+					type: "event",
+					event: "state",
+					payload: buildSnapshot(a, sk),
+				} satisfies Frame);
+				frames.set(cacheKey, json);
+			}
+			return json;
+		};
+		for (const ws of clients) {
+			const ready = prepareClient(ws);
+			if (!ready) continue;
+			const { connId } = ready;
+			// Recipient planning lives in `state-fanout.ts` so it is covered by a
+			// focused unit test rather than a live WS server — same split as
+			// `connWantsFrame` / `shouldDeliverFrame`.
+			const targets = planStateFanout({
+				agentSubs: connId ? clientAgentSubs.get(connId) : undefined,
+				sessionSubs: connId ? clientSessionSubs.get(connId) : undefined,
+				bootAgentId: agentId,
+				ownerOf: (sk) => parseAgentSessionKey(sk)?.agentId,
+			});
+			for (const t of targets) {
+				sendIfWritable(ws, frameFor(t.agentId, t.sessionKey));
 			}
 		}
-		broadcast("state", buildSnapshot());
-		for (const id of seen) {
-			broadcast("state", buildSnapshot(id));
+	};
+
+	/**
+	 * Coalesced state fan-out for the STREAMING path.
+	 *
+	 * `broadcastStateAllBindings` was called once per Pi event — i.e. per token —
+	 * and it is not cheap: it rebuilds a snapshot per distinct (agent, session)
+	 * binding, and each rebuild does a synchronous `readFileSync` of IDENTITY.md
+	 * plus a full parse of that agent's session store. Measured at ~22 µs per
+	 * binding, looped over every connected client, that is an N² term in
+	 * (sessions × clients) and it was the gateway's actual concurrency ceiling.
+	 *
+	 * Deduplication does not help: the snapshot now carries LIVE usage and
+	 * reasoning state, so it genuinely differs on every token. Rate does help —
+	 * the header is read by a human, and the reference TUI already batches its
+	 * own repaints to ~150 ms, so sending state faster than that buys nothing at
+	 * all.
+	 *
+	 * Turn boundaries and explicit mutations still flush immediately, so
+	 * "running" flips, model switches and final totals are never delayed.
+	 */
+	const STATE_COALESCE_MS = Math.max(
+		16,
+		Number(process.env.BRIGADE_STATE_BROADCAST_MS) || 120,
+	);
+	let stateCoalesceTimer: NodeJS.Timeout | null = null;
+	const broadcastStateCoalesced = (): void => {
+		if (stateCoalesceTimer) return;
+		stateCoalesceTimer = setTimeout(() => {
+			stateCoalesceTimer = null;
+			broadcastStateAllBindings();
+		}, STATE_COALESCE_MS);
+		if (typeof stateCoalesceTimer.unref === "function") stateCoalesceTimer.unref();
+	};
+	/** Cancel a pending coalesced send — the caller is about to send immediately. */
+	const flushStateCoalesced = (): void => {
+		if (stateCoalesceTimer) {
+			clearTimeout(stateCoalesceTimer);
+			stateCoalesceTimer = null;
 		}
+		broadcastStateAllBindings();
 	};
 
 	// Approval bridge — the seam between the per-turn exec-gate (which
@@ -2136,10 +2664,64 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// stay undefined for now — the scheduler logs a warning and degrades
 	// gracefully (no system-event injection, no failure-alert delivery)
 	// until those subsystems land.
+	/**
+	 * Drop every per-session map the gateway holds.
+	 *
+	 * ONE definition, because the failure mode of having two is a map that gets
+	 * added to one list and not the other — a leak whose only symptom is slow
+	 * growth. `sessions.delete` and the cron/thread reaper both go through here.
+	 */
+	const forgetSessionState = (forgetAgentId: string, forgetSessionKey: string): void => {
+		usageLedger.forget(forgetAgentId, forgetSessionKey);
+		reasoningTracker.forget(forgetAgentId, forgetSessionKey);
+		frameRing.forget(forgetSessionKey);
+		sessionCaches.forget(forgetAgentId, forgetSessionKey);
+	};
+
 	const cronState = createCronServiceState({
 		deps: {
 			log: createSubsystemLogger("cron"),
-			runIsolatedAgentJob: runCronIsolatedAgentJob,
+			// THE REAPER MUST CLEAN MEMORY TOO. It deletes the store entry and the
+			// transcript, but the ledger, reasoning tracker, frame ring and session
+			// caches are keyed by session and live here — so every reaped cron fire
+			// and idle thread used to leave its rows behind. That matters more now
+			// that cron runs are metered: an `isolated` job takes a fresh
+			// `cron:<id>:run:<uuid>` key on every fire, so the rows it leaves are
+			// unbounded in count and can never be read again.
+			forgetSessionState,
+			// METER CRON RUNS.
+			//
+			// Cron calls `runSingleTurn` directly rather than going through
+			// `runGatewayTurn`, so `attachTurnSession` never ran for it and the
+			// usage ledger was never written. The event-bus fallback that catches
+			// everything else explicitly skips depth-0 runs, so nothing caught it
+			// either: a nightly job on a frontier model reported ZERO on the
+			// footer, in `/usage` and in `sessions.list`, for ever, while showing
+			// up in full on the provider's invoice. Its sub-agent and compaction
+			// spend WAS recorded — to per-fire keys no surface renders.
+			//
+			// Attaching here rather than inside the cron executor keeps the ledger
+			// private to the gateway; the executor only learns that a session
+			// exists.
+			runIsolatedAgentJob: (cronArgs) =>
+				runCronIsolatedAgentJob({
+					...cronArgs,
+					onSessionReady: (session, cronAgentId, cronSessionKey) => {
+						try {
+							attachTurnSession(session as AgentSession, cronSessionKey, cronAgentId);
+						} catch (err) {
+							// Metering must never fail a cron run — but it must not fail
+							// SILENTLY either. A swallowed error here reproduces the very
+							// bug being fixed: spend that quietly goes unrecorded while
+							// every surface reports zero.
+							createSubsystemLogger("cron").warn("cron usage metering failed to attach", {
+								jobId: cronArgs.job?.id,
+								sessionKey: cronSessionKey,
+								error: err instanceof Error ? err.message : String(err),
+							});
+						}
+					},
+				}),
 			onEvent: (event) => {
 				broadcast("log", {
 					level: event.action === "finished" && event.status === "error" ? "warn" : "info",
@@ -2454,6 +3036,33 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		agentIdForTurn: string,
 	): (() => void) => {
 		liveSessionsByKey.set(sessionKeyForTurn, session);
+		// Seed this session's ledger from its own transcript, ONCE. `getSessionStats`
+		// walks the loaded messages (5 passes), so it is far too heavy for the
+		// per-token path — but exactly right here: it recovers the real history of a
+		// session resumed after a gateway restart, which the old in-memory counters
+		// zeroed. The ledger ignores a second seed, so re-attaching cannot double it.
+		// What THIS backend exposes of its reasoning. Anthropic (and OpenAI's
+		// hosted reasoning models, and Grok) return a SUMMARY written by another
+		// model — never the raw chain of thought — so a UI that calls it "the
+		// model's thinking" misrepresents it. Refined from the actual blocks
+		// below, which is the only way to observe the two states a model id
+		// cannot predict: omitted-but-billed, and safety-redacted.
+		try {
+			const rtForTurn = getAgentRuntime(agentIdForTurn);
+			reasoningTracker.setVisibility(
+				agentIdForTurn,
+				sessionKeyForTurn,
+				initialReasoningVisibility({ provider: rtForTurn?.provider, modelId: rtForTurn?.modelId }),
+			);
+		} catch {
+			/* runtime not resolvable — the tracker keeps its conservative default */
+		}
+		try {
+			usageLedger.seedFromStats(agentIdForTurn, sessionKeyForTurn, session.getSessionStats());
+		} catch {
+			// A torn-down or partially-initialised session must never block a turn
+			// over bookkeeping; the ledger simply starts from zero for it.
+		}
 		// Stream this turn's Pi events to the JSONL log file. Logger silently
 		// degrades on I/O errors so log loss never crashes the server.
 		const detachLogger = attachEventLogger(session);
@@ -2465,17 +3074,196 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// agent_start/agent_end. Toggling registry state here would flap it
 			// false mid-turn, flicker the connect header, and re-open the
 			// single-turn concurrency guard. We only forward the events.
-			if (piEvent.type === "turn_end") {
-				const usage = (piEvent as any).message?.usage;
-				if (usage) {
-					totalIn += usage.input ?? 0;
-					totalOut += usage.output ?? 0;
-					totalCost += ((c) => (typeof c?.total === "number" && Number.isFinite(c.total) && c.total > 0 ? c.total : 0))(usage.cost as { total?: number } | undefined); // .total only; ignore the -1 sentinel of an unpriced model
+			// Usage accounting, per (agent, session).
+			//
+			// `message_update` is the live path: Pi's provider mutates the
+			// assistant message's `usage` in place as tokens arrive (input tokens
+			// land at the provider's `message_start`, ~1s into the turn), so the
+			// running total is EXACT, not estimated. Previously only `turn_end`
+			// was read, which left the header frozen on the previous turn's number
+			// for the whole of a long turn and then jumped.
+			if (piEvent.type === "turn_start") {
+				usageLedger.beginTurn(agentIdForTurn, sessionKeyForTurn);
+				reasoningTracker.beginTurn(agentIdForTurn, sessionKeyForTurn);
+			} else if (piEvent.type === "message_update") {
+				usageLedger.observePartial(agentIdForTurn, sessionKeyForTurn, (piEvent as any).message?.usage);
+				// Reasoning tokens, normalised across every provider shape.
+				//
+				// This used to read `usage.reasoningTokens` — a field Pi's `Usage`
+				// does not declare — through an `as any`, so it resolved for
+				// exactly one transport and silently to `undefined` everywhere
+				// else. `extractReasoningTokens` knows the Anthropic, OpenAI,
+				// Gemini and flat spellings, so any backend that reports the figure
+				// is read without a per-provider branch here.
+				//
+				// Absent stays absent: the tracker ignores non-numbers and the
+				// renderer falls back to reasoning VOLUME rather than printing a
+				// zero it cannot vouch for.
+				reasoningTracker.setTokens(
+					agentIdForTurn,
+					sessionKeyForTurn,
+					extractReasoningTokens((piEvent as any).message?.usage),
+				);
+				// Drive the live reasoning phase from the INNER streaming event.
+				// Pi carries `thinking_start` / `thinking_delta` / `thinking_end`
+				// inside every `message_update`, and they were never read — which is
+				// why a model that reasoned for 40 seconds was indistinguishable from
+				// one that had stalled.
+				const inner = (piEvent as any).assistantMessageEvent as
+					| { type?: string; delta?: unknown }
+					| undefined;
+				if (inner?.type === "thinking_start") {
+					reasoningTracker.start(agentIdForTurn, sessionKeyForTurn);
+				} else if (inner?.type === "thinking_delta") {
+					reasoningTracker.delta(
+						agentIdForTurn,
+						sessionKeyForTurn,
+						typeof inner.delta === "string" ? inner.delta : undefined,
+					);
+				} else if (inner?.type === "thinking_end") {
+					reasoningTracker.end(agentIdForTurn, sessionKeyForTurn);
 				}
+				// Refine visibility from the block itself. An empty thinking block
+				// carrying a signature is the CURRENT Anthropic default
+				// (`display:"omitted"`): fully billed, no deltas emitted, and it must
+				// still round-trip. Reporting that as "no reasoning" would hide real
+				// cost and justify dropping a block the API requires.
+				const blocks = (piEvent as any).message?.content;
+				if (Array.isArray(blocks)) {
+					for (const b of blocks) {
+						if (b?.type !== "thinking") continue;
+						// Record what the block REVEALED; never overwrite what the
+						// backend can return. Refining into `visibility` meant the
+						// first empty reasoning item pinned the session to `hidden`
+						// for the rest of the turn — `refineReasoningVisibility`
+						// never widens — so a later block carrying a real summary
+						// rendered under a label saying reasoning was never exposed.
+						reasoningTracker.noteThinkingBlock(agentIdForTurn, sessionKeyForTurn, b);
+					}
+				}
+			} else if (piEvent.type === "agent_start" || piEvent.type === "agent_end") {
+				// Lifecycle edges must not wait out the coalesce window: these are
+				// where "running" flips and where the final totals land.
+				flushStateCoalesced();
+			} else if (piEvent.type === "turn_end") {
+				// A turn can end while a reasoning phase is still open (abort, error,
+				// a provider that never closes the block). Leaving it open would
+				// strand the header on "thinking…" indefinitely.
+				reasoningTracker.end(agentIdForTurn, sessionKeyForTurn);
+				usageLedger.commitTurn(agentIdForTurn, sessionKeyForTurn, (piEvent as any).message?.usage);
+				// PERSIST WHAT WE JUST DISPLAYED.
+				//
+				// The ledger is in-memory and a restart zeroes it, which left a
+				// reconnecting client reporting `0 billed` until its next turn.
+				// Writing the ledger's own answer — rather than rebuilding it from
+				// the transcript later — keeps ONE definition of the number, and is
+				// the only way out-of-band spend (sub-agents, compaction, memory
+				// sweeps) and the `costComplete` floor marker survive at all; no
+				// transcript fold can recover either. See `agents/usage/persist.ts`.
+				persistSessionUsage(
+					agentIdForTurn,
+					sessionKeyForTurn,
+					usageLedger.displayTotals(agentIdForTurn, sessionKeyForTurn),
+					usageLedger.turnsFor(agentIdForTurn, sessionKeyForTurn),
+				);
 			}
 			// Keep the between-turns snapshot caches (message count, context
 			// usage %, thinking caps) tracking the live session.
-			refreshCachesFromSession(session);
+			refreshCachesFromSession(session, agentIdForTurn, sessionKeyForTurn);
+			// COMPACTION MEASUREMENT.
+			//
+			// `compaction_end` carries the provider's `tokensBefore` and nothing
+			// about the result, and the context percentage does not refresh until
+			// the next SUCCESSFUL reply — so "✓ compacted" was unfalsifiable, and a
+			// compaction that reclaimed nothing looked identical to one that
+			// reclaimed everything. The cost of the summarization cannot be priced
+			// (Pi reports no usage for it), but what it FREED can always be
+			// measured, so measure that and put it on the wire.
+			let piEventForWire: unknown = piEvent;
+			if (piEvent.type === "compaction_start") {
+				compactionMessagesBefore.set(sessionKeyForTurn, {
+					messages: session.messages.length,
+					tokens: estimateContextTokensFromMessages(session.messages),
+				});
+			} else if (piEvent.type === "compaction_end") {
+				// A compaction_end is NOT a success. Pi emits one with
+				// `aborted: false`, `result: undefined` and an `errorMessage` on every
+				// failure path — a summarization error, a 401, a rate limit, and
+				// overflow-recovery exhaustion (agent-session.js:1357-1376, :1439,
+				// :1605-1620). Branching on `aborted` alone therefore reported a
+				// compaction that never happened as "✓ compacted · reclaimed almost
+				// nothing", AND billed it as unpriced spend, permanently degrading
+				// the session's cost total to `≥$X` for a model call never made.
+				//
+				// A real compaction has a result and no error. Anything else is a
+				// failure, and gets neither an outcome nor a ledger entry.
+				const failed =
+					typeof (piEvent as { errorMessage?: unknown }).errorMessage === "string" ||
+					!(piEvent as { result?: unknown }).result;
+				const aborted = (piEvent as { aborted?: boolean }).aborted === true;
+				if (aborted || failed) {
+					// The overflow-exhaustion failure emits no matching
+					// `compaction_start`, so it would otherwise consume a stale count
+					// left by an earlier compaction and report a `messagesBefore` from
+					// a different one entirely. Clear on every terminal event.
+					compactionMessagesBefore.delete(sessionKeyForTurn);
+				} else {
+					try {
+					// MEASURE BOTH SIDES WITH ONE ESTIMATOR.
+					//
+					// Mixing Pi's figures silently compares different units: its
+					// `tokensBefore` is `calculateContextTokens(usage)` — the
+					// provider's count of the whole prompt, system prompt and tool
+					// schemas included — while its `estimatedTokensAfter` is plain
+					// chars/4 over message blocks. The difference between them is not
+					// what compaction freed; it is everything the second estimator
+					// cannot see, and it biases `madeProgress` toward true.
+					//
+					// Brigade's own snapshot from `compaction_start` is the same
+					// estimator on both sides, so the delta means what it says. Fall
+					// back to Pi's `tokensBefore` only when no snapshot exists (an
+					// overflow-recovery `compaction_end` arrives without a matching
+					// start), and accept the looser figure there rather than none.
+					const snapshot = compactionMessagesBefore.get(sessionKeyForTurn);
+					const result = (piEvent as { result?: { tokensBefore?: number } }).result;
+					const after = estimateContextTokensFromMessages(session.messages);
+					const before = snapshot?.tokens ?? result?.tokensBefore ?? after;
+					const outcome = summarizeCompactionOutcome({
+						tokensBefore: before,
+						tokensAfter: after,
+						messagesBefore: snapshot?.messages ?? session.messages.length,
+						messagesAfter: session.messages.length,
+					});
+					piEventForWire = {
+						...(piEvent as Record<string, unknown>),
+						outcome: {
+							tokensBefore: outcome.tokensBefore,
+							tokensAfter: outcome.tokensAfter,
+							freedTokens: outcome.freedTokens,
+							messagesBefore: outcome.messagesBefore,
+							messagesAfter: outcome.messagesAfter,
+							madeProgress: outcome.madeProgress,
+						},
+					};
+				} catch {
+					/* measurement must never break a turn — forward the raw event */
+				}
+				// Record the compaction as UNPRICED spend.
+				//
+				// The provider reports no usage for the summarization, so a dollar
+				// figure would be invented — and inventing one is the exact
+				// dishonesty this session started by removing. But staying silent is
+				// also wrong: a compaction is a real, sometimes large, model call.
+				// Recording it with `costKnown: false` taints the session's
+				// completeness flag, so the total renders as `≥$X` — "at least this
+				// much, and there is spend we could not price" — instead of a
+				// confident number that is quietly short.
+					usageLedger.recordOutOfBand(agentIdForTurn, sessionKeyForTurn, "compaction", {
+						costKnown: false,
+					});
+					compactionMessagesBefore.delete(sessionKeyForTurn);
+				}
+			}
 			// Live console stream (verbose mode). Mirrors the JSONL file but
 			// human-readable. Same event sequence in both places.
 			opts.consoleStream?.pi(piEvent);
@@ -2484,11 +3272,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// watching THIS agent's turn only. Untagged frames fall through
 			// to the back-compat "broadcast to everyone" branch.
 			broadcast("pi", {
-				event: piEvent,
+				event: piEventForWire,
 				agentId: agentIdForTurn,
 				sessionId: sessionKeyForTurn,
 			});
-			broadcastStateAllBindings();
+			// Coalesced: this fires per TOKEN, and the header is read by a human.
+			// Turn boundaries below flush immediately.
+			broadcastStateCoalesced();
 		});
 		let cleaned = false;
 		return () => {
@@ -2506,7 +3296,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			// Final cache refresh so the idle snapshot reflects the settled
 			// turn, then drop the session reference (no session between turns).
-			refreshCachesFromSession(session);
+			refreshCachesFromSession(session, agentIdForTurn, sessionKeyForTurn);
 			if (liveSessionsByKey.get(sessionKeyForTurn) === session) {
 				liveSessionsByKey.delete(sessionKeyForTurn);
 			}
@@ -2583,17 +3373,179 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// settled": the gateway looked wedged while a whole child turn was streaming.
 		if (event.subagentDepth && event.subagentDepth > 0) {
 			opts.consoleStream?.pi(event.piEvent as AgentSessionEvent, event.subagentDepth);
+		} else if (isSynthetic) {
+			// Depth-0 SYNTHETIC frames reach the console only here. `attachTurnSession`
+			// wires the console to the PI session's own subscribe, which by definition
+			// never sees an event Pi did not emit — so without this branch a
+			// top-level mid-turn compaction printed nothing on the gateway console,
+			// and a two-minute stall looked like a wedged daemon.
+			opts.consoleStream?.pi(event.piEvent as AgentSessionEvent);
 		}
-		// Wave I — forward the parent's agentId + sessionId from the bus
-		// event so child pi frames carry the same routing tags as the
-		// top-level pi frames; the operator's subscription filter applies
-		// identically to top-level and sub-agent events.
+		// MID-TURN COMPACTION COST.
+		//
+		// Handled here rather than in `attachTurnSession` because these frames are
+		// SYNTHETIC — Brigade minted them, Pi never emitted them, so the direct
+		// session subscribe never sees them. This bus handler is the only path
+		// they take, at depth 0 and inside sub-agents alike.
+		//
+		// Unlike Pi's own compaction — which reports no usage at all, and so can
+		// only be recorded as unpriceable — the mid-turn summarization runs on a
+		// Brigade-owned isolated session, so Pi's accounting for THAT session
+		// gives a real figure. Recording it as genuine spend keeps the operator's
+		// total exact instead of degrading it to `≥$X` for a call we can price.
+		{
+			const midPi = event.piEvent as {
+				type?: string;
+				reason?: string;
+				usage?: Partial<Record<"input" | "output" | "cacheRead" | "cacheWrite" | "cost", number>> & {
+					costKnown?: boolean;
+				};
+			};
+			if (midPi?.type === "mid_turn_compaction_end" && event.sessionId) {
+				// Bill the operator's thread, walking past intermediate sub-agents —
+				// the same attribution the sub-agent turn accounting below uses.
+				const billTo = event.parentSessionKey
+					? rootAncestorOf(event.parentSessionKey)
+					: event.sessionId;
+				const bill = (usage: Record<string, unknown>): void => {
+					usageLedger.recordOutOfBand(
+						resolveAgentIdFromSessionKey(billTo),
+						billTo,
+						"compaction",
+						usage as never,
+					);
+				};
+				const u = midPi.usage;
+				if (u) {
+					bill({
+						input: u.input ?? 0,
+						output: u.output ?? 0,
+						cacheRead: u.cacheRead ?? 0,
+						cacheWrite: u.cacheWrite ?? 0,
+						cost: { total: u.cost ?? 0 },
+						costKnown: u.costKnown === true,
+					});
+				} else if (
+					// A summarization RAN on these outcomes. It may have timed out or
+					// errored, but the provider still did the work and still charged for
+					// it — and on a timeout the usage arrives after we have already
+					// given up waiting, so there is no figure to attach. Recording the
+					// spend as UNPRICED is the honest answer: the total renders `≥$X`
+					// rather than silently omitting a call that cost real money.
+					//
+					// The declining outcomes (`too-few-messages`, `no-safe-boundary`,
+					// `not-worth-it`, `below-threshold`, `cache-hit`) never made a call,
+					// so they must record nothing — inventing spend is the opposite
+					// failure and just as wrong.
+					midPi.reason === "applied" ||
+					midPi.reason === "fallback-truncated" ||
+					midPi.reason === "timeout" ||
+					midPi.reason === "error" ||
+					midPi.reason === "empty-summary" ||
+					midPi.reason === "aborted"
+				) {
+					bill({ costKnown: false });
+				}
+			}
+		}
+		// Record this child->parent link, then tag the frame with the ROOT
+		// ancestor rather than the immediate parent. A depth-2 sub-agent's
+		// immediate parent is itself a sub-agent session the operator never
+		// subscribed to, so tagging that would drop the frame.
+		let resolvedParentKey = event.parentSessionKey;
+		if (event.parentSessionKey && event.sessionId) {
+			// LRU, not FIFO. A chain is inserted root-link first, so evicting by
+			// insertion order drops the ROOT link earliest — `rootAncestorOf` then
+			// stops mid-chain, the frame is tagged with a sub-agent key nobody is
+			// subscribed to, and the child's output silently vanishes from the
+			// operator's view (and mis-bills). Re-inserting on touch keeps a live
+			// chain whole. Same delete+set the usage ledger and reasoning tracker
+			// already use, for the same reason.
+			if (subagentParents.has(event.sessionId)) {
+				const existing = subagentParents.get(event.sessionId)!;
+				subagentParents.delete(event.sessionId);
+				subagentParents.set(event.sessionId, existing);
+			} else {
+				subagentParents.set(event.sessionId, event.parentSessionKey);
+			}
+			while (subagentParents.size > SUBAGENT_ANCESTRY_MAX) {
+				const oldest = subagentParents.keys().next().value as string | undefined;
+				if (oldest === undefined) break;
+				subagentParents.delete(oldest);
+			}
+			resolvedParentKey = rootAncestorOf(event.parentSessionKey);
+		}
+		// Meter sub-agent spend. `attachTurnSession` only subscribes to the
+		// TOP-LEVEL Pi session, so a parent turn that fanned out five children
+		// burning tokens added exactly zero to any usage figure — delegation is a
+		// headline feature and was the single largest hole in the meter.
+		//
+		// Attribution is to the run that INCURRED the spend, using the ids the bus
+		// event carries. It is deliberately not rolled up to a parent session:
+		// the child key is built as `agent:<childAgentId>:subagent:<uuid>`
+		// (subagent-spawn.ts:272) from the CHILD's agent, so it carries no link
+		// back to the parent and any derivation would be a guess. Per-agent
+		// rollup via `usageLedger.agentTotals` is correct today; a true
+		// parent→child rollup needs `parentSessionKey` threaded onto the bus
+		// event, which is a separate change.
+		if (event.subagentDepth && event.subagentDepth > 0) {
+			const childPi = event.piEvent as {
+				type?: string;
+				message?: { usage?: unknown };
+				result?: unknown;
+				aborted?: boolean;
+				errorMessage?: unknown;
+			};
+			// A sub-agent's COMPACTION is a real model call and was entirely
+			// unbilled: `attachTurnSession` only sees the top-level session, so a
+			// parent that fanned out five children, each summarizing a full window,
+			// added nothing to any figure. Gated on success exactly as the top-level
+			// path is — Pi emits `compaction_end` on failure too, and billing a call
+			// that never happened is worse than not billing one that did.
+			if (
+				childPi?.type === "compaction_end" &&
+				event.sessionId &&
+				childPi.aborted !== true &&
+				typeof childPi.errorMessage !== "string" &&
+				childPi.result
+			) {
+				const billTo = resolvedParentKey ?? event.sessionId;
+				usageLedger.recordOutOfBand(resolveAgentIdFromSessionKey(billTo), billTo, "compaction", {
+					costKnown: false,
+				});
+			}
+			if (childPi?.type === "turn_end" && event.sessionId) {
+				// Bill the ROOT session — the operator's thread — not the child's own.
+				//
+				// Attributing to the child meant the spend landed on a ledger entry
+				// nobody looks at: the header reads `displayTotals(parentAgent,
+				// parentSession)`, so a parent turn that fanned out five children was
+				// still free on the only surface an operator sees. The ancestry map
+				// resolved above walks past intermediate sub-agents, so a grandchild
+				// bills the same thread its grandparent does.
+				const billTo = resolvedParentKey ?? event.sessionId;
+				usageLedger.recordOutOfBand(
+					resolveAgentIdFromSessionKey(billTo),
+					billTo,
+					"subagent",
+					childPi.message?.usage as never,
+				);
+			}
+		}
+		// Wave I — forward the routing tags the bus event carries so child pi
+		// frames are filtered identically to top-level ones.
 		broadcast("pi", {
 			event: event.piEvent,
 			...(event.subagentDepth ? { subagentDepth: event.subagentDepth } : {}),
 			...(isSynthetic ? { synthetic: true } : {}),
 			agentId: event.agentId,
 			sessionId: event.sessionId,
+			// Route a child's frames to whoever is watching the PARENT thread. Its
+			// own key (`agent:<childAgent>:subagent:<uuid>`) shares no prefix with
+			// the parent's, so without this the only rule that matched was the
+			// agent-wide one — which is what pulled other sessions' work into the
+			// operator's view.
+			...(resolvedParentKey ? { parentSessionKey: resolvedParentKey } : {}),
 		});
 	});
 
@@ -2849,7 +3801,30 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// shutdown calls `abortAllSessions("shutdown")` which fires every
 			// turn's controller in parallel.
 			const turnAbortController = new AbortController();
-			const targetAgentId = turn.agentId ?? agentId;
+			// THE SESSION KEY ALREADY ENCODES THE AGENT — use it before falling back
+			// to the BOOT agent.
+			//
+			// `sessions.send` did not forward `agentId` (the sibling `agent` handler
+			// does), so a cross-agent turn on `agent:ops:main` was billed to the boot
+			// agent's ledger row while its out-of-band spend — which resolves the
+			// agent from the key — landed on `ops`. One thread, two rows, and every
+			// surface that reads by agent (`sessions.list`, a TUI bound to `ops`)
+			// showed only half of it. `sessions.delete`'s cleanup would likewise have
+			// cleared one row and orphaned the other.
+			//
+			// `dispatchAgentRun` has always resolved it this way; matching that here
+			// fixes the caller that forgot AND any future one, rather than patching
+			// a single call site. An explicit `turn.agentId` still wins.
+			// `parseAgentSessionKey`, NOT `resolveAgentIdFromSessionKey`.
+			//
+			// The resolver never returns undefined — it falls back to
+			// DEFAULT_AGENT_ID — so using it here would make the boot-agent
+			// fallback below dead code, and a gateway booted with a non-default
+			// agent would bill every legacy/alias key to "main" instead of itself.
+			// Parsing directly means only a key that GENUINELY encodes an agent
+			// overrides the boot agent.
+			const keyAgentId = parseAgentSessionKey(turn.sessionKey)?.agentId;
+			const targetAgentId = turn.agentId ?? keyAgentId ?? agentId;
 			const turnSessionKey = turn.sessionKey;
 			const runId = crypto.randomUUID();
 
@@ -2893,8 +3868,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// so a turn for `agent:ops` no longer sees mutations meant for
 				// `agent:main`.
 				const turnRuntime = getAgentRuntime(targetAgentId);
-				const turnProvider = turnRuntime.provider;
-				const turnModelId = turnRuntime.modelId;
+				// Per-session model pin, when this session has one. A pin is the
+				// ONLY thing that makes a session diverge from its agent: sessions
+				// without one read `turnRuntime` live, so an agent-wide `/model`
+				// still moves every unpinned session, existing or brand new.
+				//
+				// Deliberately NOT `entry.provider`/`entry.modelId` — every turn
+				// stamps those with whatever served it, so reading them here would
+				// freeze each session to its first turn's model and make an
+				// agent-wide switch a silent no-op. See `readSessionModelPin`.
+				const turnPin = turn.sessionKey
+					? readSessionModelPin(targetAgentId, turn.sessionKey)
+					: null;
+				const turnProvider = turnPin?.provider ?? turnRuntime.provider;
+				const turnModelId = turnPin?.modelId ?? turnRuntime.modelId;
 				const turnThinkingLevel = turnRuntime.thinkingLevel;
 
 				// C2: forward the per-agent `workspace` override from cfg so the
@@ -3117,9 +4104,138 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				}
 				const liveSession = liveSessionsByKey.get(targetKey);
 				if (!liveSession) throw new Error("nothing to steer — no turn in progress");
-				await liveSession.steer(p.text);
+				// `followUp` lands at a turn BOUNDARY — Pi holds it until there are no
+				// more tool calls and no pending steering. `steer` injects into the
+				// turn in progress. The distinction is the whole point: a message the
+				// operator queued by reflex must not derail a plan the model is
+				// halfway through, and Claude Code's own docs-vs-behaviour bug plus
+				// five open steering issues are what that ambiguity costs.
+				if (resolveSteerDelivery(p.deliverAs) === "followUp") {
+					await liveSession.followUp(p.text);
+				} else {
+					await liveSession.steer(p.text);
+				}
 				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
+			}
+			case "sessions.rewind": {
+				// CONVERSATION ONLY. Files are named, never reverted — see
+				// `src/sessions/rewind.ts` for the evidence behind that choice.
+				const p = params as RequestParams["sessions.rewind"];
+				const targetAgentId = p.agentId?.trim() || agentId;
+				const targetKey = p.sessionKey?.trim() || defaultSessionKey(targetAgentId);
+				// `agentId` and `sessionKey` are INDEPENDENT params, so a caller could
+				// pass a key guarded under one agent and have us read and write a
+				// different agent's store. `set-model` already checks this; rewind
+				// must too, or the guard protects a different row than the mutation
+				// touches.
+				if (p.sessionKey?.trim() && !targetKey.startsWith(`agent:${targetAgentId}:`)) {
+					throw new Error("sessionKey does not belong to the requested agent");
+				}
+				const rewindVerdict = sessionsAccessCheck({
+					action: "steer",
+					targetSessionKey: targetKey,
+				});
+				if (!rewindVerdict.allowed) {
+					const err = new Error(rewindVerdict.reason ?? "rewind forbidden");
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
+
+				const entries = await readSessionTranscriptEntries(targetKey);
+				const targets = rewindTargets(entries);
+
+				// REFUSE ON A SEVERED TREE. A compaction with no parent link makes
+				// pre-compaction history unreachable; rewinding into it would show
+				// the operator a silently truncated conversation, which is exactly
+				// the failure this check exists to prevent.
+				const orphan = findOrphanedCompaction(entries);
+				if (orphan) {
+					return {
+						targets,
+						rewound: false,
+						blocked:
+							"this transcript has a compaction entry with no parent link, so history before it cannot be reached safely",
+					} as ResponseFor[M];
+				}
+
+				// No entryId → this is the picker call. Nothing is mutated.
+				if (!p.entryId?.trim()) {
+					return { targets, rewound: false } as ResponseFor[M];
+				}
+
+				const entryId = p.entryId.trim();
+				if (!targets.some((t) => t.entryId === entryId)) {
+					throw new Error("that is not a point you can rewind to in this session");
+				}
+				if (liveSessionsByKey.get(targetKey)) {
+					throw new Error("a turn is in progress — abort it before rewinding");
+				}
+
+				const store = readSessionStore(targetAgentId);
+				const current = store.sessions?.[targetKey];
+				// FALL BACK TO THE FILE'S OWN LEAF when no pin exists.
+				//
+				// `leafEntryId` is absent on any session that has never been rewound —
+				// i.e. the FIRST rewind, the common case. Passing `undefined` made
+				// `pathToRoot` return `[]`, so the report said "0 entries abandoned"
+				// and listed no touched files. That is the feature's entire safety
+				// promise ("we name the files, we do not revert them") reading as
+				// vacuous exactly when it matters most.
+				//
+				// Pi derives the leaf the same way: the last entry in the file.
+				const currentLeaf =
+					current?.leafEntryId ?? entries[entries.length - 1]?.id;
+				const abandoned = abandonedByRewind(entries, currentLeaf, entryId);
+				const files = filesTouchedAfter(entries, currentLeaf, entryId);
+
+				// PERSIST the leaf. Pi's `branch()` moves it in memory only and
+				// `_buildIndex` recomputes it as "last entry in the file" on load, so
+				// without this a rewind silently un-does itself on the next resume.
+				updateSessionEntry(targetAgentId, targetKey, { leafEntryId: entryId });
+				broadcastStateAllBindings();
+
+				return {
+					targets,
+					rewound: true,
+					entryId,
+					abandoned: abandoned.length,
+					files,
+				} as ResponseFor[M];
+			}
+			case "flush-queue": {
+				// PROMOTE queued follow-ups into the running turn.
+				//
+				// The operator queued messages while the model worked and has now
+				// decided it should see them without waiting for the turn to end —
+				// DeepSeek's empty-draft Ctrl+Enter gesture, exposed as an RPC so the
+				// desktop and watch clients get it too rather than it living only in
+				// the TUI's key handling.
+				//
+				// `clearQueue()` REMOVES and returns both queues, which is what makes
+				// this safe: nothing is duplicated, and Brigade does not need a
+				// shadow queue that could drift from Pi's.
+				const p = params as RequestParams["flush-queue"];
+				const targetKey =
+					p.sessionKey?.trim() ||
+					(p.agentId ? defaultSessionKey(p.agentId.trim()) : sessionKey);
+				const flushVerdict = sessionsAccessCheck({
+					action: "steer",
+					targetSessionKey: targetKey,
+				});
+				if (!flushVerdict.allowed) {
+					const err = new Error(flushVerdict.reason ?? "steer forbidden");
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
+				const flushSession = liveSessionsByKey.get(targetKey);
+				if (!flushSession) throw new Error("nothing to flush — no turn in progress");
+
+				// Ordering and the restore-on-failure path live in `promoteQueue` so
+				// they are reachable by a test — inline here, they were not.
+				const delivered = await promoteQueue(flushSession as never);
+				if (delivered > 0) broadcastStateAllBindings();
+				return { promoted: delivered, sessionKey: targetKey } as ResponseFor[M];
 			}
 			case "set-model": {
 				const p = params as RequestParams["set-model"];
@@ -3153,6 +4269,41 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						authStorage: targetAuth,
 					})) as Model<string> | undefined);
 				if (!target) throw new Error(`model ${p.provider}/${p.modelId} not found`);
+				// Session scope — pin THIS session and stop. The agent's runtime
+				// entry and its persisted config are deliberately left alone:
+				// giving one thread a different model must not move the agent or
+				// any of its other threads. Validation above already ran, so a
+				// pin can only ever name a model that actually resolves.
+				if (p.scope === "session") {
+					const rawPinKey = typeof p.sessionKey === "string" ? p.sessionKey.trim() : "";
+					if (!rawPinKey) {
+						throw new Error('set-model: scope "session" requires a sessionKey');
+					}
+					// The pin is READ back at turn time under the turn's own
+					// agentId, so writing it under a different agent's store would
+					// file it where no turn will ever look for it. Reject the
+					// mismatch instead of silently cross-filing.
+					const parsedPinKey = parseAgentSessionKey(rawPinKey);
+					if (parsedPinKey && parsedPinKey.agentId !== targetAgentId) {
+						throw new Error(
+							`set-model: session ${rawPinKey} does not belong to agent ${targetAgentId}`,
+						);
+					}
+					const pinVerdict = sessionsAccessCheck({
+						action: "send",
+						targetSessionKey: rawPinKey,
+					});
+					if (!pinVerdict.allowed) {
+						const err = new Error(pinVerdict.reason ?? "set-model forbidden");
+						(err as Error & { code?: string }).code = "forbidden";
+						throw err;
+					}
+					if (!pinSessionModel(targetAgentId, rawPinKey, p.provider, p.modelId)) {
+						throw new Error(`set-model: cannot pin session ${rawPinKey}`);
+					}
+					broadcastStateAllBindings();
+					return undefined as ResponseFor[M];
+				}
 				// Mutate ONLY this agent's runtime entry — never spill model
 				// changes for one agent onto another's next turn.
 				perAgentRuntime.set(targetAgentId, {
@@ -3226,6 +4377,34 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				}
 				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
+			}
+			case "clear-session-model": {
+				const p = params as RequestParams["clear-session-model"];
+				const targetAgentId = p.agentId?.trim() || agentId;
+				const rawKey = typeof p.sessionKey === "string" ? p.sessionKey.trim() : "";
+				const pinKey = rawKey || defaultSessionKey(targetAgentId);
+				const parsedPinKey = parseAgentSessionKey(pinKey);
+				if (parsedPinKey && parsedPinKey.agentId !== targetAgentId) {
+					throw new Error(
+						`clear-session-model: session ${pinKey} does not belong to agent ${targetAgentId}`,
+					);
+				}
+				const clearVerdict = sessionsAccessCheck({
+					action: "send",
+					targetSessionKey: pinKey,
+				});
+				if (!clearVerdict.allowed) {
+					const err = new Error(clearVerdict.reason ?? "clear-session-model forbidden");
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
+				// Report whether a pin was actually dropped, so the TUI can say
+				// "this thread wasn't pinned" instead of implying it changed
+				// something. Read before the clear — after it, both look alike.
+				const hadPin = readSessionModelPin(targetAgentId, pinKey) !== null;
+				clearSessionModelPin(targetAgentId, pinKey);
+				if (hadPin) broadcastStateAllBindings();
+				return { cleared: hadPin } as ResponseFor[M];
 			}
 			case "switch-model-mid-turn": {
 				const p = params as RequestParams["switch-model-mid-turn"];
@@ -3427,9 +4606,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				}
 				const liveSession = liveSessionsByKey.get(targetKey);
 				if (!liveSession) {
-					throw new Error(
-						"nothing to compact yet — compaction runs during a turn and auto-triggers near the context limit",
-					);
+					// NO LIVE SESSION — DEFER, DO NOT REFUSE.
+					//
+					// A session only exists inside a turn, and the moment a person
+					// types `/compact` is precisely when they are idle, looking at a
+					// full context bar. Failing there made an advertised command
+					// unusable exactly when it was wanted, and told the operator
+					// "nothing to compact" about a thread that plainly had plenty.
+					//
+					// Record the request instead: the next turn compacts before it
+					// sends, regardless of fill, and clears the flag. The window is
+					// reclaimed before the operator's next message is processed,
+					// which is the outcome they were asking for.
+					requestForcedCompaction(targetKey);
+					return undefined as ResponseFor[M];
 				}
 				await (liveSession as AgentSession & { compact?: () => Promise<unknown> }).compact?.();
 				broadcastStateAllBindings();
@@ -3678,6 +4868,23 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					sessionKey: targetSessionKey,
 					limit: RESUME_TRANSCRIPT_MAX,
 				});
+				// RESTORE THIS SESSION'S SPEND BEFORE THE SNAPSHOT IS TAKEN.
+				//
+				// The ledger is in-memory, so a restart zeroes it and a reconnecting
+				// client showed `0 billed` until its first turn. The totals are read
+				// back from what the ledger itself last wrote — see
+				// `agents/usage/persist.ts` for why this is NOT rebuilt from the
+				// transcript, which produces a second, disagreeing definition of the
+				// same number.
+				//
+				// Absent record → seed nothing. Marking a session seeded with zeros
+				// would suppress the turn-attach seed, which has the real history.
+				if (!usageLedger.hasSeeded(targetAgentId, targetSessionKey)) {
+					const persisted = readPersistedSessionUsage(targetAgentId, targetSessionKey);
+					if (persisted) {
+						usageLedger.seedFromPersisted(targetAgentId, targetSessionKey, persisted);
+					}
+				}
 				const headSeq = seqCounters.get(targetSessionKey) ?? 0;
 				// Recovery for the two non-transcript event types so a (re)connecting
 				// client loses NOTHING: tool-approval prompts still pending on this
@@ -3699,15 +4906,102 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						...(a.agentId !== undefined ? { agentId: a.agentId } : {}),
 						...(a.sessionId !== undefined ? { sessionId: a.sessionId } : {}),
 					})) as EventPayload["approval-request"][];
+				// CURSOR REPLAY, for the streams the transcript cannot rebuild.
+				//
+				// Only meaningful within one gateway epoch: a restart resets the
+				// seq counters to 0, so an old cursor would replay the wrong
+				// frames. The client learns the epoch from `HelloOk` and from this
+				// response and discards a stale cursor — but the server must not
+				// depend on it having done so, hence the head check below.
+				//
+				// A cursor AHEAD of head means the client is describing a stream
+				// this gateway never emitted (a restart it has not noticed yet).
+				// Replaying nothing and reporting incomplete is the safe answer:
+				// it degrades to the transcript, which is always correct.
+				const cursor = typeof p.sinceSeq === "number" ? p.sinceSeq : undefined;
+				const replay = ((): { frames: { json: string }[]; complete: boolean } | undefined => {
+					if (cursor === undefined) return undefined;
+					// A cursor outside this epoch's range describes a stream this
+					// gateway never emitted. Degrade to the transcript, which is
+					// always correct.
+					if (cursor < 0 || cursor > headSeq) return { frames: [], complete: false };
+					// ALREADY CURRENT. The ring cannot know this — it only sees its
+					// own contents — so the comparison belongs here, where `headSeq`
+					// is in scope. Without it every resume of a perfectly healthy
+					// session (no sub-agents, no synthetic frames, so nothing ever
+					// retained) reported `replayComplete: false`, telling a
+					// conforming client that data had been lost when none had.
+					if (cursor === headSeq) return { frames: [], complete: true };
+					return frameRing.replayFrom(targetSessionKey, cursor);
+				})();
 				return {
 					sessionKey: targetSessionKey,
 					agentId: targetAgentId,
 					messages: messages as WireMessage[],
 					headSeq,
+					...(replay
+						? {
+								replayedFrames: replay.frames.map((f) => f.json),
+								replayComplete: replay.complete,
+							}
+						: {}),
 					pendingApprovals,
 					recentSystemEvents: recentSystemEvents.get(targetSessionKey) ?? [],
 					epoch: gatewayEpoch,
-					snapshot: buildSnapshot(targetAgentId),
+					snapshot: buildSnapshot(targetAgentId, targetSessionKey),
+				} as ResponseFor[M];
+			}
+			case "usage.summary": {
+				// WHERE THE SPEND ACTUALLY WENT.
+				//
+				// Two questions the header cannot answer. Within a thread: how much
+				// of the total was the conversation versus sub-agents, compaction and
+				// memory sweeps — recorded since `outOfBandByKind` was introduced and
+				// read by nothing until now. Across the agent: what the other threads
+				// cost, which is the ONLY place cron runs and background maintenance
+				// appear at all, because both bill to keys (`cron:<job>:run:<uuid>`,
+				// `<agent>:__maintenance`) that no list renders.
+				//
+				// Read-only; same default-pass guard as the other read surfaces.
+				const guardErr = defaultPassSessionGuard(rawParams, "list");
+				if (guardErr) throw guardErr;
+				const p = (params ?? {}) as RequestParams["usage.summary"];
+				const uAgentId = p.agentId?.trim() || agentId;
+				const uSessionKey = p.sessionKey?.trim() || defaultSessionKey(uAgentId);
+				const bucket = (label: string, t: { totalTokens: number; costUsd: number }) => ({
+					label,
+					tokens: t.totalTokens,
+					costUsd: t.costUsd,
+				});
+				const sessionTotals = usageLedger.displayTotals(uAgentId, uSessionKey);
+				const { own, byKind } = usageLedger.breakdown(uAgentId, uSessionKey);
+				const rows = usageLedger.forAgent(uAgentId);
+				const agentRollup = usageLedger.agentTotals(uAgentId);
+				return {
+					agentId: uAgentId,
+					sessionKey: uSessionKey,
+					session: {
+						total: bucket("total", sessionTotals),
+						own: bucket("conversation", own),
+						buckets: Object.entries(byKind).map(([kind, t]) =>
+							bucket(kind, t as { totalTokens: number; costUsd: number }),
+						),
+					},
+					agent: {
+						total: bucket("total", agentRollup),
+						sessions: rows
+							.map((r) => {
+								const t = usageLedger.displayTotals(r.agentId, r.sessionKey);
+								return { ...bucket(r.sessionKey, t), sessionKey: r.sessionKey };
+							})
+							.filter((r) => r.tokens > 0 || r.costUsd > 0)
+							.sort((a, b) => b.costUsd - a.costUsd || b.tokens - a.tokens),
+						// The ledger is LRU-bounded, so a long-lived gateway's rollup is
+						// "what is still in memory", not "everything ever". Saying so is
+						// the difference between a number and a misleading one.
+						truncated: rows.length >= usageLedger.capacity(),
+					},
+					costComplete: sessionTotals.costComplete === true,
 				} as ResponseFor[M];
 			}
 			case "memory-graph": {
@@ -3933,6 +5227,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			features: {
 				methods: [...REQUEST_METHODS, ...customMethods.keys()],
 				events: [...EVENT_NAMES],
+				// Named behaviours, so a client can detect what this gateway does
+				// instead of inferring it from a version integer that cannot say
+				// WHAT changed. Unknown names are ignorable by construction.
+				capabilities: [...PROTOCOL_CAPABILITIES],
 			},
 			policy: {
 				maxPayload: MAX_WS_PAYLOAD_BYTES,
@@ -3991,11 +5289,71 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// touching the cross-cutting `handleRequest` dispatcher.
 			if (reqFrame.method === "subscribe" || reqFrame.method === "unsubscribe") {
 				const p =
-					(reqFrame.params ?? {}) as { agentId?: string; sessionId?: string };
+					(reqFrame.params ?? {}) as {
+						agentId?: string;
+						sessionId?: string;
+						deltas?: boolean;
+						scope?: "session" | "agent";
+					};
 				try {
 					if (reqFrame.method === "subscribe") {
+						// GUARD THE SUBSCRIPTION, NOT JUST THE READS.
+						//
+						// `resume`, `sessions.list`, `sessions.history` and
+						// `sessions.rewind` all run the sessions access check; this
+						// surface did not — and it is strictly more powerful than a
+						// read. It takes an arbitrary agentId/sessionId off the wire,
+						// registers the connection for that session's FUTURE frames,
+						// and immediately pushes a snapshot carrying its spend, cost,
+						// billing mode, pinned provider/model and agent name. With
+						// `visibility: "self"` and A2A disabled, `resume` on another
+						// agent refused while this handed back the same data.
+						//
+						// The target is built explicitly rather than via
+						// `extractSessionTargetFromParams`, which reads `sessionKey`
+						// and `agentId` but not this method's `sessionId` — so the
+						// generic helper would have guarded the agent-wide case and
+						// silently missed the session-specific one.
+						const subTarget =
+							typeof p.sessionId === "string" && p.sessionId.trim().length > 0
+								? p.sessionId.trim()
+								: typeof p.agentId === "string" && p.agentId.trim().length > 0
+									? defaultSessionKey(p.agentId.trim())
+									: undefined;
+						if (subTarget) {
+							const verdict = sessionsAccessCheck({
+								action: "list",
+								targetSessionKey: subTarget,
+							});
+							if (!verdict.allowed) {
+								const denied: Frame = {
+									type: "res",
+									id: reqFrame.id,
+									ok: false,
+									error: { code: "forbidden", message: verdict.reason ?? "forbidden" },
+								};
+								if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(denied));
+								opts.consoleStream?.wsResponse(
+									reqFrame.method,
+									reqFrame.id,
+									false,
+									Date.now() - startedAt,
+								);
+								return;
+							}
+						}
 						if (p.agentId) subscribeAgent(connId, p.agentId.trim());
 						if (p.sessionId) subscribeSession(connId, p.sessionId.trim());
+						// Full frames are the default; `deltas: true` opts a client IN
+						// to content-stripped `message_update` frames. Sticky per
+						// connection, so a re-subscribe on rebind does not silently
+						// change the client's mode.
+						if (p.deltas === true) clientDeltaFrames.add(connId);
+						else if (p.deltas === false) clientDeltaFrames.delete(connId);
+						// `scope: "agent"` restores pre-narrowing breadth; "session" is
+						// the default and the fix. Sticky per connection, like `deltas`.
+						if (p.scope === "agent") clientBroadScope.add(connId);
+						else if (p.scope === "session") clientBroadScope.delete(connId);
 					} else {
 						if (p.agentId) unsubscribeAgent(connId, p.agentId.trim());
 						if (p.sessionId) unsubscribeSession(connId, p.sessionId.trim());
@@ -4011,7 +5369,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						const snapFrame: Frame = {
 							type: "event",
 							event: "state",
-							payload: buildSnapshot(p.agentId.trim()),
+							payload: buildSnapshot(
+								p.agentId.trim(),
+								typeof p.sessionId === "string" ? p.sessionId.trim() : undefined,
+							),
 						};
 						ws.send(JSON.stringify(snapFrame));
 					}
@@ -4071,6 +5432,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			clientConnIds.delete(ws);
 			clientAgentSubs.delete(connId);
 			clientSessionSubs.delete(connId);
+			clientDeltaFrames.delete(connId);
+			clientBroadScope.delete(connId);
 			opts.consoleStream?.clientDisconnected(clientLabel, clients.size);
 		});
 
@@ -4079,6 +5442,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			clientConnIds.delete(ws);
 			clientAgentSubs.delete(connId);
 			clientSessionSubs.delete(connId);
+			clientDeltaFrames.delete(connId);
+			clientBroadScope.delete(connId);
 		});
 	});
 
@@ -4428,7 +5793,38 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		registerGatewayHandler("sessions.list", (params: unknown) =>
 			handleSessionsList(
 				params as Parameters<typeof handleSessionsList>[0],
+				{
+					accessCheck: sessionsAccessCheck,
+					// Fill the `totalTokens` / `estimatedCostUsd` columns the row type
+					// has always declared and nothing ever wrote.
+					usageFor: (rowAgentId, rowSessionKey) => {
+						const t = usageLedger.displayTotals(rowAgentId ?? agentId, rowSessionKey);
+						return { totalTokens: t.totalTokens, costUsd: t.costUsd, costComplete: t.costComplete };
+					},
+				},
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("sessions.rename", (params: unknown) =>
+			handleSessionsRename(
+				params as Parameters<typeof handleSessionsRename>[0],
 				{ accessCheck: sessionsAccessCheck },
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("sessions.delete", (params: unknown) =>
+			handleSessionsDelete(
+				params as Parameters<typeof handleSessionsDelete>[0],
+				{
+					accessCheck: sessionsAccessCheck,
+					// The gateway's in-memory accounting for this key is now stale,
+					// and `/new` rolls a fresh sessionId under the SAME sessionKey —
+					// so without this a brand-new conversation silently inherits the
+					// deleted one's cost total and reasoning state, permanently.
+					forgetSessionState,
+				},
 			),
 		),
 	);
@@ -5425,6 +6821,36 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// wait on the npm registry, and an offline machine must boot in silence. The
 	// result rides the next state snapshot to every attached client, which ASKS the
 	// operator — we never update anything on our own. See `core/update-check.ts`.
+	// RE-CHECK PERIODICALLY, NOT ONCE AT BOOT.
+	//
+	// This ran exactly once, at startup, which makes the answer wrong for the
+	// normal case: a gateway that has been up for days booted BEFORE the release
+	// it is being asked about. `latestUpdate` stays `undefined`, and `/update`
+	// answers "You're on the latest published version" about a version that is
+	// no longer the latest — confidently, and self-reinforcingly, since the
+	// longer it runs the staler it gets. Observed with 1.35.1 published and
+	// 1.35.0 installed.
+	//
+	// Six hours is well under the interval at which anyone would notice a missed
+	// release, and it is one HEAD-ish request to the npm registry — negligible
+	// beside a daemon that streams tokens all day. `unref` so a pending timer can
+	// never hold the process open, and the check never rejects, so a laptop that
+	// is offline for a week simply keeps the last answer it had.
+	const UPDATE_RECHECK_MS = 6 * 60 * 60 * 1000;
+	const updateRecheck = setInterval(() => {
+		void checkForUpdate()
+			.then((found) => {
+				if (!found || found.latest === latestUpdate?.latest) return;
+				latestUpdate = found;
+				broadcastStateAllBindings();
+			})
+			.catch(() => {
+				/* never rejects; belt for a future refactor */
+			});
+	}, UPDATE_RECHECK_MS);
+	updateRecheck.unref?.();
+	disposeHandlers.push(() => clearInterval(updateRecheck));
+
 	void checkForUpdate()
 		.then((found) => {
 			if (!found) return;

@@ -32,6 +32,7 @@ import {
 	createMonitorState,
 	decideInbound,
 	echoScope,
+	normalizeHandle,
 	normalizeIMessageMessage,
 	parseIMessageNotification,
 	type MonitorState,
@@ -45,6 +46,7 @@ import {
 	type ReadFileLike,
 } from "./remote-attachments.js";
 import { sendMessageIMessage, type IMessageSendResult } from "./send.js";
+import { parseIMessageTarget } from "./targets.js";
 import { sanitizeIMessageWatchErrorPayload } from "./watch-error.js";
 import type { BrigadeConfig } from "../sdk.js";
 import type { OutboundMedia, OutboundSendOptions, InboundMediaAttachment } from "../sdk.js";
@@ -120,11 +122,47 @@ export interface ConnectIMessageArgs {
 }
 
 /** The live connection handle the adapter drives. */
+/**
+ * Does a typing failure mean this Mac cannot do typing indicators AT ALL, as
+ * opposed to a one-off hiccup?
+ *
+ * Matched on the bridge's own wording — it names `imagent`, IMCore and library
+ * validation when the private path is closed to it. A method the bridge does
+ * not expose is the same conclusion: stop asking. Anything else is treated as
+ * transient, because latching off on a blip would silently cost the feature for
+ * the rest of the process's life.
+ */
+export function isTypingPermanentlyUnavailable(message: string): boolean {
+	const m = message.toLowerCase();
+	return (
+		m.includes("imagent") ||
+		m.includes("imcore") ||
+		m.includes("library validation") ||
+		m.includes("method not found") ||
+		m.includes("not supported") ||
+		m.includes("entitlement")
+	);
+}
+
 export interface IMessageConnection {
 	isConnected(): boolean;
 	connectedAt(): number | null;
+	/**
+	 * The last error the WATCH reported, if any.
+	 *
+	 * Distinct from a transport close: the subprocess is alive and the socket is
+	 * fine, but the thing that reads chat.db has failed — so `isConnected()` is
+	 * true while no message will ever arrive again. Exposed so `health()` can
+	 * say that instead of reporting ok.
+	 */
+	lastWatchError(): string | undefined;
 	/** Send text; returns the bridge message id when available. */
 	sendText(conversationId: string, text: string, opts?: OutboundSendOptions): Promise<{ messageId?: string }>;
+	/**
+	 * Show or clear the "typing…" bubble in Messages.app. Best-effort — see
+	 * `setTyping` in the implementation for why this can never throw.
+	 */
+	setTyping(conversationId: string, on: boolean): Promise<void>;
 	/** Send media; returns the bridge message id when available. */
 	sendMedia(conversationId: string, media: OutboundMedia): Promise<{ messageId?: string }>;
 	/** Tear down the subprocess + stop reconnecting. */
@@ -164,6 +202,7 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 	let client: IMessageRpcLike | null = null;
 	let connected = false;
 	let connectedAtMs: number | null = null;
+	let lastWatchError: string | undefined;
 	let closed = false;
 	let attempt = 0;
 
@@ -188,6 +227,14 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 	}
 
 	const handleNotification = (msg: IMessageRpcNotification): void => {
+		// A CLOSED CONNECTION DELIVERS NOTHING.
+		//
+		// `close()` can land while a `watch.subscribe` is still in flight, and the
+		// client it was building stays subscribed and keeps calling this. Without
+		// this line those rows reach `onMessage` after close — and if the account
+		// has since reconnected, the operator is answered twice for one message.
+		// `subscribeOnce` tears the orphan down; this closes the window before it.
+		if (closed || args.signal?.aborted) return;
 		// Wrap the whole handler so a synchronous throw (malformed payload, a
 		// decideInbound bug, a downstream onMessage error) can NEVER escape into the
 		// RPC client's notification loop and wedge the watch / crash the gateway.
@@ -197,7 +244,21 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 				// Sanitize before logging — the payload is attacker-influenced (a
 				// crafted row / remote bridge could smuggle ANSI escapes or a huge
 				// blob). Keep only a finite code + a stripped/truncated message.
-				args.log("imessage watch error", { error: sanitizeIMessageWatchErrorPayload(msg.params) });
+				const sanitized = sanitizeIMessageWatchErrorPayload(msg.params);
+				args.log("imessage watch error", { error: sanitized });
+				// A DEAD WATCH MUST NOT REPORT HEALTHY.
+				//
+				// This was logged and nothing else: `connected` stayed true and
+				// `health()` kept returning ok, so a watch that had died — chat.db
+				// unreadable, Full Disk Access revoked mid-run, the watcher thread
+				// gone — presented as a working channel that simply never received
+				// anything. Silence is the one symptom an operator cannot
+				// distinguish from "nobody messaged me".
+				//
+				// Recorded so `health()` can degrade and say what happened. The
+				// supervise loop owns reconnection; this makes the state visible
+				// rather than pretending it away.
+				lastWatchError = sanitized.message ?? "the imsg watch reported an error";
 				return;
 			}
 			if (msg.method !== "message") return;
@@ -219,14 +280,26 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 			// then record THIS message for the next turn. iMessage's `imsg rpc`
 			// transport exposes no history method, so this is a pure in-memory buffer
 			// of messages the monitor has already seen (mirrors the upstream monitor).
-			const isUntaggedGroup =
-				normalized.isGroup && (!normalized.mentions || normalized.mentions.length === 0) && !normalized.replyTo;
-			if (account.historyLimit > 0 && isUntaggedGroup && normalized.text.trim()) {
-				const entries = history.recent(normalized.conversationId, account.historyLimit);
+			//
+			// GROUPS USE `historyLimit`, DMs USE `dmHistoryLimit`. Both are
+			// resolved by `account-config`, documented, and settable — but only
+			// the group one was ever read here, so setting `dmHistoryLimit` did
+			// nothing at all. (BlueBubbles' `historyLimitFor` has always honoured
+			// both; this is the same rule.)
+			const untagged =
+				(!normalized.mentions || normalized.mentions.length === 0) && !normalized.replyTo;
+			const historyLimit = normalized.isGroup ? account.historyLimit : account.dmHistoryLimit;
+			if (historyLimit > 0 && untagged && normalized.text.trim()) {
+				const entries = history.recent(normalized.conversationId, historyLimit);
 				const block = renderIMessageHistoryBlock(entries);
 				if (block) (normalized as IMessageInboundMessage).historyContext = block;
 			}
-			if (normalized.isGroup) {
+			// RECORD WHEREVER WE MIGHT LATER READ. This was `if (isGroup)`, so
+			// enabling `dmHistoryLimit` alone would have read a buffer nothing
+			// ever wrote to — the setting would still look inert, just one layer
+			// deeper. Gated on the limit so an install that leaves DM history off
+			// (the default) buffers nothing for its DMs, as before.
+			if (historyLimit > 0 || normalized.isGroup) {
 				history.record(normalized.conversationId, {
 					sender: normalized.fromName || normalized.from || "Unknown",
 					body: normalized.text,
@@ -303,7 +376,26 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 		for (let i = 1; i <= WATCH_SUBSCRIBE_MAX_ATTEMPTS; i++) {
 			if (closed || args.signal?.aborted) return;
 			try {
-				client = await subscribeAttempt();
+				const c = await subscribeAttempt();
+				// RE-CHECK AFTER THE AWAIT, NOT ONLY BEFORE IT.
+				//
+				// The guard at the top of this loop runs before two awaits (spawn,
+				// then `watch.subscribe`). `close()` during either one saw
+				// `client === null` and stopped nothing, and then this line
+				// published a live, subscribed client into a connection that had
+				// already been closed — a leaked `imsg` subprocess that no code
+				// path can reach to stop, still streaming rows. Reconnecting the
+				// account then delivered every message twice: once from the orphan,
+				// once from its replacement.
+				if (closed || args.signal?.aborted) {
+					try {
+						await c.stop();
+					} catch {
+						/* best-effort; the process is already unreachable */
+					}
+					return;
+				}
+				client = c;
 				connected = true;
 				connectedAtMs = Date.now();
 				attempt = 0;
@@ -401,12 +493,23 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 		else args.signal.addEventListener("abort", () => void close(), { once: true });
 	}
 
+	/**
+	 * Does this error mean the IMCore typing path is unavailable on this machine,
+	 * as opposed to a one-off failure?
+	 *
+	 * Matched on the bridge's own wording. A method the bridge does not expose at
+	 * all ("method not found") is the same conclusion: stop asking.
+	 */
+	let typingUnavailable = false;
+
 	const remember = (conversationId: string, sent: IMessageSendResult): void => {
 		// Build the same scope the inbound poll keys on so the echo is suppressed.
 		const numericChat = conversationId.startsWith("chat:") ? Number.parseInt(conversationId.slice(5), 10) : NaN;
 		const scope = Number.isFinite(numericChat)
 			? echoScope(account.accountId, { chat_id: numericChat })
-			: `${account.accountId}:imessage:${conversationId}`;
+			// Normalised the SAME way the inbound scope is, or the two disagree
+			// on casing/phone punctuation and the echo is never suppressed.
+			: `${account.accountId}:imessage:${normalizeHandle(conversationId)}`;
 		state.sentMessageCache.remember(scope, { text: sent.sentText, messageId: sent.messageId });
 	};
 
@@ -424,7 +527,61 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 
 	return {
 		isConnected: () => connected,
+		lastWatchError: () => lastWatchError,
 		connectedAt: () => connectedAtMs,
+		/**
+		 * Typing indicator.
+		 *
+		 * ─────────────────────────────────────────────────────────────────────
+		 * WHY THIS IS BEST-EFFORT, AND WHY IT GOES QUIET
+		 * ─────────────────────────────────────────────────────────────────────
+		 * Every other channel Brigade speaks shows a typing indicator while the
+		 * agent thinks; iMessage was the only one that did not, because the
+		 * adapter never implemented `setComposing`. The bridge does support it —
+		 * `imsg`'s `typing` RPC — but ONLY through IMCore, which needs SIP
+		 * disabled and Messages launched with `imsg launch`. On a stock Mac it
+		 * fails every time:
+		 *
+		 *   "Failed to connect to imagent (Messages daemon) … imagent can reject
+		 *    third-party clients without Apple-private entitlements"
+		 *
+		 * So two rules. It NEVER throws — a cosmetic bubble must not be able to
+		 * fail a turn that is otherwise fine. And it LATCHES OFF after the first
+		 * unavailability, logging once with the remedy, because the alternative
+		 * is two failures per turn forever in the operator's log, which trains
+		 * people to ignore the log. A transient failure does not latch — only
+		 * the answer that means "this Mac cannot do this at all".
+		 */
+		async setTyping(conversationId, on): Promise<void> {
+			if (typingUnavailable || !connected) return;
+			const c = client;
+			if (!c) return;
+			try {
+				const params: Record<string, unknown> = { service: account.service || "auto" };
+				// Same conversation-id → wire-param mapping the sender uses, so a
+				// thread that can be sent to can always be typed into.
+				const target = parseIMessageTarget(conversationId);
+				if (target.kind === "chat_id") params.chat_id = target.chatId;
+				else if (target.kind === "chat_guid") params.chat_guid = target.chatGuid;
+				else if (target.kind === "chat_identifier") params.chat_identifier = target.chatIdentifier;
+				else params.to = target.to;
+				if (!on) params.stop = true;
+				await c.request("typing", params, { timeoutMs: account.probeTimeoutMs });
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				if (isTypingPermanentlyUnavailable(msg)) {
+					typingUnavailable = true;
+					args.log(
+						"imessage: typing indicators unavailable on this Mac — they need IMCore " +
+							"(SIP disabled + `imsg launch`). Everything else is unaffected; not retrying.",
+					);
+					return;
+				}
+				// Transient — stay enabled, and keep it at debug volume.
+				if (account.verbose) args.log(`imessage: typing indicator failed (transient): ${msg}`);
+			}
+		},
+
 		async sendText(conversationId, text, opts): Promise<{ messageId?: string }> {
 			const result = await sendFn(conversationId, text, {
 				cliPath: account.cliPath,

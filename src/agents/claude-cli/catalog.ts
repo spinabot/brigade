@@ -415,6 +415,16 @@ export function isStructuredJsonPrompt(systemPrompt: string | undefined): boolea
 export interface BuildArgsInput {
 	/** Requested Brigade model id (with or without the `claude-cli/` prefix). */
 	modelId: string;
+	/**
+	 * Pi's thinking level for this turn (`off` | `minimal` | `low` | `medium` |
+	 * `high` | `xhigh`), read from `options.reasoning`.
+	 *
+	 * Was not passed at all, which made the operator's `/thinking` setting a
+	 * no-op on this backend: the catalog advertises `reasoning: true` for every
+	 * Opus/Sonnet/Fable entry, the TUI offers the levels, and nothing reached the
+	 * binary — so every turn ran at the CLI's own default regardless.
+	 */
+	thinkingLevel?: string;
 	/** System prompt to append (Brigade's assembled persona). Omitted when blank. */
 	systemPrompt?: string;
 	/**
@@ -488,6 +498,37 @@ export function composeClaudeCliSystemPrompt(input: {
  * (see spawn.ts) to avoid the OS command-line length limit — and the user
  * prompt is delivered on STDIN. So argv stays tiny + constant.
  */
+/**
+ * Map Pi's thinking level onto the binary's `--effort` vocabulary.
+ *
+ * Pi:  off | minimal | low | medium | high | xhigh
+ * CLI: low | medium | high | xhigh | max        (`claude --help`, 2.1.234)
+ *
+ * `off` returns undefined — the caller then sends no reasoning flags at all,
+ * rather than inventing a "lowest" effort the operator did not ask for. The two
+ * vocabularies differ at both ends: Pi's `minimal` floors to the CLI's `low`,
+ * and the CLI's `max` has no Pi equivalent so nothing maps to it. An
+ * unrecognized value returns undefined rather than guessing.
+ */
+export function resolveClaudeCliEffort(level: string | undefined): string | undefined {
+	switch ((level ?? "").trim().toLowerCase()) {
+		case "minimal":
+		case "low":
+			return "low";
+		case "medium":
+			return "medium";
+		case "high":
+			return "high";
+		case "xhigh":
+			return "xhigh";
+		case "max":
+			return "max";
+		default:
+			// Covers "off", "", and anything unrecognized.
+			return undefined;
+	}
+}
+
 export function buildClaudeCliArgs(input: BuildArgsInput): string[] {
 	const args = [...CLAUDE_CLI_BASE_ARGS];
 	// IMAGES. The default stdin protocol is plain text, which has nowhere to put an
@@ -503,6 +544,29 @@ export function buildClaudeCliArgs(input: BuildArgsInput): string[] {
 	// in the product through a new path to fix a case most turns don't have.
 	if (input.streamJsonInput === true) args.push("--input-format", "stream-json");
 	args.push("--model", resolveCliModelArg(input.modelId));
+
+	// REASONING. Two flags, both verified against `claude --help` on 2.1.234.
+	//
+	// `--effort <low|medium|high|xhigh|max>` carries the operator's chosen
+	// thinking level. Without it every turn ran at the binary's default and
+	// `/thinking` was decorative.
+	//
+	// `--settings` takes "a settings JSON file OR a JSON string", so the thinking
+	// summaries can be requested PER TURN without mutating the operator's global
+	// `~/.claude/settings.json`. `showThinkingSummaries` defaults to false in the
+	// binary, and when false the CLI actively asks the API to redact reasoning
+	// (the `redact-thinking-2026-02-12` beta — all three strings are present in
+	// the 2.1.234 binary). That default is why this backend produced ZERO
+	// thinking blocks across a real 591-message transcript history: the reasoning
+	// was never sent, so there was nothing for any renderer to show.
+	//
+	// Only requested when the operator actually asked for thinking. At `off` we
+	// send neither flag and the binary keeps its own behaviour.
+	const effort = resolveClaudeCliEffort(input.thinkingLevel);
+	if (effort) {
+		args.push("--effort", effort);
+		args.push("--settings", JSON.stringify({ showThinkingSummaries: true }));
+	}
 	const structured = input.structured ?? isStructuredJsonPrompt(input.systemPrompt);
 	const conversational = input.conversational !== false;
 	// A distiller is tool-less too — it must emit JSON, never touch the fs.

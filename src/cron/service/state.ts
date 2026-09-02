@@ -63,6 +63,15 @@ export interface CronIsolatedRunArgs {
 	job: CronJob;
 	runAtMs: number;
 	abortSignal?: AbortSignal;
+	/**
+	 * Called once the run's Pi session exists, so the gateway can meter it.
+	 *
+	 * Cron turns went through `runSingleTurn` directly rather than the
+	 * gateway's turn path, so nothing ever attached them to the usage ledger —
+	 * a nightly job burning hundreds of dollars a month reported zero on every
+	 * surface Brigade has. The gateway supplies this; other callers may omit it.
+	 */
+	onSessionReady?: (session: unknown, agentId: string, sessionKey: string) => void;
 }
 
 /** Args the cron service hands to its system-event injector. */
@@ -138,6 +147,13 @@ export interface CronServiceDeps {
 	onEvent?: (event: CronEvent) => void;
 	/** Run an `agentTurn` payload as an isolated child session. */
 	runIsolatedAgentJob?: (args: CronIsolatedRunArgs) => Promise<CronIsolatedRunOutcome>;
+	/**
+	 * Drop the gateway's per-session in-memory state when the reaper prunes a
+	 * session. Without it the usage ledger, reasoning tracker, frame ring and
+	 * session caches keep a row for every reaped cron fire and idle thread —
+	 * `sessions.delete` has always cleared them; the reaper never did.
+	 */
+	forgetSessionState?: (agentId: string, sessionKey: string) => void;
 	/** Inject text as a system event into the operator's main session. */
 	enqueueSystemEvent?: (args: CronSystemEventArgs) => void;
 	/**

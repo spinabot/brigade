@@ -4,7 +4,10 @@
  * Brand-scrubbed analogue of upstream's connect/hello flow. Defines the
  * THREE moving parts of the handshake:
  *
- *   - `PROTOCOL_VERSION`  — single integer; bumped only on breaking changes
+ *   - `PROTOCOL_VERSION`  — single integer; bumped ONLY on FRAMING
+ *                           incompatibility (a client can no longer parse the
+ *                           frames). Behaviour changes ride `features.
+ *                           capabilities` instead — see below.
  *   - `ConnectParams`     — what the client sends in its first frame
  *   - `HelloOk`           — server's reply confirming version + features
  *
@@ -14,7 +17,45 @@
  * WebSocket.
  */
 
+/**
+ * Framing version. Deliberately still 1, and expected to stay there.
+ *
+ * Nothing in Brigade or in its known clients COMPARES this number — it is
+ * advertised in `hello-ok` and in `/health` and read nowhere. And Brigade
+ * cannot serve two behaviours at once, so bumping it could only ever mean
+ * "something changed, take it or leave it". For a client doing a strict
+ * `=== 1` check that is a hard outage in exchange for zero information.
+ *
+ * Every project that solved this with third-party clients reached the same
+ * answer: LSP has no version number at all, only capabilities; DAP froze at 1
+ * on purpose ("an explicit design goal to support new features in a completely
+ * backward compatible way"); MCP keeps a date string for wire-incompatible
+ * changes and moves everything else into capabilities/extensions.
+ *
+ * So: a behaviour change gets a CAPABILITY plus an opt-out on the call that
+ * changed. A version bump is reserved for the one case a capability cannot
+ * express — the frames themselves becoming unparseable.
+ */
 export const PROTOCOL_VERSION = 1 as const;
+
+/**
+ * Behaviours a client can detect and opt into, by name.
+ *
+ * An unknown string is ignorable by construction, which is what makes this
+ * safe to extend — unlike an integer, where "newer than me" is the only
+ * possible reading. Brigade's desktop client already feature-detects off
+ * `features.methods`, so this reuses a channel that is live and proven.
+ */
+export const PROTOCOL_CAPABILITIES = [
+	/** `subscribe { deltas: true }` — content-stripped `message_update` frames. */
+	"subscribe.deltas",
+	/** `subscribe { scope: "session" | "agent" }` — how broadly frames are delivered. */
+	"subscribe.scope",
+	/** `resume { seq }` — gap-free replay from a per-session sequence cursor. */
+	"resume.seq",
+] as const;
+
+export type ProtocolCapability = (typeof PROTOCOL_CAPABILITIES)[number];
 
 /* ─── Client identity ───────────────────────────────────────────── */
 
@@ -113,6 +154,11 @@ export interface HelloOk {
 	features: {
 		methods: readonly string[];
 		events: readonly string[];
+		/**
+		 * Named behaviours this gateway supports. Absent on older gateways, so a
+		 * client must treat `undefined` as "none of them".
+		 */
+		capabilities?: readonly string[];
 	};
 	policy: {
 		maxPayload: number;

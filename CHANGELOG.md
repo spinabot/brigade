@@ -1,5 +1,133 @@
 # Changelog
 
+## [1.37.0](https://github.com/spinabot/brigade/compare/brigade-v1.36.1...brigade-v1.37.0) (2026-09-02)
+
+
+### Features
+
+* **connect:** /clear takes a name and gains its /reset alias ([26b2e8b](https://github.com/spinabot/brigade/commit/26b2e8be434eeafe0edcee112499b3157d3a840c))
+* **connect:** add /clear, and stop mailing mistyped commands to the model ([3f94970](https://github.com/spinabot/brigade/commit/3f94970580aeef8e82432288606458026ee99311))
+* **usage:** surface where the spend actually went ([a09b9b9](https://github.com/spinabot/brigade/commit/a09b9b9680897c35a73d19ac0be9e9299a7f01f5))
+
+
+### Bug Fixes
+
+* **cron:** scheduled runs were never metered ([46b7298](https://github.com/spinabot/brigade/commit/46b7298cff4632b2c6493b8808d239e7b1900042))
+* **gateway:** a resumed session reported zero spend until its first turn ([1261319](https://github.com/spinabot/brigade/commit/1261319dc93a5adb32d22119295a5383ad21d7ac))
+* **gateway:** one session's context usage was painted onto every other session ([fb3e80a](https://github.com/spinabot/brigade/commit/fb3e80a59c8b3dec801c834c409e0c6cffd1ab93))
+* **gateway:** reaped sessions left their in-memory rows behind, and a bill could land on the wrong agent ([d966f13](https://github.com/spinabot/brigade/commit/d966f13929270c895b185a667bee9371b6980db3))
+* **gateway:** subscribe handed out another agent's spend with no access check ([16ea43f](https://github.com/spinabot/brigade/commit/16ea43ff491c0b9cb620d06c73512176a60c1a1d))
+* iMessage replies were lost, spend was wrong or invisible, and one session's context painted another's ([d6c4558](https://github.com/spinabot/brigade/commit/d6c455865d3bc558db70bf6dba7a6fe8df3ceb79))
+* **usage:** persist session spend instead of rebuilding it from the transcript ([63315dd](https://github.com/spinabot/brigade/commit/63315dd92901335cee0663526fd9b82c09633cbf))
+
+## [1.36.1](https://github.com/spinabot/brigade/compare/brigade-v1.36.0...brigade-v1.36.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* **connect:** nine slash commands were unusable mid-turn ([04b1cc8](https://github.com/spinabot/brigade/commit/04b1cc82a753154dad9192291f50ee9cb9348502))
+* **connect:** nine slash commands were unusable mid-turn ([9b5b92f](https://github.com/spinabot/brigade/commit/9b5b92f8a424ef8e38258214561dac2f71f40b91))
+
+## [1.36.0](https://github.com/spinabot/brigade/compare/brigade-v1.35.3...brigade-v1.36.0) (2026-08-31)
+
+
+### Features
+
+* **imessage:** show a typing indicator while the agent thinks ([5751c67](https://github.com/spinabot/brigade/commit/5751c67889f6a00519ec0e08b204187177889c06))
+* **providers:** add OrcaRouter as a first-class provider ([e89f76c](https://github.com/spinabot/brigade/commit/e89f76cab07c2306c105c07be0cd331403395ba3))
+
+
+### Bug Fixes
+
+* **catalog:** OrcaRouter entry was missing the required billing field ([f707b68](https://github.com/spinabot/brigade/commit/f707b6844ab37c83ffd9d36702e14e4df15d6815))
+* **catalog:** OrcaRouter entry was missing the required billing field ([e508a76](https://github.com/spinabot/brigade/commit/e508a76350efef0f255bfc3925c713e6f02fdfc7))
+* **channels:** close four dead-setting bugs, and the DM/group misclassification behind them ([ff7a8e5](https://github.com/spinabot/brigade/commit/ff7a8e5ea1519bceefc63d1bf317fc6e3e4b46e3))
+* **channels:** four dead settings, a DM/group misclassification, and the missing iMessage typing indicator ([c83973f](https://github.com/spinabot/brigade/commit/c83973fa0d47d94692abb1c3d3018ca6c0dc0083))
+* **update:** the update command warned about a stale install on every success, and answered from cache ([e377d63](https://github.com/spinabot/brigade/commit/e377d63bda2c462621caad78d606ff54b88404d0))
+* **update:** warned about a stale install on every success, and answered from cache ([6973de4](https://github.com/spinabot/brigade/commit/6973de46b70d35f60f45e82e9a545d3f6387de78))
+
+## [1.35.3](https://github.com/spinabot/brigade/compare/brigade-v1.35.2...brigade-v1.35.3) (2026-08-31)
+
+
+### Bug Fixes
+
+* **tui:** one context-switch routine, an abort that stays aborted, and two regressions of my own ([28f1d17](https://github.com/spinabot/brigade/commit/28f1d1750082eeeb5af98803d3edc4508eb47066))
+
+## [1.35.2](https://github.com/spinabot/brigade/compare/brigade-v1.35.1...brigade-v1.35.2) (2026-08-31)
+
+
+### Bug Fixes
+
+* **export:** /export thinking parsed the flag and then ignored it ([1f333e3](https://github.com/spinabot/brigade/commit/1f333e3b6ea68b82e1d47b5638026cee7471326e))
+* reasoning tokens for every provider, and an update check that re-checks ([ccd9894](https://github.com/spinabot/brigade/commit/ccd98948096bedc7edb339a02117f08ef065407a))
+* reasoning tokens on every provider, and an update check that actually re-checks ([ecf0243](https://github.com/spinabot/brigade/commit/ecf0243ad564c6739161522d5dd7142d08877134))
+* **tui:** /session and /agent bound the input but not the view ([14a507d](https://github.com/spinabot/brigade/commit/14a507de6fdd645b56e825d4f9516fc6eacb5c78))
+
+## [1.35.1](https://github.com/spinabot/brigade/compare/brigade-v1.35.0...brigade-v1.35.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* a source file was BINARY, and the loop guard accused the model of looping ([477fb09](https://github.com/spinabot/brigade/commit/477fb094df9d1610cc56b716f85ef61a16519be5))
+* **tui:** /compact refused when idle, and the header hid what it knew ([762ac24](https://github.com/spinabot/brigade/commit/762ac2481a8ae607be54d4fc70fbd7a16cebb5d8))
+* **tui:** say why reasoning shows nothing instead of leaving it blank ([6382580](https://github.com/spinabot/brigade/commit/63825806afc5aea8de07bae5938a0e3f5e02c18c))
+* **tui:** surface what the TUI already knew — queue, effort, compaction, and why reasoning is blank ([db533c9](https://github.com/spinabot/brigade/commit/db533c9f3c9e4d8c5547b12227dac9371475c4e0))
+
+## [1.35.0](https://github.com/spinabot/brigade/compare/brigade-v1.34.0...brigade-v1.35.0) (2026-08-31)
+
+
+### Features
+
+* surface reasoning honestly, provider-agnostic limits, /context ([087fac2](https://github.com/spinabot/brigade/commit/087fac2d9052b71b7d91e378ef8c526962e2265a))
+* surface reasoning honestly, provider-agnostic limits, /context ([e79a612](https://github.com/spinabot/brigade/commit/e79a61294e78cf7f5f6187dc774ae6473d1270a9))
+
+
+### Bug Fixes
+
+* **channels:** stop advertising a logout hook the runtime never calls ([46a15ce](https://github.com/spinabot/brigade/commit/46a15cea8faa55767674420f5c0053886a9ce6a1))
+* **config:** delete the dead parallel config implementation ([46a15ce](https://github.com/spinabot/brigade/commit/46a15cea8faa55767674420f5c0053886a9ce6a1))
+* delete the dead parallel config implementation; stop advertising an uncalled logout hook ([02867ab](https://github.com/spinabot/brigade/commit/02867ab4bec91603a905c9b143a491721bb09e07))
+* four reviewers found the cursor-replay design was net-negative ([d384279](https://github.com/spinabot/brigade/commit/d38427911558533c595cae626a954c7211483b4e))
+* reasoning label could invert the misrepresentation it fixes; add cursor replay ([813e991](https://github.com/spinabot/brigade/commit/813e991cc84537b534caf993a21237b723d6a1b9))
+
+## [1.34.0](https://github.com/spinabot/brigade/compare/brigade-v1.33.0...brigade-v1.34.0) (2026-08-31)
+
+
+### Features
+
+* mid-turn compaction, transcript tooling, and a typed Pi dialect boundary ([960c9ed](https://github.com/spinabot/brigade/commit/960c9edd95686b301c8ba27bdfbe00fe82357a8a))
+* mid-turn compaction, transcript tooling, and a typed Pi dialect boundary ([f4b6c6b](https://github.com/spinabot/brigade/commit/f4b6c6bca9b905aec1a60f90747b490de1251463))
+
+
+### Bug Fixes
+
+* **documents:** PDF generation fails whenever the Unicode font is used ([3232a1f](https://github.com/spinabot/brigade/commit/3232a1ffea7a1df0d487a41a14199f9cbf447a91))
+
+## [1.33.0](https://github.com/spinabot/brigade/compare/brigade-v1.32.1...brigade-v1.33.0) (2026-08-27)
+
+
+### Features
+
+* **sessions:** per-session model pin, so one thread can run its own model ([9c7d43d](https://github.com/spinabot/brigade/commit/9c7d43dc3c054ae6cdf158dc2e92342532c6efe3))
+* **sessions:** per-session model pin, so one thread can run its own model ([ff63300](https://github.com/spinabot/brigade/commit/ff633004f04c5f140cfcfd69736a0e1c78521ef2))
+* **sessions:** surface the model pin on sessions.list rows ([84c3a9c](https://github.com/spinabot/brigade/commit/84c3a9c25f664b1210c46e9e87c5bd6d5bde609f))
+
+## [1.32.1](https://github.com/spinabot/brigade/compare/brigade-v1.32.0...brigade-v1.32.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* **sessions:** /delete accepts the short key form /sessions shows ([b7abf9e](https://github.com/spinabot/brigade/commit/b7abf9e202f1708682e29a84bf0290ba5e428a95))
+* **sessions:** /delete accepts the short key form /sessions shows ([dba8c6c](https://github.com/spinabot/brigade/commit/dba8c6cdc7a4a58ca4ea46a146a2d6dde1c4346b))
+
+## [1.32.0](https://github.com/spinabot/brigade/compare/brigade-v1.31.4...brigade-v1.32.0) (2026-08-22)
+
+
+### Features
+
+* **sessions:** name and delete threads from the TUI, gateway and agent ([65c8cac](https://github.com/spinabot/brigade/commit/65c8cac24b8f01456f5cb91767db01654e21cd6a))
+* **sessions:** name and delete threads from the TUI, gateway and agent ([15b072c](https://github.com/spinabot/brigade/commit/15b072c85b20f74b30428868e06d6dde52f98ca6))
+
 ## [1.31.4](https://github.com/spinabot/brigade/compare/brigade-v1.31.3...brigade-v1.31.4) (2026-08-22)
 
 

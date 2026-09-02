@@ -81,6 +81,46 @@ function resolveMessageId(result: unknown): string | null {
  * Send an iMessage. `to` is the target string; `opts.chatId` (when set) wins and
  * forces a `chat_id:` target. Resolves the message id (or a coarse fallback).
  */
+/**
+ * Does this error mean the transport cannot thread replies, as opposed to the
+ * send being refused for a real reason?
+ *
+ * Matched on the bridge's own wording. Deliberately narrow: a broad match here
+ * would retry sends that genuinely failed, and re-sending a message the bridge
+ * already refused is worse than not sending it.
+ */
+export function isThreadingUnsupported(err: unknown): boolean {
+	const m = err instanceof Error ? err.message : String(err);
+	// Pattern widened to match OpenClaw's `isThreadedReplyUnsupportedError`,
+	// which drives the same fallback against the same `imsg` binary and has
+	// therefore already met the error shapes this one had not. The narrower
+	// first version required the literal `reply_to`, so a bridge that said only
+	// "threaded replies are unavailable" would have been treated as a real
+	// failure and lost the message — the exact bug being fixed.
+	// MUST NAME THE REPLY/THREADING FEATURE, not just a transport requirement.
+	//
+	// OpenClaw's equivalent carries a bare `requires bridge transport`
+	// alternation, and the shipped `imsg` binary (0.14.2) contains a real,
+	// unrelated string that matches it:
+	//
+	//     send.tracked requires bridge transport
+	//
+	// That is a different RPC method than the `send` this file issues, so it is
+	// not reachable today — but a predicate one bridge release away from
+	// re-sending a message that was refused for an unrelated capability reason
+	// is not a predicate worth keeping. Requiring BOTH a reply/threading token
+	// and a refusal token keeps every intended case and drops that one.
+	//
+	// The cost of being wrong in the other direction is small: a bridge that
+	// refuses a threaded reply without naming it simply fails, as it did before
+	// this fallback existed. Not retrying is always safe; retrying a genuinely
+	// refused send is not.
+	const mentionsThreading = /reply_to|threaded repl/iu.test(m);
+	const mentionsRefusal =
+		/bridge transport|cannot send|unsupported|not supported|unavailable|requires/iu.test(m);
+	return mentionsThreading && mentionsRefusal;
+}
+
 export async function sendMessageIMessage(
 	to: string,
 	text: string,
@@ -92,9 +132,20 @@ export async function sendMessageIMessage(
 	// Target — an explicit chatId wins, else parse the `to` string.
 	const target = parseIMessageTarget(opts.chatId ? formatIMessageChatTarget(opts.chatId) : to);
 
-	// Service — explicit opt → the handle's parsed service → the account default.
-	const service: IMessageService =
-		opts.service ?? (target.kind === "handle" ? target.service : undefined) ?? "auto";
+	// Service — the target's own prefix, then the account default, then `auto`.
+	//
+	// THE ORDER USED TO BE BACKWARDS AND THAT MADE THE PREFIX DEAD. This read
+	// `opts.service ?? target.service`, and `opts.service` is the ACCOUNT DEFAULT,
+	// which `coerceIMessageService` always resolves to a real value — so the left
+	// side never fell through and the right side was unreachable. Every documented
+	// `sms:+1555…` / `imessage:…` prefix parsed correctly and was then discarded,
+	// sending over whatever the account was configured for.
+	//
+	// `serviceExplicit` rather than `service !== "auto"`, because a deliberate
+	// `auto:` on an account pinned to `sms` is a real instruction too.
+	const targetService: IMessageService | undefined =
+		target.kind === "handle" && target.serviceExplicit ? target.service : undefined;
+	const service: IMessageService = targetService ?? opts.service ?? "auto";
 	const region = opts.region?.trim() || "US";
 	const maxBytes = typeof opts.maxBytes === "number" ? opts.maxBytes : 16 * 1024 * 1024;
 
@@ -144,12 +195,78 @@ export async function sendMessageIMessage(
 			: await createIMessageRpcClient({ cliPath, dbPath }));
 	const shouldClose = !opts.client;
 	try {
-		const result = await client.request<{ ok?: string } & Record<string, unknown>>("send", params, {
+		const requestOpts = {
 			...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-		});
+		};
+		let result: ({ ok?: string } & Record<string, unknown>) | undefined;
+		try {
+			result = await client.request<{ ok?: string } & Record<string, unknown>>(
+				"send",
+				params,
+				requestOpts,
+			);
+		} catch (err) {
+			// A REPLY THAT CANNOT BE THREADED IS STILL A REPLY.
+			//
+			// `reply_to` needs the bridge transport; the AppleScript fallback
+			// rejects it outright:
+			//
+			//   "reply_to requires bridge transport; AppleScript fallback cannot
+			//    send threaded replies"
+			//
+			// That killed the whole send. Threading is a nicety — being ANSWERED
+			// is not — and the message this cost most often is the pairing
+			// challenge, which is the one that tells a new sender how to get
+			// authorised. Losing it leaves them messaging into silence with no
+			// way to discover why, which is exactly what it looks like from the
+			// other end: a bot that is simply ignoring you.
+			//
+			// So: drop the threading and send it flat. Only for this specific
+			// refusal — any other failure is still a failure.
+			if (!replyTo || !isThreadingUnsupported(err)) throw err;
+			delete params.reply_to;
+			result = await client.request<{ ok?: string } & Record<string, unknown>>(
+				"send",
+				params,
+				requestOpts,
+			);
+		}
 		const resolvedId = resolveMessageId(result);
+		// A SEND IS NOT SUCCESSFUL BECAUSE IT RETURNED.
+		//
+		// The transport rejects on a JSON-RPC `error` member, so this code only
+		// ever sees a 200-shaped answer — but the bridge reports a refused send
+		// INSIDE the result: `{ok:false, error:"no such handle"}`. That fell
+		// through to `messageId:"unknown"`, which every caller reads as success,
+		// so an undeliverable message was reported delivered. The operator is
+		// then told their reply went out and it never did.
+		//
+		// Absence of evidence is treated as failure here rather than success:
+		// no id and no positive acknowledgement means nothing confirmed the send,
+		// and claiming delivery on that basis is the failure mode this whole
+		// codebase keeps finding.
+		const record = (result ?? {}) as Record<string, unknown>;
+		const explicitFailure =
+			record.ok === false ||
+			(typeof record.error === "string" && record.error.trim() !== "") ||
+			(typeof record.ok === "string" && record.ok.trim().toLowerCase() === "false");
+		if (explicitFailure) {
+			const detail =
+				typeof record.error === "string" && record.error.trim() !== ""
+					? record.error.trim()
+					: "the bridge refused the send without saying why";
+			throw new Error(`iMessage send failed: ${detail}`);
+		}
+		const acknowledged =
+			record.ok === true ||
+			(typeof record.ok === "string" && record.ok.trim() !== "" && record.ok.trim().toLowerCase() !== "false");
+		if (!resolvedId && !acknowledged) {
+			throw new Error(
+				"iMessage send was not confirmed — the bridge returned no message id and no acknowledgement",
+			);
+		}
 		return {
-			messageId: resolvedId ?? (result && (result as { ok?: string }).ok ? "ok" : "unknown"),
+			messageId: resolvedId ?? "ok",
 			sentText: message,
 		};
 	} finally {

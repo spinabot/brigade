@@ -49,6 +49,35 @@ import {
 	type IMessageInboundMessage,
 } from "./connection.js";
 import { markdownToIMessageText } from "./format.js";
+import { normalizeIMessageAclEntry, normalizeIMessageHandle } from "./targets.js";
+
+/**
+ * The identities one inbound message can be allow-listed under.
+ *
+ * `from` is whatever the chat database stores — `+1 (555) 123-4567`,
+ * `User@Example.com`, sometimes an `iMessage;-;` service-prefixed handle. The
+ * operator types what the setup wizard showed them. Exact matching between
+ * those two spellings fails, so the sender is refused despite being listed.
+ *
+ * The wizard also documents `chat_id:123`, which describes the THREAD, not the
+ * sender, and so could never equal `from` under any spelling. It is listed here
+ * so allow-listing a conversation does what the wizard says it does.
+ */
+function imessageSenderAliases(msg: {
+	from: string;
+	chatId?: number;
+	chatIdentifier?: string;
+}): string[] {
+	const out = new Set<string>();
+	const handle = normalizeIMessageHandle(msg.from);
+	if (handle) out.add(handle);
+	if (typeof msg.chatId === "number" && Number.isFinite(msg.chatId)) {
+		out.add(`chat_id:${msg.chatId}`);
+	}
+	const ident = normalizeIMessageHandle(msg.chatIdentifier ?? "");
+	if (ident) out.add(`chat_identifier:${ident}`);
+	return [...out];
+}
 
 /** iMessage's practical per-message text limit for chunked sends (default; config can override). */
 const IMESSAGE_TEXT_LIMIT = DEFAULT_IMESSAGE_TEXT_CHUNK_LIMIT;
@@ -162,6 +191,7 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 							...(msg.messageId ? { messageId: msg.messageId } : {}),
 							...(msg.createdAtMs !== undefined ? { messageTimestampMs: msg.createdAtMs } : {}),
 							from: msg.from,
+							senderAliases: imessageSenderAliases(msg),
 							...(msg.fromName !== undefined ? { fromName: msg.fromName } : {}),
 							text: body,
 							chatType: msg.isGroup ? "group" : "direct",
@@ -192,7 +222,37 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 
 		health(): ChannelHealth {
 			if (!connection) {
+				// SURFACE THE REASON WE ALREADY CAPTURED.
+				//
+				// `start()` records the real failure into `closedReason` —
+				// "authorization denied" when Full Disk Access is off,
+				// "imsg: command not found" when the bridge is missing — and this
+				// branch threw it away and said "not started yet", which reads as
+				// a transient boot state rather than a permission wall the
+				// operator has to go and fix. That is why a denied FDA presented
+				// as the channel simply never answering.
+				if (closedReason) {
+					return {
+						ok: false,
+						kind: "disconnected",
+						reason: `iMessage failed to start — ${closedReason}.`,
+						remediation:
+							"Check that the imsg CLI is installed and that Terminal has Full Disk Access, then restart the gateway.",
+					};
+				}
 				return { ok: false, kind: "starting", reason: "iMessage adapter is not started yet." };
+			}
+			// A watch error means the socket is fine and the reader is dead — no
+			// message will arrive again, yet every liveness signal says ok.
+			const watchErr = connection.lastWatchError?.();
+			if (watchErr) {
+				return {
+					ok: false,
+					kind: "disconnected",
+					reason: `iMessage is connected but its watch failed — ${watchErr}. Incoming messages are not being read.`,
+					remediation:
+						"Check Full Disk Access for Terminal and that Messages.app is signed in, then restart the channel.",
+				};
 			}
 			if (!connected || !connection.isConnected()) {
 				return {
@@ -221,6 +281,7 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 			}
 			let first = true;
 			let lastMessageId: string | undefined;
+			let sentAny = false;
 			for (const chunk of chunks) {
 				const body = markdownToIMessageText(chunk);
 				if (body.trim().length === 0) continue;
@@ -228,7 +289,21 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 				const replyOpt = first && opts?.replyToId ? { replyToId: opts.replyToId } : {};
 				const sent = await connection.sendText(conversationId, body, { ...replyOpt });
 				if (sent.messageId) lastMessageId = sent.messageId;
+				sentAny = true;
 				first = false;
+			}
+			// NOTHING WENT OUT — SAY SO.
+			//
+			// Every chunk can be skipped: an empty reply, whitespace, or a body
+			// that was entirely internal scaffolding (the outbound sanitizer now
+			// correctly returns "" for that rather than leaking it). This used to
+			// return `undefined`, which `plugin.ts` reports as `{ok:true}` — so a
+			// message that was never sent was reported delivered, and the operator
+			// had no way to know their reply vanished.
+			if (!sentAny) {
+				throw new Error(
+					"iMessage: nothing to send — the reply was empty after formatting (all chunks were blank or internal-only)",
+				);
 			}
 			return lastMessageId ? { messageId: lastMessageId } : undefined;
 		},
@@ -253,7 +328,34 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 		// iMessage senders are phone numbers / emails on the operator's own device;
 		// the bot runs AS the operator (Messages.app), so the pairing card uses the
 		// "account" label and ownership is NOT bootstrapped from a separate bot.
+		/**
+		 * Typing indicator while the agent thinks.
+		 *
+		 * iMessage was the only channel without one — Discord, Telegram, Slack,
+		 * WhatsApp and BlueBubbles all implement this slot, so a conversation on
+		 * iMessage simply sat silent until the reply landed. The bridge supports
+		 * it through IMCore, which not every Mac allows; the connection treats it
+		 * as strictly cosmetic and never throws, so a Mac that cannot show the
+		 * bubble behaves exactly as it does today.
+		 */
+		async setComposing(conversationId: string, state: "composing" | "paused"): Promise<void> {
+			if (!connection) return;
+			await connection.setTyping(conversationId, state === "composing");
+		},
+
 		pairing: { idLabel: "account" as const },
+
+		/**
+		 * Canonicalize the operator's allow-list entries to the same spelling
+		 * `imessageSenderAliases` produces, so exact matching can succeed.
+		 *
+		 * `chat_id:` / `chat_identifier:` entries keep their prefix — they are
+		 * conversation identities, matched against the thread rather than the
+		 * sender. Everything else is a handle: an email lowercases, a phone
+		 * becomes E.164. Neither mapping can collide two real identities, so the
+		 * allow-list is not widened.
+		 */
+		normalizeAclEntry: normalizeIMessageAclEntry,
 
 		// iMessage has no bot token — the `imsg` binary path + Messages.app sign-in
 		// are the auth. `brigade channels add imessage` walks: cliPath → dmPolicy →

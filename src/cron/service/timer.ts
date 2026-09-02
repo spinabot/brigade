@@ -348,6 +348,9 @@ export async function onTimer(state: CronServiceState): Promise<void> {
 								retentionMs: retentionMs as number,
 								nowMs: sweepNow,
 								log: state.deps.log,
+								...(state.deps.forgetSessionState
+									? { forgetSessionState: state.deps.forgetSessionState }
+									: {}),
 							});
 						} catch (err) {
 							state.deps.log.warn("session reaper sweep threw", {
@@ -363,6 +366,9 @@ export async function onTimer(state: CronServiceState): Promise<void> {
 								ttlMs: threadIdleTtlMs,
 								nowMs: sweepNow,
 								log: state.deps.log,
+								...(state.deps.forgetSessionState
+									? { forgetSessionState: state.deps.forgetSessionState }
+									: {}),
 							});
 						} catch (err) {
 							state.deps.log.warn("thread reaper sweep threw", {

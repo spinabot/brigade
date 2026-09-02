@@ -1,6 +1,6 @@
 {
   "name": "@spinabot/brigade",
-  "version": "1.31.4",
+  "version": "1.37.0",
   "description": "Brigade — your personal AI crew",
   "homepage": "https://brigade.spinabot.com",
   "author": "Spinabot <hello@brigade-agent.ai>",
@@ -60,6 +60,7 @@
     "clean": "node -e \"import('node:fs').then(fs => fs.rmSync('dist', { recursive: true, force: true }))\"",
     "prepack": "npm run build",
     "test": "node scripts/run-tests.mjs",
+    "test:mutation": "node scripts/mutation-check.mjs",
     "bench": "npx tsx --test src/agents/memory/eval/comparison.test.ts src/agents/memory/eval/gold-hard.test.ts src/agents/memory/eval/gold-parity.test.ts src/agents/memory/eval/asr-bench.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "brigade": "node brigade.mjs",

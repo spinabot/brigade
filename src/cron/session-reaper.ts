@@ -87,6 +87,19 @@ export interface ReapSweepArgs {
 	retentionMs: number;
 	nowMs: number;
 	log: SubsystemLogger;
+	/**
+	 * Drop the gateway's in-memory state for a reaped session.
+	 *
+	 * The sweep deletes the store entry and the transcript, but the usage
+	 * ledger, reasoning tracker, frame ring and session caches are keyed by
+	 * session and live in the gateway's memory — so without this their rows
+	 * outlive the session that owned them. `sessions.delete` has always cleared
+	 * them; the reaper never did, so the maps grew by one row per reaped cron
+	 * fire and idle thread.
+	 *
+	 * Optional so the reaper stays usable outside the gateway (tests, CLI).
+	 */
+	forgetSessionState?: (agentId: string, sessionKey: string) => void;
 }
 
 export interface ReapSweepResult {
@@ -146,6 +159,8 @@ export async function reapIsolatedCronSessions(args: ReapSweepArgs): Promise<Rea
 		}
 		try {
 			deleteSessionEntry(agentId, sessionKey);
+			// Drop the gateway's per-session maps too — see `forgetSessionState`.
+			args.forgetSessionState?.(agentId, sessionKey);
 			pruned++;
 		} catch (err) {
 			log.warn("reaper failed to delete session entry", {
@@ -183,6 +198,8 @@ export async function reapIdleThreadSessions(args: {
 	ttlMs: number;
 	nowMs: number;
 	log: SubsystemLogger;
+	/** See `ReapSweepArgs.forgetSessionState` — same contract. */
+	forgetSessionState?: (agentId: string, sessionKey: string) => void;
 }): Promise<ReapSweepResult> {
 	const { agentId, ttlMs, nowMs, log } = args;
 	const cutoff = nowMs - ttlMs;
@@ -217,6 +234,8 @@ export async function reapIdleThreadSessions(args: {
 		}
 		try {
 			deleteSessionEntry(agentId, sessionKey);
+			// Drop the gateway's per-session maps too — see `forgetSessionState`.
+			args.forgetSessionState?.(agentId, sessionKey);
 			pruned++;
 		} catch (err) {
 			log.warn("thread-reaper failed to delete session entry", {

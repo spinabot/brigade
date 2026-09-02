@@ -105,8 +105,36 @@ export function launchdAdapter(): ServiceAdapter {
 		},
 
 		async restart(): Promise<ServiceResult> {
-			await run("launchctl", ["kickstart", "-k", `${domain}/${SERVICE_LABEL}`]);
-			return { ok: true, message: "Brigade gateway restarted." };
+			// REPORT WHAT ACTUALLY HAPPENED.
+			//
+			// This ignored `launchctl`'s exit code and returned `ok: true`
+			// unconditionally, so on macOS `brigade gateway restart` ALWAYS said
+			// "Brigade gateway restarted." — including when it restarted nothing.
+			// Its two siblings (`systemd`, `schtasks`) have always checked
+			// `r.code === 0`; macOS was the sole outlier, and macOS is the platform
+			// where iMessage lives.
+			//
+			// The cost is worse than a wrong message: the whole point of restarting
+			// is to pick up new code, so a false success means an operator verifies
+			// a fix against the build they were trying to replace and concludes the
+			// fix does not work. That happened while diagnosing this very channel.
+			if (!existsSync(plistPath())) {
+				return {
+					ok: false,
+					message:
+						"No launchd service is installed, so there was nothing to restart. " +
+						"Install it with `brigade gateway install`, or stop and start the " +
+						"gateway yourself if you are running it in a terminal.",
+				};
+			}
+			const r = await run("launchctl", ["kickstart", "-k", `${domain}/${SERVICE_LABEL}`]);
+			return {
+				ok: r.code === 0,
+				message:
+					r.code === 0
+						? "Brigade gateway restarted."
+						: r.stderr.trim() || `launchctl kickstart failed (exit ${r.code}).`,
+			};
 		},
 
 		async status(): Promise<{ installed: boolean; running: boolean; detail: string }> {

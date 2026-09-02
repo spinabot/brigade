@@ -107,11 +107,11 @@ export declare const recordMediaBlob: import("convex/server").RegisteredMutation
     fileName?: string | undefined;
     accountId: string;
     channelId: string;
+    messageId: string;
     mimeType: string;
     bytes: number;
     index: number;
     ownerId: string;
-    messageId: string;
     storageId: import("convex/values").GenericId<"_storage">;
 }, Promise<{
     ok: boolean;
@@ -119,9 +119,9 @@ export declare const recordMediaBlob: import("convex/server").RegisteredMutation
 export declare const getMediaBlobUrl: import("convex/server").RegisteredQuery<"public", {
     accountId: string;
     channelId: string;
+    messageId: string;
     index: number;
     ownerId: string;
-    messageId: string;
 }, Promise<{
     url: string;
     mimeType: string;

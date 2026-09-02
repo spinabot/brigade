@@ -45,7 +45,9 @@ function staticModelIds(): string[] {
 // nothing unbounded or malformed is ever persisted or propagated. (CodeQL:
 // "network data written to file system".)
 const MAX_MODEL_IDS = 200;
-const MAX_MODEL_ID_LEN = 128;
+/** Fast path only — the regex below already caps at 127. Keeps a pathological
+ *  multi-MB string from ever reaching the regex engine. */
+const MAX_MODEL_ID_LEN = 127;
 /** Every Claude model id is `claude-` + printable id chars. No spaces, no
  *  control characters, no path separators. */
 const MODEL_ID_RE = /^claude-[A-Za-z0-9._[\]-]{1,120}$/;
@@ -141,8 +143,13 @@ export async function fetchClaudeCliModelIds(opts: { force?: boolean; nowMs?: nu
 		if (ids.length === 0) return fallbackModelIds();
 		// Merge: live ids first (current), then any static id the API omitted, so a
 		// catalogued default never vanishes from the picker.
-		const seen = new Set(ids);
-		for (const s of staticModelIds()) if (!seen.has(s)) ids.push(s);
+		// Merge the seed catalogue THROUGH the same sanitizer, so the cap and the
+		// shape check apply to what actually gets persisted. Appending past them
+		// wrote >200 ids to disk; the next start re-sanitized to 200 and dropped
+		// exactly the catalogue entries this merge exists to preserve.
+		const merged = sanitizeModelIds([...ids, ...staticModelIds()]);
+		ids.length = 0;
+		ids.push(...merged);
 		cache = { atMs: now, ids };
 		writeDiscoveredModelIds(ids);
 		return ids;

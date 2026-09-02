@@ -92,7 +92,7 @@ import path from "node:path";
 import { Type, type Static } from "typebox";
 
 import { guardedFetch, SsrfBlockedError } from "../../infra/net/fetch-guard.js";
-import { validateOutboundMediaPath } from "../../security/media-path-guard.js";
+import { rootSpellings, validateOutboundMediaPath } from "../../security/media-path-guard.js";
 import { wrapWebContent } from "../../security/external-content.js";
 import {
 	downscaleImageToBudget,
@@ -660,13 +660,12 @@ interface AcquiredBytes {
 /** Roots a local source path is allowed to live under (workspace, cwd, OS cache/temp, state dir). */
 function allowedLocalRoots(opts: { workspaceDir?: string; cwd?: string; ownerLocalAccess?: boolean }): string[] {
 	const roots = new Set<string>();
+	// Both spellings of each root — see `rootSpellings`. The candidate side is
+	// realpathed before containment, so a symlinked root (macOS `os.tmpdir()`)
+	// must appear here in realpathed form too.
 	const add = (p?: string) => {
 		if (!p) return;
-		try {
-			roots.add(path.resolve(p));
-		} catch {
-			/* ignore */
-		}
+		for (const spelling of rootSpellings(p)) roots.add(spelling);
 	};
 	add(opts.workspaceDir);
 	add(opts.cwd);

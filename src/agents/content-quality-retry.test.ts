@@ -358,3 +358,39 @@ describe("harness backends: the recovery tier must not re-run side effects", () 
 		assert.deepEqual(order, []);
 	});
 });
+
+describe("a cancelled turn is not a low-quality turn", () => {
+/* ─────────────────────────────────────────────────────────────────────────
+ * A cancelled turn is not a low-quality turn.
+ *
+ * Reported live: Ctrl+C, then immediately "empty — re-prompting for a usable
+ * answer" and a full billed reply to a question the operator had just
+ * withdrawn. An aborted turn leaves an empty assistant message, which every
+ * heuristic here reads as "the model said nothing".
+ * ───────────────────────────────────────────────────────────────────────── */
+
+it("an ABORTED turn is never treated as a quality problem", () => {
+	assert.equal(
+		detectContentIssue({ role: "assistant", content: [], stopReason: "aborted" }, false),
+		null,
+		"the operator asked for it to stop; re-prompting bills them for a withdrawn question",
+	);
+});
+
+it("an ERRORED turn is not re-prompted on top of its own failure", () => {
+	// The retry/fallback machinery upstream already handled it.
+	assert.equal(
+		detectContentIssue({ role: "assistant", content: [], stopReason: "error" }, false),
+		null,
+	);
+});
+
+it("a genuinely empty COMPLETED turn is still caught", () => {
+	// The guard must not blunt the check it is narrowing.
+	assert.equal(
+		detectContentIssue({ role: "assistant", content: [], stopReason: "stop" }, false),
+		"empty",
+	);
+	assert.equal(detectContentIssue({ role: "assistant", content: [] }, false), "empty");
+});
+});

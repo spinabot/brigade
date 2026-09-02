@@ -100,3 +100,41 @@ describe("session-reaper — shouldRunSweep", () => {
 		assert.equal(shouldRunSweep(now - 1000, now), false);
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// The reaper deletes the session store entry and the transcript, but the
+// gateway's per-session maps — usage ledger, reasoning tracker, frame ring,
+// session caches — live in memory and are keyed by session. Without a
+// cleanup hook their rows outlive the session that owned them.
+//
+// This matters more now that cron runs are metered: an `isolated` job takes a
+// fresh `cron:<id>:run:<uuid>` key on EVERY fire, so the rows left behind are
+// unbounded in count and can never be read again. Three 5-minute jobs leave
+// ~864 dead rows a day.
+// ─────────────────────────────────────────────────────────────────────────
+describe("session-reaper — forgets gateway state for reaped sessions", () => {
+	it("declares the cleanup hook on both sweeps", async () => {
+		// Structural: the sweeps need a real session store on disk to prune
+		// anything, so this asserts the contract both call sites depend on.
+		const src = await import("node:fs").then((fs) =>
+			fs.readFileSync(new URL("./session-reaper.ts", import.meta.url), "utf8"),
+		);
+		assert.match(src, /forgetSessionState\?:/, "ReapSweepArgs must expose the hook");
+		const calls = src.match(/args\.forgetSessionState\?\.\(agentId, sessionKey\)/g) ?? [];
+		assert.equal(
+			calls.length,
+			2,
+			"both sweeps (cron runs and idle threads) must call it — one that does not is a silent leak",
+		);
+	});
+
+	it("calls it next to every store deletion, never instead of one", async () => {
+		const src = await import("node:fs").then((fs) =>
+			fs.readFileSync(new URL("./session-reaper.ts", import.meta.url), "utf8"),
+		);
+		const deletes = src.match(/deleteSessionEntry\(agentId, sessionKey\);/g) ?? [];
+		const forgets = src.match(/args\.forgetSessionState\?\.\(agentId, sessionKey\)/g) ?? [];
+		assert.equal(deletes.length, forgets.length, "every deletion must be paired with a forget");
+		assert.ok(deletes.length > 0, "no deletions found — this test needs updating");
+	});
+});

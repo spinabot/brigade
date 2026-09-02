@@ -85,7 +85,23 @@ export interface SessionListRow {
 	kind?: string;
 	channel?: string;
 	subject?: string;
+	/**
+	 * The model that last SERVED this session — a record of what ran, not a
+	 * choice. Absent on a session that has never taken a turn. A UI labelling
+	 * a thread's model wants `pinnedModel` (an explicit pin) or the resolved
+	 * `modelId` from `SessionStateSnapshot` (pin ?? agent ?? defaults); this
+	 * field goes stale the moment the agent's model moves under an unpinned
+	 * session, and lags a pin that hasn't been used yet.
+	 */
 	model?: string;
+	/**
+	 * Set only when the operator PINNED this session to a model (`/model <id>
+	 * --thread`). Absent means the session follows its agent, so an agent-wide
+	 * `/model` moves it. Together with `model` above, a UI can distinguish
+	 * "pinned to X" from "last ran on Y".
+	 */
+	pinnedProvider?: string;
+	pinnedModel?: string;
 	state?: string;
 	startedAt?: number;
 	endedAt?: number;

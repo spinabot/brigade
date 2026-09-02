@@ -285,8 +285,23 @@ function updateNpmGlobal(pkg: PackageInfo, opts: UpdateOptions, run: CommandRunn
 	// machine keeps launching a stale Brigade while every update "succeeds".
 	if (latest) {
 		const v = run("brigade", ["--version"], { capture: true });
-		const reported = v.code === 0 ? v.stdout.split("\n").pop()?.trim() : undefined;
-		if (reported && reported !== latest) {
+		// COMPARE VERSIONS, NOT BANNERS.
+		//
+		// `--version` prints `Brigade 1.35.2 (28f1d17, built 2026-09-01 01:19)`,
+		// and this compared that WHOLE STRING against the bare `1.35.2`. They can
+		// never be equal, so the "a stale install is shadowing the new one"
+		// warning fired on every SUCCESSFUL update — telling the operator their
+		// PATH is broken while the banner it printed one line above says the
+		// right version. A warning that always fires is worse than none: it
+		// trains people to ignore the real case it exists for, which is an `npm
+		// i -g` into one Node while PATH resolves another.
+		//
+		// Pull the semver out of the banner and compare that. If no version can
+		// be found at all, stay silent rather than guess — an unparseable banner
+		// is not evidence of a stale install.
+		const reportedVersion = extractSemver(v.code === 0 ? v.stdout : "");
+		if (reportedVersion && reportedVersion !== latest) {
+			const reported = reportedVersion;
 			out(`${chalk.yellow(`⚠ Installed ${latest}, but the brigade on your PATH reports ${reported}.`)}\n`);
 			const which =
 				process.platform === "win32"
@@ -302,6 +317,19 @@ function updateNpmGlobal(pkg: PackageInfo, opts: UpdateOptions, run: CommandRunn
 	}
 
 	return restartAndReport(run, false, pkg.root, opts);
+}
+
+/**
+ * The first semantic version in a string, or undefined.
+ *
+ * `--version` prints a banner (`Brigade 1.35.2 (sha, built …)`), and the update
+ * check needs the version out of it. Deliberately returns undefined rather than
+ * a guess when nothing matches: silence is correct for an unrecognised banner,
+ * because "I could not read it" is not evidence of a stale install.
+ */
+export function extractSemver(text: string): string | undefined {
+	const m = /\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/.exec(text ?? "");
+	return m?.[1];
 }
 
 export async function runUpdateCommand(opts: UpdateOptions = {}): Promise<number> {

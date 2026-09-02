@@ -25,6 +25,13 @@ export function nextSeq(
 ): number | undefined {
 	if (!sessionId) return undefined;
 	const next = (counters.get(sessionId) ?? 0) + 1;
+	// DELETE BEFORE SET, so the Map's insertion order is least-recently-USED.
+	// `Map.set` on an existing key does NOT reorder, so without this the map is
+	// ordered by first-seen and an LRU sweep over it evicts the OLDEST LIVE
+	// session first — in practice the operator's own long-running thread, whose
+	// counter then restarts at 1 and makes every connected client see a
+	// backwards seq, resync, and repaint its whole transcript.
+	counters.delete(sessionId);
 	counters.set(sessionId, next);
 	return next;
 }

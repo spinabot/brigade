@@ -70,7 +70,7 @@ describe("assertSafeCronSessionTargetId + InvalidCronSessionTargetIdError", () =
 
 	it("throws on control characters", () => {
 		assert.throws(
-			() => assertSafeCronSessionTargetId("ab"),
+			() => assertSafeCronSessionTargetId("a\x01b"),
 			/control characters/,
 		);
 	});

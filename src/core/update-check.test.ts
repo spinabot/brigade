@@ -169,3 +169,65 @@ test("an unidentifiable build reports nothing rather than guessing", async () =>
 	const real = await checkForUpdate(deps({ packageInfo: { ...PKG, version: "0.1.0" }, fetchLatest: async () => "0.2.0" }));
 	assert.deepEqual(real, { current: "0.1.0", latest: "0.2.0" });
 });
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * An explicit ask must not be answered from cache.
+ *
+ * The 6h TTL is right for the ambient check that rides every boot — it stops a
+ * gateway restarted twenty times in an afternoon hammering the registry. It is
+ * wrong for `/update`, where someone typed a command and gets "you're on the
+ * latest published version" about a release that shipped an hour ago.
+ *
+ * Observed live: npm at 1.35.3, the machine on 1.35.2, and the command
+ * reporting it was current.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+test("a fresh cache hides a newer release from the ambient check", () => {
+	// Documents the behaviour that is CORRECT for the ambient path.
+	return checkForUpdate({
+		packageInfo: { name: "@spinabot/brigade", version: "1.35.2", root: "/tmp/x" },
+		isSourceCheckout: () => false,
+		readCache: () => ({ latest: "1.35.2", checkedAt: Date.now() }),
+		writeCache: () => {},
+		fetchLatest: async () => "1.35.3",
+	}).then((r) => assert.equal(r, undefined));
+});
+
+test("force:true skips the cache and finds the newer release", async () => {
+	const r = await checkForUpdate({
+		packageInfo: { name: "@spinabot/brigade", version: "1.35.2", root: "/tmp/x" },
+		isSourceCheckout: () => false,
+		readCache: () => ({ latest: "1.35.2", checkedAt: Date.now() }),
+		writeCache: () => {},
+		fetchLatest: async () => "1.35.3",
+		force: true,
+	});
+	assert.deepEqual(r, { current: "1.35.2", latest: "1.35.3" });
+});
+
+test("force:true still refreshes the cache for the ambient path", async () => {
+	let written: unknown;
+	await checkForUpdate({
+		packageInfo: { name: "@spinabot/brigade", version: "1.35.2", root: "/tmp/x" },
+		isSourceCheckout: () => false,
+		readCache: () => ({ latest: "1.35.2", checkedAt: Date.now() }),
+		writeCache: (v: unknown) => {
+			written = v;
+		},
+		fetchLatest: async () => "1.35.3",
+		force: true,
+	});
+	assert.ok(written, "a forced check must not bypass the cache twice");
+});
+
+test("force:true on an up-to-date install still reports no update", async () => {
+	const r = await checkForUpdate({
+		packageInfo: { name: "@spinabot/brigade", version: "1.35.3", root: "/tmp/x" },
+		isSourceCheckout: () => false,
+		readCache: () => undefined,
+		writeCache: () => {},
+		fetchLatest: async () => "1.35.3",
+		force: true,
+	});
+	assert.equal(r, undefined);
+});

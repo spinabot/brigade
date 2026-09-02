@@ -25,6 +25,23 @@ import process from "node:process";
 import chalk from "chalk";
 
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+
+/**
+ * Brigade-minted events that ride the pi channel but are not in Pi's union.
+ *
+ * Pi never emits these; Brigade does, for things Pi has no concept of — today,
+ * mid-turn compaction. They are shaped like pi events so they route and render
+ * through the same path.
+ */
+type BrigadeSyntheticPiEvent =
+	| { type: "mid_turn_compaction_start"; messagesBefore?: number; tokensBefore?: number }
+	| {
+			type: "mid_turn_compaction_end";
+			applied?: boolean;
+			reason?: string;
+			freedTokens?: number;
+			durationMs?: number;
+	  };
 import type { RequestMethod } from "../protocol.js";
 
 /* ─────────────────────────── public surface ─────────────────────────── */
@@ -47,7 +64,13 @@ export interface ConsoleStream {
 	 * indented and marked `↳`, so a `spawn_agent` that runs for a minute is not a
 	 * minute of silence in the operator's terminal.
 	 */
-	pi(event: AgentSessionEvent, subagentDepth?: number): void;
+	/**
+	 * A Pi session event, or one of Brigade's own SYNTHETIC pi-shaped events
+	 * (`mid_turn_compaction_*`). The synthetic ones are not in Pi's union, and
+	 * typing this to Pi's union alone is what left them falling through to the
+	 * anonymous debug-level default.
+	 */
+	pi(event: AgentSessionEvent | BrigadeSyntheticPiEvent, subagentDepth?: number): void;
 	/** Inbound WebSocket request from a client. */
 	wsRequest(method: RequestMethod, id: string, clientLabel?: string): void;
 	/** Response sent back to a client (durationMs measured at the call site). */
@@ -259,6 +282,17 @@ export function createConsoleStream(opts: ConsoleStreamOptions = {}): ConsoleStr
 						reason: ev.errorMessage,
 					})}`;
 					levelFor = "warn";
+					break;
+				case "mid_turn_compaction_start":
+					// The gateway console is what an operator watches when a turn looks
+					// wedged. A mid-turn compaction is the most likely reason for a
+					// multi-minute stall, so it must not fall through to the anonymous
+					// debug-level default.
+					body = `${arrow("event")} mid_turn_compaction_start ${fields({ messages: ev.messagesBefore, tokens: ev.tokensBefore })}`;
+					break;
+				case "mid_turn_compaction_end":
+					body = `${arrow("event")} mid_turn_compaction_end ${status(ev.applied === true)} ${fields({ reason: ev.reason, freed: ev.freedTokens, ms: ev.durationMs })}`;
+					if (ev.applied !== true) levelFor = "warn";
 					break;
 				case "auto_retry_end":
 					body = `${arrow("event")} auto_retry_end ${status(ev.success !== false)} ${fields({ attempt: ev.attempt })}`;

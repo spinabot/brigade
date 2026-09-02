@@ -14,6 +14,8 @@ import { readConfigOrInit } from "../../config/io.js";
 import { DEFAULT_AGENT_ID, resolveAllPaths } from "../../config/paths.js";
 import {
   defaultSessionKey,
+  pinSessionModel,
+  readSessionModelPin,
   readSessionStore,
   writeSessionStore,
 } from "../../sessions/session-store.js";
@@ -124,7 +126,11 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
 
   // Provider/model resolution order:
   //   1. CLI flag (`--provider` / `--model`) — explicit user intent for this run.
-  //   2. Persisted session override — set by a prior `/model X` command.
+  //   2. Persisted session PIN — set by a prior `/model X` command. Read from
+  //      `pinnedProvider`/`pinnedModelId`, never from `provider`/`modelId`:
+  //      the latter are stamped with the serving model on EVERY turn, so
+  //      reading them here froze each session to its first turn's model and
+  //      made a later change to the agent default a silent no-op.
   //   3. Per-agent legacy slot (`agents.<id>.defaultProvider/defaultModel`)
   //      — kept for back-compat with pre-wizard configs.
   //   4. Onboard-wizard defaults (`agents.defaults.{provider, model.primary}`)
@@ -139,15 +145,15 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
   const wizardDefaults = cfg.agents?.defaults as
     | { provider?: string; model?: { primary?: string } }
     | undefined;
-  const sessionEntry = readSessionStore(agentId).sessions[sessionKey];
+  const sessionPin = readSessionModelPin(agentId, sessionKey);
   const provider =
     opts.provider ??
-    sessionEntry?.provider ??
+    sessionPin?.provider ??
     agentCfg?.defaultProvider ??
     wizardDefaults?.provider;
   const modelId =
     opts.model ??
-    sessionEntry?.modelId ??
+    sessionPin?.modelId ??
     agentCfg?.defaultModel ??
     wizardDefaults?.model?.primary;
 
@@ -272,28 +278,22 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
   if (!result.reply.endsWith("\n")) process.stdout.write("\n");
 }
 
-// Persist the session's model override to sessions.json so the NEXT
-// `brigade agent` invocation against this session uses the new model
-// without the user having to repeat `/model X` or pass --model.
+// Persist the session's model PIN so the NEXT `brigade agent` invocation
+// against this session uses the new model without the user having to repeat
+// `/model X` or pass --model.
+//
+// Writes the dedicated pin fields, not `provider`/`modelId` — those are
+// overwritten on every turn with whatever model served it, so a pin stored
+// there would survive only until the next message.
 function persistSessionModel(args: {
   agentId: string;
   sessionKey: string;
   provider: string;
   modelId: string;
 }): void {
-  const store = readSessionStore(args.agentId);
-  const entry = store.sessions[args.sessionKey];
-  if (!entry) {
-    // No session yet (first turn) — the model override will land in the
-    // entry that resolveOrCreateSession creates on this turn. Nothing to
-    // persist here ahead of time. The active turn already uses the
-    // override via the runSingleTurn call.
-    return;
-  }
-  entry.provider = args.provider;
-  entry.modelId = args.modelId;
-  entry.lastUsedAt = new Date().toISOString();
-  writeSessionStore(args.agentId, store);
+  // Creates the entry when the session has not taken its first turn yet, so
+  // `/model` on a brand-new session key persists instead of silently no-opping.
+  pinSessionModel(args.agentId, args.sessionKey, args.provider, args.modelId);
 }
 
 // Forget the session entirely. Next `brigade agent` against the same

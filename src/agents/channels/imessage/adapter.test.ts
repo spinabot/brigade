@@ -9,11 +9,20 @@ import type { ChannelStartContext, InboundMessage } from "../sdk.js";
 const cfg = { channels: { imessage: { enabled: true } } } as never;
 
 /** A fake connection that records sends + lets the test push inbound messages. */
-function fakeConnection(): IMessageConnection & { sentText: Array<{ to: string; text: string }> } {
+function fakeConnection(): IMessageConnection & {
+	sentText: Array<{ to: string; text: string }>;
+	typing: boolean[];
+} {
 	const sentText: Array<{ to: string; text: string }> = [];
+	const typing: boolean[] = [];
 	return {
 		sentText,
+		typing,
+		async setTyping(_conversationId: string, on: boolean): Promise<void> {
+			typing.push(on);
+		},
 		isConnected: () => true,
+	lastWatchError: () => undefined,
 		connectedAt: () => Date.now(),
 		async sendText(conversationId, text): Promise<{ messageId?: string }> {
 			sentText.push({ to: conversationId, text });
@@ -217,5 +226,18 @@ describe("IMessageRpcClient (test-env guard)", () => {
 			if (prev === undefined) delete process.env.NODE_ENV;
 			else process.env.NODE_ENV = prev;
 		}
+	});
+});
+
+// iMessage was the only channel without a typing indicator — every other one
+// implements `setComposing`, so a thread just sat silent until the reply landed.
+describe("iMessage adapter — typing indicator", () => {
+	it("maps composing/paused onto the connection's typing call", async () => {
+		const conn = fakeConnection();
+		const adapter = createIMessageAdapter({ connectImpl: async () => conn });
+		await adapter.start(startCtx(async () => {}));
+		await adapter.setComposing!("+15551234567", "composing");
+		await adapter.setComposing!("+15551234567", "paused");
+		assert.deepEqual(conn.typing, [true, false]);
 	});
 });

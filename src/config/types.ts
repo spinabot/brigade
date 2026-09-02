@@ -18,6 +18,7 @@ export type {
 	AgentConfig,
 	BrigadeGatewayConfig,
 	BrigadeSessionConfig,
+	BrigadeChatConfig,
 	BrigadeToolsConfig,
 	BrigadeAuthConfig,
 	BrigadeAuthProfileMeta,

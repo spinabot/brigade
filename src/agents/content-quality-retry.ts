@@ -23,6 +23,7 @@
  */
 
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { isText, isThinking, isToolCall } from "./pi-dialect.js";
 
 import { detectSlop } from "./quality/slop-detector.js";
 
@@ -73,23 +74,33 @@ const STEER_FOR: Record<NonNullable<ContentQualityIssue>, string> = {
  * write the code" IS the deliverable).
  */
 export function detectContentIssue(
-	message: { role?: string; content?: unknown } | null | undefined,
+	message: { role?: string; content?: unknown; stopReason?: unknown } | null | undefined,
 	hadTools: boolean,
 ): ContentQualityIssue {
 	if (!message || message.role !== "assistant") return null;
+	// A CANCELLED TURN IS NOT A LOW-QUALITY TURN.
+	//
+	// An aborted turn leaves an empty or partial assistant message, which reads
+	// to every heuristic below as "the model said nothing" — so the operator
+	// pressed Ctrl+C and Brigade immediately re-prompted, producing a full,
+	// billed answer to a question they had just cancelled. Reported live: an
+	// abort followed instantly by "empty — re-prompting for a usable answer"
+	// and a long reply to an earlier message.
+	//
+	// `error` is excluded for the same reason from the other direction: a turn
+	// that failed has already been handled by the retry/fallback machinery
+	// upstream, and re-prompting on top of it doubles the damage rather than
+	// improving the answer. Neither is a QUALITY judgement, which is the only
+	// thing this function is entitled to make.
+	if (message.stopReason === "aborted" || message.stopReason === "error") return null;
 	const content = message.content;
 	if (!Array.isArray(content) || content.length === 0) return "empty";
 
 	const textBlocks = content.filter(
-		(b) => b && typeof b === "object" && (b as { type?: unknown }).type === "text"
-			&& typeof (b as { text?: unknown }).text === "string",
+		(b) => isText(b) && typeof b.text === "string",
 	);
-	const thinkingBlocks = content.filter(
-		(b) => b && typeof b === "object" && (b as { type?: unknown }).type === "thinking",
-	);
-	const toolCallBlocks = content.filter(
-		(b) => b && typeof b === "object" && (b as { type?: unknown }).type === "toolCall",
-	);
+	const thinkingBlocks = content.filter(isThinking);
+	const toolCallBlocks = content.filter(isToolCall);
 
 	const totalText = textBlocks
 		.map((b) => (b as { text: string }).text)
@@ -165,6 +176,13 @@ export interface ContentQualityRetryOptions {
 	 * Omitted (every loop backend) => no-op; Pi's loop already persists tool calls.
 	 */
 	beforeRetry?: () => void;
+	/**
+	 * Was this turn cancelled by the operator?
+	 *
+	 * A cancelled turn must never be re-prompted: the operator asked for it to
+	 * STOP, and a retry bills them for an answer to a question they withdrew.
+	 */
+	aborted?: () => boolean;
 }
 
 /**
@@ -204,6 +222,14 @@ export async function runWithContentQualityRetry(
 
 	const issue = inspectLast();
 	if (!issue) return;
+
+	// The turn's signal, checked independently of the message.
+	//
+	// Belt to the `stopReason` brace above: Pi DELETES an aborted assistant
+	// message in some paths, so the "last assistant" we inspect can be an older,
+	// legitimately-empty one from before the abort. The signal is the fact that
+	// cannot be erased by whatever the transcript ends up holding.
+	if (options.aborted?.() === true) return;
 
 	// A harness backend ran tools out-of-band, so the assistant message cannot
 	// carry toolCall blocks and the recovery heuristics all misread it as "never

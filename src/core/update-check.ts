@@ -36,6 +36,13 @@ interface CacheFile {
 }
 
 export interface UpdateCheckDeps {
+	/**
+	 * Skip the cache READ and ask the registry now.
+	 *
+	 * For explicit operator commands only. The ambient boot/interval check must
+	 * keep using the cache, or a restart loop becomes a registry hammer.
+	 */
+	force?: boolean;
 	now?: () => number;
 	env?: NodeJS.ProcessEnv;
 	/** Resolve the published `latest` version, or undefined when unreachable. */
@@ -163,7 +170,18 @@ export async function checkForUpdate(deps: UpdateCheckDeps = {}): Promise<Update
 	const writeCache = deps.writeCache ?? defaultWriteCache;
 
 	let latest: string | undefined;
-	const cached = readCache();
+	// `force` SKIPS THE CACHE READ, for an operator who explicitly asked.
+	//
+	// The 6h TTL is right for the ambient check that rides every boot — it stops
+	// a gateway restarted twenty times in an afternoon hammering the registry.
+	// It is wrong for `/update` or `brigade update`, where someone has typed a
+	// command to ask a question and gets a cached "you're on the latest" about a
+	// release that shipped an hour ago. Observed exactly that: npm at 1.35.3,
+	// the machine on 1.35.2, and the command reporting it was current.
+	//
+	// The write still happens either way, so a forced check refreshes the cache
+	// for the ambient path rather than bypassing it twice.
+	const cached = deps.force === true ? undefined : readCache();
 	if (cached && now() - cached.checkedAt < UPDATE_CHECK_TTL_MS) {
 		latest = cached.latest;
 	} else {

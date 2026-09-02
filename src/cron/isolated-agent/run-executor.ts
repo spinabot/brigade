@@ -185,6 +185,17 @@ export async function executeCronAgentRun(
 			modelId,
 			message: messageWithPrefix,
 			sessionKey,
+			// METER THIS RUN. Cron went straight to `runSingleTurn`, bypassing the
+			// gateway's turn path, so nothing attached it to the usage ledger and a
+			// nightly job's spend was invisible on every surface — footer, /usage,
+			// sessions.list — while appearing in full on the provider's invoice.
+			...(args.onSessionReady
+				? {
+						onSessionReady: (session: unknown): void => {
+							args.onSessionReady?.(session, agentId, sessionKey);
+						},
+					}
+				: {}),
 			...(payload.thinking !== undefined ? { thinkingLevel: payload.thinking } : {}),
 			...(abortSignal ? { signal: abortSignal } : {}),
 			// Cron turns are non-operator by default. Owner-only tools (composio,

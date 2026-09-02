@@ -36,6 +36,7 @@ import {
 } from "../protocol.js";
 import type { HelloOk } from "../protocol/handshake.js";
 import { isSeqGap } from "../protocol/stream-seq.js";
+import { BrigadeRequestError } from "../protocol/errors.js";
 
 /** Payload of the client-emitted `"resync"` event: a seq gap was detected on a
  *  session's ordered `pi` stream, so the consumer should `resume()` to backfill. */
@@ -386,9 +387,12 @@ export class BrigadeClient extends EventEmitter {
 			if (frame.ok) {
 				pending.resolve(frame.payload);
 			} else {
-				pending.reject(
-					new Error(frame.error?.message ?? `request failed (${frame.error?.code ?? "unknown"})`),
-				);
+				// Reject with the server's STRUCTURED error, not a flattened string.
+				// Collapsing it here meant no caller could ever tell a rate-limit
+				// that clears in 30s from a permanent authorization failure.
+				// `BrigadeRequestError extends Error`, so existing `err.message`
+				// handlers are unaffected.
+				pending.reject(new BrigadeRequestError(frame.error ?? {}));
 			}
 			return;
 		}
@@ -401,7 +405,10 @@ export class BrigadeClient extends EventEmitter {
 			// a gateway restart); emit `"resync"` so the consumer `resume`s and
 			// backfills (transcript + pending approvals + recent system-events).
 			// Frames without `seq` (state/error/log + sub-agent pi) are unordered
-			// side-channels and skip the check.
+			// side-channels and skip the check. Sub-agent frames stay unsequenced
+			// deliberately: they are tagged with the child's Pi session UUID, which
+			// `resume` cannot look up, so a gap in them is undetectable-but-honest
+			// rather than detectable-but-unrepairable.
 			if (typeof frame.seq === "number") {
 				const sid = (frame.payload as { sessionId?: string } | undefined)?.sessionId;
 				if (sid) {

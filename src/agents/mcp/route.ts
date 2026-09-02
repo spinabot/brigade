@@ -18,6 +18,34 @@ import { randomBytes } from "node:crypto";
 import type { BeforeToolCallContext } from "@earendil-works/pi-agent-core";
 import { validateToolArguments } from "@earendil-works/pi-ai/base";
 
+/**
+ * Pi's `prepareToolCallArguments`, mirrored.
+ *
+ * Not exported from `pi-agent-core` (it is a module-local function in
+ * `agent-loop.js`), so this plane has to carry its own copy. Kept
+ * byte-for-byte equivalent to Pi's: a tool without `prepareArguments` is
+ * untouched, and a shim that returns its input unchanged is a no-op.
+ *
+ * A tool's `prepareArguments` is its compatibility shim for shapes real models
+ * emit that the schema does not accept — `edit` repairs `edits` sent as a JSON
+ * string and the legacy flat `oldText`/`newText` pair. Pi's loop runs it before
+ * validation; anything that validates without it diverges from a Pi-loop turn.
+ */
+function prepareToolCallArguments(
+	tool: { prepareArguments?: (args: unknown) => unknown },
+	args: Record<string, unknown>,
+): unknown {
+	if (typeof tool.prepareArguments !== "function") return args;
+	try {
+		return tool.prepareArguments(args);
+	} catch {
+		// A shim is a convenience, never a gate. If it throws, fall through to
+		// validation with the raw arguments and let the validator produce the
+		// error the model can act on.
+		return args;
+	}
+}
+
 import { emitAgentEvent } from "../agent-event-bus.js";
 import { createMcpServer, type McpServer, type McpContentBlock, type McpToolResult, type McpServerTool } from "./protocol.js";
 import type { McpTurnContext } from "./tool-plane-host.js";
@@ -66,15 +94,26 @@ export function buildMcpTurnServer(turn: McpTurnContext, opts: { serverName?: st
 			// makes an MCP call subtly different from a Pi-loop dispatch, which is
 			// precisely the guarantee this plane is built on.
 
-			// (1) VALIDATE + COERCE against the tool's schema, using Pi's own
-			// validator. Without it, a malformed call from the binary reaches
-			// `execute` raw. A failure is a tool error carrying the validator's
-			// message — exactly what Pi surfaces.
+			// (1) PREPARE, then VALIDATE + COERCE against the tool's schema, using
+			// Pi's own validator. Without validation a malformed call from the
+			// binary reaches `execute` raw; a failure is a tool error carrying the
+			// validator's message — exactly what Pi surfaces.
+			//
+			// PREPARE FIRST. Pi's loop does `prepareToolCallArguments` and only then
+			// `validateToolArguments` (pi-agent-core agent-loop.js:370-371), and
+			// skipping the first step broke `edit` on this plane specifically:
+			// its `prepareArguments` repairs two shapes real models emit — `edits`
+			// arriving as a JSON *string* (Pi's own comment names Opus 4.6 and
+			// GLM-5.1) and the legacy flat `oldText`/`newText` form. Both are
+			// rejected by the schema unrepaired, so the identical call succeeded on
+			// a Pi-loop turn and failed on a claude-cli harness turn — same agent,
+			// same model, different backend.
+			const prepared = prepareToolCallArguments(tool, args);
 			let validated: Record<string, unknown>;
 			try {
 				validated = validateToolArguments(tool as never, {
 					name: tool.name,
-					arguments: args,
+					arguments: prepared,
 				} as never) as Record<string, unknown>;
 			} catch (e) {
 				return errorResult((e as Error).message);

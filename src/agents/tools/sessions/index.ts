@@ -14,7 +14,7 @@
  *     sessionContext: buildSessionContext({ sessionKey }),
  *     callerDepth: resolveCallerDepth({ sessionKey }),
  *   });
- *   // tools is `{ send, spawn, list, history }` — each factory output
+ *   // tools is `{ send, spawn, list, history, rename }` — each factory output
  *   // is already wired with the caller's context.
  *   ```
  *
@@ -33,6 +33,7 @@ import type { SessionContext } from "../../session-context.js";
 import type { ChannelApprovalRoute } from "../../channels/approval-router.js";
 import { createSessionsHistoryTool } from "./history.js";
 import { createSessionsListTool } from "./list.js";
+import { createSessionsRenameTool } from "./rename.js";
 import { createSessionsSendTool } from "./send.js";
 import { createSessionsSpawnTool } from "./spawn.js";
 import type {
@@ -98,10 +99,11 @@ export interface SessionsToolsBundle {
 	spawn: ReturnType<typeof createSessionsSpawnTool>;
 	list: ReturnType<typeof createSessionsListTool>;
 	history: ReturnType<typeof createSessionsHistoryTool>;
+	rename: ReturnType<typeof createSessionsRenameTool>;
 }
 
 /**
- * Build the four-tool bundle the gateway dispatcher (Step 25) installs
+ * Build the sessions tool bundle the gateway dispatcher (Step 25) installs
  * for one agent turn. Every tool in the bundle is pre-wired with the
  * caller's session context — no further hand-threading needed.
  *
@@ -169,7 +171,15 @@ export function createSessionsToolsBundle(
 		agentSessionKey: sharedOpts.agentSessionKey,
 		...accessGuard,
 	});
-	return { send, spawn, list, history };
+	// No `accessGuard` spread: this tool can only ever touch the caller's OWN
+	// session, so visibility / A2A policy — which exist to gate reaching OTHER
+	// sessions — have nothing to decide. Requiring them would disable
+	// self-titling in legitimate configs for no security gain. The gateway's own
+	// access check still runs on the resulting `sessions.rename`.
+	const rename = createSessionsRenameTool({
+		agentSessionKey: sharedOpts.agentSessionKey,
+	});
+	return { send, spawn, list, history, rename };
 }
 
 /**
@@ -226,5 +236,6 @@ export function createSessionsBrigadeTools(
 		toBrigadeTool(bundle.spawn),
 		toBrigadeTool(bundle.list),
 		toBrigadeTool(bundle.history),
+		toBrigadeTool(bundle.rename),
 	];
 }

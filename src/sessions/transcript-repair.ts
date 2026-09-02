@@ -27,6 +27,13 @@
 //     (corruption), we drop it.
 
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import {
+  isToolCall,
+  PI_TOOL_CALL,
+  PI_TOOL_RESULT,
+  WIRE_TOOL_RESULT,
+  WIRE_TOOL_USE,
+} from "../agents/pi-dialect.js";
 
 const log = createSubsystemLogger("sessions/transcript-repair");
 
@@ -86,11 +93,39 @@ export function sanitizeToolUseResultPairing<M extends RepairableMessage>(
     const blocks = arrayContent(m.content);
     if (!blocks) continue;
     if (m.role === "assistant") {
+      // AN ABORTED OR ERRORED ASSISTANT NEVER REACHES THE PROVIDER.
+      //
+      // Pi deletes these outright before sending
+      // (`pi-ai/dist/providers/transform-messages.js:156`) — they may carry
+      // partial content, and replaying them causes API errors. Their tool calls
+      // therefore vanish, so announcing them here would make us synthesise a
+      // result for a call that is about to be deleted, leaving a `tool_result`
+      // with nothing to answer. Every provider rejects that outright:
+      // Anthropic "tool_result block(s) provided when previous message does not
+      // contain any tool_use blocks", OpenAI "must be a response to a preceding
+      // message with 'tool_calls'", Gemini "function response turn must come
+      // immediately after a function call turn".
+      //
+      // And it would be PERMANENT: the aborted message is written to the
+      // transcript, so a single Ctrl+C during a tool call would brick the
+      // session for every subsequent request. Skipping them here also means a
+      // REAL result referencing such a call is left unannounced, so pass 2
+      // correctly drops it as an orphan — which is the other half of the same
+      // 400.
+      const stopReason = (m as unknown as { stopReason?: unknown }).stopReason;
+      if (stopReason === "error" || stopReason === "aborted") continue;
       for (const block of blocks) {
         const tu = asToolUse(block);
         if (tu) announcedToolUseIds.add(tu.id);
       }
     } else if (m.role === "user" || m.role === "tool" || m.role === "toolResult") {
+      // Pi shape first: the whole MESSAGE is the result, and its id is not in
+      // any block.
+      const msgId = messageToolResultId(m as { role?: unknown; toolCallId?: unknown });
+      if (msgId) {
+        if (announcedToolUseIds.has(msgId)) resolvedToolUseIds.add(msgId);
+        else orphanedToolResultIds.add(msgId);
+      }
       for (const block of blocks) {
         const tr = asToolResult(block);
         if (!tr) continue;
@@ -125,6 +160,14 @@ export function sanitizeToolUseResultPairing<M extends RepairableMessage>(
       continue;
     }
     if (m.role === "user" || m.role === "tool" || m.role === "toolResult") {
+      // A Pi-shaped orphan is an entire MESSAGE (role "toolResult" whose
+      // `toolCallId` names a call that never appeared). There is no block to
+      // strip — drop the message, or the provider rejects the request.
+      const msgId = messageToolResultId(m as { role?: unknown; toolCallId?: unknown });
+      if (msgId && orphanedToolResultIds.has(msgId)) {
+        orphanedToolResultsDropped++;
+        continue;
+      }
       const filtered: unknown[] = [];
       for (const block of blocks) {
         const tr = asToolResult(block);
@@ -161,12 +204,34 @@ export function sanitizeToolUseResultPairing<M extends RepairableMessage>(
       const blocks = arrayContent(m.content);
       if (!blocks) continue;
 
+      // SYNTHESISE IN THE DIALECT THE CALL USED. A Pi-shaped `toolCall` must be
+      // answered by a Pi `ToolResultMessage` (its own role, message-level
+      // `toolCallId`, and a `timestamp` the type requires); an Anthropic-shaped
+      // `tool_use` by a user message carrying `tool_result` blocks. Emitting the
+      // wrong one is not a repair — it is a second malformed message.
       const synthBlocks: ToolResultBlock[] = [];
+      const piResults: M[] = [];
+      // Derived from the assistant's own timestamp, never `Date.now()`: this
+      // runs on EVERY request, and a clock read would make the prompt prefix
+      // differ every call and invalidate the provider's cache.
+      const rawTs = (m as unknown as { timestamp?: unknown }).timestamp;
+      const baseTs = typeof rawTs === "number" ? rawTs : 0;
       for (const block of blocks) {
         const tu = asToolUse(block);
         if (!tu) continue;
         if (!remainingUnmatched.has(tu.id)) continue;
         remainingUnmatched.delete(tu.id);
+        if (isToolCall(block)) {
+          piResults.push({
+            role: PI_TOOL_RESULT,
+            toolCallId: tu.id,
+            toolName: typeof tu.name === "string" ? tu.name : "unknown",
+            content: [{ type: "text", text: SYNTHETIC_TOOL_RESULT_TEXT }],
+            isError: true,
+            timestamp: baseTs + 1,
+          } as unknown as M);
+          continue;
+        }
         synthBlocks.push({
           type: "tool_result",
           tool_use_id: tu.id,
@@ -174,6 +239,7 @@ export function sanitizeToolUseResultPairing<M extends RepairableMessage>(
           is_error: true,
         });
       }
+      for (const r of piResults) finalOut.push(r);
       if (synthBlocks.length > 0) {
         finalOut.push({
           role: "user",
@@ -223,17 +289,39 @@ function arrayContent(content: unknown): unknown[] | null {
 function asToolUse(block: unknown): ToolUseBlock | null {
   if (!block || typeof block !== "object") return null;
   const b = block as { type?: unknown; id?: unknown };
-  // Anthropic spec uses "tool_use"; some Pi shapes use "toolUse" — accept both.
-  if ((b.type !== "tool_use" && b.type !== "toolUse") || typeof b.id !== "string") {
-    return null;
-  }
+  // Three dialects, and the third is the one that matters most:
+  //   • "tool_use"  — Anthropic's wire shape (on-disk JSONL records)
+  //   • "toolUse"   — an older Pi spelling
+  //   • "toolCall"  — what Pi ACTUALLY puts in `AgentMessage[]` today
+  //                   (pi-ai `types.d.ts`: ToolCall { type: "toolCall", id, … })
+  //
+  // Only the first two were matched for a long time, and the only caller is the
+  // transform chain, which is handed Pi's in-memory messages. So this repair —
+  // documented as the thing that keeps an orphaned tool call from crashing the
+  // next request after a power loss — matched nothing and did nothing.
+  if (b.type !== WIRE_TOOL_USE && b.type !== "toolUse" && b.type !== PI_TOOL_CALL) return null;
+  if (typeof b.id !== "string") return null;
   return block as ToolUseBlock;
+}
+
+/**
+ * The id a PI-SHAPED tool result carries at the MESSAGE level.
+ *
+ * Pi does not model a tool result as a block inside a user message; it is its
+ * own message role with `toolCallId` on the message
+ * (pi-ai `types.d.ts`: ToolResultMessage). A block-level scan therefore never
+ * sees it, and every tool call looked unresolved — or would have, if the
+ * block-level scan had recognised Pi's calls in the first place.
+ */
+function messageToolResultId(m: { role?: unknown; toolCallId?: unknown }): string | null {
+  if (m?.role !== PI_TOOL_RESULT) return null;
+  return typeof m.toolCallId === "string" ? m.toolCallId : null;
 }
 
 function asToolResult(block: unknown): ToolResultBlock | null {
   if (!block || typeof block !== "object") return null;
   const b = block as { type?: unknown; tool_use_id?: unknown; toolUseId?: unknown };
-  if (b.type !== "tool_result" && b.type !== "toolResult") return null;
+  if (b.type !== WIRE_TOOL_RESULT && b.type !== "toolResult") return null;
   const id = typeof b.tool_use_id === "string" ? b.tool_use_id : typeof b.toolUseId === "string" ? b.toolUseId : null;
   if (!id) return null;
   return { type: "tool_result", tool_use_id: id, ...(block as object) } as ToolResultBlock;

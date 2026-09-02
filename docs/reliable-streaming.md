@@ -118,6 +118,34 @@ recovered here.
    `closed`).
 2. **Subscribe** to the lane you want: `req subscribe { agentId, sessionId }`.
    Without a subscribe you receive everything (back-compat).
+
+   **Delivery rules**, in order — the first that matches wins:
+
+   - A frame carrying neither `agentId` nor `sessionId` goes to everyone.
+   - A frame whose `parentSessionKey` is a session you subscribed to is
+     delivered: a sub-agent spawned by your thread is yours to see.
+   - **If you named a session on the frame's agent, that is your scope** —
+     the agent's *other* sessions (cron runs, channel traffic, a second chat)
+     are filtered out. Pass `scope: "agent"` to opt out and take the agent's
+     whole stream instead; `scope: "session"` is the default.
+   - Otherwise you get anything matching a broader `agentId` or `sessionId`
+     subscription.
+
+   Naming a session used to widen delivery to the agent as well, which meant
+   other threads bled into your view. If your client names a session for a
+   reason OTHER than narrowing — a snapshot push gated on the session id, say —
+   pass `scope: "agent"`.
+
+   **Deltas** are opt-in: `subscribe { deltas: true }` strips `message.content`
+   from `message_update` frames (roughly 18x fewer bytes on a long answer) and
+   requires the client to append `text_delta` / `thinking_delta` itself. Leave
+   it unset and frames stay byte-identical to the pre-delta protocol.
+
+   Both are advertised in `hello-ok` under `features.capabilities`
+   (`subscribe.scope`, `subscribe.deltas`, `resume.seq`). **Feature-detect on
+   those names, not on `protocol`** — the version integer is bumped only if the
+   frames themselves become unparseable, and behaviour changes ride capabilities
+   so an unknown name is safely ignorable.
 3. **Resume.** `resume` → render `messages` (see render contract), set the seq
    cursor to `headSeq`. This loads history on first connect and backfills the
    gap on a reconnect.
@@ -216,3 +244,50 @@ client.on("resync", recover);      // backfill after a mid-stream gap
 
 That is the whole contract: **subscribe → resume → apply live by identity →
 resume again on any gap.** In order, nothing missing, nothing misplaced.
+
+## Cursor replay for synthetic frames
+
+The ordered stream was gap-*detectable* everywhere and gap-*repairable* only
+where the JSONL transcript could rebuild it. **Synthetic** frames — the tool
+events Brigade mints for a `claude-cli` turn, whose tools run inside the
+binary's own loop — are in no transcript at all, yet they carry the routing
+session key, so `resume` can find them again.
+
+`FrameRing` (`src/core/frame-ring.ts`) retains them per session — bounded by
+count, bytes, and distinct sessions — so `resume({ sinceSeq })` returns
+`replayedFrames`: the exact bytes originally broadcast, applied after the
+transcript and deduped by the same identity keys as a live frame. The TUI sends
+the cursor from its `resync` handler, where the last-seen seq is already in
+hand.
+
+Top-level `message_update` frames are deliberately **not** retained: they are
+cumulative, so buffering a long reply would cost O(n²) memory to redeliver what
+the transcript already returns better.
+
+`replayComplete` is the load-bearing part of the contract. It is `false` when
+retention was trimmed past the cursor, meaning some frames are gone for good
+and the client should treat that span as lost rather than assume it was empty.
+It answers only "is the oldest frame I still hold the next one this cursor
+expects?" — never "are there interior gaps?", since the frames that create
+those are precisely the ones the transcript rebuilds better.
+
+### Why sub-agent frames are still unsequenced
+
+They look like the same case and are not. A sub-agent frame is tagged with the
+**child's Pi session UUID**, while `resume` is called with an `agent:…` session
+**key**. Retaining under one namespace and replaying from the other means the
+replay can never fire — so sequencing them would rest on a guarantee that does
+not exist, which is exactly what the "never sequence what you cannot replay"
+rule forbids.
+
+Sequencing them also has costs that promise was meant to justify: every
+`spawn_agent` mints a new per-session counter, and that map evicts in creation
+order, so the operator's own long-lived session — created first — is evicted
+first, restarting its counter and repainting the transcript on every connected
+client. A terminal `agent_end` frame also carries the child's entire
+transcript, which the ring's oversize carve-out would retain permanently on a
+session that never receives another frame.
+
+Making sub-agent replay real means teaching `resume` the child namespace. Until
+then they stay unsequenced: a gap in them is undetectable-but-honest rather
+than detectable-but-unrepairable.

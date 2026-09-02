@@ -145,3 +145,250 @@ export function summarizeToolResult(
 	}
 	return { preview: `${collapsed.slice(0, maxLength - 1)}…`, hasContent: true, multiline: false };
 }
+
+/* ─────────────────────────── tool ARGUMENTS ─────────────────────────── */
+
+/** Argument keys that identify what a tool is about to act on, most specific first. */
+const ARG_PRIORITY = [
+	"command",
+	"cmd",
+	"path",
+	"file_path",
+	"filePath",
+	"filename",
+	"pattern",
+	"query",
+	"url",
+	"prompt",
+	"task",
+	"agent",
+	"agentId",
+	"name",
+	"key",
+	"id",
+] as const;
+
+const ARG_MAX_LENGTH = 72;
+
+/**
+ * A one-line summary of a tool call's ARGUMENTS, for the `⚡` chip.
+ *
+ * The chip used to render only the tool name — `⚡ bash`, `⚡ edit` — so the
+ * operator could see that something was happening but never WHAT: which command,
+ * which file. `tool_execution_start` carries `args` on the wire and the renderer
+ * discarded it.
+ *
+ * Deliberately lossy. This is a glance-able subtitle, not a debug dump: one
+ * line, hard-truncated, whitespace collapsed. The full arguments remain in the
+ * JSONL event log for anyone who needs them.
+ *
+ * Returns `undefined` when there is nothing worth showing, so the caller renders
+ * the bare tool name rather than an empty pair of brackets.
+ */
+export function formatToolArgs(args: unknown, maxLength = ARG_MAX_LENGTH): string | undefined {
+	if (args === null || args === undefined) return undefined;
+
+	// A bare string argument is already the answer.
+	if (typeof args === "string") return condenseArg(args, maxLength);
+	if (typeof args !== "object") return condenseArg(String(args), maxLength);
+
+	const obj = args as Record<string, unknown>;
+
+	// Prefer the key that says what is being acted on.
+	for (const key of ARG_PRIORITY) {
+		const v = obj[key];
+		if (typeof v === "string" && v.trim()) return condenseArg(v, maxLength);
+		if (typeof v === "number" || typeof v === "boolean") return condenseArg(String(v), maxLength);
+	}
+
+	// No known key — fall back to the first short scalar, so a custom tool still
+	// says something useful instead of nothing.
+	for (const [k, v] of Object.entries(obj)) {
+		if (typeof v === "string" && v.trim()) return condenseArg(`${k}=${v}`, maxLength);
+		if (typeof v === "number" || typeof v === "boolean") return condenseArg(`${k}=${String(v)}`, maxLength);
+	}
+	return undefined;
+}
+
+/** Collapse to one line, trim, and hard-truncate with an ellipsis. */
+function condenseArg(raw: string, maxLength: number): string | undefined {
+	const flat = raw.replace(/\s+/g, " ").trim();
+	if (!flat) return undefined;
+	return flat.length > maxLength ? `${flat.slice(0, Math.max(1, maxLength - 1))}…` : flat;
+}
+
+/* ─────────────────────────── unified diffs ─────────────────────────── */
+
+/**
+ * Does this text look like a unified diff?
+ *
+ * Deliberately conservative — it must not fire on prose that merely starts a
+ * line with `-`, which is every markdown bullet list ever written. Requires the
+ * structural markers a real diff has: a hunk header (`@@ … @@`), or a
+ * `---`/`+++` file-header pair.
+ *
+ * Backend-agnostic on purpose. Brigade has no file-edit tool of its own — edits
+ * come from Pi's built-ins or, on the harness backends, from the vendor binary's
+ * own tools — so keying off tool NAMES or argument shapes would silently miss
+ * whichever backend the operator is actually running. Recognising the output
+ * shape works for all of them.
+ */
+export function looksLikeUnifiedDiff(text: string): boolean {
+	if (!text || text.length < 8) return false;
+	if (/^@@ -\d+(,\d+)? \+\d+(,\d+)? @@/m.test(text)) return true;
+	return /^--- .+\n\+\+\+ .+/m.test(text);
+}
+
+/** One line of a diff, classified for rendering. */
+export type DiffLineKind = "add" | "remove" | "hunk" | "meta" | "context";
+
+/** Classify a single diff line. */
+export function classifyDiffLine(line: string): DiffLineKind {
+	if (line.startsWith("@@")) return "hunk";
+	// File headers are `---`/`+++`; check them BEFORE the single-char add/remove
+	// tests, or every header reads as a removed/added line.
+	if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ") || line.startsWith("index ")) {
+		return "meta";
+	}
+	if (line.startsWith("+")) return "add";
+	if (line.startsWith("-")) return "remove";
+	return "context";
+}
+
+/** Added / removed line counts, for a one-line summary like `+12 −3`. */
+export function summarizeDiffStats(text: string): { added: number; removed: number } {
+	let added = 0;
+	let removed = 0;
+	for (const line of text.split("\n")) {
+		const kind = classifyDiffLine(line);
+		if (kind === "add") added += 1;
+		else if (kind === "remove") removed += 1;
+	}
+	return { added, removed };
+}
+
+/* ─────────────────────────── todo / plan lists ─────────────────────────── */
+
+/** One item of a model-authored plan. */
+export interface TodoItem {
+	text: string;
+	status: "pending" | "in_progress" | "completed" | "cancelled" | "unknown";
+}
+
+function normalizeTodoStatus(raw: unknown): TodoItem["status"] {
+	const v = typeof raw === "string" ? raw.trim().toLowerCase().replace(/[\s-]/g, "_") : "";
+	switch (v) {
+		case "pending":
+		case "todo":
+		case "not_started":
+			return "pending";
+		case "in_progress":
+		case "active":
+		case "running":
+			return "in_progress";
+		case "completed":
+		case "done":
+		case "complete":
+			return "completed";
+		case "cancelled":
+		case "canceled":
+		case "skipped":
+			return "cancelled";
+		default:
+			return "unknown";
+	}
+}
+
+/**
+ * Parse a plan-update tool's arguments into items, or `undefined` when this is
+ * not one.
+ *
+ * Tolerant about the wrapper key and the item shape because the tool is not
+ * Brigade's: on the claude-cli backend `TodoWrite` comes from the vendor binary,
+ * and other backends spell it differently. Keying off a single hardcoded schema
+ * would silently fall back to raw JSON for every provider but one.
+ */
+export function parseTodoArgs(args: unknown): TodoItem[] | undefined {
+	if (!args || typeof args !== "object") return undefined;
+	const obj = args as Record<string, unknown>;
+	const raw = obj.todos ?? obj.items ?? obj.plan ?? obj.tasks;
+	if (!Array.isArray(raw) || raw.length === 0) return undefined;
+
+	const items: TodoItem[] = [];
+	for (const entry of raw) {
+		if (typeof entry === "string") {
+			const t = entry.trim();
+			if (t) items.push({ text: t, status: "unknown" });
+			continue;
+		}
+		if (!entry || typeof entry !== "object") continue;
+		const e = entry as Record<string, unknown>;
+		const text = [e.content, e.text, e.title, e.task, e.activeForm].find(
+			(v): v is string => typeof v === "string" && v.trim().length > 0,
+		);
+		if (!text) continue;
+		items.push({ text: text.trim(), status: normalizeTodoStatus(e.status ?? e.state) });
+	}
+	return items.length > 0 ? items : undefined;
+}
+
+/** `✓` done · `▸` in progress · `✗` cancelled · `○` pending/unknown. */
+export function todoMarker(status: TodoItem["status"]): string {
+	switch (status) {
+		case "completed":
+			return "✓";
+		case "in_progress":
+			return "▸";
+		case "cancelled":
+			return "✗";
+		default:
+			return "○";
+	}
+}
+
+/** `2/5 done` — the one-line progress summary for a collapsed row. */
+export function summarizeTodos(items: readonly TodoItem[]): string {
+	const done = items.filter((i) => i.status === "completed").length;
+	return `${done}/${items.length} done`;
+}
+
+/* ─────────────────────── live command output ─────────────────────── */
+
+/** Tools whose output is a running log worth watching rather than a value. */
+export function isShellLikeTool(name: string): boolean {
+	return /^(bash|sh|shell|exec|run|command|terminal|process)/i.test(name.trim());
+}
+
+/**
+ * The last `maxLines` of a running command's output, for a live tail pane.
+ *
+ * A long command's output was collapsed to a single 120-char line that
+ * flickered in place, so a four-minute test run showed one truncated row and
+ * you could not see which test failed until it finished. Every comparable
+ * harness streams this into a bounded pane instead (Codex caps at 50 lines,
+ * Gemini and Crush at a similar window).
+ *
+ * Takes the TAIL, not the head: on a build or a test run the interesting part
+ * is always what just happened. Each line is also width-clipped, because one
+ * pathological line (a minified bundle, a base64 blob) would otherwise wrap
+ * across the whole viewport and push everything else off screen.
+ */
+export function tailLines(text: string, maxLines = 12, maxCols = 160): string[] {
+	if (!text) return [];
+	const lines = text.split("\n");
+	// Trailing blank lines are an artifact of the stream, not content.
+	while (lines.length > 0 && lines[lines.length - 1]!.trim() === "") lines.pop();
+	const tail = lines.slice(Math.max(0, lines.length - maxLines));
+	return tail.map((line) => {
+		// Tabs render at unpredictable widths and break the clip arithmetic.
+		const flat = line.replace(/\t/g, "  ");
+		return flat.length > maxCols ? `${flat.slice(0, maxCols - 1)}…` : flat;
+	});
+}
+
+/** `1.2k lines` / `84 lines` — the scale of what the tail is a window onto. */
+export function describeOutputSize(text: string): string {
+	const n = text ? text.split("\n").length : 0;
+	if (n < 1000) return `${n} line${n === 1 ? "" : "s"}`;
+	return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k lines`;
+}

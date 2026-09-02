@@ -1,0 +1,92 @@
+/**
+ * Turn-complete notification.
+ *
+ * A long turn is one you walk away from. Every comparable harness tells you
+ * when it finished — Claude Code (`preferredNotifChannel`, plus a Notification
+ * hook), Gemini CLI (`general.enableNotifications`, OS notification falling back
+ * to a bell), opencode (`attention.notifications`/`sound`), Crush, and Aider
+ * (`--notifications`). Brigade's `turn_end` handler was an explicit no-op, so a
+ * six-minute turn finished in silence and you found out by looking.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY A DURATION THRESHOLD RATHER THAN FOCUS DETECTION
+ * ─────────────────────────────────────────────────────────────────────────
+ * Focus reporting (`\x1b[?1004h`) exists in `animations.ts`, but reading it
+ * requires owning the stdin stream to strip the focus events out of the input
+ * the editor sees — real plumbing, and it fails silently on terminals that
+ * don't implement 1004.
+ *
+ * The duration threshold gets the same outcome more simply: a turn short enough
+ * that you were still watching is a turn you don't need to be told about, and
+ * one long enough to walk away from is one you do. It also degrades sanely when
+ * you WERE watching — a single bell after 30 seconds of waiting is not noise.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHAT WE EMIT
+ * ─────────────────────────────────────────────────────────────────────────
+ *   BEL (`\x07`)          universal; every terminal either dings or flashes.
+ *   OSC 9 (`ESC ] 9 ; text BEL`)  a desktop notification on iTerm2, Windows
+ *                         Terminal, WezTerm, Ghostty and others. Terminals that
+ *                         don't know it discard the sequence — it is
+ *                         well-formed and terminated, so nothing leaks to the
+ *                         screen.
+ *
+ * Written straight to the tty rather than through the widget tree: this is
+ * out-of-band signalling, not content, and it must not dirty a render line.
+ */
+
+/** Turns shorter than this are ones you were still watching. */
+export const NOTIFY_MIN_TURN_MS = 30_000;
+
+export interface NotifyOptions {
+	/** How long the turn took. */
+	durationMs: number;
+	/** Operator preference; `false` disables entirely. */
+	enabled?: boolean;
+	/** Override the threshold (tests, or an impatient operator). */
+	minMs?: number;
+	/** Short label for the desktop notification body. */
+	summary?: string;
+	/** Sink — defaults to stderr so it never collides with stdout protocols. */
+	write?: (s: string) => void;
+	/** Terminals that cannot receive escape sequences (pipes, CI) get nothing. */
+	isTty?: boolean;
+}
+
+/**
+ * Emit the notification, or nothing.
+ *
+ * Returns the string written (empty when suppressed) so a caller — and a test —
+ * can assert what happened without a terminal.
+ */
+export function notifyTurnComplete(opts: NotifyOptions): string {
+	const {
+		durationMs,
+		enabled = true,
+		minMs = NOTIFY_MIN_TURN_MS,
+		summary,
+		isTty = true,
+	} = opts;
+
+	if (!enabled) return "";
+	if (!isTty) return "";
+	if (!Number.isFinite(durationMs) || durationMs < minMs) return "";
+
+	// Strip anything that could terminate the OSC early or inject a sequence of
+	// its own. The summary can carry model-authored text.
+	const safe = (summary ?? "turn finished")
+		.replace(/[\x00-\x1f]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.slice(0, 120);
+
+	const out = `\x07\x1b]9;Brigade — ${safe}\x07`;
+	const write = opts.write ?? ((s: string) => void process.stderr.write(s));
+	try {
+		write(out);
+	} catch {
+		// A closed or broken tty must never take down a turn over a bell.
+		return "";
+	}
+	return out;
+}
