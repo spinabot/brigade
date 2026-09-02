@@ -2657,7 +2657,39 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const cronState = createCronServiceState({
 		deps: {
 			log: createSubsystemLogger("cron"),
-			runIsolatedAgentJob: runCronIsolatedAgentJob,
+			// METER CRON RUNS.
+			//
+			// Cron calls `runSingleTurn` directly rather than going through
+			// `runGatewayTurn`, so `attachTurnSession` never ran for it and the
+			// usage ledger was never written. The event-bus fallback that catches
+			// everything else explicitly skips depth-0 runs, so nothing caught it
+			// either: a nightly job on a frontier model reported ZERO on the
+			// footer, in `/usage` and in `sessions.list`, for ever, while showing
+			// up in full on the provider's invoice. Its sub-agent and compaction
+			// spend WAS recorded — to per-fire keys no surface renders.
+			//
+			// Attaching here rather than inside the cron executor keeps the ledger
+			// private to the gateway; the executor only learns that a session
+			// exists.
+			runIsolatedAgentJob: (cronArgs) =>
+				runCronIsolatedAgentJob({
+					...cronArgs,
+					onSessionReady: (session, cronAgentId, cronSessionKey) => {
+						try {
+							attachTurnSession(session as AgentSession, cronSessionKey, cronAgentId);
+						} catch (err) {
+							// Metering must never fail a cron run — but it must not fail
+							// SILENTLY either. A swallowed error here reproduces the very
+							// bug being fixed: spend that quietly goes unrecorded while
+							// every surface reports zero.
+							createSubsystemLogger("cron").warn("cron usage metering failed to attach", {
+								jobId: cronArgs.job?.id,
+								sessionKey: cronSessionKey,
+								error: err instanceof Error ? err.message : String(err),
+							});
+						}
+					},
+				}),
 			onEvent: (event) => {
 				broadcast("log", {
 					level: event.action === "finished" && event.status === "error" ? "warn" : "info",

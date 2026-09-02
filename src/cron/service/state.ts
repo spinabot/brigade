@@ -63,6 +63,15 @@ export interface CronIsolatedRunArgs {
 	job: CronJob;
 	runAtMs: number;
 	abortSignal?: AbortSignal;
+	/**
+	 * Called once the run's Pi session exists, so the gateway can meter it.
+	 *
+	 * Cron turns went through `runSingleTurn` directly rather than the
+	 * gateway's turn path, so nothing ever attached them to the usage ledger —
+	 * a nightly job burning hundreds of dollars a month reported zero on every
+	 * surface Brigade has. The gateway supplies this; other callers may omit it.
+	 */
+	onSessionReady?: (session: unknown, agentId: string, sessionKey: string) => void;
 }
 
 /** Args the cron service hands to its system-event injector. */
