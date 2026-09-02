@@ -175,6 +175,7 @@ import { onConfigCachePrimed } from "../storage/config-cache.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { UsageLedger } from "../agents/usage/ledger.js";
+import { sessionStatsFromMessages } from "../agents/usage/transcript-stats.js";
 import { ReasoningTracker } from "../agents/reasoning/reasoning-state.js";
 import { resolveAgentIdFromSessionKey } from "../agents/routing/session-key.js";
 import { initialReasoningVisibility, refineReasoningVisibility } from "../agents/reasoning/visibility.js";
@@ -4735,6 +4736,39 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					sessionKey: targetSessionKey,
 					limit: RESUME_TRANSCRIPT_MAX,
 				});
+				// REBUILD THIS SESSION'S SPEND BEFORE THE SNAPSHOT IS TAKEN.
+				//
+				// `UsageLedger` is in-memory, so a gateway restart zeroes it. The
+				// ledger already knows how to recover — but the only caller of
+				// `seedFromStats` was the turn-attach path, which needs a LIVE
+				// session. So a client that reconnected and resumed a thread saw
+				// `0 billed` and no context percentage until it sent a message,
+				// and the header appeared to fill itself in only after the first
+				// turn. The numbers were not wrong; nothing had recovered them.
+				//
+				// Deliberately a SECOND, uncapped read rather than folding
+				// `messages` above: that slice is capped at RESUME_TRANSCRIPT_MAX,
+				// so folding it would undercount any longer thread — and because
+				// `seedFromStats` is idempotent, the undercount would then be
+				// permanent for the life of the process. A wrong number that
+				// cannot be corrected is worse than a missing one.
+				//
+				// Guarded by `hasSeeded` so the extra read happens at most once
+				// per session per gateway lifetime, not on every reconnect.
+				if (!usageLedger.hasSeeded(targetAgentId, targetSessionKey)) {
+					try {
+						const all = await readSessionTranscriptMessages({ sessionKey: targetSessionKey });
+						usageLedger.seedFromStats(
+							targetAgentId,
+							targetSessionKey,
+							sessionStatsFromMessages(all),
+						);
+					} catch {
+						// Bookkeeping must never fail a resume — a client that cannot
+						// resume loses its transcript, which is far worse than a header
+						// that starts at zero.
+					}
+				}
 				const headSeq = seqCounters.get(targetSessionKey) ?? 0;
 				// Recovery for the two non-transcript event types so a (re)connecting
 				// client loses NOTHING: tool-approval prompts still pending on this

@@ -228,6 +228,18 @@ export class UsageLedger {
 	 * Idempotent: only the FIRST seed applies, so re-attaching a live session
 	 * cannot double its history.
 	 */
+	/**
+	 * Whether this session's history has already been folded in.
+	 *
+	 * Exposed so a caller can skip the READ that produces the stats, not just
+	 * the seed. Rebuilding totals means walking a whole transcript, and on a
+	 * busy gateway `resume` is called often enough that doing it per reconnect
+	 * would be a real cost for an answer that cannot change.
+	 */
+	hasSeeded(agentId: string, sessionKey: string): boolean {
+		return this.entries.get(this.key(agentId, sessionKey))?.seeded === true;
+	}
+
 	seedFromStats(
 		agentId: string,
 		sessionKey: string,
