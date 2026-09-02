@@ -176,6 +176,7 @@ import { onConfigCachePrimed } from "../storage/config-cache.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { UsageLedger } from "../agents/usage/ledger.js";
+import { SessionCaches } from "./session-caches.js";
 import { persistSessionUsage, readPersistedSessionUsage } from "../agents/usage/persist.js";
 import { ReasoningTracker } from "../agents/reasoning/reasoning-state.js";
 import { resolveAgentIdFromSessionKey } from "../agents/routing/session-key.js";
@@ -1785,9 +1786,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// (context usage %, message count, thinking capabilities). With no
 	// session between turns we cache the last-known values: seeded from the
 	// model at boot, refreshed from the in-flight session during each turn.
-	let lastContextUsagePercent: number | null = null;
-	let lastContextTokens: number | null = null;
-	let lastContextWindow: number | null = null;
+	// Per-session, NOT per-gateway. These were single variables written by every
+	// turn of every session, so one busy channel thread repainted the operator's
+	// header with its own context usage. See `core/session-caches.ts`.
+	const sessionCaches = new SessionCaches();
 	// Live reasoning phase, per (agent, session). Answers "is this model thinking
 	// RIGHT NOW" — which nothing on the wire could say before: `thinkingLevel`
 	// and `supportsThinking` are capabilities, not state.
@@ -1835,7 +1837,6 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// Filled once, in the background, shortly after listen. Rides every subsequent
 	// state snapshot so an attaching client can ASK the operator. Never acted on here.
 	let latestUpdate: { current: string; latest: string } | undefined;
-	let lastMessageCount = 0;
 	let cachedSupportsThinking = !!args.model.reasoning;
 	let cachedThinkingLevels: string[] = deriveThinkingLevels(args.model);
 
@@ -1843,9 +1844,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// every forwarded event during a turn so the snapshot tracks the live
 	// state, and once more as the turn settles so the between-turns snapshot
 	// reflects the final message count / context usage.
-	const refreshCachesFromSession = (s: AgentSession): void => {
+	const refreshCachesFromSession = (
+		s: AgentSession,
+		cacheAgentId: string,
+		cacheSessionKey: string,
+	): void => {
 		try {
-			lastMessageCount = s.messages.length;
+			sessionCaches.set(cacheAgentId, cacheSessionKey, { messageCount: s.messages.length });
 		} catch {
 			/* session torn down — keep last value */
 		}
@@ -1861,19 +1866,23 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// compaction — and the TUI rendered the derived percent only above 50%,
 			// so for most of a session's life the operator saw nothing at all.
 			const ctx = s.getContextUsage();
-			lastContextUsagePercent = ctx?.percent ?? null;
-			lastContextTokens = ctx?.tokens ?? null;
-			lastContextWindow = typeof ctx?.contextWindow === "number" ? ctx.contextWindow : null;
+			sessionCaches.set(cacheAgentId, cacheSessionKey, {
+				contextPercent: ctx?.percent ?? null,
+				contextTokens: ctx?.tokens ?? null,
+				contextWindow: typeof ctx?.contextWindow === "number" ? ctx.contextWindow : null,
+			});
 		} catch {
 			/* session torn down — keep last value */
 		}
 		try {
-			cachedSupportsThinking = s.supportsThinking();
+			sessionCaches.set(cacheAgentId, cacheSessionKey, { supportsThinking: s.supportsThinking() });
 		} catch {
 			/* ignore */
 		}
 		try {
-			cachedThinkingLevels = [...s.getAvailableThinkingLevels()];
+			sessionCaches.set(cacheAgentId, cacheSessionKey, {
+				thinkingLevels: [...s.getAvailableThinkingLevels()],
+			});
 		} catch {
 			/* ignore */
 		}
@@ -1889,8 +1898,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 * the workspace files are tiny + on local disk — turning it async would
 	 * complicate the buildSnapshot signature for sub-millisecond savings.
 	 */
-	const computeFirstRunBootstrap = (): boolean => {
-		if (lastMessageCount > 0) return false;
+	const computeFirstRunBootstrap = (messageCount: number): boolean => {
+		// PER SESSION, not gateway-wide. This read a single shared counter, so a
+		// cron fire or a channel message on ANY session made every agent look
+		// "already started" and silently suppressed the first-run bootstrap flow
+		// for one that had genuinely never run.
+		if (messageCount > 0) return false;
 		const wsDir = getBrigadeWorkspaceDir();
 		try {
 			if (!existsSync(joinPath(wsDir, "BOOTSTRAP.md"))) return false;
@@ -1958,6 +1971,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// session caused. A pure map read — no I/O — so it stays safe on the
 		// state-broadcast path.
 		const snapshotUsage = usageLedger.displayTotals(targetAgentId, targetSessionKey);
+		// Live-session-derived fields for THIS binding (context usage, message
+		// count, observed thinking caps). Absent until this session has run a
+		// turn in this process, which is honest: reporting another session's
+		// numbers is what this replaced.
+		const snapshotCache = sessionCaches.get(targetAgentId, targetSessionKey);
 		const pin = readSessionModelPin(targetAgentId, targetSessionKey);
 		// A pinned model is validated against the registry when it is set, but
 		// the registry can be refreshed/reseeded since; an unresolvable pin
@@ -1965,15 +1983,19 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// rather than borrowing the agent model's, which would be a lie.
 		const pinnedModel = pin ? modelRegistry.find(pin.provider, pin.modelId) : undefined;
 		const effectiveModel = pin ? pinnedModel : rt.model;
+		// Observed capabilities come from THIS session, falling back to the boot
+		// model. They used to be gateway-wide, so a turn on an agent running a
+		// non-reasoning model made a different agent's header claim its model
+		// could not reason and emptied `/thinking`'s level list.
 		const supportsThinking = pin
 			? !!pinnedModel?.reasoning
 			: isBoot
-				? cachedSupportsThinking
+				? (snapshotCache?.supportsThinking ?? cachedSupportsThinking)
 				: !!rt.model?.reasoning;
 		const availableThinkingLevels = pin
 			? pinnedModel ? deriveThinkingLevels(pinnedModel) : []
 			: isBoot
-				? cachedThinkingLevels
+				? (snapshotCache?.thinkingLevels ?? cachedThinkingLevels)
 				: rt.model ? deriveThinkingLevels(rt.model) : [];
 		// Computed once: the provider this snapshot actually reports (pin-aware),
 		// and the reasoning state (previously built twice per snapshot).
@@ -1991,9 +2013,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			supportsVision: modelSupportsImageInput(effectiveModel) === true,
 			availableThinkingLevels,
 			...(latestUpdate ? { updateAvailable: latestUpdate } : {}),
-			contextUsagePercent: lastContextUsagePercent,
-			contextTokens: lastContextTokens,
-			contextWindow: lastContextWindow,
+			// READ THIS BINDING'S CACHE, not a gateway-wide one. A busy channel
+			// thread at 91% used to repaint an idle operator thread sitting at 4%.
+			contextUsagePercent: snapshotCache?.contextPercent ?? null,
+			contextTokens: snapshotCache?.contextTokens ?? null,
+			contextWindow: snapshotCache?.contextWindow ?? null,
 			...(reasoningSnapshot ? { reasoning: reasoningSnapshot } : {}),
 			// PROVIDER CONSUMPTION WINDOWS.
 			//
@@ -2064,8 +2088,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// to route a fresh prompt through the mid-turn steer path which
 			// throws.
 			isAgentRunning: countActiveLiveSessionsForAgent(targetAgentId) > 0,
-			messageCount: lastMessageCount,
-			firstRunBootstrap: computeFirstRunBootstrap(),
+			messageCount: snapshotCache?.messageCount ?? 0,
+			firstRunBootstrap: computeFirstRunBootstrap(snapshotCache?.messageCount ?? 0),
 			agentName: computeAgentName(targetAgentId),
 			// Multi-agent visibility: surface the agent id + session key the
 			// TUI is bound to so the operator sees `agent main · agent:main:main`
@@ -3081,7 +3105,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			// Keep the between-turns snapshot caches (message count, context
 			// usage %, thinking caps) tracking the live session.
-			refreshCachesFromSession(session);
+			refreshCachesFromSession(session, agentIdForTurn, sessionKeyForTurn);
 			// COMPACTION MEASUREMENT.
 			//
 			// `compaction_end` carries the provider's `tokensBefore` and nothing
@@ -3208,7 +3232,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			// Final cache refresh so the idle snapshot reflects the settled
 			// turn, then drop the session reference (no session between turns).
-			refreshCachesFromSession(session);
+			refreshCachesFromSession(session, agentIdForTurn, sessionKeyForTurn);
 			if (liveSessionsByKey.get(sessionKeyForTurn) === session) {
 				liveSessionsByKey.delete(sessionKeyForTurn);
 			}
@@ -3713,7 +3737,22 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// shutdown calls `abortAllSessions("shutdown")` which fires every
 			// turn's controller in parallel.
 			const turnAbortController = new AbortController();
-			const targetAgentId = turn.agentId ?? agentId;
+			// THE SESSION KEY ALREADY ENCODES THE AGENT — use it before falling back
+			// to the BOOT agent.
+			//
+			// `sessions.send` did not forward `agentId` (the sibling `agent` handler
+			// does), so a cross-agent turn on `agent:ops:main` was billed to the boot
+			// agent's ledger row while its out-of-band spend — which resolves the
+			// agent from the key — landed on `ops`. One thread, two rows, and every
+			// surface that reads by agent (`sessions.list`, a TUI bound to `ops`)
+			// showed only half of it. `sessions.delete`'s cleanup would likewise have
+			// cleared one row and orphaned the other.
+			//
+			// `dispatchAgentRun` has always resolved it this way; matching that here
+			// fixes the caller that forgot AND any future one, rather than patching
+			// a single call site. An explicit `turn.agentId` still wins.
+			const targetAgentId =
+				turn.agentId ?? resolveAgentIdFromSessionKey(turn.sessionKey) ?? agentId;
 			const turnSessionKey = turn.sessionKey;
 			const runId = crypto.randomUUID();
 
