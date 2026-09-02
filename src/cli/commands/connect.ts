@@ -30,6 +30,7 @@ import * as os from "node:os";
 
 import { resolveStateDir } from "../../config/paths.js";
 import { exportFileName, renderTranscriptMarkdown } from "../../ui/transcript-export.js";
+import { nearestSlashCommand } from "../../ui/slash-suggest.js";
 import { searchTranscript } from "../../ui/transcript-search.js";
 import { describeRedactions, redactForExport } from "../../ui/transcript-redact.js";
 
@@ -1296,6 +1297,7 @@ export async function wireConnectUi(
 	// ─────────────────────────────────────────────────────────────────────────
 	const SLASH_COMMANDS: SlashCommand[] = [
 		{ name: "help", description: "show all slash commands" },
+		{ name: "clear", description: "start a fresh thread with empty context (same as /new)" },
 		{ name: "switch", description: "switch the TUI to another session", argumentHint: "<session-key>" },
 		{ name: "cancel", description: "cancel the pending prompt (provider key entry)" },
 		{ name: "clip", description: "copy the last reply to your clipboard (alias of /clipboard)" },
@@ -3887,7 +3889,7 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/context")} — where this thread's context window is going\n` +
 						`- ${chalk.bold("/steer <text>")} — redirect the running turn (or just type mid-turn)\n` +
 						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's reasoning, or press ctrl+t (default: on, remembered)\n` +
-						`- ${chalk.bold("/new")} — start a fresh thread (new session, clean screen, no prior context)\n` +
+						`- ${chalk.bold("/new")} or ${chalk.bold("/clear")} — start a fresh thread (new session, clean screen, no prior context)\n` +
 						`- ${chalk.bold("/agent [<id>]")} — show/bind the connection's active agent\n` +
 						`- ${chalk.bold("/session [<key>]")} — show/bind the connection's active session\n` +
 						`- ${chalk.bold("/agents")} — list every agent the gateway knows about\n` +
@@ -3928,7 +3930,22 @@ export async function wireConnectUi(
 		// `/new` is how you deliberately start over — the same affordance as the
 		// "new chat" button in Claude.ai / ChatGPT. `/sessions` lists threads,
 		// `/session <key>` jumps back to one.
-		if (trimmed === "/new") {
+		// `/clear` IS `/new`, DELIBERATELY.
+		//
+		// Every harness an operator arrives from has `/clear`, so the muscle
+		// memory is universal — and until now typing it here sent the literal
+		// text "/clear" to the model as a prompt.
+		//
+		// It is an ALIAS rather than a distinct "wipe this thread in place"
+		// because Brigade's transcript is an append-only TREE and this codebase's
+		// stated rule (see `sessions/rewind.ts`) is never to destroy, only to
+		// branch. Clearing a thread's history in place would mean either severing
+		// the tree — precisely the orphaned-parent bug rewind.ts exists to guard
+		// against — or driving Pi's untyped `branch()` at a non-message entry.
+		// `/new` already gives a genuinely empty context, keeps every earlier
+		// thread listed by `/sessions`, and cannot lose anything. That is what
+		// `/clear` should mean here.
+		if (trimmed === "/new" || trimmed === "/clear") {
 			editor.setText("");
 			const agentForNew = boundAgentId ?? lastSnapshot?.agentId ?? "main";
 			const freshKey = `agent:${agentForNew}:t-${randomUUID().slice(0, 8)}`;
@@ -6179,6 +6196,39 @@ export async function wireConnectUi(
 				const msg = err instanceof Error ? err.message : String(err);
 				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
 			}
+			return;
+		}
+
+		// A MISTYPED COMMAND IS NOT A PROMPT.
+		//
+		// Everything above this line has had its chance to claim the input, so
+		// anything still starting with `/` is a command this build does not have.
+		// It used to fall straight through to `sendTurn`, which mailed the
+		// literal text to the model: `/clear` asked the assistant to interpret
+		// the word "/clear", and a typo like `/hlep` became a turn that cost
+		// money and answered nothing. Worse, it is indistinguishable from the
+		// command having silently done nothing.
+		//
+		// Deliberately narrow so it cannot eat real input. A bare `/` is not a
+		// command attempt, and neither is anything whose first character after
+		// the slash is not a letter — `/usr/local/bin`, `/^regex$/`, a path
+		// pasted at the start of a message, or a date like `/2026` all still
+		// reach the model. Only a plausible command word is refused, and the
+		// refusal names the closest registered command so a near-miss is one
+		// keystroke from correct.
+		if (/^\/[a-z]/i.test(trimmed) && !isKnownSlashCommand(trimmed)) {
+			const word = trimmed.slice(1).split(/\s/, 1)[0]?.toLowerCase() ?? "";
+			const suggestion = nearestSlashCommand(word, SLASH_COMMANDS.map((c) => c.name));
+			editor.setText("");
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.error("✗")} ${brand.dim("unknown command")} ${brand.error(`/${word}`)}` +
+						(suggestion ? ` ${brand.dim("— did you mean")} ${brand.amber(`/${suggestion}`)}${brand.dim("?")}` : "") +
+						` ${brand.dim("· /help lists them all")}`,
+					0,
+					0,
+				),
+			);
 			return;
 		}
 
