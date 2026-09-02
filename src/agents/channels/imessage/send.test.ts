@@ -274,7 +274,6 @@ describe("sendMessageIMessage — threaded-reply fallback", () => {
 		"cannot send threaded replies",
 		"threaded replies are unavailable",
 		"threaded reply not supported on this transport",
-		"requires bridge transport",
 	]) {
 		it(`recognises: ${msg}`, async () => {
 			const client = new ReplyRejectingClient(msg);
@@ -283,6 +282,18 @@ describe("sendMessageIMessage — threaded-reply fallback", () => {
 			assert.equal(client.attempts.length, 2);
 		});
 	}
+
+	it("does NOT retry an unrelated bridge-transport refusal", async () => {
+		// The shipped imsg binary contains `send.tracked requires bridge
+		// transport` — a different RPC's capability error. Matching it would
+		// re-send a message the bridge deliberately refused.
+		const client = new ReplyRejectingClient("send.tracked requires bridge transport");
+		await assert.rejects(
+			() => sendMessageIMessage("+15551234567", "hi", { client, replyToId: "p:1" }),
+			/send\.tracked/,
+		);
+		assert.equal(client.attempts.length, 1, "failed once, did not retry");
+	});
 
 	it("does not retry when there was no reply_to to drop", async () => {
 		const client = new ReplyRejectingClient("reply_to requires bridge transport");

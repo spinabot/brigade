@@ -87,6 +87,7 @@ import {
 	abandonedByRewind,
 	filesTouchedAfter,
 	findOrphanedCompaction,
+	pathToRoot,
 	rewindTargets,
 	type RewindEntry,
 } from "../sessions/rewind.js";
@@ -175,7 +176,7 @@ import { onConfigCachePrimed } from "../storage/config-cache.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { UsageLedger } from "../agents/usage/ledger.js";
-import { sessionStatsFromMessages } from "../agents/usage/transcript-stats.js";
+import { persistSessionUsage, readPersistedSessionUsage } from "../agents/usage/persist.js";
 import { ReasoningTracker } from "../agents/reasoning/reasoning-state.js";
 import { resolveAgentIdFromSessionKey } from "../agents/routing/session-key.js";
 import { initialReasoningVisibility, refineReasoningVisibility } from "../agents/reasoning/visibility.js";
@@ -458,7 +459,7 @@ async function readSessionTranscriptEntries(sessionKey: string): Promise<RewindE
 			id?: unknown;
 			parentId?: unknown;
 			type?: unknown;
-			message?: { role?: unknown; content?: unknown; timestamp?: unknown };
+			message?: { role?: unknown; content?: unknown; timestamp?: unknown; usage?: unknown };
 		};
 		if (typeof row?.id !== "string") return undefined;
 		return {
@@ -470,6 +471,11 @@ async function readSessionTranscriptEntries(sessionKey: string): Promise<RewindE
 			...(typeof row.message?.timestamp === "number"
 				? { timestamp: row.message.timestamp }
 				: {}),
+			// Carried so usage can be folded along the ACTIVE BRANCH. Rewind is
+			// non-destructive, so the file keeps abandoned entries; summing the
+			// whole file would price a thread by work its own model can no longer
+			// see.
+			...(row.message?.usage !== undefined ? { usage: row.message.usage } : {}),
 		};
 	};
 
@@ -3057,6 +3063,21 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// strand the header on "thinking…" indefinitely.
 				reasoningTracker.end(agentIdForTurn, sessionKeyForTurn);
 				usageLedger.commitTurn(agentIdForTurn, sessionKeyForTurn, (piEvent as any).message?.usage);
+				// PERSIST WHAT WE JUST DISPLAYED.
+				//
+				// The ledger is in-memory and a restart zeroes it, which left a
+				// reconnecting client reporting `0 billed` until its next turn.
+				// Writing the ledger's own answer — rather than rebuilding it from
+				// the transcript later — keeps ONE definition of the number, and is
+				// the only way out-of-band spend (sub-agents, compaction, memory
+				// sweeps) and the `costComplete` floor marker survive at all; no
+				// transcript fold can recover either. See `agents/usage/persist.ts`.
+				persistSessionUsage(
+					agentIdForTurn,
+					sessionKeyForTurn,
+					usageLedger.displayTotals(agentIdForTurn, sessionKeyForTurn),
+					usageLedger.turnsFor(agentIdForTurn, sessionKeyForTurn),
+				);
 			}
 			// Keep the between-turns snapshot caches (message count, context
 			// usage %, thinking caps) tracking the live session.
@@ -4736,37 +4757,21 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					sessionKey: targetSessionKey,
 					limit: RESUME_TRANSCRIPT_MAX,
 				});
-				// REBUILD THIS SESSION'S SPEND BEFORE THE SNAPSHOT IS TAKEN.
+				// RESTORE THIS SESSION'S SPEND BEFORE THE SNAPSHOT IS TAKEN.
 				//
-				// `UsageLedger` is in-memory, so a gateway restart zeroes it. The
-				// ledger already knows how to recover — but the only caller of
-				// `seedFromStats` was the turn-attach path, which needs a LIVE
-				// session. So a client that reconnected and resumed a thread saw
-				// `0 billed` and no context percentage until it sent a message,
-				// and the header appeared to fill itself in only after the first
-				// turn. The numbers were not wrong; nothing had recovered them.
+				// The ledger is in-memory, so a restart zeroes it and a reconnecting
+				// client showed `0 billed` until its first turn. The totals are read
+				// back from what the ledger itself last wrote — see
+				// `agents/usage/persist.ts` for why this is NOT rebuilt from the
+				// transcript, which produces a second, disagreeing definition of the
+				// same number.
 				//
-				// Deliberately a SECOND, uncapped read rather than folding
-				// `messages` above: that slice is capped at RESUME_TRANSCRIPT_MAX,
-				// so folding it would undercount any longer thread — and because
-				// `seedFromStats` is idempotent, the undercount would then be
-				// permanent for the life of the process. A wrong number that
-				// cannot be corrected is worse than a missing one.
-				//
-				// Guarded by `hasSeeded` so the extra read happens at most once
-				// per session per gateway lifetime, not on every reconnect.
+				// Absent record → seed nothing. Marking a session seeded with zeros
+				// would suppress the turn-attach seed, which has the real history.
 				if (!usageLedger.hasSeeded(targetAgentId, targetSessionKey)) {
-					try {
-						const all = await readSessionTranscriptMessages({ sessionKey: targetSessionKey });
-						usageLedger.seedFromStats(
-							targetAgentId,
-							targetSessionKey,
-							sessionStatsFromMessages(all),
-						);
-					} catch {
-						// Bookkeeping must never fail a resume — a client that cannot
-						// resume loses its transcript, which is far worse than a header
-						// that starts at zero.
+					const persisted = readPersistedSessionUsage(targetAgentId, targetSessionKey);
+					if (persisted) {
+						usageLedger.seedFromPersisted(targetAgentId, targetSessionKey, persisted);
 					}
 				}
 				const headSeq = seqCounters.get(targetSessionKey) ?? 0;

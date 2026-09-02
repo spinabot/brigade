@@ -97,9 +97,28 @@ export function isThreadingUnsupported(err: unknown): boolean {
 	// first version required the literal `reply_to`, so a bridge that said only
 	// "threaded replies are unavailable" would have been treated as a real
 	// failure and lost the message — the exact bug being fixed.
-	return /reply_to requires bridge transport|cannot send threaded repl|threaded repl(?:y|ies)\b.*(?:unsupported|not supported|requires|unavailable)|requires bridge transport/iu.test(
-		m,
-	);
+	// MUST NAME THE REPLY/THREADING FEATURE, not just a transport requirement.
+	//
+	// OpenClaw's equivalent carries a bare `requires bridge transport`
+	// alternation, and the shipped `imsg` binary (0.14.2) contains a real,
+	// unrelated string that matches it:
+	//
+	//     send.tracked requires bridge transport
+	//
+	// That is a different RPC method than the `send` this file issues, so it is
+	// not reachable today — but a predicate one bridge release away from
+	// re-sending a message that was refused for an unrelated capability reason
+	// is not a predicate worth keeping. Requiring BOTH a reply/threading token
+	// and a refusal token keeps every intended case and drops that one.
+	//
+	// The cost of being wrong in the other direction is small: a bridge that
+	// refuses a threaded reply without naming it simply fails, as it did before
+	// this fallback existed. Not retrying is always safe; retrying a genuinely
+	// refused send is not.
+	const mentionsThreading = /reply_to|threaded repl/iu.test(m);
+	const mentionsRefusal =
+		/bridge transport|cannot send|unsupported|not supported|unavailable|requires/iu.test(m);
+	return mentionsThreading && mentionsRefusal;
 }
 
 export async function sendMessageIMessage(

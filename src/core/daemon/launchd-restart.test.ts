@@ -12,7 +12,7 @@
  */
 
 import { strict as assert } from "node:assert";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -20,16 +20,31 @@ import { afterEach, describe, it } from "node:test";
 import { launchdAdapter } from "./launchd.js";
 
 const realHome = process.env.HOME;
+// Track and remove the temp homes: the review flagged that this leaked one
+// mkdtemp directory per test, which is small but accumulates across CI runs.
+const madeDirs: string[] = [];
+function tempHome(): void {
+	const d = mkdtempSync(path.join(os.tmpdir(), "brigade-launchd-"));
+	madeDirs.push(d);
+	process.env.HOME = d;
+}
 afterEach(() => {
 	if (realHome === undefined) delete process.env.HOME;
 	else process.env.HOME = realHome;
+	while (madeDirs.length > 0) {
+		try {
+			rmSync(madeDirs.pop()!, { recursive: true, force: true });
+		} catch {
+			/* best-effort cleanup */
+		}
+	}
 });
 
 describe("launchd restart — reports the truth", () => {
 	it("fails, and says why, when no service is installed", async () => {
 		// A gateway started by hand in a terminal has no plist. That is the
 		// common case this reported success for.
-		process.env.HOME = mkdtempSync(path.join(os.tmpdir(), "brigade-launchd-"));
+		tempHome();
 		const res = await launchdAdapter().restart();
 		assert.equal(res.ok, false, "must not claim success when nothing was restarted");
 		assert.match(res.message, /nothing to restart/i);
@@ -38,7 +53,7 @@ describe("launchd restart — reports the truth", () => {
 	});
 
 	it("never returns the success message on that path", async () => {
-		process.env.HOME = mkdtempSync(path.join(os.tmpdir(), "brigade-launchd-"));
+		tempHome();
 		const res = await launchdAdapter().restart();
 		assert.doesNotMatch(res.message, /Brigade gateway restarted\./);
 	});

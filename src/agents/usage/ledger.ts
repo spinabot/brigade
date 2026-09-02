@@ -240,6 +240,54 @@ export class UsageLedger {
 		return this.entries.get(this.key(agentId, sessionKey))?.seeded === true;
 	}
 
+	/**
+	 * Seed from the ledger's OWN previously-persisted totals.
+	 *
+	 * Distinct from `seedFromStats` in one way that matters: this restores
+	 * `costComplete` as recorded rather than inferring it from `cost > 0`.
+	 * Inferring it turns a session that honestly rendered `≥$22.27` — because
+	 * most of its turns came back unpriced — into a confident `$22.27`, which is
+	 * precisely the "unmeasured reads as measured" failure this module exists to
+	 * refuse. Measured on a real transcript: 169 of 207 assistant turns unpriced.
+	 *
+	 * Idempotent for the same reason `seedFromStats` is: whichever seed lands
+	 * first wins, and a later one must not reset a bucket that live turns have
+	 * since moved on from.
+	 */
+	seedFromPersisted(
+		agentId: string,
+		sessionKey: string,
+		rec: {
+			input: number;
+			output: number;
+			cacheRead: number;
+			cacheWrite: number;
+			costUsd: number;
+			costComplete: boolean;
+			turns: number;
+		},
+	): void {
+		const e = this.touch(agentId, sessionKey);
+		if (e.seeded) return;
+		e.seeded = true;
+		e.committed = {
+			input: num(rec.input),
+			output: num(rec.output),
+			cacheRead: num(rec.cacheRead),
+			cacheWrite: num(rec.cacheWrite),
+			totalTokens:
+				num(rec.input) + num(rec.output) + num(rec.cacheRead) + num(rec.cacheWrite),
+			costUsd: num(rec.costUsd),
+			costComplete: rec.costComplete === true,
+		};
+		e.turns = num(rec.turns);
+	}
+
+	/** Turn count, for persisting alongside the totals. */
+	turnsFor(agentId: string, sessionKey: string): number {
+		return this.peek(agentId, sessionKey)?.turns ?? 0;
+	}
+
 	seedFromStats(
 		agentId: string,
 		sessionKey: string,
