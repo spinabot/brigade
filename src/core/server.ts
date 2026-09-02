@@ -282,6 +282,10 @@ import {
 	shouldRunConsolidation,
 } from "../agents/memory/consolidate.js";
 import { loadBrigadeAuthStorage } from "./auth-bridge.js";
+import {
+	type OAuthCapableRegistry,
+	registerOpencodeConsoleOnRegistry,
+} from "../providers/opencode-console.js";
 import { validateApiKeyOnline } from "../providers/validate-key.js";
 import { upsertApiKeyProfile } from "../auth/profiles.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig, saveConfig, type Config } from "./config.js";
@@ -586,6 +590,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 		// never see keys that onboarding produced.
 		const authStorage = loadBrigadeAuthStorage() as AuthStorage;
 		const modelRegistry = ModelRegistry.create(authStorage, resolveModelsPath(DEFAULT_AGENT_ID));
+		// This registry is long-lived and separate from the per-turn one in
+		// agent-loop: it resolves the boot model, both `/model` switches, and the
+		// isolated-LLM sweeps. Without this call an opencode-console oauth
+		// credential resolves to `undefined` on all of those paths — and Pi does not
+		// throw for a missing OAuth provider, it just sends no credential.
+		registerOpencodeConsoleOnRegistry(modelRegistry as unknown as OAuthCapableRegistry);
 
 		// F:\Brigade's brigade.json (post-2026-05-02 wizard refactor) stores
 		// the default model under `agents.defaults.{provider, model.primary}`.

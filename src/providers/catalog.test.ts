@@ -8,6 +8,10 @@ import {
 	readProviderEnvKey,
 	resolveProviderEnvVarSource,
 } from "./catalog.js";
+import {
+	OPENCODE_CONSOLE_ENV_VAR,
+	OPENCODE_CONSOLE_PROVIDER,
+} from "./opencode-console.js";
 
 // Snapshot + restore the env vars we mutate so tests can run in any order
 // without leaking state across tests OR back into the parent process.
@@ -200,10 +204,48 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 			"openai",
 			"openai-codex",
 			"opencode",
+			"opencode-console",
 			"opencode-go",
 			"openrouter",
 			"qwen",
 			"xai",
 		]);
+	});
+
+	it("every subscription entry's routing id IS its oauthProviderId", () => {
+		// `AuthStorage.getApiKey` resolves an oauth credential via
+		// `getOAuthProvider(providerId)`, where providerId is `providerId ?? id`. If
+		// these diverge the lookup returns undefined and the request goes out with no
+		// credential instead of failing — the one mistake this indirection invites.
+		for (const p of PROVIDERS) {
+			if (!p.subscription) continue;
+			assert.equal(
+				p.subscription.oauthProviderId,
+				p.providerId ?? p.id,
+				`provider "${p.id}": oauthProviderId must equal its routing id`,
+			);
+		}
+	});
+
+	it("the opencode-console entry matches the provider module's constants", () => {
+		// catalog.ts hardcodes these rather than importing the provider module, so
+		// this is what keeps the two copies honest.
+		const entry = findProvider("opencode-console")!;
+		assert.equal(entry.envVar, OPENCODE_CONSOLE_ENV_VAR);
+		assert.equal(entry.subscription?.oauthProviderId, OPENCODE_CONSOLE_PROVIDER);
+	});
+
+	it("the three OpenCode entries stay distinct: two API-key, one account login", () => {
+		// Zen and Go take a pasted OPENCODE_API_KEY; the console login is a different
+		// credential against different endpoints. Adding `subscription` to Zen or Go
+		// would hijack their key paste (onboarding checks it first), and offering a
+		// Zen key to the console entry would 401 on its first turn.
+		for (const id of ["opencode", "opencode-go"]) {
+			const entry = findProvider(id)!;
+			assert.equal(entry.subscription, undefined, `${id} must stay an API-key entry`);
+			assert.equal(entry.envVar, "OPENCODE_API_KEY");
+			assert.equal(entry.sharedKeyWith?.includes("opencode-console") ?? false, false);
+		}
+		assert.equal(findProvider("opencode-console")!.sharedKeyWith, undefined);
 	});
 });

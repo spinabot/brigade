@@ -290,7 +290,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		// with a models.json entry and drop the provider from `/provider`.
 		id: "opencode",
 		name: "OpenCode Zen",
-		description: "Claude, GPT, Gemini, Kimi, GLM from one key — plus free models",
+		description: "Paste a Zen API key — pay-as-you-go (Claude, GPT, Gemini, Kimi, GLM, plus free models)",
 		keyUrl: "https://opencode.ai/auth",
 		envVar: "OPENCODE_API_KEY",
 		envVarFallbacks: ["OPENCODE_ZEN_API_KEY"],
@@ -301,11 +301,34 @@ export const PROVIDERS: ProviderInfo[] = [
 		// own entry because the routing id decides the base URL (/zen/go/v1).
 		id: "opencode-go",
 		name: "OpenCode Go",
-		description: "OpenCode's separately-subscribed coding lineup (Kimi, GLM, MiniMax, Qwen)",
+		description: "Paste a Go API key — separate Go plan (Kimi, GLM, MiniMax, Qwen)",
 		keyUrl: "https://opencode.ai/auth",
 		envVar: "OPENCODE_API_KEY",
 		envVarFallbacks: ["OPENCODE_ZEN_API_KEY"],
 		sharedKeyWith: ["opencode"],
+	},
+	{
+		// A DIFFERENT credential and different endpoints from the two entries above,
+		// not a second way into Zen: an account login serves inference from
+		// `/inference/{openai,anthropic,google}/…`, which Pi ships no catalog for, so
+		// the models are discovered from the console at login and written to
+		// models.json. Its own entry because onboarding routes `subscription` BEFORE
+		// the api-key branch — adding it to the Zen entry would hijack the key paste.
+		// One login covers every model, so the Zen-vs-Go split does not apply here.
+		id: "opencode-console",
+		name: "OpenCode (login)",
+		description: "No key to paste — sign in to your OpenCode account; covers every model",
+		keyUrl: "https://opencode.ai/console",
+		// Literals rather than imports: this file is imported by nearly everything
+		// and depends on nothing. `catalog.test.ts` pins them to the real constants.
+		envVar: "OPENCODE_CONSOLE_TOKEN",
+		liveModels: true, // catalog fetched from /console/api/config at login
+		api: "openai-completions",
+		baseUrl: "https://opencode.ai/inference/openai/v1",
+		subscription: {
+			oauthProviderId: "opencode-console",
+			label: "Log in with your OpenCode account",
+		},
 	},
 	{
 		id: "ollama",

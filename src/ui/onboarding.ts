@@ -51,6 +51,12 @@ import {
 	routesToCustomProvider,
 	type ProviderInfo,
 } from "../providers/catalog.js";
+import {
+	buildModelsJsonEntry,
+	ensureOpencodeConsoleOAuthRegistered,
+	OPENCODE_CONSOLE_PROVIDER,
+	takeOpencodeConsoleCatalog,
+} from "../providers/opencode-console.js";
 import { validateApiKeyOnline } from "../providers/validate-key.js";
 import { loaderIndicator } from "./animations.js";
 import { renderBrandHeader } from "./brand.js";
@@ -1048,6 +1054,10 @@ export async function ensureSubscriptionLogin(
 	provider: ProviderInfo,
 ): Promise<"ok" | "back"> {
 	const sub = provider.subscription!;
+	// Brigade-supplied OAuth providers aren't Pi built-ins, and
+	// `ModelRegistry.refresh()` drops them — so re-assert before the lookup below,
+	// or the wizard reports "sign-in isn't supported yet".
+	ensureOpencodeConsoleOAuthRegistered();
 	const oauthProvider = getOAuthProvider(sub.oauthProviderId);
 	if (!oauthProvider) {
 		// Pi build doesn't know this provider — fail cleanly back to the picker
@@ -1220,12 +1230,18 @@ export async function ensureSubscriptionLogin(
 		// Resolve to the real Pi provider for storage — e.g. the "claude-code"
 		// entry stores its OAuth credential under "anthropic".
 		const providerId = provider.providerId ?? provider.id;
+		// OpenCode Console rides its discovered catalog out on the credential. Split
+		// it off before anything persists — it belongs in models.json, and 60+ models
+		// in the profile would be spread into the live Pi credential every turn by
+		// `subscriptionProfileToCredential`. A no-op for other providers.
+		const { credentials: storedCreds, catalog: discoveredCatalog } =
+			takeOpencodeConsoleCatalog(creds);
 		// Preserve provider-specific extras the login returned — notably GitHub
 		// Copilot's `availableModelIds` (the exact models THIS account's plan
 		// enabled), which Pi's `modifyModels` uses to filter the model menu. Hand
 		// the whole credential to Pi's in-memory store and stash the extras in the
 		// profile metadata so they survive a reboot.
-		const { access, refresh, expires, ...extras } = creds;
+		const { access, refresh, expires, ...extras } = storedCreds;
 		upsertOAuthProfile(DEFAULT_AGENT_ID, {
 			provider: providerId,
 			access,
@@ -1233,8 +1249,26 @@ export async function ensureSubscriptionLogin(
 			expires,
 			metadata: Object.keys(extras).length > 0 ? extras : undefined,
 		});
-		authStorage.set(providerId, { type: "oauth", ...creds });
+		authStorage.set(providerId, { type: "oauth", ...storedCreds });
 		authStorage.reload();
+
+		// Pi ships no catalog for OpenCode's account-login endpoints, so without this
+		// write the credential is stored and no model can use it. A failure here is
+		// not a failed login — the credential is already durable — so warn and carry
+		// on rather than sending the operator back to the picker.
+		if (discoveredCatalog && providerId === OPENCODE_CONSOLE_PROVIDER) {
+			try {
+				await writeCustomProviderToModelsJson(
+					resolveModelsPath(DEFAULT_AGENT_ID),
+					buildModelsJsonEntry(discoveredCatalog),
+				);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				tui.addChild(
+					new Text(`  ${brand.error("!")} ${brand.dim(`Couldn't save the model list: ${detail}`)}`, 0, 0),
+				);
+			}
+		}
 
 		// Warm the live model cache with THIS account's current models so the
 		// model picker (next step) shows exactly what the subscription enables,
