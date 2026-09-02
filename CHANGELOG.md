@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.37.0](https://github.com/spinabot/brigade/compare/brigade-v1.36.1...brigade-v1.37.0) (2026-09-02)
+
+
+### Features
+
+* **connect:** /clear takes a name and gains its /reset alias ([26b2e8b](https://github.com/spinabot/brigade/commit/26b2e8be434eeafe0edcee112499b3157d3a840c))
+* **connect:** add /clear, and stop mailing mistyped commands to the model ([3f94970](https://github.com/spinabot/brigade/commit/3f94970580aeef8e82432288606458026ee99311))
+* **usage:** surface where the spend actually went ([a09b9b9](https://github.com/spinabot/brigade/commit/a09b9b9680897c35a73d19ac0be9e9299a7f01f5))
+
+
+### Bug Fixes
+
+* **cron:** scheduled runs were never metered ([46b7298](https://github.com/spinabot/brigade/commit/46b7298cff4632b2c6493b8808d239e7b1900042))
+* **gateway:** a resumed session reported zero spend until its first turn ([1261319](https://github.com/spinabot/brigade/commit/1261319dc93a5adb32d22119295a5383ad21d7ac))
+* **gateway:** one session's context usage was painted onto every other session ([fb3e80a](https://github.com/spinabot/brigade/commit/fb3e80a59c8b3dec801c834c409e0c6cffd1ab93))
+* **gateway:** reaped sessions left their in-memory rows behind, and a bill could land on the wrong agent ([d966f13](https://github.com/spinabot/brigade/commit/d966f13929270c895b185a667bee9371b6980db3))
+* **gateway:** subscribe handed out another agent's spend with no access check ([16ea43f](https://github.com/spinabot/brigade/commit/16ea43ff491c0b9cb620d06c73512176a60c1a1d))
+* iMessage replies were lost, spend was wrong or invisible, and one session's context painted another's ([d6c4558](https://github.com/spinabot/brigade/commit/d6c455865d3bc558db70bf6dba7a6fe8df3ceb79))
+* **usage:** persist session spend instead of rebuilding it from the transcript ([63315dd](https://github.com/spinabot/brigade/commit/63315dd92901335cee0663526fd9b82c09633cbf))
+
 ## [1.36.1](https://github.com/spinabot/brigade/compare/brigade-v1.36.0...brigade-v1.36.1) (2026-08-31)
 
 
