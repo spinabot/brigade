@@ -347,6 +347,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		// the credential alone makes them resolve. `custom` would shadow that catalog
 		// with a models.json entry and drop the provider from `/provider`.
 		id: "opencode",
+		billing: "metered",
 		name: "OpenCode Zen",
 		description: "Paste a Zen API key — pay-as-you-go (Claude, GPT, Gemini, Kimi, GLM, plus free models)",
 		keyUrl: "https://opencode.ai/auth",
@@ -358,6 +359,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		// Same credential as `opencode`, separate catalog and separate paid plan. Its
 		// own entry because the routing id decides the base URL (/zen/go/v1).
 		id: "opencode-go",
+		billing: "metered",
 		name: "OpenCode Go",
 		description: "Paste a Go API key — separate Go plan (Kimi, GLM, MiniMax, Qwen)",
 		keyUrl: "https://opencode.ai/auth",
@@ -374,6 +376,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		// the api-key branch — adding it to the Zen entry would hijack the key paste.
 		// One login covers every model, so the Zen-vs-Go split does not apply here.
 		id: "opencode-console",
+		billing: "metered",
 		name: "OpenCode (login)",
 		description: "No key to paste — sign in to your OpenCode account; covers every model",
 		keyUrl: "https://opencode.ai/console",
