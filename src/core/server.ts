@@ -5234,6 +5234,51 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					};
 				try {
 					if (reqFrame.method === "subscribe") {
+						// GUARD THE SUBSCRIPTION, NOT JUST THE READS.
+						//
+						// `resume`, `sessions.list`, `sessions.history` and
+						// `sessions.rewind` all run the sessions access check; this
+						// surface did not — and it is strictly more powerful than a
+						// read. It takes an arbitrary agentId/sessionId off the wire,
+						// registers the connection for that session's FUTURE frames,
+						// and immediately pushes a snapshot carrying its spend, cost,
+						// billing mode, pinned provider/model and agent name. With
+						// `visibility: "self"` and A2A disabled, `resume` on another
+						// agent refused while this handed back the same data.
+						//
+						// The target is built explicitly rather than via
+						// `extractSessionTargetFromParams`, which reads `sessionKey`
+						// and `agentId` but not this method's `sessionId` — so the
+						// generic helper would have guarded the agent-wide case and
+						// silently missed the session-specific one.
+						const subTarget =
+							typeof p.sessionId === "string" && p.sessionId.trim().length > 0
+								? p.sessionId.trim()
+								: typeof p.agentId === "string" && p.agentId.trim().length > 0
+									? defaultSessionKey(p.agentId.trim())
+									: undefined;
+						if (subTarget) {
+							const verdict = sessionsAccessCheck({
+								action: "list",
+								targetSessionKey: subTarget,
+							});
+							if (!verdict.allowed) {
+								const denied: Frame = {
+									type: "res",
+									id: reqFrame.id,
+									ok: false,
+									error: { code: "forbidden", message: verdict.reason ?? "forbidden" },
+								};
+								if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(denied));
+								opts.consoleStream?.wsResponse(
+									reqFrame.method,
+									reqFrame.id,
+									false,
+									Date.now() - startedAt,
+								);
+								return;
+							}
+						}
 						if (p.agentId) subscribeAgent(connId, p.agentId.trim());
 						if (p.sessionId) subscribeSession(connId, p.sessionId.trim());
 						// Full frames are the default; `deltas: true` opts a client IN
