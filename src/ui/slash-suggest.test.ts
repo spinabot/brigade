@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { nearestSlashCommand } from "./slash-suggest.js";
+import { isUnknownCommandAttempt, nearestSlashCommand } from "./slash-suggest.js";
 
 // A representative slice of the real registry, including the deliberately
 // confusable neighbours (`session`/`sessions`, `search`/`switch`).
@@ -60,5 +60,43 @@ describe("nearestSlashCommand", () => {
 		assert.equal(nearestSlashCommand("nwe", CMDS), "new");
 		// Two edits on a 4-letter word must stay out of budget.
 		assert.equal(nearestSlashCommand("hxxp", CMDS), undefined);
+	});
+});
+
+// The guard decides between "unknown command" and "send this to the model".
+// It must be conservative in ONE direction: refusing real input is far worse
+// than forwarding a typo, because the operator loses what they typed.
+describe("isUnknownCommandAttempt", () => {
+	const known = (w: string) => CMDS.includes(w);
+
+	it("refuses a plausible command word that is not registered", () => {
+		assert.equal(isUnknownCommandAttempt("/hlep", known), true);
+		assert.equal(isUnknownCommandAttempt("/deploy", known), true);
+		assert.equal(isUnknownCommandAttempt("/hlep me please", known), true);
+	});
+
+	it("lets registered commands through untouched", () => {
+		assert.equal(isUnknownCommandAttempt("/help", known), false);
+		assert.equal(isUnknownCommandAttempt("/model gpt-5", known), false);
+		assert.equal(isUnknownCommandAttempt("/CLEAR", known), false);
+	});
+
+	it("never eats a path", () => {
+		// The single most likely false positive: someone pasting a path.
+		assert.equal(isUnknownCommandAttempt("/usr/local/bin", known), false);
+		assert.equal(isUnknownCommandAttempt("/etc/hosts is the file", known), false);
+		assert.equal(isUnknownCommandAttempt("/Users/me/dev", known), false);
+	});
+
+	it("never eats a regex or a date", () => {
+		assert.equal(isUnknownCommandAttempt("/^foo$/", known), false);
+		assert.equal(isUnknownCommandAttempt("/2026/09/01", known), false);
+	});
+
+	it("never eats a bare slash or ordinary prose", () => {
+		assert.equal(isUnknownCommandAttempt("/", known), false);
+		assert.equal(isUnknownCommandAttempt("and/or", known), false);
+		assert.equal(isUnknownCommandAttempt("what is 6/2?", known), false);
+		assert.equal(isUnknownCommandAttempt("", known), false);
 	});
 });

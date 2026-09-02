@@ -30,7 +30,7 @@ import * as os from "node:os";
 
 import { resolveStateDir } from "../../config/paths.js";
 import { exportFileName, renderTranscriptMarkdown } from "../../ui/transcript-export.js";
-import { nearestSlashCommand } from "../../ui/slash-suggest.js";
+import { isUnknownCommandAttempt, nearestSlashCommand } from "../../ui/slash-suggest.js";
 import { searchTranscript } from "../../ui/transcript-search.js";
 import { describeRedactions, redactForExport } from "../../ui/transcript-redact.js";
 
@@ -6216,7 +6216,7 @@ export async function wireConnectUi(
 		// reach the model. Only a plausible command word is refused, and the
 		// refusal names the closest registered command so a near-miss is one
 		// keystroke from correct.
-		if (/^\/[a-z]/i.test(trimmed) && !isKnownSlashCommand(trimmed)) {
+		if (isUnknownCommandAttempt(trimmed, (w) => isKnownSlashCommand(`/${w}`))) {
 			const word = trimmed.slice(1).split(/\s/, 1)[0]?.toLowerCase() ?? "";
 			const suggestion = nearestSlashCommand(word, SLASH_COMMANDS.map((c) => c.name));
 			editor.setText("");

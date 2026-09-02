@@ -102,3 +102,32 @@ export function nearestSlashCommand(
 	}
 	return bestScore <= budget ? best : undefined;
 }
+
+/**
+ * Is this input a COMMAND ATTEMPT that no handler claimed — as opposed to
+ * ordinary text that merely begins with a slash?
+ *
+ * The distinction decides whether the operator gets "unknown command" or the
+ * model gets a prompt, so it has to be conservative in one specific direction:
+ * refusing real input is far worse than forwarding a typo. A path, a regex, a
+ * date, or a bare slash all reach the model unchanged; only something shaped
+ * like a command word is refused.
+ *
+ * `known` answers whether a word is a registered command; it is passed in
+ * rather than imported so this stays a pure function the TUI's real registry
+ * can be tested against.
+ */
+export function isUnknownCommandAttempt(
+	text: string,
+	known: (word: string) => boolean,
+): boolean {
+	const t = text.trim();
+	// A command word starts with a letter. `/`, `/2026`, `/…` do not.
+	if (!/^\/[a-z]/i.test(t)) return false;
+	const word = t.slice(1).split(/\s/, 1)[0] ?? "";
+	// A path (`/usr/local/bin`) or a regex (`/^foo$/`) carries more structure
+	// than a command word. Anything with a second slash or a non-word character
+	// in the first token is text, not a command.
+	if (!/^[a-z][a-z0-9-]*$/i.test(word)) return false;
+	return !known(word.toLowerCase());
+}
