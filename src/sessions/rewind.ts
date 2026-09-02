@@ -49,6 +49,13 @@ export interface RewindEntry {
 	role?: string;
 	/** Message content, for showing the operator what they are rewinding to. */
 	content?: unknown;
+	/**
+	 * Per-message usage, when the transcript recorded it. Present so a caller
+	 * can total a session's spend along the ACTIVE branch — the same path this
+	 * module already computes — rather than over the whole file, which still
+	 * holds every abandoned branch by design.
+	 */
+	usage?: unknown;
 	timestamp?: number;
 }
 

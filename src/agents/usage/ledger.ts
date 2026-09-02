@@ -228,6 +228,66 @@ export class UsageLedger {
 	 * Idempotent: only the FIRST seed applies, so re-attaching a live session
 	 * cannot double its history.
 	 */
+	/**
+	 * Whether this session's history has already been folded in.
+	 *
+	 * Exposed so a caller can skip the READ that produces the stats, not just
+	 * the seed. Rebuilding totals means walking a whole transcript, and on a
+	 * busy gateway `resume` is called often enough that doing it per reconnect
+	 * would be a real cost for an answer that cannot change.
+	 */
+	hasSeeded(agentId: string, sessionKey: string): boolean {
+		return this.entries.get(this.key(agentId, sessionKey))?.seeded === true;
+	}
+
+	/**
+	 * Seed from the ledger's OWN previously-persisted totals.
+	 *
+	 * Distinct from `seedFromStats` in one way that matters: this restores
+	 * `costComplete` as recorded rather than inferring it from `cost > 0`.
+	 * Inferring it turns a session that honestly rendered `≥$22.27` — because
+	 * most of its turns came back unpriced — into a confident `$22.27`, which is
+	 * precisely the "unmeasured reads as measured" failure this module exists to
+	 * refuse. Measured on a real transcript: 169 of 207 assistant turns unpriced.
+	 *
+	 * Idempotent for the same reason `seedFromStats` is: whichever seed lands
+	 * first wins, and a later one must not reset a bucket that live turns have
+	 * since moved on from.
+	 */
+	seedFromPersisted(
+		agentId: string,
+		sessionKey: string,
+		rec: {
+			input: number;
+			output: number;
+			cacheRead: number;
+			cacheWrite: number;
+			costUsd: number;
+			costComplete: boolean;
+			turns: number;
+		},
+	): void {
+		const e = this.touch(agentId, sessionKey);
+		if (e.seeded) return;
+		e.seeded = true;
+		e.committed = {
+			input: num(rec.input),
+			output: num(rec.output),
+			cacheRead: num(rec.cacheRead),
+			cacheWrite: num(rec.cacheWrite),
+			totalTokens:
+				num(rec.input) + num(rec.output) + num(rec.cacheRead) + num(rec.cacheWrite),
+			costUsd: num(rec.costUsd),
+			costComplete: rec.costComplete === true,
+		};
+		e.turns = num(rec.turns);
+	}
+
+	/** Turn count, for persisting alongside the totals. */
+	turnsFor(agentId: string, sessionKey: string): number {
+		return this.peek(agentId, sessionKey)?.turns ?? 0;
+	}
+
 	seedFromStats(
 		agentId: string,
 		sessionKey: string,
@@ -319,6 +379,41 @@ export class UsageLedger {
 		const e = this.peek(agentId, sessionKey);
 		if (!e) return emptyTotals();
 		return addTotals(addTotals(e.committed, e.inFlight ?? emptyTotals()), e.outOfBand);
+	}
+
+	/**
+	 * Where a session's spend actually went.
+	 *
+	 * `outOfBandByKind` has been populated since it was introduced and read by
+	 * nothing, so the question its own doc comment poses — "where did the spend
+	 * go" — had no answer on any surface. A turn that fanned out to sub-agents
+	 * and triggered a compaction showed one total with no way to see that most
+	 * of it was not the conversation itself.
+	 *
+	 * Only non-empty kinds are returned, so a plain session stays a plain
+	 * answer rather than four zeros.
+	 */
+	breakdown(
+		agentId: string,
+		sessionKey: string,
+	): { own: UsageTotals; byKind: Partial<Record<OutOfBandKind, UsageTotals>> } {
+		const e = this.peek(agentId, sessionKey);
+		if (!e) return { own: emptyTotals(), byKind: {} };
+		const byKind: Partial<Record<OutOfBandKind, UsageTotals>> = {};
+		for (const [kind, totals] of Object.entries(e.outOfBandByKind)) {
+			if (!totals) continue;
+			if (totals.totalTokens > 0 || totals.costUsd > 0) {
+				byKind[kind as OutOfBandKind] = totals;
+			}
+		}
+		// `own` is the session's own loop — committed plus anything in flight —
+		// so `own` + the kinds always reconciles to `displayTotals`.
+		return { own: addTotals(e.committed, e.inFlight ?? emptyTotals()), byKind };
+	}
+
+	/** The LRU bound, so a caller can say whether a rollup was truncated. */
+	capacity(): number {
+		return this.maxSessions;
 	}
 
 	/** Every session this agent has a ledger for. */

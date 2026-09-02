@@ -30,6 +30,7 @@ import * as os from "node:os";
 
 import { resolveStateDir } from "../../config/paths.js";
 import { exportFileName, renderTranscriptMarkdown } from "../../ui/transcript-export.js";
+import { isUnknownCommandAttempt, nearestSlashCommand } from "../../ui/slash-suggest.js";
 import { searchTranscript } from "../../ui/transcript-search.js";
 import { describeRedactions, redactForExport } from "../../ui/transcript-redact.js";
 
@@ -96,6 +97,7 @@ import type {
 	PromptAttachment,
 	SessionDeleteResult,
 	SessionRenameResult,
+	UsageSummaryResult,
 	SessionRewindResult,
 	SessionStateSnapshot,
 	SessionSummary,
@@ -1296,6 +1298,12 @@ export async function wireConnectUi(
 	// ─────────────────────────────────────────────────────────────────────────
 	const SLASH_COMMANDS: SlashCommand[] = [
 		{ name: "help", description: "show all slash commands" },
+		{
+			name: "clear",
+			description: "start a fresh thread with empty context; a name labels the one you leave",
+			argumentHint: "[<name for the previous thread>]",
+		},
+		{ name: "reset", description: "start a fresh thread with empty context (same as /clear)" },
 		{ name: "switch", description: "switch the TUI to another session", argumentHint: "<session-key>" },
 		{ name: "cancel", description: "cancel the pending prompt (provider key entry)" },
 		{ name: "clip", description: "copy the last reply to your clipboard (alias of /clipboard)" },
@@ -3880,15 +3888,14 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
 						`- ${chalk.bold("/copy [code]")} — copy the last reply (or just its code block)\n` +
 						`- ${chalk.bold("/expand [n]")} — show a truncated tool result in full (1 = most recent)\n` +
-						`- ${chalk.bold("/search <query>")} — search this conversation, including tool results\n` +
-						`- ${chalk.bold("/search --regex <pattern>")} — same, treating the query as a regular expression\n` +
+						`- ${chalk.bold("/search [--regex] [--case] <query>")} — search this conversation, including tool results\n` +
 						`- ${chalk.bold("/export [full] [thinking]")} — write this transcript to a Markdown file (secrets redacted; \`full\` keeps whole tool results, \`thinking\` includes the model's reasoning)\n` +
 						`- ${chalk.bold("/rewind [n]")} — go back to one of your earlier messages (no arg = list; conversation only, never files)\n` +
 						`- ${chalk.bold("/flush")} — send everything you queued to the running turn right now\n` +
 						`- ${chalk.bold("/context")} — where this thread's context window is going\n` +
 						`- ${chalk.bold("/steer <text>")} — redirect the running turn (or just type mid-turn)\n` +
 						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's reasoning, or press ctrl+t (default: on, remembered)\n` +
-						`- ${chalk.bold("/new")} — start a fresh thread (new session, clean screen, no prior context)\n` +
+						`- ${chalk.bold("/new")}, ${chalk.bold("/clear [name]")} or ${chalk.bold("/reset")} — start a fresh thread (new session, clean screen, no prior context); a name labels the thread you leave so /sessions can find it\n` +
 						`- ${chalk.bold("/agent [<id>]")} — show/bind the connection's active agent\n` +
 						`- ${chalk.bold("/session [<key>]")} — show/bind the connection's active session\n` +
 						`- ${chalk.bold("/agents")} — list every agent the gateway knows about\n` +
@@ -3929,8 +3936,69 @@ export async function wireConnectUi(
 		// `/new` is how you deliberately start over — the same affordance as the
 		// "new chat" button in Claude.ai / ChatGPT. `/sessions` lists threads,
 		// `/session <key>` jumps back to one.
-		if (trimmed === "/new") {
+		// `/clear` IS `/new`, DELIBERATELY.
+		//
+		// Every harness an operator arrives from has `/clear`, so the muscle
+		// memory is universal — and until now typing it here sent the literal
+		// text "/clear" to the model as a prompt.
+		//
+		// It is an ALIAS rather than a distinct "wipe this thread in place"
+		// because Brigade's transcript is an append-only TREE and this codebase's
+		// stated rule (see `sessions/rewind.ts`) is never to destroy, only to
+		// branch. Clearing a thread's history in place would mean either severing
+		// the tree — precisely the orphaned-parent bug rewind.ts exists to guard
+		// against — or driving Pi's untyped `branch()` at a non-message entry.
+		// `/new` already gives a genuinely empty context, keeps every earlier
+		// thread listed by `/sessions`, and cannot lose anything. That is what
+		// `/clear` should mean here.
+		if (
+			trimmed === "/new" ||
+			trimmed === "/clear" ||
+			trimmed.startsWith("/clear ") ||
+			trimmed === "/reset"
+		) {
 			editor.setText("");
+			// `/clear <name>` LABELS THE THREAD BEING LEFT, not the new one.
+			//
+			// Straight from the reference behaviour: "Pass a name to label the
+			// PREVIOUS conversation in the /resume picker." The point is that the
+			// thread you are walking away from is the one that becomes hard to find
+			// later — the new one is right in front of you. Brigade's equivalent of
+			// that picker is `/sessions`, and `sessions.rename` is what puts a name
+			// in it, so this is the same gesture wired to the same machinery.
+			//
+			// Done BEFORE the switch, while `boundSessionKey` still points at the
+			// outgoing thread. Failure is reported and does not block the clear:
+			// being unable to label the old thread is no reason to refuse the new
+			// one.
+			const clearLabel = trimmed.startsWith("/clear ")
+				? (sanitizeSessionName(trimmed.slice("/clear ".length)) ?? "")
+				: "";
+			if (clearLabel) {
+				const outgoingKey = boundSessionKey ?? lastSnapshot?.sessionKey;
+				if (outgoingKey) {
+					try {
+						const res = (await client.request("sessions.rename", {
+							sessionKey: outgoingKey,
+							name: clearLabel,
+						})) as SessionRenameResult;
+						insertBeforeEditor(
+							new Text(
+								res?.ok
+									? `  ${brand.amber("✓")} ${brand.dim("previous thread labelled")} ${brand.amber(clearLabel)}`
+									: `  ${brand.error("✗")} ${brand.dim("could not label the previous thread")}`,
+								0,
+								0,
+							),
+						);
+					} catch (err) {
+						const msg = err instanceof Error ? err.message : String(err);
+						insertBeforeEditor(
+							new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0),
+						);
+					}
+				}
+			}
 			const agentForNew = boundAgentId ?? lastSnapshot?.agentId ?? "main";
 			const freshKey = `agent:${agentForNew}:t-${randomUUID().slice(0, 8)}`;
 			boundSessionKey = freshKey;
@@ -4940,16 +5008,54 @@ export async function wireConnectUi(
 		// achievable and, for "what was that path", the more useful answer.
 		if (trimmed === "/search" || trimmed.startsWith("/search ")) {
 			editor.setText("");
-			const q = trimmed === "/search" ? "" : trimmed.slice("/search ".length).trim();
+			// PARSE THE FLAGS THE HELP TEXT ADVERTISES.
+			//
+			// `searchTranscript` has supported `regex` and `caseSensitive` since it
+			// was written, `/help` documents `--regex`, and this passed the whole
+			// tail through as the literal QUERY — so `/search --regex \bfoo\b`
+			// searched for the string "--regex \bfoo\b" and reported "no matches",
+			// which is a silent false negative on a documented flag.
+			const rawArgs = trimmed === "/search" ? "" : trimmed.slice("/search ".length).trim();
+			const searchOpts: { regex?: boolean; caseSensitive?: boolean } = {};
+			let q = rawArgs;
+			// Flags only at the FRONT, so a query containing "--regex" later on is
+			// still searchable verbatim.
+			for (;;) {
+				if (q.startsWith("--regex ") || q === "--regex") {
+					searchOpts.regex = true;
+					q = q.slice("--regex".length).trim();
+					continue;
+				}
+				if (q.startsWith("--case ") || q === "--case") {
+					searchOpts.caseSensitive = true;
+					q = q.slice("--case".length).trim();
+					continue;
+				}
+				break;
+			}
 			if (!q) {
-				insertBeforeEditor(new Text(`  ${brand.dim("usage: /search <text>")}`, 0, 0));
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("usage: /search [--regex] [--case] <text>")}`, 0, 0),
+				);
 				tui.requestRender();
 				return;
 			}
 			try {
 				const snap = await client.resume(withBinding());
 				const messages = (snap?.messages ?? []) as WireMessage[];
-				const { hits, truncated } = searchTranscript(messages, q);
+				const { hits, truncated, usedRegex } = searchTranscript(messages, q, searchOpts);
+				// An invalid pattern falls back to a literal search rather than
+				// throwing — say so, or the operator reads the literal result as a
+				// regex result and concludes their pattern matched nothing.
+				if (searchOpts.regex && !usedRegex) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.dim("that isn't a valid regular expression — searched for it literally instead")}`,
+							0,
+							0,
+						),
+					);
+				}
 				// A search that silently sees only a window is a false negative
 				// dressed as an answer, so the scope is always stated.
 				const windowed = messages.length >= RESUME_TRANSCRIPT_WINDOW;
@@ -5314,6 +5420,59 @@ export async function wireConnectUi(
 						? `${Math.round(snap.contextUsagePercent)}%`
 						: "—";
 			const reasoningStrUsage = formatReasoningLine({ state: snap.reasoning });
+			// WHERE THE SPEND WENT, on demand.
+			//
+			// Fetched here rather than carried on the state snapshot: that snapshot
+			// goes out on every broadcast, many times a second while a reply
+			// streams, and this is a command run occasionally.
+			//
+			// It surfaces two things the header cannot. Within the thread, how much
+			// of the total was the conversation itself versus sub-agents,
+			// compaction and memory sweeps. Across the agent, what the OTHER
+			// threads cost — the only place cron runs and background maintenance
+			// are visible at all, since both bill to keys no list renders.
+			//
+			// Failure is silent by design: `/usage` already answered the main
+			// question from the snapshot, and losing the breakdown is not a reason
+			// to fail the command.
+			// A session key is long and mostly boilerplate (`agent:main:...`); the
+			// distinguishing tail is what an operator recognises.
+			const shortSessionLabel = (key: string): string => {
+				const tail = key.split(":").slice(2).join(":");
+				const label = tail || key;
+				return label.length > 28 ? `…${label.slice(-27)}` : label;
+			};
+			let usageBreakdownLines = "";
+			try {
+				const sum = (await client.request(
+					"usage.summary",
+					withBinding({}),
+				)) as UsageSummaryResult;
+				const money = (n: number): string => `$${n.toFixed(4)}`;
+				const approx = sum.costComplete ? "" : "≥";
+				const parts = sum.session.buckets
+					.filter((b) => b.costUsd > 0 || b.tokens > 0)
+					.map((b) => `${b.label} ${approx}${money(b.costUsd)}`);
+				if (parts.length > 0) {
+					// Only worth showing when something OTHER than the conversation
+					// spent money — on a plain thread this line would just restate the
+					// total under a second name.
+					usageBreakdownLines +=
+						`\n- ${chalk.bold("of which:")} ${brand.dim(`conversation ${approx}${money(sum.session.own.costUsd)} · ${parts.join(" · ")}`)}`;
+				}
+				const others = sum.agent.sessions.filter((r) => r.sessionKey !== sum.sessionKey);
+				if (others.length > 0) {
+					const top = others
+						.slice(0, 3)
+						.map((r) => `${shortSessionLabel(r.sessionKey)} ${money(r.costUsd)}`);
+					usageBreakdownLines +=
+						`\n- ${chalk.bold("agent:")}    ${money(sum.agent.total.costUsd)} across ${sum.agent.sessions.length} threads` +
+						(sum.agent.truncated ? brand.dim(" (recent threads only)") : "") +
+						`\n  ${brand.dim(`other threads: ${top.join(" · ")}${others.length > 3 ? " · …" : ""}`)}`;
+				}
+			} catch {
+				/* the breakdown is additive; /usage still answered the main question */
+			}
 			insertBeforeEditor(
 				new Markdown(
 					`${brand.dim("usage")}\n` +
@@ -5348,7 +5507,8 @@ export async function wireConnectUi(
 						`- ${chalk.bold("thinking:")} ${snap.thinkingLevel}` +
 						(snap.supportsThinking
 							? brand.dim(` (available: ${snap.availableThinkingLevels.join(", ")})`)
-							: brand.dim(" (model doesn't support reasoning)")),
+							: brand.dim(" (model doesn't support reasoning)")) +
+						usageBreakdownLines,
 					1,
 					0,
 					markdownTheme,
@@ -6142,6 +6302,39 @@ export async function wireConnectUi(
 				const msg = err instanceof Error ? err.message : String(err);
 				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
 			}
+			return;
+		}
+
+		// A MISTYPED COMMAND IS NOT A PROMPT.
+		//
+		// Everything above this line has had its chance to claim the input, so
+		// anything still starting with `/` is a command this build does not have.
+		// It used to fall straight through to `sendTurn`, which mailed the
+		// literal text to the model: `/clear` asked the assistant to interpret
+		// the word "/clear", and a typo like `/hlep` became a turn that cost
+		// money and answered nothing. Worse, it is indistinguishable from the
+		// command having silently done nothing.
+		//
+		// Deliberately narrow so it cannot eat real input. A bare `/` is not a
+		// command attempt, and neither is anything whose first character after
+		// the slash is not a letter — `/usr/local/bin`, `/^regex$/`, a path
+		// pasted at the start of a message, or a date like `/2026` all still
+		// reach the model. Only a plausible command word is refused, and the
+		// refusal names the closest registered command so a near-miss is one
+		// keystroke from correct.
+		if (isUnknownCommandAttempt(trimmed, (w) => isKnownSlashCommand(`/${w}`))) {
+			const word = trimmed.slice(1).split(/\s/, 1)[0]?.toLowerCase() ?? "";
+			const suggestion = nearestSlashCommand(word, SLASH_COMMANDS.map((c) => c.name));
+			editor.setText("");
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.error("✗")} ${brand.dim("unknown command")} ${brand.error(`/${word}`)}` +
+						(suggestion ? ` ${brand.dim("— did you mean")} ${brand.amber(`/${suggestion}`)}${brand.dim("?")}` : "") +
+						` ${brand.dim("· /help lists them all")}`,
+					0,
+					0,
+				),
+			);
 			return;
 		}
 

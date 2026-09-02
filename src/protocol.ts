@@ -242,6 +242,7 @@ export type RequestMethod =
 	 * `lastUsedAt` — a rename must not reorder a recency-sorted history.
 	 */
 	| "sessions.rename"
+	| "usage.summary"
 	/**
 	 * Delete a session and its transcript. OPERATOR-ONLY — there is deliberately
 	 * no agent tool for this: deletion is irreversible and the sessions tool
@@ -346,6 +347,7 @@ export const REQUEST_METHODS = [
 	"agents.list",
 	"sessions.list",
 	"sessions.rename",
+	"usage.summary",
 	"sessions.delete",
 	"cron.status",
 	"cron.list",
@@ -995,6 +997,12 @@ export interface RequestParams {
 		/** The session to delete. The owning agent is derived from it. */
 		sessionKey: string;
 	};
+	"usage.summary": {
+		/** Agent to summarise. Defaults to the caller's binding. */
+		agentId?: string;
+		/** Session to break down. Defaults to the agent's default session. */
+		sessionKey?: string;
+	};
 	"sessions.rename": {
 		/** The session to rename. */
 		sessionKey: string;
@@ -1070,6 +1078,7 @@ export interface ResponseFor {
 	"agents.list": AgentSummary[];
 	"sessions.list": SessionSummary[];
 	"sessions.rename": SessionRenameResult;
+	"usage.summary": UsageSummaryResult;
 	"sessions.delete": SessionDeleteResult;
 	/* ─── Cron methods (Wave N6) ─────────────────────────────── */
 	"cron.status": CronStatusResultV2;
@@ -1477,6 +1486,51 @@ export interface SessionDeleteResult {
 	 * operator knows the bytes are still on disk.
 	 */
 	transcriptRemoved?: boolean;
+}
+
+/** One bucket of spend, as `usage.summary` reports it. */
+export interface UsageSummaryBucket {
+	label: string;
+	tokens: number;
+	costUsd: number;
+}
+
+/**
+ * Where an agent's spend went.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY THIS IS ITS OWN RPC
+ * ─────────────────────────────────────────────────────────────────────────
+ * The state snapshot goes out on EVERY broadcast, many times a second while a
+ * reply streams. `/usage` is a command an operator runs occasionally, so its
+ * detail belongs on an on-demand call rather than riding the hot path.
+ *
+ * It answers two questions the header cannot. Within a thread: how much of the
+ * total was the conversation itself versus sub-agents, compaction and memory
+ * sweeps — `outOfBandByKind` recorded that from the start and nothing ever read
+ * it. Across the agent: what the OTHER threads cost, which is the only place
+ * cron runs and background maintenance are visible at all, because both bill to
+ * keys (`cron:<job>:run:<uuid>`, `<agent>:__maintenance`) that no list renders.
+ */
+export interface UsageSummaryResult {
+	agentId: string;
+	sessionKey: string;
+	/** This session: its own loop, then each non-empty out-of-band kind. */
+	session: {
+		total: UsageSummaryBucket;
+		own: UsageSummaryBucket;
+		buckets: UsageSummaryBucket[];
+	};
+	/** Every session of this agent the gateway currently has a ledger for. */
+	agent: {
+		total: UsageSummaryBucket;
+		/** Sessions the agent has spent on, largest first. */
+		sessions: (UsageSummaryBucket & { sessionKey: string })[];
+		/** True when totals were bounded by the ledger's LRU rather than complete. */
+		truncated: boolean;
+	};
+	/** False when any contribution had an unknown cost, so a caller renders `≥`. */
+	costComplete: boolean;
 }
 
 export interface SessionRenameResult {
