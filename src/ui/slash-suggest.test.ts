@@ -7,7 +7,7 @@ import { isUnknownCommandAttempt, nearestSlashCommand } from "./slash-suggest.js
 // confusable neighbours (`session`/`sessions`, `search`/`switch`).
 const CMDS = [
 	"help", "exit", "quit", "abort", "copy", "expand", "steer", "flush", "new",
-	"clear", "switch", "cancel", "clip", "agent", "agents", "session", "sessions",
+	"clear", "reset", "switch", "cancel", "clip", "agent", "agents", "session", "sessions",
 	"rename", "delete", "mute", "org", "model", "provider", "thinking",
 	"reasoning", "compact", "export", "search", "rewind", "usage", "context",
 	"update",
@@ -98,5 +98,27 @@ describe("isUnknownCommandAttempt", () => {
 		assert.equal(isUnknownCommandAttempt("and/or", known), false);
 		assert.equal(isUnknownCommandAttempt("what is 6/2?", known), false);
 		assert.equal(isUnknownCommandAttempt("", known), false);
+	});
+});
+
+// `/clear`, `/new` and `/reset` are one command with three names, matching the
+// reference harness (its docs list `/reset` and `/new` as aliases of `/clear`).
+// A typo of any of them should land on a real one.
+describe("the clear/new/reset family", () => {
+	const known = (w: string) => CMDS.includes(w);
+
+	it("all three are registered, so none is refused as unknown", () => {
+		for (const c of ["clear", "new", "reset"]) {
+			assert.equal(isUnknownCommandAttempt(`/${c}`, known), false, `/${c} must be known`);
+		}
+	});
+
+	it("a typo of one lands on it", () => {
+		assert.equal(nearestSlashCommand("clera", CMDS), "clear");
+		assert.equal(nearestSlashCommand("rest", CMDS), "reset");
+	});
+
+	it("a name argument does not make it unknown", () => {
+		assert.equal(isUnknownCommandAttempt("/clear before the refactor", known), false);
 	});
 });

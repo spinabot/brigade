@@ -1297,7 +1297,12 @@ export async function wireConnectUi(
 	// ─────────────────────────────────────────────────────────────────────────
 	const SLASH_COMMANDS: SlashCommand[] = [
 		{ name: "help", description: "show all slash commands" },
-		{ name: "clear", description: "start a fresh thread with empty context (same as /new)" },
+		{
+			name: "clear",
+			description: "start a fresh thread with empty context; a name labels the one you leave",
+			argumentHint: "[<name for the previous thread>]",
+		},
+		{ name: "reset", description: "start a fresh thread with empty context (same as /clear)" },
 		{ name: "switch", description: "switch the TUI to another session", argumentHint: "<session-key>" },
 		{ name: "cancel", description: "cancel the pending prompt (provider key entry)" },
 		{ name: "clip", description: "copy the last reply to your clipboard (alias of /clipboard)" },
@@ -3889,7 +3894,7 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/context")} — where this thread's context window is going\n` +
 						`- ${chalk.bold("/steer <text>")} — redirect the running turn (or just type mid-turn)\n` +
 						`- ${chalk.bold("/reasoning <on|off>")} — show/hide the model's reasoning, or press ctrl+t (default: on, remembered)\n` +
-						`- ${chalk.bold("/new")} or ${chalk.bold("/clear")} — start a fresh thread (new session, clean screen, no prior context)\n` +
+						`- ${chalk.bold("/new")}, ${chalk.bold("/clear [name]")} or ${chalk.bold("/reset")} — start a fresh thread (new session, clean screen, no prior context); a name labels the thread you leave so /sessions can find it\n` +
 						`- ${chalk.bold("/agent [<id>]")} — show/bind the connection's active agent\n` +
 						`- ${chalk.bold("/session [<key>]")} — show/bind the connection's active session\n` +
 						`- ${chalk.bold("/agents")} — list every agent the gateway knows about\n` +
@@ -3945,8 +3950,54 @@ export async function wireConnectUi(
 		// `/new` already gives a genuinely empty context, keeps every earlier
 		// thread listed by `/sessions`, and cannot lose anything. That is what
 		// `/clear` should mean here.
-		if (trimmed === "/new" || trimmed === "/clear") {
+		if (
+			trimmed === "/new" ||
+			trimmed === "/clear" ||
+			trimmed.startsWith("/clear ") ||
+			trimmed === "/reset"
+		) {
 			editor.setText("");
+			// `/clear <name>` LABELS THE THREAD BEING LEFT, not the new one.
+			//
+			// Straight from the reference behaviour: "Pass a name to label the
+			// PREVIOUS conversation in the /resume picker." The point is that the
+			// thread you are walking away from is the one that becomes hard to find
+			// later — the new one is right in front of you. Brigade's equivalent of
+			// that picker is `/sessions`, and `sessions.rename` is what puts a name
+			// in it, so this is the same gesture wired to the same machinery.
+			//
+			// Done BEFORE the switch, while `boundSessionKey` still points at the
+			// outgoing thread. Failure is reported and does not block the clear:
+			// being unable to label the old thread is no reason to refuse the new
+			// one.
+			const clearLabel = trimmed.startsWith("/clear ")
+				? (sanitizeSessionName(trimmed.slice("/clear ".length)) ?? "")
+				: "";
+			if (clearLabel) {
+				const outgoingKey = boundSessionKey ?? lastSnapshot?.sessionKey;
+				if (outgoingKey) {
+					try {
+						const res = (await client.request("sessions.rename", {
+							sessionKey: outgoingKey,
+							name: clearLabel,
+						})) as SessionRenameResult;
+						insertBeforeEditor(
+							new Text(
+								res?.ok
+									? `  ${brand.amber("✓")} ${brand.dim("previous thread labelled")} ${brand.amber(clearLabel)}`
+									: `  ${brand.error("✗")} ${brand.dim("could not label the previous thread")}`,
+								0,
+								0,
+							),
+						);
+					} catch (err) {
+						const msg = err instanceof Error ? err.message : String(err);
+						insertBeforeEditor(
+							new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0),
+						);
+					}
+				}
+			}
 			const agentForNew = boundAgentId ?? lastSnapshot?.agentId ?? "main";
 			const freshKey = `agent:${agentForNew}:t-${randomUUID().slice(0, 8)}`;
 			boundSessionKey = freshKey;
