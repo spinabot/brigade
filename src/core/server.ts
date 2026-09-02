@@ -2654,9 +2654,31 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// stay undefined for now — the scheduler logs a warning and degrades
 	// gracefully (no system-event injection, no failure-alert delivery)
 	// until those subsystems land.
+	/**
+	 * Drop every per-session map the gateway holds.
+	 *
+	 * ONE definition, because the failure mode of having two is a map that gets
+	 * added to one list and not the other — a leak whose only symptom is slow
+	 * growth. `sessions.delete` and the cron/thread reaper both go through here.
+	 */
+	const forgetSessionState = (forgetAgentId: string, forgetSessionKey: string): void => {
+		usageLedger.forget(forgetAgentId, forgetSessionKey);
+		reasoningTracker.forget(forgetAgentId, forgetSessionKey);
+		frameRing.forget(forgetSessionKey);
+		sessionCaches.forget(forgetAgentId, forgetSessionKey);
+	};
+
 	const cronState = createCronServiceState({
 		deps: {
 			log: createSubsystemLogger("cron"),
+			// THE REAPER MUST CLEAN MEMORY TOO. It deletes the store entry and the
+			// transcript, but the ledger, reasoning tracker, frame ring and session
+			// caches are keyed by session and live here — so every reaped cron fire
+			// and idle thread used to leave its rows behind. That matters more now
+			// that cron runs are metered: an `isolated` job takes a fresh
+			// `cron:<id>:run:<uuid>` key on every fire, so the rows it leaves are
+			// unbounded in count and can never be read again.
+			forgetSessionState,
 			// METER CRON RUNS.
 			//
 			// Cron calls `runSingleTurn` directly rather than going through
@@ -3783,8 +3805,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// `dispatchAgentRun` has always resolved it this way; matching that here
 			// fixes the caller that forgot AND any future one, rather than patching
 			// a single call site. An explicit `turn.agentId` still wins.
-			const targetAgentId =
-				turn.agentId ?? resolveAgentIdFromSessionKey(turn.sessionKey) ?? agentId;
+			// `parseAgentSessionKey`, NOT `resolveAgentIdFromSessionKey`.
+			//
+			// The resolver never returns undefined — it falls back to
+			// DEFAULT_AGENT_ID — so using it here would make the boot-agent
+			// fallback below dead code, and a gateway booted with a non-default
+			// agent would bill every legacy/alias key to "main" instead of itself.
+			// Parsing directly means only a key that GENUINELY encodes an agent
+			// overrides the boot agent.
+			const keyAgentId = parseAgentSessionKey(turn.sessionKey)?.agentId;
+			const targetAgentId = turn.agentId ?? keyAgentId ?? agentId;
 			const turnSessionKey = turn.sessionKey;
 			const runId = crypto.randomUUID();
 
@@ -5685,11 +5715,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					// and `/new` rolls a fresh sessionId under the SAME sessionKey —
 					// so without this a brand-new conversation silently inherits the
 					// deleted one's cost total and reasoning state, permanently.
-					forgetSessionState: (forgetAgentId: string, forgetSessionKey: string) => {
-						usageLedger.forget(forgetAgentId, forgetSessionKey);
-						reasoningTracker.forget(forgetAgentId, forgetSessionKey);
-						frameRing.forget(forgetSessionKey);
-					},
+					forgetSessionState,
 				},
 			),
 		),

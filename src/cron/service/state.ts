@@ -147,6 +147,13 @@ export interface CronServiceDeps {
 	onEvent?: (event: CronEvent) => void;
 	/** Run an `agentTurn` payload as an isolated child session. */
 	runIsolatedAgentJob?: (args: CronIsolatedRunArgs) => Promise<CronIsolatedRunOutcome>;
+	/**
+	 * Drop the gateway's per-session in-memory state when the reaper prunes a
+	 * session. Without it the usage ledger, reasoning tracker, frame ring and
+	 * session caches keep a row for every reaped cron fire and idle thread —
+	 * `sessions.delete` has always cleared them; the reaper never did.
+	 */
+	forgetSessionState?: (agentId: string, sessionKey: string) => void;
 	/** Inject text as a system event into the operator's main session. */
 	enqueueSystemEvent?: (args: CronSystemEventArgs) => void;
 	/**

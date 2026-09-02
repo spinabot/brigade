@@ -95,3 +95,45 @@ describe("SessionCaches", () => {
 		assert.equal(c.get("main", "s"), undefined);
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// The gateway holds several per-session maps and clears them in ONE place,
+// used by both `sessions.delete` and the session reaper. A map added later
+// and left out of that list is a leak whose only symptom is slow growth —
+// which is exactly how `SessionCaches` itself nearly shipped.
+// ─────────────────────────────────────────────────────────────────────────
+describe("gateway session-state cleanup", () => {
+	it("clears every per-session map it owns", async () => {
+		const fs = await import("node:fs");
+		const src = fs.readFileSync(
+			new URL("./server.ts", import.meta.url),
+			"utf8",
+		);
+		const start = src.indexOf("const forgetSessionState = (");
+		assert.ok(start > 0, "forgetSessionState not found — this test needs updating");
+		const body = src.slice(start, src.indexOf("\n\t};", start));
+		for (const map of [
+			"usageLedger.forget",
+			"reasoningTracker.forget",
+			"frameRing.forget",
+			"sessionCaches.forget",
+		]) {
+			assert.ok(
+				body.includes(map),
+				`${map} missing from forgetSessionState — its rows would outlive the session`,
+			);
+		}
+	});
+
+	it("is the single definition both callers use", async () => {
+		// Two copies of this list is how one of them goes stale.
+		const fs = await import("node:fs");
+		const src = fs.readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+		const definitions = src.match(/const forgetSessionState = \(/g) ?? [];
+		assert.equal(definitions.length, 1, "there must be exactly one cleanup definition");
+		assert.ok(
+			src.includes("forgetSessionState,"),
+			"it must be passed to its callers rather than re-implemented",
+		);
+	});
+});
