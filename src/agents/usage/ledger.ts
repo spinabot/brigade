@@ -381,6 +381,41 @@ export class UsageLedger {
 		return addTotals(addTotals(e.committed, e.inFlight ?? emptyTotals()), e.outOfBand);
 	}
 
+	/**
+	 * Where a session's spend actually went.
+	 *
+	 * `outOfBandByKind` has been populated since it was introduced and read by
+	 * nothing, so the question its own doc comment poses — "where did the spend
+	 * go" — had no answer on any surface. A turn that fanned out to sub-agents
+	 * and triggered a compaction showed one total with no way to see that most
+	 * of it was not the conversation itself.
+	 *
+	 * Only non-empty kinds are returned, so a plain session stays a plain
+	 * answer rather than four zeros.
+	 */
+	breakdown(
+		agentId: string,
+		sessionKey: string,
+	): { own: UsageTotals; byKind: Partial<Record<OutOfBandKind, UsageTotals>> } {
+		const e = this.peek(agentId, sessionKey);
+		if (!e) return { own: emptyTotals(), byKind: {} };
+		const byKind: Partial<Record<OutOfBandKind, UsageTotals>> = {};
+		for (const [kind, totals] of Object.entries(e.outOfBandByKind)) {
+			if (!totals) continue;
+			if (totals.totalTokens > 0 || totals.costUsd > 0) {
+				byKind[kind as OutOfBandKind] = totals;
+			}
+		}
+		// `own` is the session's own loop — committed plus anything in flight —
+		// so `own` + the kinds always reconciles to `displayTotals`.
+		return { own: addTotals(e.committed, e.inFlight ?? emptyTotals()), byKind };
+	}
+
+	/** The LRU bound, so a caller can say whether a rollup was truncated. */
+	capacity(): number {
+		return this.maxSessions;
+	}
+
 	/** Every session this agent has a ledger for. */
 	forAgent(agentId: string): SessionUsage[] {
 		return [...this.entries.values()].filter((e) => e.agentId === agentId);

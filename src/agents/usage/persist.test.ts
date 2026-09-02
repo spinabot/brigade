@@ -119,3 +119,65 @@ describe("ledger seeding from a persisted record", () => {
 		assert.equal(l.displayTotals("main", "s1").output, 723, "the turn survives");
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// `outOfBandByKind` was populated from the day it was introduced and read by
+// nothing, so the question its own doc comment poses — "where did the spend
+// go" — had no answer on any surface. A turn that fanned out to sub-agents and
+// triggered a compaction showed one total, with no way to see that most of it
+// was not the conversation.
+// ─────────────────────────────────────────────────────────────────────────
+describe("usage breakdown", () => {
+	it("separates the conversation from the work done on its behalf", () => {
+		const l = new UsageLedger();
+		l.beginTurn("main", "s");
+		l.commitTurn("main", "s", { output: 100, cost: { total: 1 } } as never);
+		l.recordOutOfBand("main", "s", "subagent", { output: 900, cost: { total: 9 } } as never);
+		l.recordOutOfBand("main", "s", "compaction", { output: 50, cost: { total: 0.5 } } as never);
+
+		const { own, byKind } = l.breakdown("main", "s");
+		assert.equal(own.costUsd, 1, "the conversation itself");
+		assert.equal(byKind.subagent?.costUsd, 9);
+		assert.equal(byKind.compaction?.costUsd, 0.5);
+	});
+
+	it("reconciles: own + every kind equals the displayed total", () => {
+		// If these ever disagree, one of the two surfaces is lying.
+		const l = new UsageLedger();
+		l.beginTurn("main", "s");
+		l.commitTurn("main", "s", { output: 10, cost: { total: 2 } } as never);
+		l.recordOutOfBand("main", "s", "memory", { output: 5, cost: { total: 3 } } as never);
+		l.recordOutOfBand("main", "s", "skills", { output: 1, cost: { total: 4 } } as never);
+
+		const { own, byKind } = l.breakdown("main", "s");
+		const summed =
+			own.costUsd + Object.values(byKind).reduce((a, t) => a + (t?.costUsd ?? 0), 0);
+		assert.ok(Math.abs(summed - l.displayTotals("main", "s").costUsd) < 1e-9);
+	});
+
+	it("omits kinds that spent nothing, so a plain thread stays plain", () => {
+		const l = new UsageLedger();
+		l.beginTurn("main", "s");
+		l.commitTurn("main", "s", { output: 10, cost: { total: 1 } } as never);
+		assert.deepEqual(l.breakdown("main", "s").byKind, {});
+	});
+
+	it("reports empty for a session it has never seen", () => {
+		const l = new UsageLedger();
+		const { own, byKind } = l.breakdown("main", "never");
+		assert.equal(own.costUsd, 0);
+		assert.deepEqual(byKind, {});
+	});
+
+	it("rolls up across an agent's sessions — the only place cron spend shows", () => {
+		// Cron bills to a fresh `cron:<job>:run:<uuid>` key per fire and
+		// maintenance to `<agent>:__maintenance`; neither is a row any list
+		// renders, so the agent rollup is where they become visible.
+		const l = new UsageLedger();
+		l.recordOutOfBand("main", "agent:main:main", "subagent", { cost: { total: 1 } } as never);
+		l.recordOutOfBand("main", "cron:nightly:run:abc", "other", { cost: { total: 18 } } as never);
+		const total = l.agentTotals("main");
+		assert.ok(Math.abs(total.costUsd - 19) < 1e-9, "cron spend is in the agent total");
+		assert.equal(l.forAgent("main").length, 2);
+	});
+});

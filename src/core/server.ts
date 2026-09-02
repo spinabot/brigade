@@ -4941,6 +4941,59 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					snapshot: buildSnapshot(targetAgentId, targetSessionKey),
 				} as ResponseFor[M];
 			}
+			case "usage.summary": {
+				// WHERE THE SPEND ACTUALLY WENT.
+				//
+				// Two questions the header cannot answer. Within a thread: how much
+				// of the total was the conversation versus sub-agents, compaction and
+				// memory sweeps — recorded since `outOfBandByKind` was introduced and
+				// read by nothing until now. Across the agent: what the other threads
+				// cost, which is the ONLY place cron runs and background maintenance
+				// appear at all, because both bill to keys (`cron:<job>:run:<uuid>`,
+				// `<agent>:__maintenance`) that no list renders.
+				//
+				// Read-only; same default-pass guard as the other read surfaces.
+				const guardErr = defaultPassSessionGuard(rawParams, "list");
+				if (guardErr) throw guardErr;
+				const p = (params ?? {}) as RequestParams["usage.summary"];
+				const uAgentId = p.agentId?.trim() || agentId;
+				const uSessionKey = p.sessionKey?.trim() || defaultSessionKey(uAgentId);
+				const bucket = (label: string, t: { totalTokens: number; costUsd: number }) => ({
+					label,
+					tokens: t.totalTokens,
+					costUsd: t.costUsd,
+				});
+				const sessionTotals = usageLedger.displayTotals(uAgentId, uSessionKey);
+				const { own, byKind } = usageLedger.breakdown(uAgentId, uSessionKey);
+				const rows = usageLedger.forAgent(uAgentId);
+				const agentRollup = usageLedger.agentTotals(uAgentId);
+				return {
+					agentId: uAgentId,
+					sessionKey: uSessionKey,
+					session: {
+						total: bucket("total", sessionTotals),
+						own: bucket("conversation", own),
+						buckets: Object.entries(byKind).map(([kind, t]) =>
+							bucket(kind, t as { totalTokens: number; costUsd: number }),
+						),
+					},
+					agent: {
+						total: bucket("total", agentRollup),
+						sessions: rows
+							.map((r) => {
+								const t = usageLedger.displayTotals(r.agentId, r.sessionKey);
+								return { ...bucket(r.sessionKey, t), sessionKey: r.sessionKey };
+							})
+							.filter((r) => r.tokens > 0 || r.costUsd > 0)
+							.sort((a, b) => b.costUsd - a.costUsd || b.tokens - a.tokens),
+						// The ledger is LRU-bounded, so a long-lived gateway's rollup is
+						// "what is still in memory", not "everything ever". Saying so is
+						// the difference between a number and a misleading one.
+						truncated: rows.length >= usageLedger.capacity(),
+					},
+					costComplete: sessionTotals.costComplete === true,
+				} as ResponseFor[M];
+			}
 			case "memory-graph": {
 				// Memory Graph dashboard data — nodes + typed edges + topic clusters
 				// + stats, for an agent's workspace. Read; default-pass access guard

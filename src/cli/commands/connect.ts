@@ -97,6 +97,7 @@ import type {
 	PromptAttachment,
 	SessionDeleteResult,
 	SessionRenameResult,
+	UsageSummaryResult,
 	SessionRewindResult,
 	SessionStateSnapshot,
 	SessionSummary,
@@ -5419,6 +5420,59 @@ export async function wireConnectUi(
 						? `${Math.round(snap.contextUsagePercent)}%`
 						: "—";
 			const reasoningStrUsage = formatReasoningLine({ state: snap.reasoning });
+			// WHERE THE SPEND WENT, on demand.
+			//
+			// Fetched here rather than carried on the state snapshot: that snapshot
+			// goes out on every broadcast, many times a second while a reply
+			// streams, and this is a command run occasionally.
+			//
+			// It surfaces two things the header cannot. Within the thread, how much
+			// of the total was the conversation itself versus sub-agents,
+			// compaction and memory sweeps. Across the agent, what the OTHER
+			// threads cost — the only place cron runs and background maintenance
+			// are visible at all, since both bill to keys no list renders.
+			//
+			// Failure is silent by design: `/usage` already answered the main
+			// question from the snapshot, and losing the breakdown is not a reason
+			// to fail the command.
+			// A session key is long and mostly boilerplate (`agent:main:...`); the
+			// distinguishing tail is what an operator recognises.
+			const shortSessionLabel = (key: string): string => {
+				const tail = key.split(":").slice(2).join(":");
+				const label = tail || key;
+				return label.length > 28 ? `…${label.slice(-27)}` : label;
+			};
+			let usageBreakdownLines = "";
+			try {
+				const sum = (await client.request(
+					"usage.summary",
+					withBinding({}),
+				)) as UsageSummaryResult;
+				const money = (n: number): string => `$${n.toFixed(4)}`;
+				const approx = sum.costComplete ? "" : "≥";
+				const parts = sum.session.buckets
+					.filter((b) => b.costUsd > 0 || b.tokens > 0)
+					.map((b) => `${b.label} ${approx}${money(b.costUsd)}`);
+				if (parts.length > 0) {
+					// Only worth showing when something OTHER than the conversation
+					// spent money — on a plain thread this line would just restate the
+					// total under a second name.
+					usageBreakdownLines +=
+						`\n- ${chalk.bold("of which:")} ${brand.dim(`conversation ${approx}${money(sum.session.own.costUsd)} · ${parts.join(" · ")}`)}`;
+				}
+				const others = sum.agent.sessions.filter((r) => r.sessionKey !== sum.sessionKey);
+				if (others.length > 0) {
+					const top = others
+						.slice(0, 3)
+						.map((r) => `${shortSessionLabel(r.sessionKey)} ${money(r.costUsd)}`);
+					usageBreakdownLines +=
+						`\n- ${chalk.bold("agent:")}    ${money(sum.agent.total.costUsd)} across ${sum.agent.sessions.length} threads` +
+						(sum.agent.truncated ? brand.dim(" (recent threads only)") : "") +
+						`\n  ${brand.dim(`other threads: ${top.join(" · ")}${others.length > 3 ? " · …" : ""}`)}`;
+				}
+			} catch {
+				/* the breakdown is additive; /usage still answered the main question */
+			}
 			insertBeforeEditor(
 				new Markdown(
 					`${brand.dim("usage")}\n` +
@@ -5453,7 +5507,8 @@ export async function wireConnectUi(
 						`- ${chalk.bold("thinking:")} ${snap.thinkingLevel}` +
 						(snap.supportsThinking
 							? brand.dim(` (available: ${snap.availableThinkingLevels.join(", ")})`)
-							: brand.dim(" (model doesn't support reasoning)")),
+							: brand.dim(" (model doesn't support reasoning)")) +
+						usageBreakdownLines,
 					1,
 					0,
 					markdownTheme,
