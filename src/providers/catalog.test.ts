@@ -3,10 +3,15 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 import {
 	findProvider,
+	findSharedKeySibling,
 	PROVIDERS,
 	readProviderEnvKey,
 	resolveProviderEnvVarSource,
 } from "./catalog.js";
+import {
+	OPENCODE_CONSOLE_ENV_VAR,
+	OPENCODE_CONSOLE_PROVIDER,
+} from "./opencode-console.js";
 
 // Snapshot + restore the env vars we mutate so tests can run in any order
 // without leaking state across tests OR back into the parent process.
@@ -23,6 +28,8 @@ const ENV_KEYS_TO_GUARD = [
 	"XAI_API_KEY",
 	"DEEPSEEK_API_KEY",
 	"MISTRAL_API_KEY",
+	"OPENCODE_API_KEY",
+	"OPENCODE_ZEN_API_KEY",
 ];
 
 const originalEnv: Record<string, string | undefined> = {};
@@ -55,6 +62,8 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 		{ id: "xai", envVar: "XAI_API_KEY" },
 		{ id: "deepseek", envVar: "DEEPSEEK_API_KEY" },
 		{ id: "mistral", envVar: "MISTRAL_API_KEY" },
+		{ id: "opencode", envVar: "OPENCODE_API_KEY" },
+		{ id: "opencode-go", envVar: "OPENCODE_API_KEY" },
 	];
 
 	for (const { id, envVar } of CLOUD_PROVIDERS_WITH_ENV) {
@@ -103,6 +112,56 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 		});
 	});
 
+	it("OpenCode falls back to OPENCODE_ZEN_API_KEY when OPENCODE_API_KEY is unset", () => {
+		// `--secret-input-mode ref` persists keyRef.id from this, so a user keyed via
+		// the alias must get OPENCODE_ZEN_API_KEY on disk, not the primary.
+		for (const id of ["opencode", "opencode-go"]) {
+			const provider = findProvider(id)!;
+			assert.deepEqual(provider.envVarFallbacks, ["OPENCODE_ZEN_API_KEY"]);
+			process.env.OPENCODE_ZEN_API_KEY = "sk-zen-fallback";
+			assert.equal(readProviderEnvKey(provider), "sk-zen-fallback");
+			assert.deepEqual(resolveProviderEnvVarSource(provider), {
+				name: "OPENCODE_ZEN_API_KEY",
+				value: "sk-zen-fallback",
+			});
+		}
+	});
+
+	it("findSharedKeySibling pairs the two OpenCode catalogs in both directions", () => {
+		const zen = findProvider("opencode")!;
+		const go = findProvider("opencode-go")!;
+		assert.deepEqual(zen.sharedKeyWith, ["opencode-go"]);
+		assert.deepEqual(go.sharedKeyWith, ["opencode"]);
+
+		const onlyGo = (id: string) => (id === "opencode-go" ? "sk-go-stored" : "");
+		assert.deepEqual(findSharedKeySibling(zen, onlyGo), {
+			providerId: "opencode-go",
+			name: "OpenCode Go",
+			value: "sk-go-stored",
+		});
+		const onlyZen = (id: string) => (id === "opencode" ? "sk-zen-stored" : "");
+		assert.deepEqual(findSharedKeySibling(go, onlyZen), {
+			providerId: "opencode",
+			name: "OpenCode Zen",
+			value: "sk-zen-stored",
+		});
+	});
+
+	it("findSharedKeySibling ignores blank keys and providers with no siblings", () => {
+		const zen = findProvider("opencode")!;
+		assert.equal(findSharedKeySibling(zen, () => ""), undefined);
+		assert.equal(findSharedKeySibling(zen, () => "   "), undefined);
+		// A provider with no siblings must not consult the store at all.
+		const openai = findProvider("openai")!;
+		assert.equal(openai.sharedKeyWith, undefined);
+		assert.equal(
+			findSharedKeySibling(openai, () => {
+				throw new Error("must not be called");
+			}),
+			undefined,
+		);
+	});
+
 	it("Ollama has no envVar (noAuth, local)", () => {
 		const ollama = findProvider("ollama")!;
 		assert.equal(ollama.envVar, "");
@@ -147,10 +206,50 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 			"ollama",
 			"openai",
 			"openai-codex",
+			"opencode",
+			"opencode-console",
+			"opencode-go",
 			"openrouter",
 			"orcarouter",
 			"qwen",
 			"xai",
 		]);
+	});
+
+	it("every subscription entry's routing id IS its oauthProviderId", () => {
+		// `AuthStorage.getApiKey` resolves an oauth credential via
+		// `getOAuthProvider(providerId)`, where providerId is `providerId ?? id`. If
+		// these diverge the lookup returns undefined and the request goes out with no
+		// credential instead of failing — the one mistake this indirection invites.
+		for (const p of PROVIDERS) {
+			if (!p.subscription) continue;
+			assert.equal(
+				p.subscription.oauthProviderId,
+				p.providerId ?? p.id,
+				`provider "${p.id}": oauthProviderId must equal its routing id`,
+			);
+		}
+	});
+
+	it("the opencode-console entry matches the provider module's constants", () => {
+		// catalog.ts hardcodes these rather than importing the provider module, so
+		// this is what keeps the two copies honest.
+		const entry = findProvider("opencode-console")!;
+		assert.equal(entry.envVar, OPENCODE_CONSOLE_ENV_VAR);
+		assert.equal(entry.subscription?.oauthProviderId, OPENCODE_CONSOLE_PROVIDER);
+	});
+
+	it("the three OpenCode entries stay distinct: two API-key, one account login", () => {
+		// Zen and Go take a pasted OPENCODE_API_KEY; the console login is a different
+		// credential against different endpoints. Adding `subscription` to Zen or Go
+		// would hijack their key paste (onboarding checks it first), and offering a
+		// Zen key to the console entry would 401 on its first turn.
+		for (const id of ["opencode", "opencode-go"]) {
+			const entry = findProvider(id)!;
+			assert.equal(entry.subscription, undefined, `${id} must stay an API-key entry`);
+			assert.equal(entry.envVar, "OPENCODE_API_KEY");
+			assert.equal(entry.sharedKeyWith?.includes("opencode-console") ?? false, false);
+		}
+		assert.equal(findProvider("opencode-console")!.sharedKeyWith, undefined);
 	});
 });

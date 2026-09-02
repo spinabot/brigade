@@ -278,3 +278,71 @@ test("classifyError: the real 'via Responses API' wording is an endpoint mismatc
   const r = classifyErrorDetailed(err);
   assert.match(r.message, /endpoint\/host/i);
 });
+
+// OpenCode answers 401 for every refusal and resolves the model before checking
+// auth, so `error.type` is the only discriminator.
+const openCodeBody = (type: string, message: string) =>
+  `{"type":"error","error":{"type":"${type}","message":"${message}"}}`;
+
+const OPENCODE_401 = (type: string, message: string) =>
+  Object.assign(new Error(`{"type":"error","error":{"type":"${type}","message":"${message}"}}`), {
+    status: 401,
+  });
+
+test("classifyError: OpenCode 401 ModelError → model_not_found", () => {
+  assert.equal(classifyErrorReason(OPENCODE_401("ModelError", "Model foo is not supported")), "model_not_found");
+});
+
+test("classifyError: OpenCode 401 CreditsError → billing", () => {
+  assert.equal(classifyErrorReason(OPENCODE_401("CreditsError", "Out of credits.")), "billing");
+});
+
+test("classifyError: OpenCode 401 RateLimitError → rate_limit", () => {
+  assert.equal(classifyErrorReason(OPENCODE_401("RateLimitError", "Slow down.")), "rate_limit");
+});
+
+test("classifyError: OpenCode 401 FreeUsageLimitError → subscription_limit", () => {
+  assert.equal(classifyErrorReason(OPENCODE_401("FreeUsageLimitError", "Free tier used up.")), "subscription_limit");
+});
+
+test("classifyError: OpenCode 401 RegionError → auth_permanent", () => {
+  assert.equal(classifyErrorReason(OPENCODE_401("RegionError", "Region unsupported.")), "auth_permanent");
+});
+
+test("classifyError: OpenCode 401 AuthError still → auth", () => {
+  assert.equal(classifyErrorReason(OPENCODE_401("AuthError", "Invalid API key.")), "auth");
+});
+
+test("classifyError: an OpenCode body with no status still classifies by type", () => {
+  const err = new Error('{"type":"error","error":{"type":"ModelError","message":"Model foo is not supported"}}');
+  assert.equal(classifyErrorReason(err), "model_not_found");
+});
+
+test("classifyErrorDetailed: OpenCode 401 ModelError advances the fallback chain", () => {
+  const r = classifyErrorDetailed(OPENCODE_401("ModelError", "Model foo is not supported"));
+  assert.equal(r.class, "model_not_found");
+  assert.equal(r.retryableOnSameModel, false);
+});
+
+test("classifyErrorDetailed: OpenCode 401 RateLimitError is the only same-model retry", () => {
+  const r = classifyErrorDetailed(OPENCODE_401("RateLimitError", "Slow down."));
+  assert.equal(r.class, "rate_limit");
+  assert.equal(r.retryableOnSameModel, true);
+});
+
+test("classifyErrorDetailed: an OpenCode envelope with no status still classifies", () => {
+  // The read sits above the status block: Pi does not always surface a parseable
+  // status, and falling to `unknown` burned the whole model-fallback chain.
+  const err = new Error(openCodeBody("CreditsError", "Out of credits."));
+  assert.equal(classifyErrorDetailed(err).class, "auth_permanent");
+  assert.equal(classifyErrorDetailed(new Error(openCodeBody("RegionError", "nope"))).class, "auth_permanent");
+  assert.equal(
+    classifyErrorDetailed(new Error(openCodeBody("FreeUsageLimitError", "used up"))).class,
+    "subscription_limit",
+  );
+});
+
+test("classifyErrorDetailed: a plain 401 is unchanged by the OpenCode rules", () => {
+  const err = Object.assign(new Error("Incorrect API key provided"), { status: 401 });
+  assert.equal(classifyErrorDetailed(err).class, "auth");
+});

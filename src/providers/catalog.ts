@@ -109,6 +109,15 @@ export interface ProviderInfo {
 	 * catalog — e.g. NVIDIA NIM. The fetch also online-validates the key.
 	 */
 	liveModels?: boolean;
+	/**
+	 * Sibling entries that authenticate with the SAME upstream credential across
+	 * separate Pi provider ids — OpenCode Zen and Go are billed as different
+	 * catalogs but both read `OPENCODE_API_KEY`. Onboarding offers a sibling's
+	 * stored key instead of asking for the same paste twice. Entitlement is NOT
+	 * shared (a Zen-only key fails on the first Go model), so the offer still goes
+	 * through confirm-then-validate rather than being silently adopted.
+	 */
+	sharedKeyWith?: string[];
 }
 
 export const PROVIDERS: ProviderInfo[] = [
@@ -334,6 +343,55 @@ export const PROVIDERS: ProviderInfo[] = [
 		baseUrl: "https://integrate.api.nvidia.com/v1",
 	},
 	{
+		// Plain api-key entry, NOT `custom`: Pi ships built-in `opencode` models, so
+		// the credential alone makes them resolve. `custom` would shadow that catalog
+		// with a models.json entry and drop the provider from `/provider`.
+		id: "opencode",
+		billing: "metered",
+		name: "OpenCode Zen",
+		description: "Paste a Zen API key — pay-as-you-go (Claude, GPT, Gemini, Kimi, GLM, plus free models)",
+		keyUrl: "https://opencode.ai/auth",
+		envVar: "OPENCODE_API_KEY",
+		envVarFallbacks: ["OPENCODE_ZEN_API_KEY"],
+		sharedKeyWith: ["opencode-go"],
+	},
+	{
+		// Same credential as `opencode`, separate catalog and separate paid plan. Its
+		// own entry because the routing id decides the base URL (/zen/go/v1).
+		id: "opencode-go",
+		billing: "metered",
+		name: "OpenCode Go",
+		description: "Paste a Go API key — separate Go plan (Kimi, GLM, MiniMax, Qwen)",
+		keyUrl: "https://opencode.ai/auth",
+		envVar: "OPENCODE_API_KEY",
+		envVarFallbacks: ["OPENCODE_ZEN_API_KEY"],
+		sharedKeyWith: ["opencode"],
+	},
+	{
+		// A DIFFERENT credential and different endpoints from the two entries above,
+		// not a second way into Zen: an account login serves inference from
+		// `/inference/{openai,anthropic,google}/…`, which Pi ships no catalog for, so
+		// the models are discovered from the console at login and written to
+		// models.json. Its own entry because onboarding routes `subscription` BEFORE
+		// the api-key branch — adding it to the Zen entry would hijack the key paste.
+		// One login covers every model, so the Zen-vs-Go split does not apply here.
+		id: "opencode-console",
+		billing: "metered",
+		name: "OpenCode (login)",
+		description: "No key to paste — sign in to your OpenCode account; covers every model",
+		keyUrl: "https://opencode.ai/console",
+		// Literals rather than imports: this file is imported by nearly everything
+		// and depends on nothing. `catalog.test.ts` pins them to the real constants.
+		envVar: "OPENCODE_CONSOLE_TOKEN",
+		liveModels: true, // catalog fetched from /console/api/config at login
+		api: "openai-completions",
+		baseUrl: "https://opencode.ai/inference/openai/v1",
+		subscription: {
+			oauthProviderId: "opencode-console",
+			label: "Log in with your OpenCode account",
+		},
+	},
+	{
 		id: "ollama",
 		name: "Ollama (local)",
 		description: "Run models locally — no API key, fully private",
@@ -408,6 +466,25 @@ export function resolveProviderEnvVarSource(
 	for (const fallback of provider.envVarFallbacks ?? []) {
 		const v = process.env[fallback];
 		if (typeof v === "string" && v.trim().length > 0) return { name: fallback, value: v };
+	}
+	return undefined;
+}
+
+/**
+ * First credential already stored for one of this provider's `sharedKeyWith`
+ * siblings, so onboarding can reuse it instead of prompting for the same paste
+ * twice. `readStoredKey` is injected to keep this module's only dependency on
+ * `process.env` — importing the credential store here would drag storage (and
+ * Convex dispatch) into every consumer that just wants the provider list.
+ */
+export function findSharedKeySibling(
+	provider: ProviderInfo,
+	readStoredKey: (providerId: string) => string,
+): { providerId: string; name: string; value: string } | undefined {
+	for (const siblingId of provider.sharedKeyWith ?? []) {
+		const value = readStoredKey(siblingId);
+		if (typeof value !== "string" || value.trim().length === 0) continue;
+		return { providerId: siblingId, name: findProvider(siblingId)?.name ?? siblingId, value };
 	}
 	return undefined;
 }

@@ -117,7 +117,7 @@ backend — all under one `~/.brigade/` directory you fully own.
 | 🖥️ **Terminal-first** | A flicker-free chat TUI by default. No browser, no Electron. |
 | 🧠 **Memory that lasts** | Facts persist across sessions with origin scoping, decay, and hybrid (keyword + vector) recall — the **Tideline** engine. |
 | 👥 **A real crew** | Spawn isolated agents with their own personas, credentials, and memory; wire them into an **org chart** that governs who can talk to whom. |
-| 🔌 **Bring any model** | Anthropic, OpenAI, Gemini, OpenRouter, OrcaRouter, Groq, Cerebras, xAI, DeepSeek, Mistral, local Ollama, or any OpenAI-compatible endpoint. Switch mid-conversation. |
+| 🔌 **Bring any model** | Anthropic, OpenAI, Gemini, OpenRouter, OrcaRouter,OpenCode Zen, Groq, Cerebras, xAI, DeepSeek, Mistral, local Ollama, or any OpenAI-compatible endpoint. Switch mid-conversation. |
 | 📅 **Always-on** | Run as a headless WebSocket gateway with a crash supervisor, cron jobs, and OS service install. |
 | 💬 **Channels** | Talk to your crew from WhatsApp, Telegram, Slack, Discord, iMessage, and BlueBubbles today; the adapter contract is built for more. |
 | 🔗 **1,000+ connectors** | Gmail, Slack, GitHub, Notion, Calendar, Linear… via the built-in Composio tool. |
@@ -177,7 +177,7 @@ brigade tui
 
 The onboarding wizard walks you through **five steps**: **(0) storage mode**
 (filesystem or self-hosted Convex), **(1) pick a provider** (Anthropic, OpenAI, Gemini,
-OpenRouter, OrcaRouter, Ollama, and more), **(2) connect it** (paste an API key, **sign in with a
+OpenRouter,OpenCode Zen, OrcaRouter, Ollama, and more), **(2) connect it** (paste an API key, **sign in with a
 Claude/ChatGPT/Copilot subscription**, reuse your Claude Code or Codex CLI login, or
 connect local Ollama), **(3) choose a default model**, and **(4) web search** (pick a
 search backend; keyless options work out of the box). Subsequent launches resume right
@@ -757,7 +757,7 @@ switch to `"tree"` to let a parent see sub-agents it spawned.
 
 ## Providers & web search
 
-**Models out of the box:** Anthropic, OpenAI, Google Gemini, OpenRouter, OrcaRouter,
+**Models out of the box:** Anthropic, OpenAI, Google Gemini, OpenRouter, OrcaRouter,**OpenCode Zen** and **Go**,
 Groq, Cerebras, xAI, DeepSeek, Mistral, **Ollama** (local), and **Custom**
 OpenAI-compatible endpoints (Together, Fireworks, vLLM, LM Studio, on-prem gateways
 — anything that speaks `/v1/chat/completions`). Connect several at once, switch with

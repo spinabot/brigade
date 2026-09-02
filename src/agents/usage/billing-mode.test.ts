@@ -32,6 +32,16 @@ const EXPECTED: Record<string, ReturnType<typeof classifyBillingMode>> = {
 	"minimax-sub": "subscription",
 	"deepseek-sub": "subscription",
 	"nvidia-nim": "metered",
+	// All three OpenCode entries bill by usage, not from an included tier. Zen and
+	// Go draw down a pasted key's balance; the account login draws down prepaid
+	// workspace credits and answers 402 "Insufficient account funds" rather than
+	// throttling — metered behaviour, not a subscription ceiling. Marking it
+	// `subscription` would make model-caps clamp requests to an included tier that
+	// does not exist here. `classifyBillingModeWithAuth` still narrows it to
+	// subscription when the credential is OAuth.
+	opencode: "metered",
+	"opencode-go": "metered",
+	"opencode-console": "metered",
 	ollama: "local",
 	custom: "unknown",
 };

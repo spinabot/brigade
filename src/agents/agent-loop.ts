@@ -129,6 +129,10 @@ import {
 } from "./payload-mutators.js";
 import { CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catalog.js";
 import { ensureClaudeCliApiRegistered } from "./claude-cli/register.js";
+import {
+  type OAuthCapableRegistry,
+  registerOpencodeConsoleOnRegistry,
+} from "../providers/opencode-console.js";
 import { stampClaudeCliToolPlane } from "./claude-cli/tool-plane.js";
 import { makeTransportDispatch } from "./transport-dispatch.js";
 import { claudeCliHarnessBackend } from "./claude-cli/harness-backend.js";
@@ -487,6 +491,11 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // /v1 path. Idempotent + best-effort; a no-op read once migrated.
   await migrateOllamaProviderToNative(modelsFile).catch(() => {});
   const modelRegistry = buildModelRegistry(authStorage, modelsFile);
+  // Registers the OpenCode Console OAuth provider into the pi-ai copy AuthStorage
+  // actually reads, without which an opencode-console credential resolves to
+  // `undefined` and the request goes out unauthenticated. Re-applied by the
+  // registry on every refresh(), so it needs no second call later.
+  registerOpencodeConsoleOnRegistry(modelRegistry as OAuthCapableRegistry);
 
   // ModelRegistry.find returns undefined when the provider+modelId pair isn't
   // registered. Surface a clear error so the user knows to seed models.json
