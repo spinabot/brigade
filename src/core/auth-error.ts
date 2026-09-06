@@ -108,6 +108,8 @@ const FRIENDLY_NAMES: Readonly<Record<string, string>> = {
 	xai: "xAI",
 	deepseek: "DeepSeek",
 	mistral: "Mistral",
+	opencode: "OpenCode Zen",
+	"opencode-go": "OpenCode Go",
 	ollama: "Ollama",
 } as const;
 

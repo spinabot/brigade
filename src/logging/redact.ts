@@ -21,6 +21,8 @@
  *     `AQ.…`) → `<redacted:provider-key>`. Google issues both the legacy
  *     `AIza…` and the newer `AQ.…` prefixes for Gemini / AI Studio keys;
  *     both shapes must be caught so a fresh key doesn't leak into logs.
+ *     OpenCode keys (`sk-` + 64 alphanumerics) need no rule of their own —
+ *     the `sk-…` pattern already covers them (pinned in redact.test.ts).
  *   - Phone numbers in `+CCNNNNNNNNNN` form (≥10 digits after `+`) →
  *     `<redacted:phone>`
  *   - Email addresses → `<redacted:email>`

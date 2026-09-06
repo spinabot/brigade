@@ -20,6 +20,12 @@
  *   - 5xx    → provider-side outage. Soft accept.
  *   - timeout/network → no internet or DNS. Hard reject (the agent loop won't
  *                       work either if the network is down).
+ *
+ * **The one exception: OpenCode.** Its `/models` route answers 200 with NO
+ * credential at all, so a listing call would "validate" a garbage key. It is
+ * probed with a one-token completion instead, and since the gateway answers 401
+ * for an unknown MODEL exactly as it does for a bad KEY, the verdict comes from
+ * `error.type` in the body — see `interpretOpenCodeFailure`.
  */
 
 const TIMEOUT_MS = 8000;
@@ -39,12 +45,23 @@ interface FailResult {
 
 export type ValidationResult = OkResult | FailResult;
 
+interface ValidationProbe {
+	url: string;
+	init: RequestInit;
+	/**
+	 * Provider-specific reading of a FAILED response. The body is read ONLY when
+	 * this hook exists, so no other provider's response is touched. Return `null`
+	 * to fall through to the generic status ladder.
+	 */
+	interpretFailure?: (status: number, bodyText: string) => ValidationResult | null;
+}
+
 /**
  * Build the validation request for a given provider.
  * Returns `null` when we have no validation endpoint for this provider —
  * caller should treat that as "skip online validation" (offline-only check).
  */
-function buildRequest(providerId: string, apiKey: string): { url: string; init: RequestInit } | null {
+function buildRequest(providerId: string, apiKey: string): ValidationProbe | null {
 	switch (providerId) {
 		case "ollama":
 			// Ollama runs locally; `/api/tags` is auth-free and lists installed models.
@@ -118,9 +135,136 @@ function buildRequest(providerId: string, apiKey: string): { url: string; init: 
 				url: "https://api.mistral.ai/v1/models",
 				init: { method: "GET", headers: { Authorization: `Bearer ${apiKey}` } },
 			};
+		case "opencode":
+		case "opencode-go": {
+			// A listing call can't validate here (see the header note) — a one-token
+			// completion is the cheapest request that actually authenticates.
+			const isGo = providerId === "opencode-go";
+			return {
+				url: isGo
+					? "https://opencode.ai/zen/go/v1/chat/completions"
+					: "https://opencode.ai/zen/v1/chat/completions",
+				init: {
+					method: "POST",
+					headers: { Authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+					body: JSON.stringify({
+						model: isGo ? OPENCODE_GO_PROBE_MODEL : OPENCODE_ZEN_PROBE_MODEL,
+						messages: [{ role: "user", content: "hi" }],
+						max_tokens: 1,
+						stream: false,
+					}),
+				},
+				interpretFailure: (status, bodyText) => interpretOpenCodeFailure(providerId, status, bodyText),
+			};
+		}
 		default:
 			return null;
 	}
+}
+
+/* ─────────────────────────── OpenCode ─────────────────────────── */
+
+/**
+ * Probe models. Both are `openai-completions` on the `/v1` host we post the
+ * OpenAI-shaped body to, and both dodge the per-model gates upstream applies to
+ * the Go catalogue (`deepseek-*` is CN-region-locked, `muse-spark-*` is
+ * data-policy gated) — either would answer before auth was ever checked.
+ * `big-pickle` is free, so a Zen probe never bills; Go has no free tier, and one
+ * token of `mimo-v2.5` rounds to nothing. Neither id is assumed to survive: a
+ * retired probe model answers `ModelError`, which soft-accepts below.
+ */
+const OPENCODE_ZEN_PROBE_MODEL = "big-pickle";
+const OPENCODE_GO_PROBE_MODEL = "mimo-v2.5";
+
+/**
+ * Error types that mean "the key authenticated; this request can't be served".
+ * Each supplies the tail of the note shown to the user.
+ */
+const OPENCODE_ACCOUNT_FAILURES: Readonly<Record<string, string>> = {
+	CreditsError: "the account is out of credits — top up at https://opencode.ai/auth.",
+	MonthlyLimitError: "the account has hit its monthly limit.",
+	UserLimitError: "the account has hit its per-user limit.",
+	FreeUsageLimitError: "the free-tier allowance is used up for now.",
+	GoUsageLimitError: "the Go plan's allowance is used up for now.",
+	BlackUsageLimitError: "the plan's allowance is used up for now.",
+	RateLimitError: "it's rate-limiting this key right now — connecting anyway.",
+	RegionError: "it doesn't serve requests from this region.",
+	DataPolicyError: "the account's data policy blocks the model we test with.",
+};
+
+/** `{"type":"error","error":{"type":"AuthError","message":"…"}}` → the inner pair. */
+function readOpenCodeError(bodyText: string): { type: string; message: string } | null {
+	if (!bodyText) return null;
+	try {
+		const parsed = JSON.parse(bodyText) as { error?: { type?: unknown; message?: unknown } };
+		const inner = parsed?.error;
+		if (!inner || typeof inner.type !== "string" || inner.type.length === 0) return null;
+		return { type: inner.type, message: typeof inner.message === "string" ? inner.message : "" };
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * `AuthError` is the ONLY type that means the key is bad; everything else
+ * soft-accepts, because refusing a valid key over our own retired probe model is
+ * the worst outcome available here. Returns `null` for an unreadable body so the
+ * generic status ladder still applies.
+ *
+ * No "subscribe to Go" hint: upstream falls through to pay-as-you-go when a
+ * workspace has no Go plan, so an unsubscribed key either works or reports
+ * CreditsError — telling the operator to subscribe would be the wrong next step,
+ * and flatly wrong on GoUsageLimitError (which means they DO have a plan).
+ */
+function interpretOpenCodeFailure(
+	providerId: string,
+	status: number,
+	bodyText: string,
+): ValidationResult | null {
+	const providerName = providerDisplayName(providerId);
+	const err = readOpenCodeError(bodyText);
+	if (!err) {
+		// No envelope. Every real gateway refusal carries one, so a bare 4xx on this
+		// route means OUR probe is malformed or misrouted — a moved endpoint, a
+		// rejected `max_tokens`, an edge-proxy error page. Blaming the key for that
+		// is the failure this whole function exists to avoid. 401 still falls
+		// through: it's the one status that genuinely implicates the credential.
+		if (status === 400 || status === 404 || status === 405) {
+			return {
+				ok: true,
+				warning: `Couldn't fully verify the key — ${providerName} rejected the test request (HTTP ${status}). Connecting anyway.`,
+			};
+		}
+		return null;
+	}
+	const rejected = `${providerName} didn't accept this key. Double-check that it's correct and active.`;
+
+	if (err.type === "AuthError") return { ok: false, reason: rejected };
+
+	// `typeof` rather than truthiness: the map is a plain object, so a response
+	// naming `constructor` / `toString` would otherwise resolve up the prototype
+	// chain and interpolate a function into the warning.
+	const tail = OPENCODE_ACCOUNT_FAILURES[err.type];
+	if (typeof tail === "string") {
+		return { ok: true, warning: `${providerName} accepted the key, but ${tail}` };
+	}
+
+	if (err.type === "ModelError") {
+		return {
+			ok: true,
+			warning: `Couldn't fully verify the key — ${providerName} no longer serves the model we test with. Connecting anyway.`,
+		};
+	}
+
+	// A type we don't know yet: sniff the message so a renamed AuthError still gets
+	// caught, otherwise soft-accept and name the type.
+	if (/invalid api key|unauthori[sz]ed|authenticat/i.test(err.message)) {
+		return { ok: false, reason: rejected };
+	}
+	return {
+		ok: true,
+		warning: `Couldn't fully verify the key — ${providerName} answered "${err.type}". Connecting anyway.`,
+	};
 }
 
 /**
@@ -167,6 +311,18 @@ export async function validateApiKeyOnline(providerId: string, apiKey: string): 
 			}
 
 			return modelCount === undefined ? { ok: true } : { ok: true, modelCount };
+		}
+
+		// Providers whose status codes don't carry the meaning get first say.
+		if (request.interpretFailure) {
+			let bodyText = "";
+			try {
+				bodyText = await response.text();
+			} catch {
+				/* unreadable body — fall through to the generic ladder */
+			}
+			const verdict = request.interpretFailure(response.status, bodyText);
+			if (verdict) return verdict;
 		}
 
 		// Auth-style failures: hard reject. Use the human-friendly provider name
@@ -227,6 +383,8 @@ function providerDisplayName(providerId: string): string {
 		xai: "xAI",
 		deepseek: "DeepSeek",
 		mistral: "Mistral",
+		opencode: "OpenCode Zen",
+		"opencode-go": "OpenCode Go",
 		ollama: "Ollama",
 	};
 	return map[providerId] ?? providerId;

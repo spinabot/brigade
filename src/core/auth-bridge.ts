@@ -248,6 +248,39 @@ export function readBrigadeCredentials(agentId: string): Record<string, unknown>
   return out;
 }
 
+/**
+ * The API key stored in `agentId`'s auth profiles for `providerId`, or "" when
+ * there is none. Plaintext `key` wins over a `keyRef`; an env-source ref is
+ * resolved against `process.env` exactly as the runtime does.
+ *
+ * Exported (and living here rather than in the wizard) so the onboarding
+ * fast-accept path and `findSharedKeySibling` share ONE implementation with
+ * `readBrigadeCredentials` — and so tests can exercise the real reader without
+ * importing the TUI module. The wizard previously carried its own copy; it had
+ * no callers, and it diverged from this one on a legacy string `keyRef`, where
+ * it reported "no key stored" for a credential the runtime resolves happily.
+ *
+ * Routes through the mode-aware `readProfiles`, so Convex mode reads the primed
+ * cache instead of a local file that is never written there.
+ */
+export function readStoredProviderKey(
+  providerId: string,
+  agentId: string = DEFAULT_AGENT_ID,
+): string {
+  let parsed: ReadProfilesFile = {};
+  try {
+    parsed = readProfiles(agentId) as unknown as ReadProfilesFile;
+  } catch {
+    return "";
+  }
+  for (const profile of Object.values(parsed.profiles ?? {})) {
+    if (profile?.provider !== providerId) continue;
+    const resolved = resolveProfileKey(profile);
+    if (resolved) return resolved;
+  }
+  return "";
+}
+
 // Resolve only an agent's STORED profile credentials (api_key / oauth / token),
 // without env or main fallback. Used by the non-main fallback above to surface
 // `main`'s keys for org agents. Routes through the mode-aware `readProfiles`.
