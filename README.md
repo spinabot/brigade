@@ -45,6 +45,10 @@
 </p>
 
 <p align="center">
+  <a href="https://trendshift.io/repositories/118354?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-118354" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/118354/daily?language=TypeScript" alt="spinabot/brigade on Trendshift" width="250" height="55" /></a>
+</p>
+
+<p align="center">
   <a href="https://github.com/spinabot/brigade/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spinabot/brigade/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI status"></a>
   <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://img.shields.io/npm/v/@spinabot/brigade?style=for-the-badge&logo=npm&logoColor=white&color=CB3837" alt="npm version"></a>
   <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://badgen.net/npm/dt/@spinabot/brigade?icon=npm&color=CB3837" alt="npm total downloads"></a>
