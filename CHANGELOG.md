@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.37.1](https://github.com/spinabot/brigade/compare/brigade-v1.37.0...brigade-v1.37.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **tideline:** preserve memory behavior across reusable engine boundaries ([0693721](https://github.com/spinabot/brigade/commit/06937210f1aa30b2fc9f34d0696d36bbb4bfd13a))
+* **tideline:** preserve memory behavior across reusable engine boundaries ([257dc4f](https://github.com/spinabot/brigade/commit/257dc4f937fe609ce34e0ec051c9c87abd626a30))
+* **validation:** constrain provider data before saving probe evidence ([9175d6b](https://github.com/spinabot/brigade/commit/9175d6b29444d2dc12f202d1bad586e86de094f8))
+* **validation:** constrain provider data before saving probe evidence ([73cc254](https://github.com/spinabot/brigade/commit/73cc2544d661f0ec50dd66cd9916539717cccfe8))
+
 ## [1.37.0](https://github.com/spinabot/brigade/compare/brigade-v1.36.1...brigade-v1.37.0) (2026-09-02)
 
 
