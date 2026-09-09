@@ -12,7 +12,7 @@ test("Convex probe persists fixed failure evidence without network-controlled er
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "tideline-convex-report-test-"));
   const networkText = "network-controlled-report-canary";
   const preload = "data:text/javascript," + encodeURIComponent(
-    `globalThis.fetch = async () => ({ ok: false, status: ${JSON.stringify(networkText)} });`,
+    'globalThis.fetch = async () => ({ ok: false, status: "network-controlled-report-canary" });',
   );
   try {
     // Download fails before any backend, imports or deployment. The injected
