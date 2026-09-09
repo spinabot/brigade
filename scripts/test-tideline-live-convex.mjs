@@ -8,7 +8,9 @@
  * TIDELINE_CONVEX_BACKEND may supply the binary instead of --backend. This does
  * not use convex:dev, contact Convex Cloud, load provider credentials, change
  * repository environment files, or retain backend data/keys. Only redacted
- * results and logs remain in the printed temporary artifact directory. This is
+ * results and logs remain in the printed temporary artifact directory. Error
+ * details are printed to the console; reports retain fixed failure categories
+ * and local operation phases only. This is
  * a correctness/recovery probe with bounded load, not a scalability benchmark.
  */
 import assert from "node:assert/strict";
@@ -69,12 +71,21 @@ let ctx;
 let resetRuntimeContext;
 let activeChild;
 let cleaning;
+let phase = "setup";
 const sensitive = () => [instanceSecret, adminKey, safeEnv.BRIGADE_ENCRYPTION_KEY].filter(Boolean);
 const redact = (value) => sensitive().reduce((out, token) => out.split(token).join("[redacted]"), String(value));
 const envFiles = [".env.local", ".env"].map((file) => path.join(ROOT, file));
 const hashEnv = () => envFiles.map((file) => fs.existsSync(file) ? createHash("sha256").update(fs.readFileSync(file)).digest("hex") : null);
 const beforeEnv = hashEnv();
 const check = (name) => { results.checks.push(name); console.log(`PASS ${name}`); };
+
+// Error messages/stacks can contain network response data. Persist only fixed
+// categories; their full redacted diagnostics remain available in the console.
+const failureCategory = (error) => {
+  if (error?.name === "AssertionError") return "assertion";
+  if (error?.name === "TimeoutError" || error?.name === "AbortError") return "timeout";
+  return "operation";
+};
 
 function platformAsset() {
   const platforms = {
@@ -185,7 +196,9 @@ for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
 try {
   fs.mkdirSync(project, { recursive: true, mode: 0o700 });
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  phase = "resolving-backend";
   await resolveBinary();
+  phase = "preparing-backend";
   fs.cpSync(path.join(ROOT, "convex"), path.join(project, "convex"), { recursive: true, filter: (source) => {
     const rel = path.relative(path.join(ROOT, "convex"), source);
     // Keep generated API bindings; omit tsc's root-level JS/declaration copies
@@ -205,6 +218,7 @@ try {
   const envFile = path.join(project, "probe.env");
   fs.writeFileSync(envFile, `CONVEX_SELF_HOSTED_URL=${url}\nCONVEX_SELF_HOSTED_ADMIN_KEY=${adminKey}\n`, { mode: 0o600 });
   await startBackend();
+  phase = "deploying-functions";
   console.log("Backend ready on isolated loopback ports; deploying current copied functions.");
   const deploy = await run(process.execPath, [path.join(ROOT, "node_modules", "convex", "bin", "main.js"), "deploy", "--yes", "--env-file", envFile, "--typecheck", "disable", "--codegen", "disable"]);
   fs.writeFileSync(path.join(WORK, "deploy.log"), deploy);
@@ -230,6 +244,7 @@ try {
   const peer = { kind: "channel", channelId: "chat", conversationId: "room", sessionKey: "session" };
   const template = seedStore.write({ content: "Amber release gate is Friday.", segment: "project", sourceType: "owner_message", createdBy: owner, metadata: { approved: "amber-proof" } });
   const rootRecord = { ...template, memoryId: "root-record" };
+  phase = "encryption-origin-isolation";
   await memory.upsertFactRecordRaw("workspace-a", rootRecord);
   await memory.upsertFactRecordRaw("workspace-a", { ...template, memoryId: "peer-record", content: "Amber private channel gate is Monday.", createdBy: peer });
   await memory.upsertFactRecordRaw("workspace-b", { ...template, memoryId: "other-workspace", content: "Amber other workspace gate is Tuesday." });
@@ -243,6 +258,7 @@ try {
   for (const field of ["channelId", "conversationId", "sessionKey"]) assert.deepEqual(await memory.listFacts({ origin: { ...peer, [field]: "other" } }), []);
   check("real stored bytes encrypted; metadata encrypted; workspace and exact-origin reads isolated");
 
+  phase = "cold-hydration";
   ctx = await runtime.createRuntimeContext({ override: { mode: "convex", convexUrl: url }, stateDir });
   runtime.setRuntimeContext(ctx);
   const hostWorkspace = path.join(stateDir, "agents", "probe-a", "workspace");
@@ -255,6 +271,7 @@ try {
   assert.equal(cache.getFactsHydrationState(workspaceId).status, "ready");
   check("cold host store fails pending, explicitly hydrates and recalls durable evidence");
 
+  phase = "bounded-load";
   const count = 240;
   const started = performance.now();
   let cursor = 0;
@@ -271,6 +288,7 @@ try {
   assert.equal((await memory.listAllFactRecordsRaw("workspace-b")).length, 1);
   check("240 bounded writes at concurrency 8; hydration and selective-origin reads complete beyond 200 rows");
 
+  phase = "durable-write-recovery";
   await stopBackend("SIGKILL");
   const pending = host.write({ content: "Cobalt recovery milestone is Thursday.", segment: "project", createdBy: owner });
   await assert.rejects(host.flush());
@@ -281,6 +299,7 @@ try {
   assert.equal((await memory.listAllFactRecordsRaw("workspace-a")).length, 242);
   check("SIGKILL restart preserves accepted rows and retry flush persists retained pending write");
 
+  phase = "hydration-recovery";
   cache.__resetFactsCacheForTests();
   await stopBackend("SIGKILL");
   const cold = new HostFactStore(hostWorkspace);
@@ -294,8 +313,8 @@ try {
   results.status = "passed";
 } catch (error) {
   results.status = "failed";
-  results.error = redact(error?.stack ?? error);
-  console.error(results.error);
+  results.error = { phase, category: failureCategory(error) };
+  console.error(redact(error?.stack ?? error));
   process.exitCode = 1;
 } finally {
   try {
@@ -304,8 +323,8 @@ try {
     check("repository .env/.env.local unchanged; backend stopped; ephemeral keys and database removed");
   } catch (error) {
     results.status = "failed";
-    results.cleanupError = redact(error?.stack ?? error);
-    console.error(results.cleanupError);
+    results.cleanupError = { phase: "cleanup", category: failureCategory(error) };
+    console.error(redact(error?.stack ?? error));
     process.exitCode = 1;
   }
   results.finished = new Date().toISOString();

@@ -25,7 +25,6 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { pickInitialThinkingLevel } from "../../core/model-caps.js";
-import { workspaceIdFromDir } from "../../storage/facts-cache.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { applyPersonaOverrideToSession } from "../../system-prompt/pi-injection.js";
 import { wrapStreamFnWithPayloadMutations } from "../payload-mutators.js";

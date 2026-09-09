@@ -11,6 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { providerReportErrorCategory, validateProviderAnswerText, validateProviderReportMetadata } from "./lib/tideline-live-report-validation.mjs";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "tideline-live-models-"));
 const state = path.join(root, "state");
@@ -67,16 +68,18 @@ async function complete(model, messages, label, extra = {}) {
    body: JSON.stringify(request), signal: AbortSignal.timeout(55000),
   });
   const data = await response.json();
-  Object.assign(entry, { httpStatus: response.status, latencyMs: Date.now() - started, generationId: data.id,
-   returnedModel: data.model, provider: data.provider, usage: data.usage, finishReason: data.choices?.[0]?.finish_reason });
+  Object.assign(entry, { httpStatus: response.status, latencyMs: Date.now() - started });
   // Error payloads may contain provider request details; never log/store them.
-  if (!response.ok || data.error || !data.choices?.[0]?.message) throw new Error(`provider response failed (${response.status})`);
+  if (!response.ok || data?.error || !data?.choices?.[0]?.message) throw new Error(`provider response failed (${response.status})`);
+  const metadata = validateProviderReportMetadata(data, { models: supportedModels, providers: Object.values(providerNames) });
+  Object.assign(entry, metadata);
   saveReport();
-  return { message: data.choices[0].message, usage: data.usage, requestId: id, finishReason: data.choices[0].finish_reason };
+  return { message: data.choices[0].message, usage: metadata.usage, requestId: id, finishReason: metadata.finishReason };
  } catch (error) {
-  Object.assign(entry, { failed: true, error: error.name, latencyMs: Date.now() - started });
+  const category = providerReportErrorCategory(error);
+  Object.assign(entry, { failed: true, error: category, latencyMs: Date.now() - started });
   saveReport();
-  throw new Error(`Live request ${id} (${label}) failed: ${error.name}`);
+  throw new Error(`Live request ${id} (${label}) failed: ${category}`);
  }
 }
 
@@ -111,10 +114,8 @@ function normalizeAnswer(content) {
 }
 
 async function modelToolRoundTrip(model, workspace) {
- const toolStore = new FactStore(workspace);
- let memory = Tideline.over(toolStore, { threatScan: { scan: scanForThreats } });
  for (const stage of ["write", "recall"]) {
-  memory = Tideline.over(new FactStore(workspace), { threatScan: { scan: scanForThreats } });
+  const memory = Tideline.over(new FactStore(workspace), { threatScan: { scan: scanForThreats } });
   const localTools = memoryMcpTools(memory, { origin: owner });
   const name = stage === "write" ? "memory_add" : "memory_search";
   const messages = [{ role: "system", content: "Use the memory tool to complete the request. After the tool result, answer briefly using its data." },
@@ -191,8 +192,9 @@ try {
        response_format: { type: "json_schema", json_schema: { name: "memory_answer", strict: true,
         schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false } } },
       });
-     const actual = normalizeAnswer(answer.message.content ?? "");
-     report.answers.push({ model, caseId: fixture.id, repetition, arm, expected: fixture.answer, actual, rawAnswer: answer.message.content ?? null, correct: actual === fixture.answer && answer.finishReason === "stop", finishReason: answer.finishReason, requestId: answer.requestId, usage: answer.usage });
+     const rawAnswer = validateProviderAnswerText(answer.message.content);
+     const actual = normalizeAnswer(rawAnswer ?? "");
+     report.answers.push({ model, caseId: fixture.id, repetition, arm, expected: fixture.answer, actual, rawAnswer, correct: actual === fixture.answer && answer.finishReason === "stop", finishReason: answer.finishReason, requestId: answer.requestId, usage: answer.usage });
      saveReport();
     }
    }
@@ -227,9 +229,12 @@ try {
  if (!report.passed) process.exitCode = 1;
 } catch (error) {
  report.failed = true;
- report.failure = error.message.replace(/sk-or-[\w-]+/g, "[REDACTED]");
+ // Exceptions can contain provider text (for example invalid tool JSON). Keep
+ // only a local category in the artifact, just like the response metadata.
+ report.failure = "Live model validation failed";
+ report.failureCategory = providerReportErrorCategory(error);
  saveReport();
- console.error(JSON.stringify({ failure: report.failure, reportFile }));
+ console.error(JSON.stringify({ failure: report.failure, failureCategory: report.failureCategory, reportFile }));
  process.exitCode = 1;
 } finally {
  apiKey = undefined;
