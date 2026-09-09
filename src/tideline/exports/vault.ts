@@ -32,7 +32,6 @@ import { renameWithRetry } from "../../infra/fs/atomic-rename.js";
 import { cosine, getDefaultEmbedder } from "../embeddings/embedder.js";
 import { linksFrom, type MemoryLink, type MemoryLinkKind } from "../graph/links.js";
 import { originBucketKey, type MemoryRecord, type MemorySegment } from "../store/records.js";
-import { tokenize } from "../retrieval/scoring.js";
 
 const PIN_OPEN = "%% pinned %%";
 const PIN_CLOSE = "%% /pinned %%";
