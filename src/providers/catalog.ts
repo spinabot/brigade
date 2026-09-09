@@ -202,6 +202,19 @@ export const PROVIDERS: ProviderInfo[] = [
 		billing: "metered",
 	},
 	{
+		id: "tokensmarket",
+		name: "Token Market",
+		description: "Multi-model AI gateway with OpenAI-compatible access",
+		keyUrl: "https://www.tokensmarket.ai/console",
+		envVar: "TOKENSMARKET_API_KEY",
+		custom: true,
+		liveModels: true, // models fetched live from /v1/models at onboarding
+		api: "openai-completions",
+		baseUrl: "https://api.tokensmarket.ai/v1",
+		billing: "metered",
+	},
+
+	{
 		id: "groq",
 		name: "Groq",
 		description: "Very fast inference (Llama, Qwen, Kimi)",
