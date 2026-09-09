@@ -1,124 +1,129 @@
-/**
- * Build the publishable `brigade-tideline` package.
- *
- * The in-repo extraction layer (src/tideline/) re-exports the memory core from
- * src/agents/memory/*, which reaches Brigade host code through ONE seam —
- * `agents/memory/host-ports.ts`. This build produces a self-contained npm package by:
- *   1. esbuild-bundling the 3 entries (index/advanced/eval) with that seam aliased to
- *      the filesystem-only `host-ports.standalone.ts` → self-contained ESM, zero `../` escapes.
- *   2. emitting .d.ts from a TEMP source tree where the seam is PHYSICALLY swapped, so the
- *      types are self-contained and Brigade-free too.
- *   3. writing the package.json (paths repointed at the bundles) + README.
- *
- * Output: dist/tideline/  (npm pack-able).  Run: `npm run build:tideline`.
- */
+/** Build the canonical Tideline engine, without swapping or stubbing host code. */
 import esbuild from "esbuild";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import { isBuiltin } from "node:module";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
-const ROOT = process.cwd();
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SRC = path.join(ROOT, "src");
-const OUT = path.join(ROOT, "dist", "tideline");
-const TMP = path.join(ROOT, "dist", ".tideline-build");
-const STANDALONE = path.join(SRC, "tideline", "host-ports.standalone.ts");
-const log = (m) => console.log(`▌ ${m}`);
-
-fs.rmSync(OUT, { recursive: true, force: true });
-fs.rmSync(TMP, { recursive: true, force: true });
-fs.mkdirSync(OUT, { recursive: true });
-
-// ── 1. bundle JS, swapping the host seam ──────────────────────────────────────
-const swap = {
-	name: "host-ports-swap",
-	setup(b) {
-		b.onResolve({ filter: /\/host-ports\.js$/ }, () => ({ path: STANDALONE }));
-	},
-};
-const entries = {
-	index: path.join(SRC, "tideline", "index.ts"),
-	advanced: path.join(SRC, "tideline", "advanced.ts"),
-	eval: path.join(SRC, "tideline", "eval.ts"),
-};
-const result = await esbuild.build({
-	entryPoints: entries,
-	outdir: OUT,
-	bundle: true,
-	format: "esm",
-	platform: "node",
-	target: "node22",
-	metafile: true,
-	plugins: [swap],
-	logLevel: "warning",
-});
-if (result.warnings.length) {
-	console.error("esbuild warnings:", result.warnings);
+const ENGINE = path.join(SRC, "tideline");
+// Brigade's normal tsc build owns dist/tideline. Never replace that directory.
+const OUT = path.join(ROOT, "dist", "packages", "tideline");
+const brigadeOutput = path.join(ROOT, "dist", "tideline");
+if (OUT === brigadeOutput || brigadeOutput.startsWith(`${OUT}${path.sep}`)) {
+	throw new Error("Standalone output must not replace Brigade's compiled engine");
 }
-log(`bundled index/advanced/eval → dist/tideline (warnings: ${result.warnings.length})`);
+const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "tideline-package-build-"));
+const staged = path.join(workDir, "package");
+const entries = Object.fromEntries(["index", "advanced", "eval"].map((name) => [name, path.join(ENGINE, `${name}.ts`)]));
 
-// ── 2. derive the exact graph source set from the metafile ────────────────────
-const inputs = Object.keys(result.metafile.inputs)
-	.map((p) => path.resolve(ROOT, p))
-	.filter((p) => p.startsWith(SRC) && p.endsWith(".ts"));
-log(`graph: ${inputs.length} source files`);
-
-// ── 3. temp tree with the seam physically swapped → emit .d.ts ────────────────
-for (const abs of inputs) {
-	if (abs === STANDALONE) continue; // becomes agents/memory/host-ports.ts below
-	const dest = path.join(TMP, path.relative(SRC, abs));
-	fs.mkdirSync(path.dirname(dest), { recursive: true });
-	fs.copyFileSync(abs, dest);
+// Shared helpers, not Brigade runtime bindings. Both runtime and erased
+// type-only dependency closures must stay inside this explicit boundary.
+const sharedHelpers = new Set([
+	path.join(SRC, "security", "injection-patterns.ts"),
+	path.join(SRC, "system-prompt", "sanitize.ts"),
+	path.join(SRC, "infra", "fs", "atomic-rename.ts"),
+]);
+function assertEngineSource(file) {
+	const resolved = fs.realpathSync(file);
+	if (!(resolved.startsWith(`${ENGINE}${path.sep}`) || sharedHelpers.has(resolved)) || resolved.endsWith(".test.ts")) {
+		throw new Error(`Tideline package boundary violation: ${path.relative(ROOT, resolved)}`);
+	}
 }
-const standaloneSrc = fs
-	.readFileSync(STANDALONE, "utf8")
-	.replace(/\.\.\/agents\/memory\/records\.js/g, "./records.js");
-const hpDest = path.join(TMP, "agents", "memory", "host-ports.ts");
-fs.mkdirSync(path.dirname(hpDest), { recursive: true });
-fs.writeFileSync(hpDest, standaloneSrc);
 
-const tsconfig = {
-	compilerOptions: {
-		target: "es2022",
-		module: "nodenext",
-		moduleResolution: "nodenext",
+try {
+	// An esbuild metafile omits erased type-only imports. TypeScript discovers
+	// that declaration graph too, and checks it at the same strictness as Brigade.
+	const program = ts.createProgram(Object.values(entries), {
+		target: ts.ScriptTarget.ES2022,
+		module: ts.ModuleKind.NodeNext,
+		moduleResolution: ts.ModuleResolutionKind.NodeNext,
+		strict: true,
+		noUncheckedIndexedAccess: true,
+		noImplicitOverride: true,
+		forceConsistentCasingInFileNames: true,
+		esModuleInterop: true,
+		skipLibCheck: true,
 		declaration: true,
 		emitDeclarationOnly: true,
-		skipLibCheck: true,
-		// Keep strictNullChecks (the core's discriminated-union narrowing — e.g. WriteGateVerdict —
-		// depends on it) but disable noImplicitAny: the standalone seam types the never-reached
-		// convex store as `any`, so the core's dead convex branch infers a few implicit-any params.
-		strict: true,
-		noImplicitAny: false,
-		outDir: path.join(OUT, "types"),
-		rootDir: TMP,
-	},
-	include: ["**/*.ts"],
-	exclude: ["**/*.test.ts"],
-};
-fs.writeFileSync(path.join(TMP, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
-log("emitting .d.ts …");
-execFileSync("node", [path.join(ROOT, "node_modules", "typescript", "bin", "tsc"), "-p", path.join(TMP, "tsconfig.json")], {
-	stdio: "inherit",
-	cwd: ROOT,
-});
-log("✔ .d.ts → dist/tideline/types");
+		noEmitOnError: true,
+		rootDir: SRC,
+		outDir: path.join(staged, "types"),
+		types: ["node"],
+		typeRoots: [path.join(ROOT, "node_modules", "@types")],
+		lib: ["lib.es2022.d.ts"],
+	});
+	const sources = program.getSourceFiles().filter((source) => !source.isDeclarationFile);
+	const boundarySources = program.getSourceFiles().filter((source) =>
+		!source.isDeclarationFile || (!program.isSourceFileDefaultLibrary(source) && !program.isSourceFileFromExternalLibrary(source)),
+	);
+	// Project-local declarations are part of the boundary too; only external
+	// type libraries (such as Node's declarations) are exempt from source ownership.
+	for (const source of boundarySources) assertEngineSource(source.fileName);
+	const diagnostics = ts.getPreEmitDiagnostics(program);
+	if (diagnostics.length) {
+		throw new Error(ts.formatDiagnosticsWithColorAndContext(diagnostics, {
+			getCanonicalFileName: (file) => file,
+			getCurrentDirectory: () => ROOT,
+			getNewLine: () => "\n",
+		}));
+	}
+	if (program.emit().emitSkipped) throw new Error("Tideline declaration emit was skipped");
 
-// ── 4. package.json (repointed) + README ──────────────────────────────────────
-const pkg = JSON.parse(fs.readFileSync(path.join(SRC, "tideline", "package.json"), "utf8"));
-pkg.main = "./index.js";
-pkg.types = "./types/tideline/index.d.ts";
-pkg.exports = {
-	".": { types: "./types/tideline/index.d.ts", import: "./index.js" },
-	"./advanced": { types: "./types/tideline/advanced.d.ts", import: "./advanced.js" },
-	"./eval": { types: "./types/tideline/eval.d.ts", import: "./eval.js" },
-};
-pkg.files = ["index.js", "advanced.js", "eval.js", "types", "README.md"];
-// Entries run registerBuiltInEmbedderAdapters() at import — mark them as having side
-// effects so a consumer's bundler can't tree-shake the registration away.
-pkg.sideEffects = ["./index.js", "./advanced.js", "./eval.js"];
-fs.writeFileSync(path.join(OUT, "package.json"), `${JSON.stringify(pkg, null, "\t")}\n`);
-fs.copyFileSync(path.join(SRC, "tideline", "README.md"), path.join(OUT, "README.md"));
-log("wrote package.json + README");
+	const result = await esbuild.build({
+		absWorkingDir: ROOT,
+		entryPoints: entries,
+		outdir: staged,
+		bundle: true,
+		splitting: true,
+		chunkNames: "chunks/[name]-[hash]",
+		format: "esm",
+		platform: "node",
+		target: "node22",
+		metafile: true,
+		logLevel: "warning",
+		plugins: [{
+			name: "tideline-source-boundary",
+			setup(build) {
+				build.onLoad({ filter: /\.[cm]?[jt]sx?$/ }, (args) => {
+					assertEngineSource(args.path);
+					return undefined;
+				});
+			},
+		}],
+	});
+	if (result.warnings.length) throw new Error("Tideline bundle produced warnings");
+	for (const input of Object.keys(result.metafile.inputs)) assertEngineSource(path.resolve(ROOT, input));
+	for (const output of Object.values(result.metafile.outputs)) {
+		for (const dependency of output.imports) {
+			if (dependency.external && !isBuiltin(dependency.path)) {
+				throw new Error(`Unexpected runtime dependency: ${dependency.path}`);
+			}
+		}
+	}
 
-fs.rmSync(TMP, { recursive: true, force: true });
-log("✔ build complete → dist/tideline");
+	const pkg = JSON.parse(fs.readFileSync(path.join(ENGINE, "package.json"), "utf8"));
+	pkg.main = "./index.js";
+	pkg.types = "./types/tideline/index.d.ts";
+	pkg.exports = Object.fromEntries(["index", "advanced", "eval"].map((name) => [
+		name === "index" ? "." : `./${name}`,
+		{ types: `./types/tideline/${name}.d.ts`, import: `./${name}.js` },
+	]));
+	pkg.files = ["index.js", "advanced.js", "eval.js", "chunks", "types", "README.md"];
+	// Shared chunks preserve class identity and module-level embedder state across
+	// entry points. Provider registration is an intentional import-time effect.
+	pkg.sideEffects = ["./index.js", "./advanced.js", "./eval.js", "./chunks/*.js"];
+	fs.writeFileSync(path.join(staged, "package.json"), `${JSON.stringify(pkg, null, "\t")}\n`);
+	fs.copyFileSync(path.join(ENGINE, "README.md"), path.join(staged, "README.md"));
+	fs.mkdirSync(path.dirname(OUT), { recursive: true });
+	// Validation and compilation finish before replacing the generated package.
+	fs.rmSync(OUT, { recursive: true, force: true });
+	fs.cpSync(staged, OUT, { recursive: true });
+	console.log(`Tideline package built: ${sources.length} declaration sources; shared ESM chunks; strict types.`);
+	console.log("Output: dist/packages/tideline (no Brigade runtime, Convex client, or scan stubs).");
+} finally {
+	fs.rmSync(workDir, { recursive: true, force: true });
+}

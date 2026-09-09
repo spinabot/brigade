@@ -23,6 +23,7 @@ function makeEventStore() {
 		mode: "convex",
 		init: async () => {},
 		memory: {
+			listAllFactRecordsRaw: async () => [],
 			upsertFactRecordRaw: async () => {},
 			deleteFactRecordRaw: async () => {},
 			appendMemoryEvent: async (_workspaceId: string, event: Record<string, unknown>) => {
@@ -55,6 +56,7 @@ describe("convex audit log — emit() routes to the appendMemoryEvent hook", () 
 		const { store: cxStore, events } = makeEventStore();
 		setRuntimeContext(await createRuntimeContext({ store: cxStore, stateDir: dir }));
 		const store = new FactStore(path.join(dir, "cxws"));
+		await store.ready();
 		store.write({ content: "I live in Lisbon", segment: "identity" });
 		// emit() is fire-and-forget (an audit-log write must never fail a memory write) —
 		// let the microtask queue drain.
@@ -76,10 +78,11 @@ describe("convex audit log — emit() routes to the appendMemoryEvent hook", () 
 		const store0 = {
 			mode: "convex",
 			init: async () => {},
-			memory: { upsertFactRecordRaw: async () => {}, deleteFactRecordRaw: async () => {} },
+			memory: { listAllFactRecordsRaw: async () => [], upsertFactRecordRaw: async () => {}, deleteFactRecordRaw: async () => {} },
 		} as unknown as BrigadeStore;
 		setRuntimeContext(await createRuntimeContext({ store: store0, stateDir: dir }));
 		const store = new FactStore(path.join(dir, "cxws2"));
+		await store.ready();
 		store.write({ content: "no event hook present", segment: "knowledge" }); // must not throw
 		await new Promise((r) => setTimeout(r, 0));
 		assert.deepEqual(await store.readEventsAsync(), [], "no hook ⇒ empty audit trail (additive degrade)");

@@ -112,6 +112,7 @@ export async function runConsolidation(args: {
 	minFacts?: number;
 }): Promise<ConsolidationResult> {
 	const store = new FactStore(args.workspaceDir);
+	await store.ready();
 	const active = store.list(); // active-only
 	const min = args.minFacts ?? MIN_FACTS_TO_CONSOLIDATE;
 
@@ -223,6 +224,7 @@ export async function runConsolidation(args: {
 		archived += evicted.length;
 		log.info("consolidation sweep (origin)", { considered: bucket.length, archived: evicted.length });
 	}
+	await store.flush();
 	return { ran, archived, considered: active.length };
 }
 

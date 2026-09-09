@@ -35,6 +35,7 @@ function makeConvexStore() {
 		mode: "convex",
 		init: async () => {},
 		memory: {
+			listAllFactRecordsRaw: async () => [],
 			upsertFactRecordRaw: async (workspaceId: string, record: Record<string, unknown>) => {
 				captured.push({ workspaceId, record });
 			},
@@ -65,6 +66,7 @@ describe("convex hybrid lane — embed-on-write + searchHybrid", () => {
 		const { store: cxStore, captured } = makeConvexStore();
 		setRuntimeContext(await createRuntimeContext({ store: cxStore, stateDir: dir }));
 		const store = new FactStore(path.join(dir, "cxws"));
+		await store.ready();
 		store.write({ content: "I reside in Hyderabad, India", segment: "identity", createdBy: owner });
 		store.write({ content: "I prefer tabs over spaces when coding", segment: "preference", createdBy: owner });
 		store.write({ content: "I drink black coffee with no sugar", segment: "preference", createdBy: owner });

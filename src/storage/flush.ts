@@ -55,8 +55,8 @@ export async function flushAllPendingWrites(): Promise<void> {
 	try {
 		const { awaitFactsFlush } = await import("./facts-cache.js");
 		await awaitFactsFlush();
-	} catch {
-		/* best-effort */
+	} catch (error) {
+		console.error(`brigade: pending memory facts could not be persisted: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	try {
 		const { awaitCursorFlush } = await import("../agents/memory/extract.js");

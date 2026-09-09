@@ -196,7 +196,7 @@ async function hydrateFactsCaches(
 	store: BrigadeStore,
 	cfg: Record<string, unknown>,
 ): Promise<void> {
-	const { primeFactsCache, canonicalWorkspaceId } = await import("./facts-cache.js");
+	const { ensureFactsHydrated, canonicalWorkspaceId } = await import("./facts-cache.js");
 	const agents = cfg.agents as Record<string, unknown> | undefined;
 	const ids = new Set<string>(["main"]);
 	if (agents && typeof agents === "object") {
@@ -211,8 +211,7 @@ async function hydrateFactsCaches(
 	await Promise.all(
 		Array.from(ids, async (workspaceId) => {
 			try {
-				const records = await store.memory.listAllFactRecordsRaw(workspaceId);
-				primeFactsCache(workspaceId, records as never[]);
+				await ensureFactsHydrated(store, workspaceId);
 			} catch (err) {
 				console.error(
 					`brigade: memory hydration failed for workspace ${workspaceId} — ${(err as Error).message}`,

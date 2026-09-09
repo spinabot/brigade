@@ -38,6 +38,7 @@ function makeConvexStore() {
 		mode: "convex",
 		init: async () => {},
 		memory: {
+			listAllFactRecordsRaw: async () => [],
 			upsertFactRecordRaw: async (ws: string, rec: unknown) => {
 				upserts.push({ ws, rec });
 			},
@@ -103,7 +104,9 @@ describe("dual-mode runtime — recall identical + isolated in BOTH modes", () =
 		// flip to convex mode with an injected fake store
 		const { store: cxStore, upserts } = makeConvexStore();
 		setRuntimeContext(await createRuntimeContext({ store: cxStore, stateDir: dir }));
-		const cxResult = seedAndRecall(new FactStore(path.join(dir, "cxws"))); // convex mode → cache
+		const hosted = new FactStore(path.join(dir, "cxws"));
+		await hosted.ready();
+		const cxResult = seedAndRecall(hosted); // convex mode → cache
 		await awaitFactsFlush();
 
 		// the convex storage path must change NEITHER recall ranking NOR isolation

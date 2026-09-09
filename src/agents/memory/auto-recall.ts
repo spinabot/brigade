@@ -133,6 +133,7 @@ async function buildBlockFromCapability(
 		// relational message ALSO pulls in graph-connected facts. Read-only over
 		// `active` ⇒ passive (no decay reinforcement), matching markAccessed:false.
 		const store = capability.factStore;
+		await store.ready();
 		const active = store.list(opts.origin !== undefined ? { origin: opts.origin } : {});
 		// Async so a LEARNED (async) embedder embeds the query for true-synonymy
 		// recall; the sync HRR default awaits a no-op → identical result.

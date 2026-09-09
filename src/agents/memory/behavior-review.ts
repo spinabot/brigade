@@ -80,6 +80,8 @@ export type BehaviorReviewer = (transcript: string) => Promise<ExtractedFact[]>;
 
 /** Minimal write surface the apply-step needs (a `FactStore` satisfies it). */
 export interface BehaviorWriteStore {
+	ready?(): Promise<void>;
+	flush?(): Promise<void>;
 	write(fact: NewFact): MemoryRecord;
 }
 
@@ -106,6 +108,7 @@ export async function runBehaviorReview(args: {
 	store: BehaviorWriteStore;
 	origin?: MemoryRecordOrigin;
 }): Promise<BehaviorReviewResult> {
+	await args.store.ready?.();
 	let facts: ExtractedFact[];
 	try {
 		facts = await args.reviewer(args.transcript);
@@ -138,6 +141,7 @@ export async function runBehaviorReview(args: {
 			// into the sweep on an unexpected fs/embedder error.
 		}
 	}
+	await args.store.flush?.();
 	return {
 		written: segments.length,
 		segments,
