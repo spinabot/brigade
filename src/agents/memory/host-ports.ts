@@ -1,31 +1,52 @@
 /**
- * Memory host seams — the ONE swappable module.
- *
- * The Tideline core (`records.ts` / `FactStore`) needs four things it does not own:
- *   1. a subsystem LOGGER,
- *   2. the Convex write-through CACHE (convex storage mode only),
- *   3. the runtime storage-MODE probe (filesystem vs convex),
- *   4. a write-time content THREAT-SCAN (+ its error).
- *
- * Rather than have the core reach into Brigade's `../../` subsystems directly (which
- * is what made it un-extractable), the core imports ALL of them from HERE. This file
- * is Brigade's binding: it just forwards to the real host modules — PURE INDIRECTION,
- * identical behavior, no wiring, no test changes.
- *
- * The decoupling: a standalone `brigade-tideline` publish swaps THIS one file for an
- * fs-only variant (no-op logger, no Convex cache, runtime-mode = filesystem so the
- * convex branches never fire, a vendored pure threat-scan). Every other memory module
- * is already host-import-free, so the core reaches outside its own directory ONLY
- * through this seam — making the standalone build a single-file swap, not a refactor.
- * See `src/tideline/host-ports.standalone.ts` for the fs-only implementation + the
- * package README's "packaging status" for the build swap.
+ * Brigade's per-instance binding for Tideline's legacy synchronous fact store.
+ * Runtime mode, workspace identity, cache hydration and queued Convex mutations
+ * belong to the harness. Importing this module never changes standalone Tideline.
  */
 
-// 1. logger
+import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
+import { awaitFactsFlush, ensureFactsHydrated, readThroughFactsCache, workspaceIdFromDir, writeThroughFactsCache } from "../../storage/facts-cache.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
+import type { MemoryEvent } from "../../tideline/store/event-log.js";
+import type { FactStoreHostPorts } from "../../tideline/ports/host-ports.js";
+
+/** A fresh binding per consumer; runtime mode is resolved on every operation. */
+export function createBrigadeMemoryHostPorts(): FactStoreHostPorts {
+	return {
+		logger: createSubsystemLogger("memory/records"),
+		getBackend(workspaceDir) {
+			const rctx = tryGetRuntimeContext();
+			if (rctx?.mode !== "convex") return undefined;
+			const wsId = workspaceIdFromDir(workspaceDir);
+			return {
+				ready: () => ensureFactsHydrated(rctx.store, wsId),
+				flush: () => awaitFactsFlush(wsId),
+				readAll() {
+					return readThroughFactsCache(rctx.store, wsId);
+				},
+				writeAll(records) {
+					// Existing cache diffing, cloning, retry ordering and flush tracking.
+					writeThroughFactsCache(rctx.store, wsId, records);
+				},
+				appendEvent(event) {
+					// Preserve the optional, fire-and-forget legacy audit hook.
+					const append = rctx.store.memory.appendMemoryEvent;
+					if (append) {
+						void append.call(rctx.store.memory, wsId, event as unknown as Record<string, unknown>).catch(() => {});
+					}
+				},
+				async readEventsAsync() {
+					const list = rctx.store.memory.listMemoryEvents;
+					if (!list) return [];
+					return (await list.call(rctx.store.memory, wsId)) as unknown as MemoryEvent[];
+				},
+			};
+		},
+	};
+}
+
+// Preserve the old host entry's named exports for existing internal consumers.
 export { createSubsystemLogger } from "../../logging/subsystem-logger.js";
-// 2. + 3. runtime storage-mode probe (carries the convex store for write-through)
 export { tryGetRuntimeContext } from "../../storage/runtime-context.js";
-// 3. convex write-through cache (all sync; only exercised in convex mode)
 export { getCachedFacts, primeFactsCache, workspaceIdFromDir, writeThroughFactsCache } from "../../storage/facts-cache.js";
-// 4. write-time content threat-scan + its error
 export { MemoryThreatError, scanForThreats } from "../../security/injection-patterns.js";

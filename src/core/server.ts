@@ -42,13 +42,11 @@ import { WebSocketServer, type ServerOptions as WsServerOptions, type WebSocket 
 import {
 	type AgentSummary,
 	DEFAULT_PORT,
-	EVENT_NAMES,
 	type EventName,
 	type EventPayload,
 	type Frame,
 	isFrame,
 	modelToSummary,
-	REQUEST_METHODS,
 	type RequestFrame,
 	type RequestMethod,
 	type RequestParams,
@@ -57,7 +55,8 @@ import {
 	TICK_INTERVAL_MS,
 	type WireMessage,
 } from "../protocol.js";
-import { type HelloOk, PROTOCOL_CAPABILITIES, PROTOCOL_VERSION } from "../protocol/handshake.js";
+import { type HelloOk, PROTOCOL_VERSION } from "../protocol/handshake.js";
+import { buildGatewayFeatures } from "./gateway-features.js";
 import { nextSeq } from "../protocol/stream-seq.js";
 // Per-turn execution path (the single canonical runtime). The gateway no
 // longer holds a long-lived Pi session: every inbound `prompt` builds a
@@ -1592,14 +1591,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					}
 					// Cheap, no-model-call decay GC in the same quiet window for THIS
 					// agent's workspace. Runs once per drain per agent.
+					const memoryStore = new FactStore(workspaceDir);
+					await memoryStore.ready();
 					runDecayGc(workspaceDir);
+					await memoryStore.flush();
 					// Re-embed pass: fill vectors that embed-on-write SKIPPED under a
 					// LEARNED (async) embedder. No-op for the sync HRR default (facts are
 					// vectored inline on write). Best-effort + bounded — gives a selected
 					// learned embedder its synonymy recall progressively.
 					if (!getDefaultEmbedder().id.startsWith("hrr")) {
 						try {
-							await reembedPending(new FactStore(workspaceDir), getDefaultEmbedder());
+							await reembedPending(memoryStore, getDefaultEmbedder());
 						} catch (reErr) {
 							opts.consoleStream?.info?.(
 								`reembed error (agent=${targetAgentId}): ${reErr instanceof Error ? reErr.message : String(reErr)}`,
@@ -1615,10 +1617,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						// `vaultDir` re-renders the owner's Obsidian-style markdown vault
 						// AFTER a pass that actually changed facts (change-gated inside the
 						// curator; filesystem mode only) — preserving any human-pinned edits.
-						runCurator(new FactStore(workspaceDir), {
+						runCurator(memoryStore, {
 							dream: { evictMinAgeMs: Number.POSITIVE_INFINITY },
 							vaultDir: joinPath(workspaceDir, "memory-vault"),
 						});
+						await memoryStore.flush();
 					} catch (curErr) {
 						opts.consoleStream?.info?.(
 							`memory curator error (agent=${targetAgentId}): ${curErr instanceof Error ? curErr.message : String(curErr)}`,
@@ -5003,7 +5006,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				if (guardErr) throw guardErr;
 				const p = (params ?? {}) as RequestParams["memory-graph"];
 				const wsDir = resolveAgentWorkspaceDir(p.agentId ?? agentId);
-				const graph = exportMemoryGraph(new FactStore(wsDir).readAll(), { maxNodes: p.maxNodes ?? 250 });
+				const memoryStore = new FactStore(wsDir);
+				await memoryStore.ready();
+				const graph = exportMemoryGraph(memoryStore.readAll(), { maxNodes: p.maxNodes ?? 250 });
 				return graph as ResponseFor[M];
 			}
 			case "memory-query": {
@@ -5014,7 +5019,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				if (guardErr) throw guardErr;
 				const p = (params ?? {}) as RequestParams["memory-query"];
 				const wsDir = resolveAgentWorkspaceDir(p.agentId ?? agentId);
-				const result = queryMemory(new FactStore(wsDir), {
+				const memoryStore = new FactStore(wsDir);
+				await memoryStore.ready();
+				const result = queryMemory(memoryStore, {
 					action: p.action,
 					query: p.query,
 					memoryId: p.memoryId,
@@ -5214,14 +5221,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			type: "hello-ok",
 			protocol: PROTOCOL_VERSION,
 			server: { version: getBuildInfo().version, connId, epoch: gatewayEpoch },
-			features: {
-				methods: [...REQUEST_METHODS, ...customMethods.keys()],
-				events: [...EVENT_NAMES],
-				// Named behaviours, so a client can detect what this gateway does
-				// instead of inferring it from a version integer that cannot say
-				// WHAT changed. Unknown names are ignorable by construction.
-				capabilities: [...PROTOCOL_CAPABILITIES],
-			},
+			features: buildGatewayFeatures(customMethods.keys()),
 			policy: {
 				maxPayload: MAX_WS_PAYLOAD_BYTES,
 				maxBufferedBytes: MAX_WS_BUFFERED_BYTES,
@@ -5494,22 +5494,31 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					}
 				}
 				for (const id of ids) {
-					runMemoryMaintenance(
-						resolveAgentWorkspaceDir(id),
-						(stage, err) =>
-							opts.consoleStream?.info?.(
-								`memory maintenance ${stage} error (agent=${id}): ${err instanceof Error ? err.message : String(err)}`,
-							),
-						(pairs) => {
-							// Surface contradictions for human review — never auto-resolve.
-							const top = [...pairs].sort((a, b) => b.score - a.score).slice(0, 3);
-							opts.consoleStream?.info?.(
-								`memory: ${pairs.length} possible contradiction(s) for agent=${id} (review; not auto-resolved): ${top
-									.map((p) => `"${p.a.content.length > 80 ? p.a.content.slice(0, 80) + "…" : p.a.content}" <-> "${p.b.content.length > 80 ? p.b.content.slice(0, 80) + "…" : p.b.content}" (${p.score.toFixed(2)})`)
-									.join("; ")}`,
-							);
-						},
-					);
+					try {
+						const memoryStore = new FactStore(resolveAgentWorkspaceDir(id));
+						await memoryStore.ready();
+						runMemoryMaintenance(
+							resolveAgentWorkspaceDir(id),
+							(stage, err) =>
+								opts.consoleStream?.info?.(
+									`memory maintenance ${stage} error (agent=${id}): ${err instanceof Error ? err.message : String(err)}`,
+								),
+							(pairs) => {
+								// Surface contradictions for human review — never auto-resolve.
+								const top = [...pairs].sort((a, b) => b.score - a.score).slice(0, 3);
+								opts.consoleStream?.info?.(
+									`memory: ${pairs.length} possible contradiction(s) for agent=${id} (review; not auto-resolved): ${top
+										.map((p) => `"${p.a.content.length > 80 ? p.a.content.slice(0, 80) + "…" : p.a.content}" <-> "${p.b.content.length > 80 ? p.b.content.slice(0, 80) + "…" : p.b.content}" (${p.score.toFixed(2)})`)
+										.join("; ")}`,
+								);
+							},
+						);
+						await memoryStore.flush();
+					} catch (err) {
+						opts.consoleStream?.info?.(
+							`memory maintenance persistence error (agent=${id}): ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
 					// Yield to the event loop between agents so channel inbounds keep flowing
 					// during a multi-agent sweep — Brigade's org can have ~22 agents; without
 					// this the whole batch runs sync in one tick and starves inbound handling.
@@ -7634,8 +7643,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			try {
 				const { awaitFactsFlush } = await import("../storage/facts-cache.js");
 				await awaitFactsFlush();
-			} catch {
-				/* best-effort */
+			} catch (err) {
+				createSubsystemLogger("memory").error("Memory persistence failed during gateway shutdown", {
+					error: err instanceof Error ? err.message : String(err),
+				});
 			}
 			try {
 				const { awaitCursorFlush } = await import("../agents/memory/extract.js");

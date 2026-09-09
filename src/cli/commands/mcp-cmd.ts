@@ -23,6 +23,7 @@ export async function runMemoryMcpServerCli(opts: { agentId?: string } = {}): Pr
 	const tide = Tideline.open(workspaceDir, {
 		threatScan: { scan: (c) => scanForThreats(c, "strict") },
 	});
+	await tide.ready();
 	const server = createMemoryMcpServer(tide, { origin: { kind: "owner" }, serverName: "brigade-memory" });
 	process.stderr.write(
 		`brigade memory MCP server ready — agent '${agentId}', ${server.toolCount} tools, MCP over stdio. ` +

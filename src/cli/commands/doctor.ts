@@ -83,7 +83,7 @@ export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise
 	checks.push(checkClaudeCliBackend());
 	checks.push(checkWorkspace());
 	checks.push(await checkMemory());
-	checks.push(checkMemoryFreshness());
+	checks.push(await checkMemoryFreshness());
 	checks.push(checkSkills());
 	checks.push(checkMediaUnderstanding());
 	checks.push(checkLogDirWritable());
@@ -547,9 +547,11 @@ async function checkMemory(): Promise<CheckResult> {
 	// is actually populating facts.jsonl (useful when verifying memory manually).
 	let factCount = 0;
 	try {
-		factCount = new FactStore(workspaceDir).list().length;
-	} catch {
-		/* no fact store yet */
+		const facts = new FactStore(workspaceDir);
+		await facts.ready();
+		factCount = facts.list().length;
+	} catch (error) {
+		return { name: "memory", status: "warn", message: `could not read facts: ${error instanceof Error ? error.message : String(error)}` };
 	}
 	const embedder = process.env.BRIGADE_MEMORY_EMBEDDER ?? "model-free";
 	// When a non-default embedder is configured, note that the gateway
@@ -589,14 +591,16 @@ async function checkMemory(): Promise<CheckResult> {
  * sessions) or one where extraction ran but found nothing durable — so a first
  * boot / CI never trips `--strict`.
  */
-function checkMemoryFreshness(): CheckResult {
+async function checkMemoryFreshness(): Promise<CheckResult> {
 	const name = "memory freshness";
 	const workspaceDir = resolveAgentWorkspaceDir(DEFAULT_AGENT_ID);
 	let factCount = 0;
 	try {
-		factCount = new FactStore(workspaceDir).list().length;
-	} catch {
-		/* no fact store yet */
+		const facts = new FactStore(workspaceDir);
+		await facts.ready();
+		factCount = facts.list().length;
+	} catch (error) {
+		return { name, status: "warn", message: `could not read facts: ${error instanceof Error ? error.message : String(error)}` };
 	}
 	if (factCount > 0) {
 		return { name, status: "ok", message: `moat is live — ${factCount} fact${factCount === 1 ? "" : "s"} distilled` };

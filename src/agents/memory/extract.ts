@@ -25,7 +25,7 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { pickInitialThinkingLevel } from "../../core/model-caps.js";
-import { awaitFactsFlush, factsFlushErrorCount, workspaceIdFromDir } from "../../storage/facts-cache.js";
+import { workspaceIdFromDir } from "../../storage/facts-cache.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { applyPersonaOverrideToSession } from "../../system-prompt/pi-injection.js";
 import { wrapStreamFnWithPayloadMutations } from "../payload-mutators.js";
@@ -371,7 +371,8 @@ export function getCursor(workspaceDir: string, sessionId: string): number {
 /* ───────────────────────── sweep ───────────────────────── */
 
 /** Injectable distiller: given flattened conversation text, return the raw model reply. */
-export type ExtractionLlm = (conversationText: string) => Promise<string>;
+export type { ExtractionLlm } from "../../tideline/extraction/extraction-llm.js";
+import type { ExtractionLlm } from "../../tideline/extraction/extraction-llm.js";
 
 export interface SweepArgs {
 	workspaceDir: string;
@@ -434,9 +435,16 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 	// just yields no candidates (the model still relates new facts to each other).
 	let candidateBlock = "";
 	let candidateIds: Set<string> = new Set();
+	const store = new FactStore(args.workspaceDir);
+	try {
+		await store.ready();
+	} catch (error) {
+		log.warn("extraction memory hydration failed; cursor not advanced", { sessionId: args.sessionId, error: String(error) });
+		return { ran: false, stored: 0, processedTo: from };
+	}
 	try {
 		const candidates = fetchRelationshipCandidates(
-			new FactStore(args.workspaceDir),
+			store,
 			[conversation],
 			args.origin,
 			DEFAULT_CANDIDATE_K,
@@ -470,8 +478,6 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 		});
 		return { ran: false, stored: 0, processedTo: from };
 	}
-	const wsId = workspaceIdFromDir(args.workspaceDir);
-	const errorsBefore = factsFlushErrorCount(wsId);
 	const stored = storeExtractedFacts(args.workspaceDir, facts, args.sessionId, {
 		...(args.origin ? { origin: args.origin } : {}),
 		...(args.sourceType ? { sourceType: args.sourceType } : {}),
@@ -481,8 +487,9 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 	// flush fails. Await the flush and only advance if it didn't error — otherwise leave
 	// the cursor put so the next sweep re-distils (idempotent; write-time dedup absorbs
 	// the repeat). In fs mode the chain is empty, so this awaits nothing and never trips.
-	await awaitFactsFlush();
-	if (factsFlushErrorCount(wsId) > errorsBefore) {
+	try {
+		await store.flush();
+	} catch {
 		log.warn("extraction facts flush failed; cursor NOT advanced (next sweep retries)", { sessionId: args.sessionId });
 		return { ran: false, stored: 0, processedTo: from };
 	}
@@ -494,8 +501,8 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 	// written new fact OR a candidate that was in the prompt), no self-edges, strict type
 	// (closed taxonomy ∪ same_topic), reason mandatory, the strength filter, the
 	// same_topic quarantine cap, deduped. `linkRelated` is same-origin + idempotent, so
-	// this is origin-isolated and re-running adds nothing. Best-effort — never fails the
-	// sweep (the facts already landed; edges are additive connective tissue).
+	// this is origin-isolated and re-running adds nothing. Parsing is best-effort;
+	// any queued edge mutations must still flush before advancing the cursor.
 	let relatesWritten = 0;
 	try {
 		const refs = parseRelationshipRefs(reply);
@@ -507,6 +514,12 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 		}
 	} catch {
 		/* edges are additive — a failure here never undoes the stored facts */
+	}
+	try {
+		await store.flush();
+	} catch {
+		log.warn("extraction relationship flush failed; cursor NOT advanced", { sessionId: args.sessionId });
+		return { ran: false, stored: 0, processedTo: from };
 	}
 	// Advance the cursor past everything we just considered (even if 0 stored —
 	// re-distilling the same turns would only waste calls).

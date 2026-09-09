@@ -5,6 +5,9 @@ dist/
 # Dependencies
 node_modules/
 
+# Local read-only upstream implementation references (not product dependencies).
+/references/tideline/
+
 # Logs
 *.log
 logs/

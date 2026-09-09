@@ -53,6 +53,7 @@ interface StatusReport {
 		fileCount: number;
 		totalBytes: number;
 		factCount: number;
+		factsError?: string;
 		embedder: string;
 	};
 	skills: {
@@ -103,10 +104,13 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 		.status()
 		.catch(() => ({ fileCount: 0, totalBytes: 0 }));
 	let factCount = 0;
+	let factsError: string | undefined;
 	try {
-		factCount = new FactStore(getBrigadeWorkspaceDir()).list().length;
-	} catch {
-		/* no fact store yet */
+		const facts = new FactStore(getBrigadeWorkspaceDir());
+		await facts.ready();
+		factCount = facts.list().length;
+	} catch (error) {
+		factsError = error instanceof Error ? error.message : String(error);
 	}
 
 	let skillCount = 0;
@@ -133,7 +137,7 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 		authProfileProviders,
 		sessionsDir,
 		sessionCount,
-		memory: { fileCount: memoryStatus.fileCount, totalBytes: memoryStatus.totalBytes, factCount, embedder: process.env.BRIGADE_MEMORY_EMBEDDER ?? "model-free" },
+		memory: { fileCount: memoryStatus.fileCount, totalBytes: memoryStatus.totalBytes, factCount, ...(factsError ? { factsError } : {}), embedder: process.env.BRIGADE_MEMORY_EMBEDDER ?? "model-free" },
 		skills: { count: skillCount },
 		execApprovals,
 		gateway: {
@@ -212,7 +216,9 @@ function formatStatusText(r: StatusReport): string {
 	lines.push(`  dir:           ${path.relative(r.brigadeDir, r.sessionsDir) || r.sessionsDir}`);
 	lines.push("");
 	lines.push(chalk.dim("Memory"));
-	if (r.memory.fileCount === 0 && r.memory.factCount === 0) {
+	if (r.memory.factsError) {
+		lines.push(`  facts:         unavailable (${r.memory.factsError})`);
+	} else if (r.memory.fileCount === 0 && r.memory.factCount === 0) {
 		lines.push(`  stored:        ${chalk.dim("none yet (fills in as the agent learns)")}`);
 	} else {
 		const kb = (r.memory.totalBytes / 1024).toFixed(1);

@@ -10,10 +10,11 @@ A model-agnostic **long-term memory engine** for agents — the framework that b
 - **Reflect / consolidate / relate** — a nightly pass confirms repeated beliefs, merges duplicates, persists `relates` association edges, and evicts decayed noise.
 - **Evaluation harness** (`brigade-tideline/eval`) — deterministic gold sets, recall@k / MRR / nDCG@k with bootstrap CIs, baseline + competitor capabilities for head-to-head, and a privacy-safe export→approve pipeline for measuring on your own data.
 
-## Install
+## Build locally
 
 ```
-npm install brigade-tideline
+npm run build:tideline
+npm run test:tideline-package
 ```
 
 ## Quick start
@@ -26,16 +27,28 @@ const memory = Tideline.open("/path/to/workspace");
 // Write (the write-gate + dedup apply).
 memory.add({ content: "I keep a strict vegetarian diet.", segment: "preference" });
 
-// Recall (hybrid BM25 + vector), ranked.
-const hits = memory.recall("what do I eat");
+// Recall using lexical overlap; model-free vectors do not learn synonymy.
+const hits = memory.recall("vegetarian diet");
 
 // A budgeted, origin-scoped block ready to drop into a prompt.
-const block = memory.context("dietary restrictions", { maxChars: 800 });
+const block = memory.context("vegetarian diet", { maxChars: 800 });
 ```
 
 ### Adapter SPI
 
-`Tideline.open(dir, opts)` takes **four optional adapters** (`clock`, `threatScan`, `embedder`, `llm`); the **`StorageAdapter`** is injected via `Tideline.over(store, opts)` instead (the bundled `FactStore` is `open`'s default backend):
+`Tideline.open(dir, opts)` accepts `TidelineAdapters`; the synchronous
+`StorageAdapter` can instead be supplied through `Tideline.over(store, opts)`.
+Optional per-instance `hostPorts` supply the legacy store's backend and logger.
+Without them, the engine uses local JSONL and no Brigade runtime:
+
+For an asynchronous snapshot backend, await `memory.ready()` before reads or
+writes and `memory.flush()` before acknowledging persistence. Both forward to
+optional adapter methods and are no-ops for filesystem storage. Brigade's backend
+reports pending/failed hydration explicitly and rejects failed flushes; later
+readiness/flush calls retry retained work. Pending retries are process-local,
+not crash-durable, and fact flushing does not include best-effort audit events.
+MCP stdio uses `handleAsync` to enforce these barriers; the synchronous `handle`
+method remains for already-ready synchronous consumers.
 
 | Adapter | Injected via | Purpose | v1 default |
 |---|---|---|---|
@@ -44,6 +57,7 @@ const block = memory.context("dietary restrictions", { maxChars: 800 });
 | `ThreatScanAdapter` | `.open`/`.over` opt | recall-time content-safety scan | no-op (markup-escape only) |
 | `EmbedderAdapter` | `.open`/`.over` opt | learned-embedder seam — **v1: RESERVED**, recorded but not yet called (recall always uses the bundled HRR lane) | none (model-free HRR) |
 | `LlmAdapter` | `.open`/`.over` opt | reflection/synthesis LLM — **v1: RESERVED**, unused | none |
+| `FactStoreHostPorts` | `.open` opt / `new FactStore(dir, { hostPorts })` | optional backend and logger | local filesystem, no-op logger |
 
 ```ts
 import { Tideline, FactStore } from "brigade-tideline";
@@ -85,18 +99,68 @@ The power-user surface the facade is built from: the lifecycle passes (`runDream
 
 ## Packaging status
 
-This directory is the **in-repo extraction layer**: it freezes the package boundary, the public API, and this manifest, re-exported on top of the implementation in `../agents/memory/*` without modifying it.
+### Source layout
 
-**The host coupling is decoupled.** The core (`records.ts` / `FactStore`) used to reach into four Brigade subsystems via scattered `../../` imports; those are now routed through a **single seam module** — `agents/memory/host-ports.ts` — and *every other* re-exported module is already host-import-free. So the entire core reaches outside its own directory through exactly **one file**. Brigade's `host-ports.ts` forwards to the real subsystems (pure indirection — no behavior change, the full suite is unchanged); the four seams it bridges are: the subsystem **logger**, the Convex write-through **cache**, the runtime storage-**mode** probe, and the write-time content **threat-scan** (+ its error).
+```text
+src/tideline/
+  index.ts / advanced.ts / eval.ts   Stable public package entries
+  api/                              Tideline facade and adapter API
+  store/                            Records, JSONL storage and event history
+  ports/                            Optional backend and logging contracts
+  retrieval/                        Querying, scoring, hybrid and graph recall
+  graph/                            Typed links, graph operations and projections
+  embeddings/                       Embedders, providers and re-embedding
+  extraction/                       Parsing, relationship extraction and LLM callback
+  lifecycle/                        Decay, curation, reflection and maintenance
+  governance/                       Write gates, retention, inspection and purge
+  exports/                          Filesystem vault projection
+  transports/mcp/                   MCP tools, JSON-RPC server and stdio transport
+  eval/                             Evaluation harness, metrics and fixtures
+  tests/                            Public API, isolation, boundary and end-to-end tests
+```
 
-**Standalone publish = a one-file *seam* swap + a vendor/emit build step (the latter not yet scripted).** The runtime decoupling is a single file: this package ships `host-ports.standalone.ts` — a complete, type-matched, filesystem-only binding (no-op logger, no Convex cache, runtime-mode = filesystem so the convex branches never fire, and a stubbed write-scan). What is NOT yet written is the build script that performs the steps below; until it exists, this is an **in-repo extraction layer**, not a `npm install`-able package. The build (to implement):
+Unit tests live beside their implementation. Cross-cutting tests live in
+`tests/`; Brigade host integration tests stay in `src/agents/memory/` and the
+actual CLI test stays in `src/cli/commands/`.
 
-1. compiles + **vendors** the core (`records` + its host-clean siblings) into the package,
-2. **swaps** `host-ports.ts` → `host-ports.standalone.ts` (drop-in: identical export names + signatures),
-3. emits this manifest + README beside the compiled output and rewrites the vendored specifiers,
-4. *(optional, for exact write-scan parity)* vendors the pure `security/injection-patterns.ts` and re-exports its `scanForThreats` / `MemoryThreatError` from the standalone binding in place of the stubs.
+Internal modules import their specific dependencies, not the public entry
+barrels. Core modules do not import MCP transport, evaluation or test code.
+Transport and evaluation depend on the engine, and Brigade supplies host ports
+from outside it. Boundary tests enforce these rules for runtime and type-only
+imports. These are ownership boundaries, not separate services or an assertion
+that the legacy dependency graph is acyclic.
 
-In standalone, the provenance **write-gate** and the recall-time **`ThreatScanAdapter`** remain fully active; only the belt-and-suspenders write-time content scan is stubbed until step 4. None of this changes recall behavior.
+### Build and compatibility
+
+This directory owns the canonical reusable engine and core tests. Brigade's
+runtime integration imports it; old paths in `src/agents/memory/` are compatibility
+exports or thin host adapters, not another engine. Agent sessions, scheduling,
+auto-recall and extension registration stay in Brigade.
+
+`npm run build:tideline` builds `dist/packages/tideline/` with three public entries
+(`.`, `/advanced`, `/eval`), strict declarations and shared ESM chunks. This is
+separate from Brigade's normal `dist/tideline/` compiler output. The build rejects
+runtime and type-only dependencies outside the engine, except three reviewed
+shared helpers: threat scanning, prompt sanitization and atomic rename.
+
+There is no mandatory Convex package, host-module swap, or disabled write scanner.
+Brigade supplies its optional cache-backed storage through `FactStoreHostPorts`.
+`npm run test:tideline-package` checks an isolated consumer, cross-entry module
+identity, origin isolation, scanner parity, persistence, existing evaluation
+fixtures and declaration resolution. Building locally does not publish a package.
+
+## Scope of this refactor
+
+The existing primitives are facts/origins, source trust and write gates, ranked
+retrieval, typed links, lifecycle/retention, event history, embeddings and evals.
+Moving ownership preserves their behavior; it does not improve benchmarks by
+itself. Character-budgeted context is not a token or billing savings measurement.
+
+The bundled store still uses synchronous JSONL read/modify/write. Replaceable
+legacy ports do not provide distributed transactions, tenant authority, complete
+influence capture, immediate withdrawal barriers or certified enterprise storage
+adapters. The standalone memory package and Brigade workspace use the same
+implementation and retain these same legacy limitations.
 
 ## License
 

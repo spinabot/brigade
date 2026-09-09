@@ -124,7 +124,9 @@ export function makeManageMemoryTool(
 		parameters: Params,
 		execute: async (_toolCallId, args): Promise<AgentToolResult<ManageMemoryResult>> => {
 			const store = new FactStore(workspaceDir);
+			await store.ready();
 
+			try {
 			switch (args.action) {
 				case "dream": {
 					const r = runDream(store, { origin: OWNER });
@@ -336,6 +338,9 @@ export function makeManageMemoryTool(
 				}
 				default:
 					return result({ action: "export", ok: false, message: "unknown action" });
+			}
+			} finally {
+				await store.flush();
 			}
 		},
 	};

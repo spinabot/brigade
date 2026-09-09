@@ -4,9 +4,10 @@
  * The deterministic, reproducible measurement layer (build Steps 2-3): seedable
  * gold sets, the recall metrics (recall@k / MRR / nDCG@k + bootstrap CIs), the
  * baseline + production capabilities for head-to-head comparison, and the
- * privacy-safe real-data export→approve pipeline. Re-exported ON TOP of the
- * in-tree `agents/memory/eval/*` without modification, so an adopter can measure
- * Tideline on their own data exactly as Brigade does in CI.
+ * privacy-safe real-data export→approve pipeline. Exported from the canonical
+ * `tideline/eval/*` implementation, so independent adopters and Brigade use the
+ * same measurement code. Synthetic fixtures are regression checks, not evidence
+ * of improved real-world recall, token reduction, or billing savings.
  */
 
 // ── gold sets + the spec/seed/approve pipeline ──
@@ -18,11 +19,11 @@ export {
 	type GoldSpec,
 	type GoldCase,
 	type GoldFact,
-} from "../agents/memory/eval/gold.js";
-export { RICH_GOLD } from "../agents/memory/eval/gold-rich.js";
-export { HARD_GOLD } from "../agents/memory/eval/gold-hard.js";
-export { SYNTHETIC_GOLD } from "../agents/memory/eval/gold-synthetic.js";
-export { exportGoldScaffold, writeLocalGoldSpec, assertLocalGoldPath } from "../agents/memory/eval/gold-export.js";
+} from "./eval/gold.js";
+export { RICH_GOLD } from "./eval/gold-rich.js";
+export { HARD_GOLD } from "./eval/gold-hard.js";
+export { SYNTHETIC_GOLD } from "./eval/gold-synthetic.js";
+export { exportGoldScaffold, writeLocalGoldSpec, assertLocalGoldPath } from "./eval/gold-export.js";
 
 // ── the harness + metrics ──
 export {
@@ -35,8 +36,8 @@ export {
 	type PerCaseResult,
 	type CategoryRollup,
 	type RunRecallEvalOptions,
-} from "../agents/memory/eval/harness.js";
-export { bootstrapMeanCI } from "../agents/memory/eval/metrics.js";
+} from "./eval/harness.js";
+export { bootstrapMeanCI } from "./eval/metrics.js";
 
 // ── capabilities: the linear floor, the FTS/BM25 baselines, the reproduced
 //    competitor weighted-sum fusion, the graph lane, the dump-all oracle, and the
@@ -49,4 +50,4 @@ export {
 	weightedSumFusionBaseline,
 	graphRecallCapability,
 	oracleCapability,
-} from "../agents/memory/eval/capabilities.js";
+} from "./eval/capabilities.js";

@@ -109,6 +109,7 @@ export function createDefaultMemoryCapability(args: {
 	const factStore = new FactStore(args.workspaceDir);
 
 	const searchRich: DefaultMemoryCapability["searchRich"] = async (query, opts) => {
+		await factStore.ready();
 		const limit = opts?.limit;
 		const origin = opts?.origin;
 		const notes = await fileStore.search(query, limit !== undefined ? { maxResults: limit } : {});
@@ -155,6 +156,7 @@ export function createDefaultMemoryCapability(args: {
 			return [...factHits, ...noteHits];
 		},
 		async recordFact(content, opts) {
+			await factStore.ready();
 			// `meta.segment` / `meta.importance` are optional plugin-supplied
 			// hints; default to a `context` fact when not provided, which is
 			// what `write_memory` falls back to for ambient observations.
@@ -174,9 +176,11 @@ export function createDefaultMemoryCapability(args: {
 				...(importance !== undefined ? { importance } : {}),
 				...(sourceTurn ? { sourceTurn } : {}),
 			});
+			await factStore.flush();
 			return { id: rec.memoryId };
 		},
 		async status() {
+			await factStore.ready();
 			// Counts active facts — the field consumers (`brigade doctor`)
 			// care about most. Notes are an unbounded file tree; reporting
 			// them here would be misleading without a separate breakdown.

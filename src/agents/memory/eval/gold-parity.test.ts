@@ -40,6 +40,7 @@ function makeConvexStore(): BrigadeStore {
 		mode: "convex",
 		init: async () => {},
 		memory: {
+			listAllFactRecordsRaw: async () => [],
 			upsertFactRecordRaw: async () => {},
 			deleteFactRecordRaw: async () => {},
 		},
@@ -52,6 +53,7 @@ async function evalInCurrentMode(dir: string, k: number): Promise<RecallEvalResu
 	// Pinned clock → decay-deterministic in BOTH modes, so the parity comparison
 	// isn't confounded by wall-clock drift between the fs and convex eval runs.
 	const store = new FactStore(dir, { now: () => 0 });
+	await store.ready();
 	const cases = seedGold(store, SYNTHETIC_GOLD);
 	return runRecallEval(defaultRecallCapability(store), cases, { k, clock: () => 0 });
 }

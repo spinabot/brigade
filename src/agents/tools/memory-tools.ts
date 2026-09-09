@@ -239,6 +239,7 @@ export function makeRecallMemoryTool(
 			// citations, segment + importance). Plugin backend → render the
 			// minimal SDK shape (id / content / score / source).
 			if (isDefaultMemoryCapability(capability)) {
+				await capability.factStore?.ready?.();
 				const { notes: rawNotes, facts } = await capability.searchRich(
 					query,
 					{
@@ -552,6 +553,7 @@ export function makeWriteMemoryTool(
 			// the `meta` bag, and stringify `createdBy` so plugins that
 			// want to honour it can.
 			if (isDefaultMemoryCapability(capability)) {
+				await capability.factStore.ready();
 				const rec = capability.factStore.write({
 					content,
 					segment,
@@ -560,6 +562,7 @@ export function makeWriteMemoryTool(
 					...(subjectKey ? { subjectKey } : {}),
 					...(writerOrigin !== undefined ? { createdBy: writerOrigin } : {}),
 				});
+				await capability.factStore.flush();
 				return textResult(
 					`Remembered [${rec.segment}, importance ${rec.importance.toFixed(2)}]: ${rec.content}`,
 					{

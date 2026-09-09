@@ -2,17 +2,67 @@
 
 Tideline is the long-term memory framework that backs Brigade. It is a
 **model-agnostic memory engine** — it works with zero embedding model, learns from
-one if you give it, and is designed to be lifted out of Brigade and published on its
-own (`brigade-tideline`).
+one if you give it, and builds independently as `brigade-tideline` from the same
+implementation used by Brigade.
 
 Where a transcript is what an agent *just said*, Tideline is what an agent *knows*:
 durable facts about you and your work, written under a trust gate, recalled by
 meaning, decayed when stale, and reconciled over time.
 
-> TL;DR — append-only facts with origin scoping, a poisoning-resistant write gate,
+> TL;DR — JSONL-backed facts with origin scoping, a provenance write gate,
 > hybrid keyword+vector recall that needs no model to run, bi-temporal decay folded
 > into one score, a typed link graph, and a nightly reflect/consolidate pass. One
 > `Tideline` facade; a small adapter SPI underneath.
+
+---
+
+## Source ownership
+
+`src/tideline/` owns the reusable memory implementation and its core tests.
+`src/agents/memory/` owns Brigade's extraction sessions, behavioral review,
+auto-recall, extension binding and optional storage integration. Old module paths
+are compatibility re-exports (or thin host adapters), not a second engine.
+
+The engine is grouped into `api`, `store`, `ports`, `retrieval`, `graph`,
+`embeddings`, `extraction`, `lifecycle`, `governance`, `exports`, `transports/mcp`
+and `eval`. Unit tests sit with their modules; cross-cutting boundary and
+end-to-end tests live in `tests`. The [source map](../src/tideline/README.md#source-layout)
+describes each group's responsibility. The three public package entries and
+Brigade's compatibility imports stay stable across this internal reorganization.
+
+The current primitives are records and origins, source trust/write gates,
+retrieval scores, typed links, lifecycle/retention, event history, injectable
+embeddings and evaluation cases. The optional `FactStoreHostPorts` inject a
+backend and logger per store; no Convex service is required by Tideline.
+
+The legacy synchronous `StorageAdapter` and JSONL default are not a distributed
+database abstraction. No new benchmark, compression or billing improvement is
+claimed by moving the code.
+
+### Asynchronous backend readiness and durability
+
+Filesystem calls remain synchronous. When using Brigade's optional asynchronous
+backend, await `store.ready()` (or `memory.ready()`) before the first operation,
+then await `store.flush()` (or `memory.flush()`) before reporting a mutation as
+durable. Both methods are no-ops for the default filesystem implementation.
+
+```ts
+await memory.ready();
+memory.add({ content: "The staging window starts Friday.", segment: "project" });
+await memory.flush();
+```
+
+A cold synchronous read now reports pending hydration instead of pretending the
+store is empty. Failed hydration is explicit; a later `ready()` retries a bounded
+fetch cycle. Failed writes remain pending and make `flush()` reject; a later flush
+retries them without replaying a superseded update or delete. Retry state is
+process-local, not a crash-durable write-ahead log. Fact flushing does not make
+best-effort event appends atomic with facts or establish distributed cache coherence.
+
+Brigade tools, extraction, auto-recall and scheduled maintenance use these
+barriers. MCP stdio uses the asynchronous request handler and drains pending
+requests before exit. Custom asynchronous MCP transports must use `handleAsync`,
+not the compatibility synchronous `handle` method.
 
 ---
 
@@ -61,7 +111,7 @@ Segment defaults (`SEGMENT_DEFAULTS`) seed sensible tier/importance per segment 
 ### 1. Write — gated and deduped
 
 ```
-add(fact) ──▶ write-gate ──▶ same-origin dedup ──▶ FactStore (append-only JSONL)
+add(fact) ──▶ content scan + write-gate ──▶ same-origin dedup ──▶ FactStore (JSONL)
               │
               └─ rejects an UNTRUSTED source (tool_output, retrieved_document,
                  extraction, compaction) trying to author/supersede a PROTECTED
@@ -77,25 +127,27 @@ Dedup is **same-origin only** — it never merges across principals.
 ### 2. Recall — hybrid, ranked, origin-scoped, budgeted
 
 ```
-query ─▶ BM25 (tokenize + bm25Score) ─┐
-        HRR vector recovery (cosine) ─┼▶ graph walk ─▶ effectiveScore ─▶ origin
-                                       │   (typed links)   (decay × trust)   filter
-                                       └────────────────────────────────────────┘
-                                                            │
-                                          ranked hits ──▶ context() budget block
+origin + lifecycle filter ─▶ authorized candidates ─▶ BM25-primary + vector recovery
+                                                              │
+                                   optional graph recall ◀─────┘
+                                              │
+                                  ranked hits ─▶ context() budget block
 ```
 
 - **Hybrid lane** (`recallHybrid`) runs BM25 as the primary signal and a **model-free
-  HRR** vector lane as recovery, so semantically-close phrasings still match without
-  an embedding model. Swap in a learned embedder (`OpenAiEmbedder`, or your own) to
+  HRR** vector lane as recovery. HRR captures lexical/morphological overlap, not
+  learned synonymy. Bundled bag-of-words embedders remove question scaffolding
+  from recall queries to avoid function-word-only matches; learned embedders keep
+  complete queries. Stored document vectors are unchanged. A learned embedder can
   upgrade the vector lane.
 - **Graph recall** (`recallWithGraph`) expands hits along typed links, so recalling
   one fact pulls in what it `supports` / `relates` to / `supersedes`.
 - **`effectiveScore`** folds bi-temporal **decay** (recency + usage) and
   **source-trust** weighting into a single ranking number.
-- The result is filtered by the **current call's origin** *before* anything is
-  returned, then `context()` packs the top facts into a character-budgeted block
-  ready to drop into a prompt.
+- Store retrieval filters candidates by the **current call's origin before
+  ranking**. Low-level scorers and graph functions require their caller to supply
+  authorized candidates. `context()` produces a character-budgeted block, not a
+  provider-token or billing measurement.
 
 ### 3. Maintain — decay, dream, reconcile
 
@@ -134,8 +186,8 @@ import { Tideline } from "brigade-tideline";
 const memory = Tideline.open("/path/to/workspace");
 
 memory.add({ content: "I keep a strict vegetarian diet.", segment: "preference" });
-const hits  = memory.recall("what do I eat");
-const block = memory.context("dietary restrictions", { maxChars: 800 });
+const hits  = memory.recall("vegetarian diet");
+const block = memory.context("vegetarian diet", { maxChars: 800 });
 ```
 
 Facade verbs: **`add`**, **`recall`** / `search`, **`explain`** (why a fact ranked),
@@ -174,8 +226,9 @@ The power-user surface (`brigade-tideline/advanced`) exposes the passes directly
   (policy-driven eviction), `inspect` (provenance of a single fact), `exportMemory`.
   Brigade surfaces these owner-only through the `manage_memory` tool (including
   crypto-shred).
-- **Transparency** — `MemoryEventLog` is an append-only record of every memory
-  mutation, so "why does it think that?" is always answerable.
+- **Transparency** — `MemoryEventLog` provides best-effort, append-only history
+  for supported memory transitions. It helps explain recorded changes, but is
+  not a complete or atomic audit trail: event writes can fail independently of facts.
 - **Self-improving loop** — a *human-gated* cycle: `proposeFromTelemetry` →
   `gateOnEval` (must beat the eval bar) → `approve` → `applyProposal` →
   `revertProposal`. No change to recall behavior ships without passing evaluation and
@@ -217,27 +270,29 @@ Run Brigade's bundled benchmarks with `npm run bench`.
 - **Auto-recall:** before each turn Brigade injects an origin-matched, budgeted
   context block — and **fails closed** for unknown non-owner peers, so operator
   memory never leaks into a stranger's session.
-- **Backend:** the default is the filesystem `FactStore` (append-only JSONL, safe for
-  single-operator). In Convex storage mode the same records persist through the
-  storage seam.
+- **Backend:** the default is a filesystem `FactStore` (synchronous JSONL
+  read/modify/write, intended for legacy single-operator use). Brigade's optional
+  Convex integration supplies per-instance host ports; it is not imported by the
+  standalone engine.
 
 ---
 
 ## Packaging status
 
-`src/tideline/` is the **in-repo extraction layer**: it freezes the package boundary,
-the public API, and the manifest, re-exported on top of the implementation in
-`src/agents/memory/*` without modifying it. The facade and the pure core (scoring /
-links / decay / hybrid / graph / embedder) are already host-import-free; the only
-host coupling left is a **single seam module** (`agents/memory/host-ports.ts`)
-bridging four Brigade subsystems (logger, Convex write-through cache, storage-mode
-probe, write-time threat-scan).
+Run `npm run build:tideline` to create `dist/packages/tideline/`, then
+`node scripts/test-tideline-package.mjs` to check it in an isolated temporary
+consumer. `npm run test:tideline-package` performs both operations.
 
-A standalone `npm install brigade-tideline` needs one more step: a build script that
-vendors the core and swaps `host-ports.ts` → the included `host-ports.standalone.ts`
-(a complete, filesystem-only binding). Until that script exists, treat this as an
-in-repo layer, not yet a published package. The provenance write-gate and the
-recall-time threat-scan stay fully active in the standalone binding.
+The build checks runtime and type-only dependency closures, emits strict
+declarations and shares ESM chunks across the three public entries. There is no
+host-module replacement or disabled write scanner. The only allowed shared source
+helpers outside Tideline are threat patterns, prompt sanitization and atomic
+rename; they do not import the Brigade runtime.
+
+Building is not publishing. The checks cover package behavior and independence;
+enterprise storage guarantees require separate conformance and failure tests.
+The standalone output is separate from Brigade's normal `dist/tideline/` compile
+output, so either build can run without replacing the other's engine files.
 
 ---
 
@@ -246,7 +301,8 @@ recall-time threat-scan stay fully active in the standalone binding.
 - Package manifest & quick reference: [`src/tideline/README.md`](../src/tideline/README.md)
 - Public API surface: [`src/tideline/index.ts`](../src/tideline/index.ts) ·
   advanced: [`src/tideline/advanced.ts`](../src/tideline/advanced.ts)
-- Engine implementation: [`src/agents/memory/`](../src/agents/memory/)
+- Engine implementation: [`src/tideline/`](../src/tideline/)
+- Brigade integration and compatibility: [`src/agents/memory/`](../src/agents/memory/)
 - Memory in the product: [README → Features → Memory](../README.md#-memory)
 
 _License: MIT._

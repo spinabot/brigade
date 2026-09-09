@@ -8,24 +8,18 @@
  * {@link Tideline} facade with a small adapter SPI (Storage / Clock / ThreatScan /
  * Embedder / Llm).
  *
- * This module is the PACKAGE ENTRY: a curated, stable public API assembled ON TOP
- * of the in-tree implementation (`../agents/memory/*`) WITHOUT modifying it. The
- * facade was deliberately written host-import-free for exactly this lift (see the
- * note atop `agents/memory/tideline.ts`).
- *
- * PACKAGING STATUS — this is the in-repo extraction layer: it freezes the package
- * boundary + the public API + the manifest. Publishing as a fully *standalone* npm
- * package additionally requires making the v1 `FactStore`'s three host seams (the
- * Convex write-through cache, the runtime-mode probe, the subsystem logger) injected
- * or optional rather than imported — the documented next refinement. The facade and
- * the pure core (scoring / links / decay / hybrid / graph / embedder) are ALREADY
- * host-import-free; only the `FactStore` realization carries those seams. See
- * README.md for the decoupling checklist.
+ * The canonical implementation lives beside this entry. Brigade imports this
+ * engine and supplies optional, per-instance host bindings; the engine never
+ * imports the Brigade runtime. The publish build checks both runtime and type
+ * dependency closures and preserves singleton identity across public entries.
+ * The bundled FactStore is still a synchronous legacy store, not a distributed
+ * transactional authority implementation. See README.md for the current scope.
  */
 
 // ───────────────────────── the facade + its adapter SPI ─────────────────────────
 export {
 	Tideline,
+	type TidelineAdapters,
 	type RecalledFact,
 	type ExplainedFact,
 	type RecallOpts,
@@ -38,16 +32,19 @@ export {
 	type ThreatScanAdapter,
 	type EmbedderAdapter,
 	type LlmAdapter,
-} from "../agents/memory/tideline.js";
+} from "./api/tideline.js";
 
 // The error `Tideline.add` / `FactStore.write` throw on a blocked poisoning write
 // (the full write-gate API — `evaluateWriteGate` + the trust/segment helpers — is
 // in `brigade-tideline/advanced`).
-export { WriteGateError } from "../agents/memory/write-gate.js";
+export { WriteGateError } from "./governance/write-gate.js";
 
 // ───────────────────── the v1 storage backend + the record model ────────────────
 export {
 	FactStore,
+	type FactStoreOptions,
+	type FactStoreHostPorts,
+	type FactStoreBackend,
 	MEMORY_SEGMENTS,
 	SEGMENT_DEFAULTS,
 	clampImportance,
@@ -56,22 +53,24 @@ export {
 	type MemorySegment,
 	type MemoryTier,
 	type MemoryLifecycle,
+	type MemoryRecordOrigin,
+	type RecordOriginFilter,
 	type NewFact,
 	type ListFilter,
-} from "../agents/memory/records.js";
+} from "./store/records.js";
 
 // ───────────────────────────── the link-graph substrate ─────────────────────────
-export { linksFrom, backlinksTo, type MemoryLink, type MemoryLinkKind } from "../agents/memory/links.js";
+export { linksFrom, backlinksTo, type MemoryLink, type MemoryLinkKind } from "./graph/links.js";
 
 // ──────────────────── recall internals (transparency + composition) ─────────────
-export { tokenize, bm25Score, linearScanScore, type ScoreBreakdown } from "../agents/memory/scoring.js";
-export { recallHybrid } from "../agents/memory/hybrid.js";
+export { tokenize, bm25Score, linearScanScore, type ScoreBreakdown } from "./retrieval/scoring.js";
+export { recallHybrid } from "./retrieval/hybrid.js";
 export {
 	recallWithGraph,
 	recallWithGraphAsync,
 	type GraphRecallOpts,
 	type GraphRecallResult,
-} from "../agents/memory/graph-recall.js";
+} from "./retrieval/graph-recall.js";
 
 // ───────────── the embedder seam: zero-dep model-free default + learned providers ─
 export {
@@ -81,5 +80,5 @@ export {
 	HrrEmbedder,
 	HashingEmbedder,
 	type Embedder,
-} from "../agents/memory/embedder.js";
-export { resolveEmbedder, EMBEDDER_DIMS, OpenAiEmbedder } from "../agents/memory/embedder-providers.js";
+} from "./embeddings/embedder.js";
+export { resolveEmbedder, EMBEDDER_DIMS, OpenAiEmbedder } from "./embeddings/embedder-providers.js";
