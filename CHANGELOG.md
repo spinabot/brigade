@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.38.0](https://github.com/spinabot/brigade/compare/brigade-v1.37.1...brigade-v1.38.0) (2026-09-10)
+
+
+### Features
+
+* **providers:** add Token Market ([8021fef](https://github.com/spinabot/brigade/commit/8021fefb3f645135c643fe2bbdd1e2497125b6c5))
+* **providers:** add Token Market ([55a872e](https://github.com/spinabot/brigade/commit/55a872e09cb7d621d44cff9e65822375793f2f31))
+
 ## [1.37.1](https://github.com/spinabot/brigade/compare/brigade-v1.37.0...brigade-v1.37.1) (2026-09-09)
 
 
