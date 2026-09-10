@@ -14,6 +14,10 @@ on:
 
 permissions:
   contents: write
+  # Needed to OPEN the wall PR. `contents: write` alone pushes the branch and
+  # then fails on `gh pr create` — which would have replaced one silent failure
+  # with another.
+  pull-requests: write
 
 concurrency:
   group: brigadiers
@@ -34,14 +38,41 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/update-brigadiers.mjs
-      - name: Commit if the wall changed
+      # OPEN A PR — `main` no longer accepts a direct push.
+      #
+      # This step used to `git push` straight to main, and a ruleset requiring
+      # pull requests and status checks now rejects that:
+      #
+      #   GH013: Repository rule violations found for refs/heads/main
+      #   - Changes must be made through a pull request.
+      #
+      # The job kept passing on runs where the wall happened not to change, so
+      # the breakage only surfaced on the runs that mattered — the ones with a
+      # new contributor to add. A contributor merged their first PR and their
+      # avatar silently never appeared.
+      #
+      # Reusing ONE branch means repeated runs update the same PR instead of
+      # opening a new one each week.
+      - name: Open a PR if the wall changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [[ -n "$(git status --porcelain README.md)" ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add README.md
-            git commit -m "docs: refresh Brigadiers contributor wall [skip ci]"
-            git push
+          if [[ -z "$(git status --porcelain README.md)" ]]; then
+            echo "Brigadiers wall unchanged — nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B chore/brigadiers-wall
+          git add README.md
+          git commit -m "docs: refresh Brigadiers contributor wall"
+          git push --force-with-lease origin chore/brigadiers-wall
+          if [[ -z "$(gh pr list --head chore/brigadiers-wall --state open --json number -q '.[0].number')" ]]; then
+            gh pr create \
+              --base main \
+              --head chore/brigadiers-wall \
+              --title "docs: refresh Brigadiers contributor wall" \
+              --body "Regenerated from the live contributor graph by the Brigadiers workflow."
           else
-            echo "Brigadiers wall unchanged — nothing to commit."
+            echo "An open wall PR already exists — it now carries the latest wall."
           fi
