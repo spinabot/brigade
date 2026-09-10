@@ -18,6 +18,7 @@ const ENV_KEYS_TO_GUARD = [
 	"OPENROUTER_API_KEY",
 	"ORCAROUTER_API_KEY",
 	"ORCA_API_KEY",
+	"TOKENSMARKET_API_KEY",
 	"GROQ_API_KEY",
 	"CEREBRAS_API_KEY",
 	"XAI_API_KEY",
@@ -50,6 +51,7 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 		{ id: "google", envVar: "GEMINI_API_KEY" },
 		{ id: "openrouter", envVar: "OPENROUTER_API_KEY" },
 		{ id: "orcarouter", envVar: "ORCAROUTER_API_KEY" },
+		{ id: "tokensmarket", envVar: "TOKENSMARKET_API_KEY" },
 		{ id: "groq", envVar: "GROQ_API_KEY" },
 		{ id: "cerebras", envVar: "CEREBRAS_API_KEY" },
 		{ id: "xai", envVar: "XAI_API_KEY" },
@@ -150,6 +152,7 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 			"openrouter",
 			"orcarouter",
 			"qwen",
+			"tokensmarket",
 			"xai",
 		]);
 	});

@@ -19,6 +19,9 @@ const EXPECTED: Record<string, ReturnType<typeof classifyBillingMode>> = {
 	openrouter: "metered",
 	// BYOK gateway — passes each provider's published rate through.
 	orcarouter: "metered",
+	// Same shape: a multi-model gateway that bills per token at each upstream
+	// model's rate, so a turn costs real money and the cost must render.
+	tokensmarket: "metered",
 	groq: "metered",
 	cerebras: "metered",
 	xai: "metered",
