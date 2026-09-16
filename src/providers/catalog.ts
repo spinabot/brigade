@@ -213,6 +213,23 @@ export const PROVIDERS: ProviderInfo[] = [
 		baseUrl: "https://api.tokensmarket.ai/v1",
 		billing: "metered",
 	},
+	{
+		id: "opper",
+		name: "Opper",
+		description: "EU-hosted gateway — 700+ models from 30+ providers, one key — live catalog",
+		keyUrl: "https://platform.opper.ai",
+		envVar: "OPPER_API_KEY",
+		custom: true,
+		liveModels: true, // models fetched live from /v3/compat/models at onboarding
+		api: "openai-completions",
+		baseUrl: "https://api.opper.ai/v3/compat",
+		// Served ids are Opper pool names (`claude-sonnet-4-6`, `gpt-5.5`): the
+		// gateway picks the provider/region per request. A `vendor/model` id
+		// (`anthropic/claude-sonnet-4-6`) pins one route. Token rates are the
+		// upstream providers' own with no markup, so a turn costs real money and
+		// the cost must render.
+		billing: "metered",
+	},
 
 	{
 		id: "groq",
