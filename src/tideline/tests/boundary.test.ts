@@ -55,6 +55,7 @@ it("the complete Tideline implementation graph has no Brigade runtime or compati
 		path.join(repositoryRoot, "src", "security", "injection-patterns.ts"),
 		path.join(repositoryRoot, "src", "system-prompt", "sanitize.ts"),
 		path.join(repositoryRoot, "src", "infra", "fs", "atomic-rename.ts"),
+		path.join(repositoryRoot, "src", "infra", "fs", "remove.ts"),
 	]);
 	const forbidden = program.getSourceFiles()
 		.filter((source) => !source.isDeclarationFile || (!program.isSourceFileDefaultLibrary(source) && !program.isSourceFileFromExternalLibrary(source)))

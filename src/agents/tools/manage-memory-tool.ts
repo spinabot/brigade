@@ -230,7 +230,11 @@ export function makeManageMemoryTool(
 						written: w.written,
 						mergedPinned: w.mergedPinned,
 						dir,
-						message: `Wrote ${w.written} note(s) to your vault${w.mergedPinned > 0 ? ` (kept your edits on ${w.mergedPinned})` : ""}.`,
+						message:
+							`Wrote ${w.written} note(s) to your vault${w.mergedPinned > 0 ? ` (kept your edits on ${w.mergedPinned})` : ""}.` +
+							// A prune that could not remove a note is the one outcome the operator
+							// must hear about: the note it failed to remove is stale by definition.
+							(w.pruneFailed ? ` ${w.pruneFailed} note(s) could not be removed — check that ${dir} is writable.` : ""),
 					});
 				}
 				case "propose": {

@@ -29,6 +29,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { renameWithRetry } from "../../infra/fs/atomic-rename.js";
+import { removeFileSync } from "../../infra/fs/remove.js";
 import { cosine, getDefaultEmbedder } from "../embeddings/embedder.js";
 import { linksFrom, type MemoryLink, type MemoryLinkKind } from "../graph/links.js";
 import { originBucketKey, type MemoryRecord, type MemorySegment } from "../store/records.js";
@@ -598,6 +599,11 @@ export interface VaultWriteResult {
 	writeFailed?: number;
 	/** Stale notes removed (only when `prune` is set). */
 	pruned?: number;
+	/** System notes the prune could NOT remove (locked/unwritable — best effort).
+	 *  Kept separate from `pruned` on purpose: the prune's job is to leave no
+	 *  shredded plaintext behind, so a note that survived it is a fact worth
+	 *  reporting, never something to round up into a success count. */
+	pruneFailed?: number;
 }
 
 /**
@@ -622,7 +628,9 @@ export interface VaultWriteResult {
  * rather than orphaned with dangling hub links. A human's own vault notes (their
  * OWN Index/MOC/daily) carry no sentinel and are NEVER pruned. Callers that pass
  * the FULL set for a vault (e.g. the whole owner origin) should enable it; callers
- * passing a partial set must not.
+ * passing a partial set must not. Every removal is VERIFIED (see
+ * {@link removeFileSync}) and only verified removals are counted, so `pruned`
+ * never claims a note was erased while its plaintext is still on disk.
  *
  * DURABILITY: each note is written via a sibling temp + atomic rename (the same
  * tmp+rename pattern {@link FactStore} uses), so a crash mid-write leaves the
@@ -722,11 +730,10 @@ export function writeVault(
 			return true;
 		} catch {
 			writeFailed++;
-			try {
-				fs.rmSync(tmp);
-			} catch {
-				/* temp never landed / already gone */
-			}
+			// The temp holds the proposed render — for a just-shredded fact that is
+			// the plaintext the prune exists to remove — so clean it up with the
+			// verifying delete too (best effort: it may never have landed).
+			removeFileSync(tmp);
 			return false;
 		}
 	};
@@ -773,6 +780,7 @@ export function writeVault(
 	// loop — gated on `prune`, NOT on every render succeeding — so a transiently-
 	// locked UNRELATED note can't leave a just-shredded fact's plaintext on disk.
 	let pruned = 0;
+	let pruneFailed = 0;
 	let entries: string[];
 	try {
 		entries = fs.readdirSync(dir);
@@ -795,13 +803,15 @@ export function writeVault(
 			continue; // unreadable — leave it (best effort)
 		}
 		if (!isSystemNote(content)) continue;
-		try {
-			fs.rmSync(full);
-			pruned++;
-		} catch {
-			/* concurrent removal / locked — best effort */
-		}
+		// `removeFileSync` VERIFIES the file is gone instead of trusting the
+		// delete: `fs.rmSync` here returned without removing anything for paths
+		// containing non-ASCII characters, so a shredded fact's note (filenames
+		// are derived from fact CONTENT) stayed on disk while `pruned` counted it
+		// as erased. A note that survives is reported, not rounded up.
+		if (removeFileSync(full)) pruned++;
+		else pruneFailed++;
 	}
 	result.pruned = pruned;
+	if (pruneFailed > 0) result.pruneFailed = pruneFailed;
 	return result;
 }

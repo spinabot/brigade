@@ -185,6 +185,23 @@ describe("vault — prune (no plaintext lingers after a crypto-shred)", () => {
 		assert.equal(result.pruned, 0, "no system notes were pruned — README.txt is not a system fact note");
 		assert.ok(fs.existsSync(path.join(dir, "README.txt")), "a non-.md file is left alone");
 	});
+
+	it("prunes a note whose CONTENT-derived filename is non-ASCII, and verifies it is gone", () => {
+		// Note filenames come from fact CONTENT, so an em dash / accent / emoji in a
+		// fact lands in the path — and a delete primitive that reports success
+		// without removing such a path is how a shredded fact's plaintext survived a
+		// prune that counted it as erased. The prune must ask the filesystem whether
+		// the note is gone rather than trust the delete.
+		const shredded = "the café — a lovely place";
+		writeVault(dir, [rec("mem_keep1_a1b2c3", "I deploy on Fridays"), rec("mem_gone2_d4e5f6", shredded)], { prune: true });
+		const nonAsciiNote = path.join(dir, `${shredded}.md`);
+		assert.ok(fs.existsSync(nonAsciiNote), "the non-ASCII note was written by the first pass");
+
+		const result = writeVault(dir, [rec("mem_keep1_a1b2c3", "I deploy on Fridays")], { prune: true });
+		assert.equal(result.pruned, 1, "the purged fact's note is counted as pruned");
+		assert.equal(fs.existsSync(nonAsciiNote), false, "and its plaintext is really off the disk");
+		assert.equal(result.pruneFailed, undefined, "nothing was left behind to report");
+	});
 });
 
 describe("vault — clusters (topic hubs make the graph cluster)", () => {

@@ -26,6 +26,7 @@ const sharedHelpers = new Set([
 	path.join(SRC, "security", "injection-patterns.ts"),
 	path.join(SRC, "system-prompt", "sanitize.ts"),
 	path.join(SRC, "infra", "fs", "atomic-rename.ts"),
+	path.join(SRC, "infra", "fs", "remove.ts"),
 ]);
 function assertEngineSource(file) {
 	const resolved = fs.realpathSync(file);
