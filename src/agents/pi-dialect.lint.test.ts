@@ -23,7 +23,7 @@
 
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -72,11 +72,26 @@ function* walk(dir: string): Generator<string> {
 	}
 }
 
+/**
+ * The allowlist KEY for a scanned file: its path relative to `SRC`, always with
+ * FORWARD slashes.
+ *
+ * `join` is platform-native, so on Windows a raw relative path is
+ * `agents\pi-dialect.ts` and no ALLOWED entry — all written with `/`, like every
+ * path in this repo — would ever match. The allowlist would stop applying, and
+ * the two files it exists for would be reported as offenders: `npm test` failed
+ * on Windows for exactly that reason. Normalising here keeps one spelling of a
+ * path in the rule regardless of who runs it.
+ */
+function allowlistKey(file: string): string {
+	return file.slice(SRC.length).split(sep).join("/");
+}
+
 test("every file that speaks the tool dialect imports pi-dialect", () => {
 	const offenders: string[] = [];
 
 	for (const file of walk(SRC)) {
-		const rel = file.slice(SRC.length);
+		const rel = allowlistKey(file);
 		if (ALLOWED.has(rel)) continue;
 
 		const source = readFileSync(file, "utf8");
@@ -106,6 +121,20 @@ test("every file that speaks the tool dialect imports pi-dialect", () => {
 			`If this file genuinely cannot use the module, add it to ALLOWED above\n` +
 			`with a reason about the file's job.`,
 	);
+});
+
+test("every allowlist entry is in the form the scan produces", () => {
+	// Guards the guard. An entry that can never match is worse than no entry: the
+	// rule keeps reporting the file it was meant to exempt, and the only symptom is
+	// a red suite on whichever platform spells paths differently — which is how the
+	// Windows `sep` mismatch survived until someone ran `npm test` there.
+	for (const rel of ALLOWED) {
+		assert.equal(
+			allowlistKey(join(SRC, rel)),
+			rel,
+			`Allowlisted path is not in the form the scan produces, so it can never match: ${rel}`,
+		);
+	}
 });
 
 test("the allowlist stays small and every entry still exists", () => {
