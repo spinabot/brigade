@@ -130,6 +130,29 @@ describe("LocalCollaborationJournal", () => {
 		await journal.close();
 	});
 
+	it("leaves the journal usable after a torn-tail repair, and repairs it once", async () => {
+		const { journal } = await makeJournal();
+		await journal.transact(() => ({ payload: { value: 1 }, result: undefined }));
+		await fs.appendFile(journal.journalPath, '{"version":1,"seq":2');
+
+		assert.deepEqual((await journal.readAll()).map((entry) => entry.payload.value), [1]);
+
+		// A repair has to leave an APPENDABLE journal, not merely a truncated file.
+		// A repair step that throws or re-runs would either fail the read outright or
+		// drop another forensic copy on every subsequent read; both are invisible to
+		// a test that only looks at the entries that came back.
+		const forensic = async () =>
+			(await fs.readdir(journal.rootDir)).filter((name) => name.startsWith("journal.torn-"));
+		assert.equal((await forensic()).length, 1, "one forensic copy of the torn tail");
+		await journal.readAll();
+		assert.equal((await forensic()).length, 1, "a second read is not a second repair");
+
+		// …and the next committed write continues the chain from the repaired tail.
+		await journal.transact(() => ({ payload: { value: 3 }, result: undefined }));
+		assert.deepEqual((await journal.readAll()).map((entry) => entry.payload.value), [1, 3]);
+		await journal.close();
+	});
+
 	it("fails closed for a malformed committed final record", async () => {
 		const { journal } = await makeJournal();
 		await journal.transact(() => ({ payload: { value: 1 }, result: undefined }));

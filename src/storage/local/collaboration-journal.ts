@@ -373,9 +373,16 @@ async function preserveTornTail(rootDir: string, bytes: Buffer): Promise<void> {
 	if (bytes.length === 0) return;
 	const target = path.join(rootDir, `journal.torn-${Date.now()}-${randomUUID()}.bin`);
 	const tmp = `${target}.tmp`;
-	await fs.writeFile(tmp, bytes, { mode: 0o600 });
-	const handle = await fs.open(tmp, "r");
+	// Write AND fsync the same handle. This used to `fs.writeFile` and then
+	// re-open the file READ-ONLY to sync it, which fails on Windows — fsync maps
+	// to FlushFileBuffers, and that needs a write-capable handle, so a read-only
+	// one gets EPERM. The repair is the recovery path (it only runs because an
+	// earlier write was interrupted), so throwing here turned a recoverable torn
+	// tail into a journal that cannot be opened at all. syncDirectory below has
+	// always known Windows is different; the file sync has to as well.
+	const handle = await fs.open(tmp, "w", 0o600);
 	try {
+		await handle.writeFile(bytes);
 		await handle.sync();
 	} finally {
 		await handle.close();
