@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { discoverEligibleSkills } from "../skills/index.js";
 import { loadConfig } from "../../core/config.js";
-import { makeManageSkillTool, sanitizeSkillName } from "./manage-skill-tool.js";
+import { makeManageSkillTool, sanitizeSkillName, verifiedRemoveFileSync } from "./manage-skill-tool.js";
 import { resolveAgentWorkspaceDir } from "../../config/paths.js";
 
 interface ManageSkillResult {
@@ -425,6 +425,71 @@ describe("manage_skill — support files (write_file / remove_file)", () => {
 		// emptied subdir pruned, skill root intact
 		assert.equal(fs.existsSync(path.join(removed.skillDir, "templates")), false);
 		assert.ok(fs.existsSync(path.join(removed.skillDir, "SKILL.md")));
+	});
+
+	it("remove_file reports failure instead of fake success when the target cannot be removed", async () => {
+		await createSkill("stubborn");
+		// A DIRECTORY sitting at the support-file path: unlinkSync refuses
+		// directories (EPERM/EISDIR) on every platform, so the removal
+		// genuinely fails and the tool must say so — not report success
+		// while the target stays on disk.
+		const stubbornDir = path.join(tmpRoot, "skills", "stubborn", "references", "blocked.md");
+		fs.mkdirSync(stubbornDir, { recursive: true });
+		fs.writeFileSync(path.join(stubbornDir, "keep.txt"), "x");
+		const tool = makeManageSkillTool();
+		const res = parseResult(
+			(
+				await tool.execute("rf-1", {
+					action: "remove_file",
+					scope: "managed",
+					name: "stubborn",
+					filePath: "references/blocked.md",
+				})
+			).content,
+		);
+		assert.equal(res.ok, false);
+		assert.equal(res.removedFile, false);
+		assert.match(res.message, /Failed to remove|still on disk/);
+		// The unremovable target survives, and the tool left the skill usable.
+		assert.ok(fs.existsSync(stubbornDir));
+		assert.ok(fs.existsSync(path.join(res.skillDir, "SKILL.md")));
+	});
+
+	// Windows regression tripwire: fs.rmSync silently no-ops (no throw, file
+	// left on disk) on win32 for any path containing non-ASCII characters,
+	// while unlinkSync succeeds on the same path. `validateSkillFilePath`
+	// currently gates support-file segments to ASCII, so a non-ASCII name
+	// cannot be created through the tool API — `write_file` rejects it — but
+	// verifiedRemoveFileSync must still handle such paths correctly for when
+	// the charset gate is loosened, for hand-authored files, or for other
+	// callers of the helper. On non-Windows this is an ordinary delete, so
+	// the tripwire is win32-only.
+	(process.platform === "win32" ? it : it.skip)(
+		"verifiedRemoveFileSync deletes a non-ASCII path on Windows (where rmSync silently no-ops)",
+		() => {
+			const dir = fs.mkdtempSync(path.join(tmpRoot, "nonascii-"));
+			const target = path.join(dir, "café-notes.md");
+			fs.writeFileSync(target, "stale instructions");
+			assert.ok(fs.existsSync(target));
+			// Control: the old implementation's primitive silently no-ops here.
+			fs.rmSync(target, { force: true });
+			assert.ok(fs.existsSync(target), "precondition: rmSync must silently no-op for this path on win32");
+			assert.equal(verifiedRemoveFileSync(target), true);
+			assert.equal(fs.existsSync(target), false);
+		},
+	);
+});
+
+describe("verifiedRemoveFileSync", () => {
+	it("treats a missing file as removed (force semantics)", () => {
+		assert.equal(verifiedRemoveFileSync(path.join(tmpRoot, "never-existed.md")), true);
+	});
+
+	it("returns false and leaves a directory untouched (file-only contract)", () => {
+		const dir = fs.mkdtempSync(path.join(tmpRoot, "dir-target-"));
+		fs.writeFileSync(path.join(dir, "inner.txt"), "x");
+		assert.equal(verifiedRemoveFileSync(dir), false);
+		assert.ok(fs.existsSync(path.join(dir, "inner.txt")), "directory contents must survive");
 	});
 });
 

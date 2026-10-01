@@ -489,7 +489,23 @@ export function makeManageSkillTool(
 						message: `No support file at ${rel}.`,
 					} satisfies ManageSkillResult) as AgentToolResult<ManageSkillResult>;
 				}
-				fs.rmSync(target, { force: true });
+				const removed = verifiedRemoveFileSync(target);
+				if (!removed) {
+					// Deletion attempted and failed — say so instead of reporting success
+					// while the stale file stays on disk and keeps loading into the skill.
+					return jsonResult({
+						action: "remove_file",
+						name: safeName,
+						scope,
+						...(resolvedAgentId !== undefined ? { agentId: resolvedAgentId } : {}),
+						skillDir,
+						skillFile,
+						filePath: rel,
+						removedFile: false,
+						ok: false,
+						message: `Failed to remove ${rel} from ${skillDir} — the file is still on disk. Check for locks or permission issues and retry.`,
+					} satisfies ManageSkillResult) as AgentToolResult<ManageSkillResult>;
+				}
 				// Clean up a now-empty support subdir so listings stay tidy (never the
 				// skill root itself).
 				try {
@@ -820,4 +836,37 @@ function writeFileAtomic(target: string, content: string): void {
 		}
 		throw err;
 	}
+}
+
+/**
+ * Remove a single FILE and prove it is gone.
+ *
+ * The old code fired `fs.rmSync(target, { force: true })` and reported
+ * success unconditionally. rmSync does not throw for every failure — on
+ * Windows a `force` removal of a locked or otherwise unremovable target
+ * can fail quietly, and rmSync on win32 is known to silently no-op for
+ * paths containing non-ASCII characters (reproduced on Node v22/v24;
+ * `unlinkSync` succeeds on the same path). `validateSkillFilePath`
+ * currently gates support-file segments to ASCII, so that specific
+ * trigger is not reachable through the tool API today — but a stale doc
+ * that survives deletion keeps loading into the skill while the agent
+ * believes it is gone, so the removal is VERIFIED rather than assumed.
+ * `unlinkSync` refuses directories (EPERM/EISDIR), keeping the "file
+ * only" contract intact.
+ *
+ * `force` semantics preserved: a missing target is treated as removed.
+ * Returns true when the file is gone (or was never there), false when the
+ * removal attempt failed or verification shows the file survived.
+ *
+ * Exported for tests (and for future consolidation with the identical
+ * verified-removal helper landed in `src/infra/fs/remove.ts`).
+ */
+export function verifiedRemoveFileSync(target: string): boolean {
+	if (!fs.existsSync(target)) return true;
+	try {
+		fs.unlinkSync(target);
+	} catch {
+		return false;
+	}
+	return !fs.existsSync(target);
 }
