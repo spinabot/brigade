@@ -52,15 +52,48 @@ function getExtensionJiti(): ExtensionSdkJiti {
  * Import a candidate through the shared Jiti instance (applies the SDK alias +
  * TS transpile), racing against `IMPORT_TIMEOUT_MS`. Jiti takes an absolute file
  * path (not a `file://` URL), and resolves `.ts`/`.mts`/`.js` itself.
+ *
+ * The timeout timer is CLEARED when the import settles first. Without the
+ * clear, every successful import left the timer alive for the full window —
+ * harmless per-event (it's unref'd, so it never blocks exit), but discovery
+ * runs on the per-turn path and reloads re-import whole extension dirs, so a
+ * busy gateway accrues a growing population of dead 5s timers + pending
+ * rejection promises. `clearTimeout` on the settled-winner path is the whole
+ * fix; the rejection branch still fires for genuinely slow imports.
+ *
+ * `timers` is a test seam (callers normally omit it — defaults to the
+ * globals), mirroring `checkPosixSafety`'s `platformOverride`.
  */
-function importWithTimeout(absPath: string): Promise<unknown> {
-	return Promise.race([
-		getExtensionJiti().import(absPath),
-		new Promise((_, reject) => {
-			const t = setTimeout(() => reject(new Error(`import timed out after ${IMPORT_TIMEOUT_MS}ms`)), IMPORT_TIMEOUT_MS);
-			t.unref?.();
-		}),
-	]);
+export function importWithTimeout(
+	absPath: string,
+	timers: Pick<typeof globalThis, "setTimeout" | "clearTimeout"> = globalThis,
+): Promise<unknown> {
+	return new Promise((resolve, reject) => {
+		const timer = timers.setTimeout(
+			() => reject(new Error(`import timed out after ${IMPORT_TIMEOUT_MS}ms`)),
+			IMPORT_TIMEOUT_MS,
+		);
+		timer.unref?.();
+		let importing: Promise<unknown>;
+		try {
+			importing = getExtensionJiti().import(absPath);
+		} catch (err) {
+			// A synchronously-throwing import must clear the timer too.
+			timers.clearTimeout(timer);
+			reject(err);
+			return;
+		}
+		importing.then(
+			(value) => {
+				timers.clearTimeout(timer);
+				resolve(value);
+			},
+			(reason) => {
+				timers.clearTimeout(timer);
+				reject(reason);
+			},
+		);
+	});
 }
 
 /** A discovered module plus where it came from (for conflict reporting + reload). */

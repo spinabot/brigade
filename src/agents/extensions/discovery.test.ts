@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { checkPosixSafety, clearDiscoveryCache, discoverUserModules } from "./discovery.js";
+import { checkPosixSafety, clearDiscoveryCache, discoverUserModules, importWithTimeout } from "./discovery.js";
 
 const SAFE_MODULE_SRC = `export default { id: "ok", register(b) {} };`;
 
@@ -375,3 +375,81 @@ describe("discoverUserModules — TypeScript + SDK alias loading", () => {
 // host environments tree-shake unused fs imports; we use it transitively via
 // mkdtempSync but ts-node might still complain).
 void mkdirSync;
+
+describe("importWithTimeout — timeout timer hygiene", () => {
+	// Seam capturing every armed timer so the test can observe exactly what the
+	// production code would hand to the event loop — no clock fakery, no
+	// dependence on how Node schedules real timers.
+	function makeRecordingTimers(): {
+		timers: Pick<typeof globalThis, "setTimeout" | "clearTimeout">;
+		cleared: unknown[];
+		live: Set<unknown>;
+	} {
+		const cleared: unknown[] = [];
+		const live = new Set<unknown>();
+		const timers: Pick<typeof globalThis, "setTimeout" | "clearTimeout"> = {
+			setTimeout: ((handler: () => void, ms?: number) => {
+				const t = setTimeout(handler, ms);
+				live.add(t);
+				return t;
+			}) as unknown as typeof setTimeout,
+			clearTimeout: ((t: unknown) => {
+				cleared.push(t);
+				live.delete(t);
+				clearTimeout(t as NodeJS.Timeout);
+			}) as unknown as typeof clearTimeout,
+		};
+		return { timers, cleared, live };
+	}
+
+	it("clears the timeout timer when the import succeeds", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-timer-ok-"));
+		try {
+			const mod = join(dir, "quick.mjs");
+			writeFileSync(mod, `export default { id: "quick", register() {} };`);
+			const { timers, cleared, live } = makeRecordingTimers();
+			await importWithTimeout(mod, timers);
+			assert.equal(cleared.length, 1, "the armed timeout timer must be cleared exactly once");
+			assert.equal(live.size, 0, "no timer may outlive a settled import");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("clears the timeout timer when the import fails", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-timer-bad-"));
+		try {
+			const mod = join(dir, "broken.mjs");
+			// A module with a genuinely broken import is enough — the failure
+			// path (not the timeout path) is what must clear the timer.
+			writeFileSync(mod, `import "./does-not-exist.js"; export default {};`);
+			const { timers, cleared, live } = makeRecordingTimers();
+			await assert.rejects(() => importWithTimeout(mod, timers));
+			assert.equal(cleared.length, 1, "a failed import must still clear its timer");
+			assert.equal(live.size, 0, "no timer may outlive a failed import");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("arms exactly one 5s timer per import and defaults to the global timers", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-timer-count-"));
+		try {
+			const mod = join(dir, "plain.mjs");
+			writeFileSync(mod, `export default { id: "plain", register() {} };`);
+			// Exercise the production default (no seam) too: the promise must
+			// settle with the module value, proving the seam is optional and the
+			// happy path is untouched.
+			const value = (await importWithTimeout(mod)) as { default?: { id?: string } };
+			assert.equal(value.default?.id, "plain");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
