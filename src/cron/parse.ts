@@ -14,6 +14,10 @@
  *      surprises):
  *        - bare `YYYY-MM-DD`  → suffix `T00:00:00Z`
  *        - `YYYY-MM-DDT...`   → suffix `Z`
+ *        - `YYYY-MM-DD ...`   → separator rewritten to `T`, then suffix `Z`
+ *          (the space form is ISO-legal and common; left alone `Date.parse`
+ *          reads it as LOCAL time, making the resolved fire-time depend on the
+ *          host's timezone)
  *
  * Returns `null` for anything `Date.parse` rejects; caller decides whether
  * to throw or fall back. Never throws itself.
@@ -26,7 +30,10 @@
 
 const ISO_TZ_RE = /(Z|[+-]\d{2}:?\d{2})$/i;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const ISO_DATE_TIME_RE = /^\d{4}-\d{2}-\d{2}T/;
+// The date/time separator is `T` OR a single space — both are ISO-8601 (the
+// space form is what `datetime.strftime("%Y-%m-%d %H:%M:%S")`, SQL literals
+// and plenty of agent-authored timestamps actually emit).
+const ISO_DATE_TIME_RE = /^\d{4}-\d{2}-\d{2}[T ]/;
 
 function normalizeUtcIso(raw: string): string {
 	if (ISO_TZ_RE.test(raw)) {
@@ -36,7 +43,12 @@ function normalizeUtcIso(raw: string): string {
 		return `${raw}T00:00:00Z`;
 	}
 	if (ISO_DATE_TIME_RE.test(raw)) {
-		return `${raw}Z`;
+		// Rewrite the separator to `T` before stamping `Z`. Without this the
+		// space form reaches `Date.parse` unadorned, which reads it as LOCAL
+		// time — so a tz-less `at` schedule resolved to a different instant
+		// depending on the gateway host's timezone, which is exactly the
+		// "deterministic, no local-time surprises" this function promises.
+		return `${raw.replace(ISO_DATE_TIME_RE, (m) => `${m.slice(0, 10)}T`)}Z`;
 	}
 	return raw;
 }
