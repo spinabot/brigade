@@ -468,6 +468,24 @@ export async function dispatchChannelApproval(args: {
 		});
 		return false;
 	}
+	// The reservation may have been consumed while the send was in flight — an
+	// operator reply racing the await settles the bridge through the normal
+	// consume path, which deletes the slot. If anything else now occupies it
+	// (a newer dispatch that denied ours under deny-the-older), it owns the
+	// peer. Either way, do NOT resurrect ours: the bridge is already settled,
+	// so nothing would ever call `cancelChannelApprovalById` for the zombie
+	// entry, and the peer's next yes/no-shaped messages would be eaten as
+	// answers to an approval that no longer exists — for the full timeout
+	// horizon. (The bridge's own abort path removes the router slot for
+	// exactly this reason; a mid-send consume must get the same treatment.)
+	if (pendingByPeer.get(key) !== reservationToken) {
+		log.info("approval already resolved while its prompt was in flight — not re-arming the pending slot", {
+			channelId: route.channelId,
+			conversationId: route.conversationId,
+			approvalId: request.id,
+		});
+		return true;
+	}
 	// Internal watchdog independent of the bridge's own timeout: the bridge
 	// timer fires at `request.timeoutMs` and resolves the in-flight promise;
 	// when that happens we still need to clean OUR maps so a late operator

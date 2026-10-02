@@ -22,6 +22,7 @@ import { encodeApprovalCallback } from "./approval-callback-codec.js";
 import {
 	type ChannelApprovalRoute,
 	dispatchChannelApproval,
+	listPendingChannelApprovals,
 	registerChannelApprovalDispatcher,
 	resetChannelApprovalRouterForTests,
 	tryConsumeChannelApprovalCallback,
@@ -224,6 +225,79 @@ describe("approval-router — native prompt dispatch", () => {
 		await dispatchChannelApproval({ request: makeRequest("exec:text-1"), route: ROUTE, resolveOnBridge: () => {} });
 		assert.equal(sends.length, 1, "text prompt used");
 		assert.match(sends[0]!.text, /Reply/i);
+	});
+});
+
+describe("approval-router — send/reply races", () => {
+	/** A dispatcher whose sendText blocks until the test releases it. */
+	function mountGatedDispatcher(): { release: () => void; sends: number } {
+		const gate = { release: () => {} };
+		const hold = new Promise<void>((resolve) => {
+			gate.release = resolve;
+		});
+		const state = { sends: 0 };
+		registerChannelApprovalDispatcher("fake", undefined, {
+			sendText: async () => {
+				state.sends += 1;
+				await hold;
+			},
+			prettyName: "Fake",
+		});
+		return { release: () => gate.release(), sends: state.sends };
+	}
+
+	it("a reply that races the in-flight prompt send does not resurrect a settled approval", async () => {
+		const gated = mountGatedDispatcher();
+		const req = makeRequest("exec:race-1");
+		const resolutions: ApprovalDecision[] = [];
+		const dispatched = dispatchChannelApproval({
+			request: req,
+			route: ROUTE,
+			resolveOnBridge: (d) => {
+				resolutions.push(d);
+			},
+		});
+		// The operator answers while the send is still in flight. The reservation
+		// is already in the map, so this consumes it and settles the bridge.
+		const raced = tryConsumeChannelApprovalReply({ channelId: "fake", conversationId: "conv-1", text: "yes" });
+		assert.deepEqual(raced, { matched: true, decision: "allow-once", approvalId: req.id });
+		assert.deepEqual(resolutions, [{ kind: "allow-once" }]);
+
+		gated.release();
+		assert.equal(await dispatched, true, "the prompt was sent — the channel path owns the outcome");
+		assert.deepEqual(listPendingChannelApprovals(), [], "a settled approval must not linger as a pending entry");
+		// The peer's next unrelated message must dispatch normally, not be eaten
+		// as a (second) answer to an approval that is already resolved.
+		const after = tryConsumeChannelApprovalReply({ channelId: "fake", conversationId: "conv-1", text: "no" });
+		assert.deepEqual(after, { matched: false });
+		assert.equal(resolutions.length, 1, "the bridge settles exactly once");
+	});
+
+	it("a slow send must not clobber the newer reservation that denied it", async () => {
+		const gated = mountGatedDispatcher();
+		const resolutions: Array<{ id: string; decision: ApprovalDecision }> = [];
+		const first = dispatchChannelApproval({
+			request: makeRequest("exec:slow-1"),
+			route: ROUTE,
+			resolveOnBridge: (d) => {
+				resolutions.push({ id: "exec:slow-1", decision: d });
+			},
+		});
+		// A second prompt for the same peer denies the older one and takes the slot.
+		const second = dispatchChannelApproval({
+			request: makeRequest("exec:slow-2"),
+			route: ROUTE,
+			resolveOnBridge: (d) => {
+				resolutions.push({ id: "exec:slow-2", decision: d });
+			},
+		});
+		gated.release();
+		assert.equal(await first, true);
+		assert.equal(await second, true);
+		assert.deepEqual(resolutions, [{ id: "exec:slow-1", decision: { kind: "deny", timedOut: false } }], "the older prompt is denied, the newer stays pending");
+		const pending = listPendingChannelApprovals();
+		assert.equal(pending.length, 1, "exactly the newer approval stays pending");
+		assert.equal(pending[0]?.id, "exec:slow-2");
 	});
 });
 
