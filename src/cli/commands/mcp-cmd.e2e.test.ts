@@ -17,7 +17,14 @@ function runCli(stateDir: string, requests: JsonRpcRequest[]): JsonRpcResponse[]
 		cwd: repositoryRoot,
 		encoding: "utf8",
 		input: `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`,
-		timeout: 15_000,
+		// Cold `tsx` boot of the full `src/entry.ts` graph costs ~12 s on a
+		// loaded Windows host (the parallel suite saturating the CPU), and this
+		// test pays it twice — once per spawn. The old 15 s per-spawn budget
+		// made the SECOND spawn fail with `spawnSync … ETIMEDOUT` instead of a
+		// real MCP assertion, i.e. the test reported a CLI bug that wasn't one.
+		// 45 s still bounds a genuine hang (the child is killed, the assertion
+		// fires) while tolerating a loaded dev box or CI runner.
+		timeout: 45_000,
 		maxBuffer: 2 * 1024 * 1024,
 		env: {
 			...process.env,
@@ -52,7 +59,7 @@ function toolText(response: JsonRpcResponse | undefined): string {
 	return result.content.map((block) => block.text).join("\n");
 }
 
-it("the actual Brigade MCP CLI writes owner memory, survives restart, isolates peers and scans recalled content", { timeout: 40_000 }, () => {
+it("the actual Brigade MCP CLI writes owner memory, survives restart, isolates peers and scans recalled content", { timeout: 120_000 }, () => {
 	const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-mcp-e2e-"));
 	try {
 		const workspace = path.join(stateDir, "agents", "migration-e2e", "workspace");
