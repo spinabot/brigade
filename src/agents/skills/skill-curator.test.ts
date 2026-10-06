@@ -8,8 +8,11 @@ import {
 	archiveSkill,
 	detectAndRecordSkillUses,
 	restoreSkill,
+	restoreSkillsSnapshot,
 	runSkillCurator,
 	skillsArchiveRoot,
+	skillsSnapshotsRoot,
+	snapshotSkillsRoot,
 } from "./skill-curator.js";
 import {
 	listCurationCandidates,
@@ -211,5 +214,61 @@ describe("detectAndRecordSkillUses", () => {
 		const used = detectAndRecordSkillUses(root, messages, T0 + DAY);
 		assert.deepEqual(used, []);
 		assert.equal(loadUsage(root)["note-taker"]?.useCount, 0);
+	});
+});
+
+describe("snapshot / restore rollback", () => {
+	it("rolls the live root back to a snapshot and keeps an undo snapshot", () => {
+		writeSkill("keeper", "v1");
+		const snap = snapshotSkillsRoot(root, T0);
+		assert.equal(snap.ok, true);
+		assert.ok(snap.path);
+
+		// Drift the live root after the snapshot: a new skill + an edit to the keeper.
+		writeSkill("added-later");
+		fs.writeFileSync(path.join(root, "keeper", "SKILL.md"), "---\nname: keeper\ndescription: d\n---\nv2\n", "utf8");
+
+		const r = restoreSkillsSnapshot(root, snap.path!, T0 + DAY);
+		assert.equal(r.ok, true);
+		assert.ok(fs.existsSync(path.join(root, "keeper", "SKILL.md")));
+		// The snapshot predates `added-later` → it must be gone after the rollback.
+		assert.equal(fs.existsSync(path.join(root, "added-later")), false);
+		// …but the rollback is itself undoable: the pre-restore state survives.
+		assert.ok(fs.existsSync(path.join(skillsSnapshotsRoot(root), String(T0 + DAY), "added-later", "SKILL.md")));
+	});
+
+	it("leaves no staging/retired temp dirs behind after a successful restore", () => {
+		writeSkill("one");
+		const snap = snapshotSkillsRoot(root, T0);
+		const r = restoreSkillsSnapshot(root, snap.path!, T0 + DAY);
+		assert.equal(r.ok, true);
+		const leftovers = fs.readdirSync(tmp).filter((n) => n.startsWith(".skills-"));
+		assert.deepEqual(leftovers, []);
+	});
+
+	it("does not touch the live library when the snapshot is missing", () => {
+		writeSkill("precious", "body");
+		const r = restoreSkillsSnapshot(root, path.join(skillsSnapshotsRoot(root), "123456789"), T0);
+		assert.equal(r.ok, false);
+		assert.match(r.message, /no snapshot/);
+		assert.ok(fs.existsSync(path.join(root, "precious", "SKILL.md")), "live skills must survive a failed restore");
+	});
+
+	it("does not merge the live tree into the snapshot being restored from", () => {
+		// Degenerate self-restore: the caller passes `now` equal to the snapshot's
+		// own stamp. Snapshotting with that same stamp would merge the live tree
+		// INTO the source snapshot before we copy it back — the guard avoids it.
+		writeSkill("alpha", "orig");
+		const snap = snapshotSkillsRoot(root, T0);
+		writeSkill("beta"); // created AFTER the snapshot
+
+		const r = restoreSkillsSnapshot(root, snap.path!, T0);
+		assert.equal(r.ok, true);
+		assert.ok(fs.existsSync(path.join(root, "alpha", "SKILL.md")));
+		assert.equal(fs.existsSync(path.join(root, "beta")), false); // not in the snapshot
+		// The SOURCE snapshot must be pristine — no live `beta` merged in.
+		assert.equal(fs.existsSync(path.join(snap.path!, "beta")), false);
+		// The undo snapshot landed on a shifted stamp and kept the pre-restore state.
+		assert.ok(fs.existsSync(path.join(skillsSnapshotsRoot(root), String(T0 + 1), "beta", "SKILL.md")));
 	});
 });

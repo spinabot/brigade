@@ -221,12 +221,61 @@ export function restoreSkillsSnapshot(
 	now: number = Date.now(),
 ): { ok: boolean; message: string } {
 	if (!fs.existsSync(path.join(snapshotPath, ""))) return { ok: false, message: `no snapshot at ${snapshotPath}` };
-	snapshotSkillsRoot(skillsRoot, now); // make the rollback undoable
+	// Undo-snapshot the CURRENT state first so the rollback is itself reversible.
+	// Guard the degenerate self-restore case: snapshotting with the SAME stamp as
+	// the snapshot we're restoring from would merge the live tree INTO that
+	// snapshot, and we'd then "restore" the merged mess.
+	const selfStamp = path.basename(snapshotPath);
+	const undoAt = String(now) === selfStamp ? now + 1 : now;
+	snapshotSkillsRoot(skillsRoot, undoAt);
+	// Stage-then-swap instead of rm-then-copy. A direct `rmSync(skillsRoot)` +
+	// `cpSync(snapshotPath, skillsRoot)` deletes the ENTIRE live skill library
+	// before the copy runs, so a mid-copy failure (disk full, an unreadable file,
+	// EPERM on Windows) leaves the workspace with no skills at all and only a
+	// hand-recovery path. Copying into a sibling staging dir first means the live
+	// root is untouched until we've proven the copy fully succeeded.
+	const parent = path.dirname(skillsRoot);
+	const staging = path.join(parent, `.skills-restore-staging-${process.pid}-${now}`);
 	try {
-		fs.rmSync(skillsRoot, { recursive: true, force: true });
-		fs.cpSync(snapshotPath, skillsRoot, { recursive: true });
+		fs.rmSync(staging, { recursive: true, force: true });
+		fs.cpSync(snapshotPath, staging, { recursive: true });
 	} catch (err) {
+		try {
+			fs.rmSync(staging, { recursive: true, force: true });
+		} catch {
+			/* best-effort staging cleanup */
+		}
+		return { ok: false, message: `restore failed (live skills left untouched): ${err instanceof Error ? err.message : String(err)}` };
+	}
+	// Swap: move the live root aside, bring staging into place, then drop the old
+	// root. Both renames are same-volume, so they're atomic on POSIX and NTFS.
+	const retired = path.join(parent, `.skills-retired-${process.pid}-${now}`);
+	let movedAside = false;
+	try {
+		try {
+			fs.renameSync(skillsRoot, retired);
+			movedAside = true;
+		} catch {
+			/* no live root yet (first-ever restore) — nothing to move aside */
+		}
+		fs.renameSync(staging, skillsRoot);
+	} catch (err) {
+		try {
+			if (movedAside) fs.renameSync(retired, skillsRoot);
+		} catch {
+			/* best-effort rollback of the swap */
+		}
+		try {
+			fs.rmSync(staging, { recursive: true, force: true });
+		} catch {
+			/* best-effort staging cleanup */
+		}
 		return { ok: false, message: `restore failed: ${err instanceof Error ? err.message : String(err)}` };
+	}
+	try {
+		fs.rmSync(retired, { recursive: true, force: true });
+	} catch {
+		/* best-effort cleanup of the replaced root */
 	}
 	return { ok: true, message: `restored skills from ${snapshotPath}` };
 }
