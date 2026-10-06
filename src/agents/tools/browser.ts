@@ -935,13 +935,33 @@ export interface MakeBrowserToolOptions {
 	defaultTimeoutMs?: number;
 }
 
+/**
+ * Resolve whether the `browser` tool drives a headless Chromium.
+ *
+ * Precedence: an explicit `opts.headless` wins; then `BRIGADE_BROWSER_HEADLESS`
+ * (`1` = headless, `0` = visible); then TTY auto-detection.
+ *
+ * Defaulting to a VISIBLE window is only defensible when a human is watching —
+ * an interactive CLI turn attached to a terminal. A gateway daemon, a cron tick,
+ * or any piped/redirected run has nobody to watch, and every window it spawns is
+ * a stray, focus-stealing Chrome that outlives the turn AND restores whatever
+ * tabs that profile had open last time. Those contexts default to headless; set
+ * `BRIGADE_BROWSER_HEADLESS=0` to force a visible window there anyway.
+ */
+export function resolveBrowserHeadless(
+	opts: { headless?: boolean },
+	env: NodeJS.ProcessEnv = process.env,
+	isTty: boolean = Boolean(process.stdout.isTTY),
+): boolean {
+	if (opts.headless !== undefined) return opts.headless;
+	const flag = env.BRIGADE_BROWSER_HEADLESS?.trim();
+	if (flag === "1") return true;
+	if (flag === "0") return false;
+	return !isTty;
+}
+
 export function makeBrowserTool(opts: MakeBrowserToolOptions = {}): AnyBrigadeTool {
-	// Default to a VISIBLE browser window so the operator can watch what
-	// the agent is doing — heavy ops (challenge solving, slow loads) are
-	// otherwise opaque. Override via `BRIGADE_BROWSER_HEADLESS=1` for the
-	// gateway daemon case where there's no display attached.
-	const envHeadless = process.env.BRIGADE_BROWSER_HEADLESS === "1";
-	const headless = opts.headless ?? envHeadless;
+	const headless = resolveBrowserHeadless(opts);
 	// 45 s default — Justdial / Cloudflare-fronted sites routinely take
 	// 20-40 s to settle. 15 s was too tight; the model would fail a
 	// navigation it could otherwise complete.

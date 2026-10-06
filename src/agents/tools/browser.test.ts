@@ -7,7 +7,29 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { BrowserSchema, BROWSER_ACTIONS, makeBrowserTool } from "./browser.js";
+import { BrowserSchema, BROWSER_ACTIONS, makeBrowserTool, resolveBrowserHeadless } from "./browser.js";
+
+describe("resolveBrowserHeadless", () => {
+	it("an explicit opts.headless wins over everything", () => {
+		assert.equal(resolveBrowserHeadless({ headless: true }, { BRIGADE_BROWSER_HEADLESS: "0" }, false), true);
+		assert.equal(resolveBrowserHeadless({ headless: false }, { BRIGADE_BROWSER_HEADLESS: "1" }, true), false);
+	});
+
+	it("BRIGADE_BROWSER_HEADLESS forces the mode in both directions", () => {
+		assert.equal(resolveBrowserHeadless({}, { BRIGADE_BROWSER_HEADLESS: "1" }, true), true);
+		assert.equal(resolveBrowserHeadless({}, { BRIGADE_BROWSER_HEADLESS: "0" }, false), false);
+		// Surrounding whitespace must not defeat the flag.
+		assert.equal(resolveBrowserHeadless({}, { BRIGADE_BROWSER_HEADLESS: " 1 " }, false), true);
+	});
+
+	it("defaults headless when there is no TTY (daemon / cron / piped run)", () => {
+		assert.equal(resolveBrowserHeadless({}, {}, false), true);
+	});
+
+	it("keeps a visible window for an interactive terminal", () => {
+		assert.equal(resolveBrowserHeadless({}, {}, true), false);
+	});
+});
 
 describe("makeBrowserTool — identity + schema", () => {
 	const tool = makeBrowserTool();
