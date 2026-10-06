@@ -275,6 +275,182 @@ const PROFILE_STATE: Map<string, Promise<BrowserState>> = new Map();
 const DEFAULT_PROFILE = "default";
 
 /**
+ * Default on-disk user-data dirs of real browsers, per platform. Pointing
+ * `BRIGADE_BROWSER_USER_DATA_DIR` at (or under) one of these hands Chromium's
+ * profile dir to Playwright: the launch then shares session restore, cookies,
+ * and profile locks with the real browser — its old tabs come back as
+ * Brigade tabs, and two writers racing the same profile can corrupt it.
+ * Paths are computed from the environment only; no filesystem probing, so
+ * the guard also covers directories that exist but are momentarily unreadable.
+ */
+export function realBrowserUserDataRoots(
+	env: NodeJS.ProcessEnv = process.env,
+	platform: NodeJS.Platform = process.platform,
+): string[] {
+	const roots: string[] = [];
+	const home = env.HOME ?? env.USERPROFILE;
+	if (platform === "win32") {
+		const local = env.LOCALAPPDATA;
+		if (local) {
+			roots.push(
+				join(local, "Google", "Chrome", "User Data"),
+				join(local, "Google", "Chrome Beta", "User Data"),
+				join(local, "Google", "Chrome Canary", "User Data"),
+				join(local, "Google", "Chrome SxS", "User Data"),
+				join(local, "Microsoft", "Edge", "User Data"),
+				join(local, "Microsoft", "Edge Beta", "User Data"),
+				join(local, "Microsoft", "Edge SxS", "User Data"),
+				join(local, "BraveSoftware", "Brave-Browser", "User Data"),
+				join(local, "BraveSoftware", "Brave-Browser-Beta", "User Data"),
+				join(local, "Chromium", "User Data"),
+				join(local, "Vivaldi", "User Data"),
+			);
+		}
+		const roaming = env.APPDATA;
+		if (roaming) {
+			roots.push(
+				join(roaming, "Opera Software", "Opera Stable"),
+				join(roaming, "Opera Software", "Opera GX Stable"),
+				join(roaming, "Mozilla", "Firefox", "Profiles"),
+			);
+		}
+		return roots;
+	}
+	if (!home) return roots;
+	if (platform === "darwin") {
+		const appSupport = join(home, "Library", "Application Support");
+		roots.push(
+			join(appSupport, "Google", "Chrome"),
+			join(appSupport, "Google", "Chrome Beta"),
+			join(appSupport, "Google", "Chrome Canary"),
+			join(appSupport, "Microsoft Edge"),
+			join(appSupport, "BraveSoftware", "Brave-Browser"),
+			join(appSupport, "Chromium"),
+			join(appSupport, "Vivaldi"),
+			join(appSupport, "Firefox"),
+			join(appSupport, "com.operasoftware.Opera"),
+		);
+		return roots;
+	}
+	// linux (and any other posix fallback)
+	const config = env.XDG_CONFIG_HOME ?? join(home, ".config");
+	roots.push(
+		join(config, "google-chrome"),
+		join(config, "google-chrome-beta"),
+		join(config, "chromium"),
+		join(config, "chromium-browser"),
+		join(config, "microsoft-edge"),
+		join(config, "microsoft-edge-beta"),
+		join(config, "BraveSoftware", "Brave-Browser"),
+		join(config, "vivaldi"),
+		join(config, "opera"),
+		join(config, "firefox"),
+		join(home, "snap", "chromium", "common", ".config", "chromium"),
+		join(home, ".mozilla", "firefox"),
+	);
+	return roots;
+}
+
+/** Normalize a path for containment comparison: forward slashes, no trailing
+ *  separator, case-folded where the platform's default filesystem is
+ *  case-insensitive (win32, darwin — so `User Data` catches `user data`). */
+function normalizePathKey(p: string, platform: NodeJS.Platform): string {
+	const normalized = pathResolve(p).replace(/\\/g, "/").replace(/\/+$/, "");
+	return platform === "win32" || platform === "darwin" ? normalized.toLowerCase() : normalized;
+}
+
+/**
+ * The known real-browser user-data root that `candidate` equals or lives
+ * under, or `undefined` when the path is safe to use as a Brigade profile
+ * root. Pure path arithmetic — no filesystem access — so it behaves the same
+ * whether or not that browser is installed or currently running.
+ */
+export function findRealBrowserUserDataRoot(
+	candidate: string,
+	env: NodeJS.ProcessEnv = process.env,
+	platform: NodeJS.Platform = process.platform,
+): string | undefined {
+	const key = normalizePathKey(candidate, platform);
+	for (const root of realBrowserUserDataRoots(env, platform)) {
+		const r = normalizePathKey(root, platform);
+		if (key === r || key.startsWith(`${r}/`)) return root;
+	}
+	return undefined;
+}
+
+/**
+ * Resolve `BRIGADE_BROWSER_USER_DATA_DIR` + profile name into the directory
+ * Playwright will treat as Chromium's user-data dir — refusing (by throwing,
+ * with an actionable message) any override that resolves inside a real
+ * browser's user-data dir. The classic accident: pointing the override at
+ * Chrome's `User Data`, where `<override>/default` collides case-
+ * insensitively (on Windows) with Chrome's real `Default` profile — Brigade
+ * then session-restores the user's actual tabs and races the real browser on
+ * its own profile lock.
+ */
+export function resolveUserDataDirOverride(
+	override: string,
+	profileDirName: string,
+	env: NodeJS.ProcessEnv = process.env,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const resolved = join(override, profileDirName);
+	const realRoot = findRealBrowserUserDataRoot(resolved, env, platform);
+	if (realRoot) {
+		throw new Error(
+			[
+				"browser: BRIGADE_BROWSER_USER_DATA_DIR resolves inside a real browser's user-data dir:",
+				`  override: ${override}`,
+				`  resolved: ${resolved}`,
+				`  browser:  ${realRoot}`,
+				"Launching there would share that browser's session restore, cookies, and profile",
+				"lock — its open tabs come back as Brigade tabs, and concurrent writes can corrupt",
+				"the profile. Point the override at a dedicated directory, or unset it to use the",
+				"default ~/.brigade/browser/<profile>/.",
+			].join("\n"),
+		);
+	}
+	return resolved;
+}
+
+/** Minimal structural view of a restored startup page — keeps the helper
+ *  testable without a real Playwright runtime. */
+interface StartupPage {
+	goto(url: string): Promise<unknown>;
+	close(): Promise<void>;
+}
+
+/**
+ * Collapse the pages a fresh `launchPersistentContext` inherited from the
+ * previous session's restore: keep the first (navigated to `about:blank`),
+ * close the rest. Returns how many pages were closed. Best-effort by design —
+ * a page that already navigated or closed itself is not an error.
+ */
+export async function closeRestoredStartupPages(context: {
+	pages?: () => StartupPage[] | Promise<StartupPage[]>;
+}): Promise<number> {
+	if (!context.pages) return 0;
+	const pages = await context.pages();
+	const keep = pages[0];
+	if (!keep) return 0;
+	try {
+		await keep.goto("about:blank");
+	} catch {
+		/* best-effort — the page may be mid-navigation */
+	}
+	let closed = 0;
+	for (const page of pages.slice(1)) {
+		try {
+			await page.close();
+			closed += 1;
+		} catch {
+			/* raced with its own teardown */
+		}
+	}
+	return closed;
+}
+
+/**
  * Brigade-managed profiles live under `~/.brigade/browser/<name>/`. The
  * default profile is always present; others are created on first use.
  * `attached:<endpoint>` is a special pseudo-profile that points at an
@@ -296,7 +472,7 @@ function profileUserDataDir(name: string): string {
 	// Machine-local by nature: cookies/logins don't roam, which is the
 	// accepted trade-off. BRIGADE_BROWSER_USER_DATA_DIR overrides both modes.
 	const override = process.env.BRIGADE_BROWSER_USER_DATA_DIR?.trim();
-	if (override) return join(override, safe || DEFAULT_PROFILE);
+	if (override) return resolveUserDataDirOverride(override, safe || DEFAULT_PROFILE);
 	if (tryGetRuntimeContext()?.mode === "convex") {
 		return join(resolveOsCacheDir(), "browser", safe || DEFAULT_PROFILE);
 	}
@@ -363,6 +539,10 @@ async function ensureBrowser(opts: {
 			"--disable-sync",
 			"--disable-background-networking",
 			"--disable-component-update",
+			// Pair with the restored-tab cleanup below: never surface
+			// Chromium's "Restore pages?" bubble — Brigade decides the
+			// starting tabs, the previous session doesn't.
+			"--hide-crash-restore-bubble",
 		];
 		if (opts.headless) {
 			args.push("--headless=new", "--disable-gpu");
@@ -374,6 +554,18 @@ async function ensureBrowser(opts: {
 			executablePath,
 			args,
 		});
+		// A persistent profile restores whatever the previous session left
+		// open — after a crash (killed gateway, force-quit) Chromium brings
+		// every old tab back, so a visible launch could open on someone
+		// else's leftovers instead of a clean window. Collapse to a single
+		// blank page BEFORE the tool registers anything: tool tabs are
+		// created on demand, and exactly one page is kept because closing
+		// the LAST page of a persistent context shuts Chromium down.
+		try {
+			await closeRestoredStartupPages(browser);
+		} catch {
+			/* best-effort — stale tabs cost memory, not correctness */
+		}
 		const state: BrowserState = {
 			browser,
 			tabs: new Map(),
