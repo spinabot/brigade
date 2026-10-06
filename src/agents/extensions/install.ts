@@ -35,6 +35,7 @@ import {
 	mkdtempSync,
 	readFileSync,
 	readdirSync,
+	renameSync,
 	rmSync,
 	statSync,
 } from "node:fs";
@@ -395,6 +396,9 @@ export interface InstallOptions {
 export async function installExtension(source: string, opts: InstallOptions): Promise<InstallResult> {
 	const sourceKind = classifySource(source);
 	const stageRoot = mkdtempSync(path.join(tmpdir(), "brigade-ext-install-"));
+	// Private staging path inside the extensions dir (set once the id is known);
+	// cleaned in `finally` so a thrown gate never leaves a half-copied module behind.
+	let stagingDir: string | null = null;
 	try {
 		// 1. Stage the bytes into a temp dir based on the source kind.
 		const staged =
@@ -416,20 +420,55 @@ export async function installExtension(source: string, opts: InstallOptions): Pr
 			);
 		}
 
-		// 4. Copy the staged module into the extensions dir.
+		// 4. Stage the module into the extensions dir under a PRIVATE name, so the
+		//    gates below run against the FINAL bytes and nothing already installed is
+		//    disturbed until we know the new copy is acceptable. The old code deleted
+		//    the target first and copied after, so a failed `--force` upgrade (or a
+		//    mid-copy error) uninstalled the working extension.
 		mkdirSync(opts.extensionsDir, { recursive: true });
-		if (exists) rmSync(targetDir, { recursive: true, force: true });
-		cpSync(staged.stagedDir, targetDir, { recursive: true });
+		const staging = path.join(opts.extensionsDir, `.${id}.staging-${process.pid}-${Date.now()}`);
+		stagingDir = staging;
+		rmSync(staging, { recursive: true, force: true });
+		cpSync(staged.stagedDir, staging, { recursive: true });
 
-		// 5. Compat gate — the one hard failure. Roll back on incompatibility.
-		const manifest = readManifestAt(targetDir);
+		// 5. Compat gate — the one hard failure. Run it on the STAGED copy: a
+		//    forward-incompatible upgrade is refused without ever touching the
+		//    installed version.
+		const manifest = readManifestAt(staging);
 		const compat = checkCompat(manifest, opts.brigadeVersionOverride, opts.pluginApiOverride);
 		if (!compat.compatible) {
-			rmSync(targetDir, { recursive: true, force: true });
 			throw new InstallError(compat.reason);
 		}
 
-		// 6. Security scan — surfaced, never auto-blocking.
+		// 6. Swap the staged copy into place. Move the existing install aside, rename
+		//    staging over it, then drop the retired copy — both renames are same-volume
+		//    and therefore atomic on POSIX and NTFS. If the swap falls over, the
+		//    original is moved back so a failed upgrade never leaves the id missing.
+		const retiredDir = path.join(opts.extensionsDir, `.${id}.retired-${process.pid}-${Date.now()}`);
+		let movedAside = false;
+		try {
+			if (exists) {
+				renameSync(targetDir, retiredDir);
+				movedAside = true;
+			}
+			renameSync(staging, targetDir);
+			stagingDir = null;
+		} catch (err) {
+			try {
+				if (movedAside) renameSync(retiredDir, targetDir);
+			} catch {
+				/* best-effort rollback of the swap */
+			}
+			const detail = err instanceof Error ? err.message : String(err);
+			throw new InstallError(`Couldn't install "${id}": ${detail}`);
+		}
+		try {
+			rmSync(retiredDir, { recursive: true, force: true });
+		} catch {
+			/* best-effort cleanup of the replaced copy */
+		}
+
+		// 7. Security scan — surfaced, never auto-blocking.
 		const scan = scanInstalledModule(targetDir);
 
 		return {
@@ -447,6 +486,13 @@ export async function installExtension(source: string, opts: InstallOptions): Pr
 			rmSync(stageRoot, { recursive: true, force: true });
 		} catch {
 			/* best-effort temp cleanup */
+		}
+		if (stagingDir) {
+			try {
+				rmSync(stagingDir, { recursive: true, force: true });
+			} catch {
+				/* best-effort staging cleanup */
+			}
 		}
 	}
 }

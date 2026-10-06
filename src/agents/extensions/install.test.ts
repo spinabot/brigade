@@ -10,7 +10,7 @@
  */
 
 import { strict as assert } from "node:assert";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -283,6 +283,42 @@ describe("id collision + --force", () => {
 			assert.equal(result.replacedExisting, true);
 			const landed = readFileSync(join(extDir, "dup", "index.ts"), "utf8");
 			assert.match(landed, /v2/);
+		} finally {
+			for (const d of [src1, src2, extDir]) rmSync(d, { recursive: true, force: true });
+		}
+	});
+
+	it("a refused --force upgrade keeps the previously-working extension installed", async () => {
+		const good = makeSourceDir({ manifest: { id: "keep" }, indexSrc: `export default { id:"keep", register(){} }; // v1` });
+		const bad = makeSourceDir({ manifest: { id: "keep", minBrigadeVersion: "9.9.9" } });
+		const extDir = mkTemp("ext-dir");
+		try {
+			await installExtension(good, { extensionsDir: extDir, brigadeVersionOverride: "0.1.0" });
+			await assert.rejects(
+				() => installExtension(bad, { extensionsDir: extDir, force: true, brigadeVersionOverride: "0.1.0" }),
+				(err: unknown) => err instanceof InstallError && /needs Brigade 9\.9\.9/.test((err as Error).message),
+			);
+			// The v1 install must survive the refused upgrade — the old code deleted it first.
+			const landed = readFileSync(join(extDir, "keep", "index.ts"), "utf8");
+			assert.match(landed, /v1/);
+			assert.deepEqual(listInstalledIds(extDir), ["keep"]);
+		} finally {
+			for (const d of [good, bad, extDir]) rmSync(d, { recursive: true, force: true });
+		}
+	});
+
+	it("leaves no staging/retired scratch dirs behind after a --force upgrade", async () => {
+		const src1 = makeSourceDir({ manifest: { id: "dup" }, indexSrc: `export default { id:"dup", register(){} }; // v1` });
+		const src2 = makeSourceDir({ manifest: { id: "dup" }, indexSrc: `export default { id:"dup", register(){} }; // v2` });
+		const extDir = mkTemp("ext-dir");
+		try {
+			await installExtension(src1, { extensionsDir: extDir, brigadeVersionOverride: "0.1.0" });
+			await installExtension(src2, { extensionsDir: extDir, force: true, brigadeVersionOverride: "0.1.0" });
+			assert.deepEqual(
+				readdirSync(extDir).filter((n) => n.startsWith(".")),
+				[],
+			);
+			assert.deepEqual(listInstalledIds(extDir), ["dup"]);
 		} finally {
 			for (const d of [src1, src2, extDir]) rmSync(d, { recursive: true, force: true });
 		}
