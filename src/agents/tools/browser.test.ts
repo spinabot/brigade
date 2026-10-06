@@ -7,7 +7,12 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { BrowserSchema, BROWSER_ACTIONS, makeBrowserTool } from "./browser.js";
+import {
+	BrowserSchema,
+	BROWSER_ACTIONS,
+	makeBrowserTool,
+	stopAllLaunchedProfiles,
+} from "./browser.js";
 
 describe("makeBrowserTool — identity + schema", () => {
 	const tool = makeBrowserTool();
@@ -96,5 +101,13 @@ describe("makeBrowserTool — system-browser discovery + error surface", () => {
 		// `playwright-core` is a hard dep — operator doesn't run npm install.
 		assert.doesNotMatch(desc, /npm install playwright/);
 		assert.doesNotMatch(desc, /npx playwright install/);
+	});
+});
+
+describe("stopAllLaunchedProfiles", () => {
+	it("is a safe no-op with nothing launched", async () => {
+		// Must never throw during gateway shutdown, and must report 0 when no
+		// profile has been started in this process.
+		assert.equal(await stopAllLaunchedProfiles(), 0);
 	});
 });

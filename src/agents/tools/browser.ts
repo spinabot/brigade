@@ -1697,6 +1697,26 @@ async function stopProfile(profile: string): Promise<BrowserDetails> {
 	return { action: "stop", profile, externalContent: meta };
 }
 
+/**
+ * Close every Brigade-LAUNCHED browser profile. Attached profiles
+ * (`attached:<endpoint>`) are deliberately skipped — we don't own their
+ * lifecycle, so closing them would kill a browser the operator started.
+ *
+ * Wired into gateway shutdown: a launched Chromium otherwise outlives the
+ * gateway — it holds the profile's singleton lock (so the next launch can't
+ * reuse the dir cleanly), keeps its window on screen when headed, and restores
+ * its tabs on the next start. Best-effort; never throws.
+ *
+ * Returns the number of launched profiles it tore down.
+ */
+export async function stopAllLaunchedProfiles(): Promise<number> {
+	const names = [...PROFILE_STATE.keys()].filter((name) => !isAttachedProfile(name));
+	for (const name of names) {
+		await stopProfile(name);
+	}
+	return names.length;
+}
+
 /* ─────────────────────────── snapshot helpers ─────────────────────────── */
 
 /**

@@ -8073,6 +8073,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			} catch {
 				/* best-effort */
 			}
+			// Close any Brigade-LAUNCHED browser. A daemon-driven Chromium otherwise
+			// outlives the gateway: it holds the profile's singleton lock, keeps its
+			// window on screen when headed, and restores its tabs on the next launch.
+			// Attached profiles are skipped — the tool doesn't own their lifecycle.
+			try {
+				const { stopAllLaunchedProfiles } = await import("../agents/tools/browser.js");
+				await stopAllLaunchedProfiles();
+			} catch {
+				/* best-effort — an unclosable browser must never block shutdown */
+			}
 			try {
 				const { awaitCronFlush } = await import("../storage/cron-cache.js");
 				await awaitCronFlush();
