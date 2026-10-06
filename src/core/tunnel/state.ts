@@ -15,6 +15,7 @@ import * as fsAsync from "node:fs/promises";
 import * as path from "node:path";
 
 import { resolveOsCacheDir } from "../../config/paths.js";
+import { atomicTempPath } from "../../infra/json-file.js";
 
 export interface TunnelState {
   /** Public URL without the token. */
@@ -43,7 +44,7 @@ function tunnelStatePath(): string {
 export async function writeTunnelState(state: TunnelState): Promise<void> {
   const file = tunnelStatePath();
   await fsAsync.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp`;
+  const tmp = atomicTempPath(file);
   await fsAsync.writeFile(tmp, JSON.stringify(state, null, 2), "utf8");
   await fsAsync.rename(tmp, file);
 }

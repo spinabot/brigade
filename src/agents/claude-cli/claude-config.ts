@@ -25,6 +25,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { peekConvexMode, resolveOsConfigDir, resolveStateDir } from "../../config/paths.js";
+import { atomicTempPath } from "../../infra/json-file.js";
 
 /**
  * The dedicated Claude config dir. Filesystem mode: `<stateDir>/claude-config`.
@@ -290,7 +291,7 @@ export function writeBrigadeClaudeCredential(cred: {
 		},
 	};
 	const target = credentialPath();
-	const tmp = `${target}.tmp`;
+	const tmp = atomicTempPath(target);
 	fs.writeFileSync(tmp, JSON.stringify(file, null, 2), { mode: 0o600 });
 	if (os.platform() !== "win32") {
 		try {

@@ -10,6 +10,7 @@ import {
   resolveSessionTranscriptPath,
   resolveSessionsDir,
 } from "../config/paths.js";
+import { atomicTempPath } from "../infra/json-file.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
   getCachedSessionFile,
@@ -411,7 +412,7 @@ export function writeSessionStore(agentId: string, file: SessionStoreFile): void
 
   const storePath = resolveSessionStorePath(agentId);
   ensureDir(path.dirname(storePath));
-  const tmp = `${storePath}.tmp`;
+  const tmp = atomicTempPath(storePath);
   fs.writeFileSync(tmp, JSON.stringify(file, null, 2), "utf8");
   fs.renameSync(tmp, storePath);
 }

@@ -22,6 +22,7 @@ import path from "node:path";
 
 import { resolveStateDir } from "../config/paths.js";
 import { renameWithRetryAsync } from "../infra/fs/atomic-rename.js";
+import { atomicTempPath } from "../infra/json-file.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import type { CronRunLogEntry } from "./types.js";
@@ -171,7 +172,7 @@ async function maybePruneCronRunLog(
 
 /** Atomic rewrite via tmp + rename so a crash mid-prune doesn't lose data. */
 async function atomicReplace(filePath: string, contents: string): Promise<void> {
-	const tmp = `${filePath}.tmp`;
+	const tmp = atomicTempPath(filePath);
 	await fs.writeFile(tmp, contents, "utf8");
 	// Retry rename for the Windows EPERM/EBUSY window — same defence the
 	// cron store uses on its tmp+rename hot path.
