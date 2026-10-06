@@ -375,6 +375,30 @@ export async function readPid(pathOverride?: string): Promise<number | undefined
 }
 
 /**
+ * Read the PID file's mtime (epoch ms). `undefined` when the file is
+ * missing/unreadable — or in convex mode, where the gatewayCoord row carries
+ * no mtime at all.
+ *
+ * The supervisor uses this as the gateway's "birth certificate": a live PID
+ * whose PID file was written moments ago is a process still in its first
+ * beats (the initial heartbeat write is `void`-ed right after `writePidFile`),
+ * which is categorically different from a long-running gateway with no
+ * heartbeat file — that one is wedged or failing to write.
+ */
+export async function readPidMtimeMs(pathOverride?: string): Promise<number | undefined> {
+  if (pathOverride === undefined) {
+    const rctx = tryGetRuntimeContext();
+    if (rctx?.mode === "convex") return undefined;
+  }
+  try {
+    const stat = await fsAsync.stat(pathOverride ?? GATEWAY_PID_PATH);
+    return stat.mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Best-effort check whether `pid` is alive. Sends signal 0, which Node uses
  * for liveness probes (no actual signal delivered). On success the process
  * is alive; ESRCH means it's dead. EPERM (signal allowed but caller can't

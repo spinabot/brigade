@@ -12,7 +12,9 @@
  * This supervisor closes that gap. On each cycle it reads
  * `~/.brigade/gateway.heartbeat` (which the gateway updates every
  * 30s from inside the tick loop, so a starved loop can't refresh it).
- * If the file is missing OR its `ts` is older than
+ * If the file is missing BEYOND the gateway's boot grace (PID file younger
+ * than the same staleness window — the process just started and its first
+ * heartbeat hasn't landed) OR its `ts` is older than
  * `GATEWAY_HEARTBEAT_STALE_MS` (90s default) it kills the wedged
  * gateway via the existing `gateway stop` flow (SIGTERM + wait, then
  * SIGKILL fallback) and spawns a replacement via the standard
@@ -30,13 +32,23 @@ import {
 	isProcessAlive,
 	readHeartbeat,
 	readPid,
+	readPidMtimeMs,
 } from "../../core/gateway-probe.js";
 import { ensureGatewayRunning } from "../../core/gateway-spawn.js";
 
 export type SuperviseDecision =
 	| { kind: "healthy"; ageMs: number; pid: number }
 	| { kind: "no-pid"; reason: string }
-	| { kind: "no-heartbeat"; reason: string }
+	| {
+			kind: "no-heartbeat";
+			reason: string;
+			pid: number;
+			/** True while the PID file is younger than the staleness window —
+			 *  the gateway just booted and its first heartbeat hasn't landed. */
+			withinBootGrace: boolean;
+			/** Age of the PID file in ms; `undefined` when it can't be read. */
+			pidAgeMs?: number;
+	  }
 	| { kind: "stale"; ageMs: number; pid: number; reason: string }
 	| { kind: "dead-pid"; pid: number; reason: string };
 
@@ -78,13 +90,26 @@ export async function checkGatewayHealth(opts: SuperviseOptions = {}): Promise<S
 		return { kind: "dead-pid", pid, reason: `gateway PID ${pid} is no longer alive` };
 	}
 	if (!heartbeat) {
-		// Process is alive but no heartbeat file — either the file was
-		// deleted out from under us, or the gateway hasn't started writing
-		// yet (boot race). Treat as wedged ONLY after the same staleness
-		// window so a slow boot doesn't trigger an unnecessary restart.
+		// Process is alive but no usable heartbeat — the file was deleted out
+		// from under us, the gateway hasn't written it yet (boot race: the
+		// initial `void writeHeartbeatFile()` lands just after `writePidFile`),
+		// or heartbeat writes are failing outright. The PID file's mtime
+		// separates "still in its first beats" from "wedged": a PID younger
+		// than the staleness window gets grace instead of an immediate kill,
+		// while an older PID with no heartbeat is treated as wedged below.
+		// (Convex mode has no PID file to age, so it degrades to the strict
+		// read: `pidAgeMs` stays undefined and grace never applies.)
+		const mtimeMs = await readPidMtimeMs(opts.pidPath);
+		const pidAgeMs = mtimeMs === undefined ? undefined : now - mtimeMs;
+		const withinBootGrace = pidAgeMs !== undefined && pidAgeMs <= maxStale;
 		return {
 			kind: "no-heartbeat",
-			reason: "gateway is alive but no gateway.heartbeat file is present",
+			pid,
+			withinBootGrace,
+			pidAgeMs,
+			reason: withinBootGrace
+				? `gateway PID ${pid} is only ${Math.max(0, pidAgeMs ?? 0)}ms old — waiting for the first heartbeat write`
+				: "gateway is alive but no gateway.heartbeat file is present",
 		};
 	}
 	const ageMs = now - heartbeat.ts;
@@ -141,7 +166,9 @@ const EXIT_RATE_LIMITED = 3;
  * code so callers (CLI + tests) can `process.exit(result)`.
  *
  * Exit codes:
- *   0 — once-mode found a healthy gateway, OR loop was cleanly aborted.
+ *   0 — once-mode found a healthy gateway (or one still inside its boot
+ *       grace: alive, PID fresh, first heartbeat not written yet), OR
+ *       loop was cleanly aborted.
  *   1 — once-mode found a problem AND respawn failed.
  *   2 — once-mode found a problem AND respawned successfully (so the
  *       caller's shell loop can distinguish "everything ok" from "I
@@ -200,6 +227,19 @@ export async function runGatewaySupervise(opts: SuperviseRunOptions = {}): Promi
 			// service that auto-starts would re-spawn after `brigade
 			// gateway stop`, which is unexpected).
 			emit(decision.reason, decision.kind);
+			return { exitCode: 0, acted: false };
+		}
+		if (decision.kind === "no-heartbeat" && decision.withinBootGrace) {
+			// Fresh PID, heartbeat not landed yet — the gateway is mid-boot
+			// (or its first heartbeat write is still in flight). Killing it
+			// here would turn every gateway start into a restart loop: each
+			// respawn would again be younger than the window it must wait out.
+			// Treat as healthy and let the next cycle see the beat.
+			emit(decision.reason, decision.kind, {
+				pid: decision.pid,
+				pidAgeMs: decision.pidAgeMs,
+				withinBootGrace: true,
+			});
 			return { exitCode: 0, acted: false };
 		}
 		// Anything else means the gateway is wedged / dead. Before respawning,

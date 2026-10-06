@@ -7,12 +7,21 @@
  */
 
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, futimesSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { checkGatewayHealth, runGatewaySupervise } from "./gateway-supervise.js";
+
+/** Age a file we just created — via a held file handle, so there is never a
+ *  probe-then-act pair on the path itself. */
+function ageFile(filePath: string, ageMs: number): void {
+	const fd = openSync(filePath, "r+");
+	const when = new Date(Date.now() - ageMs);
+	futimesSync(fd, when, when);
+	closeSync(fd);
+}
 
 describe("checkGatewayHealth", () => {
 	let dir: string;
@@ -111,6 +120,29 @@ describe("checkGatewayHealth", () => {
 		const decision = await checkGatewayHealth({ nowMs: () => 1000, pidPath, heartbeatPath });
 		assert.equal(decision.kind, "no-heartbeat");
 	});
+
+	it("grants boot grace when the PID is alive and freshly written but no heartbeat exists yet", async () => {
+		writeFileSync(pidPath, String(process.pid), "utf8");
+		const decision = await checkGatewayHealth({ pidPath, heartbeatPath });
+		assert.equal(decision.kind, "no-heartbeat");
+		if (decision.kind === "no-heartbeat") {
+			assert.equal(decision.withinBootGrace, true, "a just-booted gateway waits for its first beat");
+		}
+	});
+
+	it("ends boot grace once the PID file is older than the staleness window", async () => {
+		writeFileSync(pidPath, String(process.pid), "utf8");
+		ageFile(pidPath, 10 * 60_000);
+		const decision = await checkGatewayHealth({ pidPath, heartbeatPath });
+		assert.equal(decision.kind, "no-heartbeat");
+		if (decision.kind === "no-heartbeat") {
+			assert.equal(decision.withinBootGrace, false, "a long-running gateway with no beat is wedged");
+			assert.ok(
+				(decision.pidAgeMs ?? 0) >= 9 * 60_000,
+				`expected ~10min pid age, got ${decision.pidAgeMs}`,
+			);
+		}
+	});
 });
 
 describe("runGatewaySupervise — once-mode integration", () => {
@@ -189,6 +221,43 @@ describe("runGatewaySupervise — once-mode integration", () => {
 		});
 		assert.equal(exit, 0);
 		assert.equal(respawned, 0);
+	});
+
+	it("--once with a fresh PID file and no heartbeat exits 0 and does NOT respawn (boot grace)", async () => {
+		writeFileSync(pidPath, String(process.pid), "utf8");
+		let respawned = 0;
+		const exit = await runGatewaySupervise({
+			once: true,
+			json: true,
+			pidPath,
+			heartbeatPath,
+			stdout: () => {},
+			stderr: () => {},
+			respawn: async () => {
+				respawned += 1;
+			},
+		});
+		assert.equal(exit, 0);
+		assert.equal(respawned, 0, "a gateway inside its boot grace must not be killed");
+	});
+
+	it("--once with an aged PID file and no heartbeat exits 2 and respawns", async () => {
+		writeFileSync(pidPath, String(process.pid), "utf8");
+		ageFile(pidPath, 10 * 60_000);
+		let respawned = 0;
+		const exit = await runGatewaySupervise({
+			once: true,
+			json: true,
+			pidPath,
+			heartbeatPath,
+			stdout: () => {},
+			stderr: () => {},
+			respawn: async () => {
+				respawned += 1;
+			},
+		});
+		assert.equal(exit, 2);
+		assert.equal(respawned, 1, "a long-running gateway with no beat gets respawned");
 	});
 
 	it("--once with a stale heartbeat AND failing respawn exits 1", async () => {
