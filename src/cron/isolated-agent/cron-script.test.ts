@@ -52,6 +52,25 @@ describe("executeCronScriptRun (cron cost-saver)", () => {
 		assert.match(out.error ?? "", /exited 3/);
 	});
 
+	for (const stream of ["stdout", "stderr"] as const) {
+		it(`preserves UTF-8 characters split across ${stream} chunks`, async () => {
+			fs.writeFileSync(path.join(dir, "output.cjs"), `
+const bytes = Buffer.from("汉🦁");
+let offset = 0;
+const timer = setInterval(() => {
+  process.${stream}.write(bytes.subarray(offset, ++offset));
+  if (offset === bytes.length) {
+    clearInterval(timer);
+    process.exitCode = ${stream === "stderr" ? 1 : 0};
+  }
+}, 40);
+`);
+			const out = await executeCronScriptRun({ job: scriptJob({ command: "node output.cjs", cwd: dir }), runAtMs: 0 });
+			assert.equal(out.status, stream === "stdout" ? "ok" : "error");
+			assert.equal(stream === "stdout" ? out.summary : out.error, stream === "stdout" ? "汉🦁" : "script exited 1: 汉🦁");
+		});
+	}
+
 	it("REFUSES a channel-origin script job (owner-only — RCE guard)", async () => {
 		const out = await executeCronScriptRun({
 			job: scriptJob({

@@ -305,11 +305,13 @@ function runShellCommand(
 		}, opts.timeoutMs);
 		timer.unref?.();
 		opts.signal?.addEventListener?.("abort", onAbort, { once: true });
-		child.stdout?.on("data", (d: Buffer) => {
-			if (stdout.length < SCRIPT_OUTPUT_CAP_BYTES) stdout += d.toString("utf8");
+		child.stdout?.setEncoding("utf8");
+		child.stderr?.setEncoding("utf8");
+		child.stdout?.on("data", (d: string) => {
+			if (stdout.length < SCRIPT_OUTPUT_CAP_BYTES) stdout += d;
 		});
-		child.stderr?.on("data", (d: Buffer) => {
-			if (stderr.length < SCRIPT_OUTPUT_CAP_BYTES) stderr += d.toString("utf8");
+		child.stderr?.on("data", (d: string) => {
+			if (stderr.length < SCRIPT_OUTPUT_CAP_BYTES) stderr += d;
 		});
 		child.on("error", (e: Error) => {
 			stderr += String(e?.message ?? e);
