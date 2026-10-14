@@ -213,6 +213,18 @@ export const PROVIDERS: ProviderInfo[] = [
 		baseUrl: "https://api.tokensmarket.ai/v1",
 		billing: "metered",
 	},
+	{
+		id: "cheaperinference",
+		name: "Cheaper Inference",
+		description: "Multi-model LLM gateway with OpenAI-compatible access",
+		keyUrl: "https://cheaperinference.com/signup",
+		envVar: "CHEAPER_INFERENCE_API_KEY",
+		custom: true,
+		liveModels: true, // models fetched live from /v1/models at onboarding
+		api: "openai-completions",
+		baseUrl: "https://api.cheaperinference.com/v1",
+		billing: "metered",
+	},
 
 	{
 		id: "groq",
