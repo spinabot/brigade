@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.39.1](https://github.com/spinabot/brigade/compare/brigade-v1.39.0...brigade-v1.39.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* **onboarding:** a failed subscription sign-in names its cause instead of "check your connection" ([a144b82](https://github.com/spinabot/brigade/commit/a144b8290f12e19ba0fc0ac1dd2f3a084e271f84))
+* **onboarding:** a failed subscription sign-in names its cause instead of "check your connection" ([c90c920](https://github.com/spinabot/brigade/commit/c90c920a93cb12ef4fd7f9fd4128e7349f39089c))
+
 ## [1.39.0](https://github.com/spinabot/brigade/compare/brigade-v1.38.0...brigade-v1.39.0) (2026-09-15)
 
 
