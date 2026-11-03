@@ -55,7 +55,7 @@ const WebSearchSchema = Type.Object({
 	provider: Type.Optional(
 		Type.String({
 			description:
-				"Override the auto-detected provider for THIS call only. One of the registered IDs (brave, tavily, exa, perplexity, duckduckgo, searxng, firecrawl). Leave unset to use the operator-configured default.",
+				"Override the auto-detected provider for THIS call only. One of the registered IDs (brave, tavily, exa, perplexity, duckduckgo, keenable, searxng, firecrawl). Leave unset to use the operator-configured default.",
 			minLength: 1,
 		}),
 	),
