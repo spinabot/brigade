@@ -55,6 +55,7 @@ import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
 import { pickStorageMode, type StorageModeResult } from "./onboard-storage-mode.js";
 import { SearchableSelectList } from "./searchable-select.js";
+import { describeSubscriptionLoginFailure } from "./subscription-login-error.js";
 import {
 	describeModelProbe,
 	fetchOpenAICompatibleModelIds,
@@ -1176,17 +1177,11 @@ export async function ensureSubscriptionLogin(
 			});
 		} catch (err) {
 			controller.abort();
-			const reason = err instanceof Error ? err.message : String(err);
-			// "cancelled" / "back" are user-initiated aborts — surface a soft line
-			// and let them retry; anything else is a real failure. NEVER render
-			// the raw Pi reason (it can leak a URL / status / internal detail) —
-			// map it to a friendly, generic line. The soft-cancel branch also
-			// matches Pi's "Login cancelled" wording so a user abort reads clean.
-			const softCancel =
-				/^login cancelled$/i.test(reason) || reason === "cancelled" || reason === "back";
-			lastError = softCancel
-				? "Login cancelled. Start again, or pick a different provider."
-				: "We couldn't finish signing you in. Check your connection and try again.";
+			// A user abort reads as a soft "Login cancelled"; a real failure names
+			// its cause (TLS interception, DNS, timeout, HTTP 429/5xx…) from the
+			// error code and status only. NEVER the raw Pi reason — it can carry a
+			// URL, a response body or a token payload.
+			lastError = describeSubscriptionLoginFailure(err, provider.name);
 			continue;
 		}
 
@@ -1511,7 +1506,7 @@ async function runClaudeBrowserLogin(tui: TUI, authStorage: AuthStorage): Promis
 		const softCancel = /^login cancelled$/i.test(reason) || reason === "cancelled" || reason === "back";
 		tui.addChild(
 			new Text(
-				`  ${brand.error("✗")} ${brand.error(softCancel ? "Sign-in cancelled." : "Couldn't finish signing in — check your connection and try again.")}`,
+				`  ${brand.error("✗")} ${brand.error(softCancel ? "Sign-in cancelled." : describeSubscriptionLoginFailure(err, "Claude"))}`,
 				0,
 				0,
 			),
