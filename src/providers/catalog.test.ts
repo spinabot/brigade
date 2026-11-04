@@ -19,6 +19,7 @@ const ENV_KEYS_TO_GUARD = [
 	"ORCAROUTER_API_KEY",
 	"ORCA_API_KEY",
 	"TOKENSMARKET_API_KEY",
+	"OPPER_API_KEY",
 	"GROQ_API_KEY",
 	"CEREBRAS_API_KEY",
 	"XAI_API_KEY",
@@ -52,6 +53,7 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 		{ id: "openrouter", envVar: "OPENROUTER_API_KEY" },
 		{ id: "orcarouter", envVar: "ORCAROUTER_API_KEY" },
 		{ id: "tokensmarket", envVar: "TOKENSMARKET_API_KEY" },
+		{ id: "opper", envVar: "OPPER_API_KEY" },
 		{ id: "groq", envVar: "GROQ_API_KEY" },
 		{ id: "cerebras", envVar: "CEREBRAS_API_KEY" },
 		{ id: "xai", envVar: "XAI_API_KEY" },
@@ -114,6 +116,18 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 		assert.equal(readProviderEnvKey(ollama), undefined);
 	});
 
+	it("Opper is a live-catalog OpenAI-compatible gateway", () => {
+		const opper = findProvider("opper")!;
+		assert.equal(opper.custom, true);
+		assert.equal(opper.liveModels, true);
+		assert.equal(opper.api, "openai-completions");
+		assert.equal(opper.baseUrl, "https://api.opper.ai/v3/compat");
+		assert.equal(opper.envVar, "OPPER_API_KEY");
+		assert.equal(opper.billing, "metered");
+		// Live discovery owns the served set — no hardcoded list to go stale.
+		assert.equal(opper.models, undefined);
+	});
+
 	it("Custom provider has no envVar (user-provided)", () => {
 		const custom = findProvider("custom")!;
 		assert.equal(custom.envVar, "");
@@ -150,6 +164,7 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 			"openai",
 			"openai-codex",
 			"openrouter",
+			"opper",
 			"orcarouter",
 			"qwen",
 			"tokensmarket",
