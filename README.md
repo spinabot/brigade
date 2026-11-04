@@ -858,6 +858,7 @@ wipes everything it knows.
 | `BRIGADE_ENCRYPTION_KEY` | At-rest encryption master key (hex) |
 | `BRIGADE_ENABLE_INBOX_PERSIST` | Persist the sub-agent inbox to JSONL (auto-on at gateway boot) |
 | `BRIGADE_HOST_ENV` | Override the host-environment tag in the system prompt's runtime line |
+| `BRIGADE_NO_SYSTEM_CA` | Set to `1` to trust only Node's bundled CAs (and `NODE_EXTRA_CA_CERTS`), not the operating system's root certificates |
 
 ---
 

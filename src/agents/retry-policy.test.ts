@@ -322,3 +322,22 @@ test("classifyErrorReason: a BrigadeRetryError('auth_recovered') is not re-class
   // the heuristics would demote it to `auth` (0 retries) and lose the recovery.
   assert.equal(classifyErrorReason(err), "auth_recovered");
 });
+
+test("RetryExhaustedError: a bare connection error says what to check, others don't", () => {
+  const info = {
+    attemptIndex: 0,
+    reason: "unknown" as const,
+    policy: getRetryPolicy("unknown"),
+    willRetry: false,
+    backoffMs: 0,
+    errorSummary: "Error: Connection error.",
+    error: new Error("Connection error."),
+  };
+  const err = new RetryExhaustedError([info], info.error);
+  assert.match(err.message, /couldn't reach the model provider/);
+  assert.match(err.message, /inspects HTTPS/);
+  assert.match(err.message, /NODE_EXTRA_CA_CERTS/);
+
+  const other = new RetryExhaustedError([{ ...info, errorSummary: "Error: boom" }], info.error);
+  assert.doesNotMatch(other.message, /couldn't reach the model provider/);
+});
