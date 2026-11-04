@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.39.2](https://github.com/spinabot/brigade/compare/brigade-v1.39.1...brigade-v1.39.2) (2026-11-04)
+
+
+### Bug Fixes
+
+* **net:** trust the operating system's root certificates, so Brigade works behind HTTPS inspection ([875ca36](https://github.com/spinabot/brigade/commit/875ca3626af0566564e377a2780f0d6e08b5162a))
+* **net:** trust the operating system's root certificates, so Brigade works behind HTTPS inspection ([32308bb](https://github.com/spinabot/brigade/commit/32308bbf3e03a068295dfaeccef9b9e3202551a8))
+
 ## [1.39.1](https://github.com/spinabot/brigade/compare/brigade-v1.39.0...brigade-v1.39.1) (2026-11-03)
 
 
