@@ -20,6 +20,7 @@ import { exaModule } from "./exa.js";
 import { firecrawlModule } from "./firecrawl.js";
 import { githubSearchModule } from "./github-search.js";
 import { hackerNewsModule } from "./hackernews.js";
+import { keenableModule } from "./keenable.js";
 import { npmSearchModule } from "./npm-search.js";
 import { ollamaSearchModule } from "./ollama-search.js";
 import { perplexityModule } from "./perplexity.js";
@@ -65,6 +66,7 @@ export const BUNDLED_MODULES: BrigadeModule[] = [
 	//     50  Firecrawl search (same key as fetch)
 	//     90  Ollama local web search (free when daemon running)
 	//     100 DuckDuckGo (keyless HTML scrape + Instant Answer fast-path)
+	//     120 Keenable (keyless public endpoint; KEENABLE_API_KEY optional)
 	//     150 Wikipedia (keyless, specialised: definitions / overviews)
 	//     160 Hacker News Algolia (keyless, specialised: tech / startup signal)
 	//     165 arXiv (keyless, specialised: research papers)
@@ -83,6 +85,7 @@ export const BUNDLED_MODULES: BrigadeModule[] = [
 	firecrawlModule,
 	githubSearchModule,
 	hackerNewsModule,
+	keenableModule,
 	npmSearchModule,
 	ollamaSearchModule,
 	perplexityModule,
