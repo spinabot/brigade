@@ -283,7 +283,11 @@ export class RetryExhaustedError extends Error {
     const hint =
       lastReason === "subscription_limit"
         ? "\nYour subscription's usage window is used up — it resets on its own (check /usage or claude.ai/settings/usage). This is the plan limit, not missing API credits."
-        : "";
+        : // The model client reports every network and TLS failure as this one
+          // phrase and drops the cause, so name the likely fixes here.
+          /\bconnection error\b/i.test(summary)
+          ? "\nBrigade couldn't reach the model provider. Check your connection. On a network that inspects HTTPS (a corporate proxy or VPN), make sure this computer trusts its root certificate, or point NODE_EXTRA_CA_CERTS at its PEM file and restart the gateway."
+          : "";
     // Chain the underlying error as `cause`. Recipient-facing classification
     // walks `.cause` to find a known reason; without this, a 402 OpenRouter
     // billing error wrapped in a retry-exhausted shell was being classified

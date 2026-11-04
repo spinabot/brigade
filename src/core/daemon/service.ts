@@ -87,6 +87,11 @@ export function buildServiceContext(overrides: Partial<ServiceContext> = {}): Se
 		cwd: overrides.cwd ?? home,
 		env: {
 			...(process.env.BRIGADE_STATE_DIR ? { BRIGADE_STATE_DIR: process.env.BRIGADE_STATE_DIR } : {}),
+			// The OS service manager doesn't pass the shell's environment, and the
+			// daemon runs from `cwd`, so a CA set only in the shell needs carrying over.
+			...(process.env.NODE_EXTRA_CA_CERTS
+				? { NODE_EXTRA_CA_CERTS: path.resolve(process.env.NODE_EXTRA_CA_CERTS) }
+				: {}),
 			...(overrides.env ?? {}),
 		},
 		stdoutPath: overrides.stdoutPath ?? path.join(logsDir, "daemon.stdout.log"),

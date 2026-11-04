@@ -57,6 +57,11 @@ if (isRootHelpInvocation(argv)) {
   process.exit(await runMain(argv));
 }
 
-// Default — full dispatch.
+// Default — full dispatch. The OS's root certificates go in first, so the CLI,
+// the TUI and the gateway all trust them before anything opens a connection. Past
+// the fast paths because reading the OS store costs ~150ms and they never touch TLS.
+const { trustSystemCertificates } = await import("./infra/net/system-ca.js");
+trustSystemCertificates();
+
 const { runMain } = await import("./cli/run-main.js");
 process.exit(await runMain(argv));
