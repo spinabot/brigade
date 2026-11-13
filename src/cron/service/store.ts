@@ -20,6 +20,7 @@ import { renameWithRetry } from "../../infra/fs/atomic-rename.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { getCachedCronJobs, writeThroughCronCache } from "../../storage/cron-cache.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
+import { atomicTempPath } from "../../infra/json-file.js";
 import { coerceScheduleInput, normalizeSchedule } from "../normalize.js";
 import { computeNextRunAtMs } from "../schedule.js";
 import type { CronJob, CronStoreFile } from "../types.js";
@@ -269,7 +270,7 @@ export function saveCronStore(storePath: string, store: CronStoreFile): void {
 	}
 
 	ensureDir(path.dirname(storePath));
-	const tmp = `${storePath}.tmp`;
+	const tmp = atomicTempPath(storePath);
 	const bak = `${storePath}.bak`;
 	// Rotate the existing store to `.bak` BEFORE we overwrite. Best-effort
 	// — a missing source file (first-ever save) skips silently; a read /

@@ -27,6 +27,7 @@ import { WebSocket } from "ws";
 import { BRIGADE_DIR } from "./config.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import type { SessionStateSnapshot } from "../protocol.js";
+import { atomicTempPath } from "../infra/json-file.js";
 import { clientAuthHeaders } from "./gateway-auth.js";
 
 export const GATEWAY_PID_PATH = path.join(BRIGADE_DIR, "gateway.pid");
@@ -88,7 +89,7 @@ export async function writeHeartbeatFile(): Promise<void> {
   }
 
   await fsAsync.mkdir(path.dirname(GATEWAY_HEARTBEAT_PATH), { recursive: true });
-  const tmp = `${GATEWAY_HEARTBEAT_PATH}.tmp`;
+  const tmp = atomicTempPath(GATEWAY_HEARTBEAT_PATH);
   await fsAsync.writeFile(tmp, JSON.stringify(payload), "utf8");
   await fsAsync.rename(tmp, GATEWAY_HEARTBEAT_PATH);
 }

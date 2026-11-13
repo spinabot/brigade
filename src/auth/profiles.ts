@@ -9,6 +9,7 @@ import {
   resolveAuthStatePath,
   resolveModelsPath,
 } from "../config/paths.js";
+import { atomicTempPath } from "../infra/json-file.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
 // Auth files all live under <agentDir>/agent/ at mode 0600 on POSIX. The
@@ -487,7 +488,7 @@ function sanitizeProfileShape(profile: AuthProfile): AuthProfile {
 
 function writeProfilesFile(profilesPath: string, file: AuthProfilesFile): void {
   ensureDir(path.dirname(profilesPath));
-  const tmp = `${profilesPath}.tmp`;
+  const tmp = atomicTempPath(profilesPath);
   fs.writeFileSync(tmp, JSON.stringify(file, null, 2), { mode: 0o600 });
   chmodIfPosix(tmp, 0o600);
   fs.renameSync(tmp, profilesPath);
@@ -495,7 +496,7 @@ function writeProfilesFile(profilesPath: string, file: AuthProfilesFile): void {
 
 function writeStateFile(statePath: string, file: AuthStateFile): void {
   ensureDir(path.dirname(statePath));
-  const tmp = `${statePath}.tmp`;
+  const tmp = atomicTempPath(statePath);
   fs.writeFileSync(tmp, JSON.stringify(file, null, 2), { mode: 0o600 });
   chmodIfPosix(tmp, 0o600);
   fs.renameSync(tmp, statePath);
