@@ -22,6 +22,9 @@ const EXPECTED: Record<string, ReturnType<typeof classifyBillingMode>> = {
 	// Same shape: a multi-model gateway that bills per token at each upstream
 	// model's rate, so a turn costs real money and the cost must render.
 	tokensmarket: "metered",
+	// EU-hosted gateway: upstream providers' token rates pass through with no
+	// markup (the fee is on credit purchases), so a turn costs real money.
+	opper: "metered",
 	groq: "metered",
 	cerebras: "metered",
 	xai: "metered",
