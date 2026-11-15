@@ -213,6 +213,19 @@ export const PROVIDERS: ProviderInfo[] = [
 		baseUrl: "https://api.tokensmarket.ai/v1",
 		billing: "metered",
 	},
+	{
+		id: "requesty",
+		name: "Requesty",
+		description: "LLM gateway with routing and failover, 700+ models from one key",
+		keyUrl: "https://app.requesty.ai/api-keys",
+		envVar: "REQUESTY_API_KEY",
+		custom: true,
+		liveModels: true, // models fetched live from /v1/models at onboarding
+		api: "openai-completions",
+		baseUrl: "https://router.requesty.ai/v1",
+		// Gateway that bills per token at each upstream model's rate.
+		billing: "metered",
+	},
 
 	{
 		id: "groq",
