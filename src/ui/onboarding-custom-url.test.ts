@@ -61,6 +61,17 @@ describe("generic custom provider onboarding", () => {
 			const nonCustom = findProvider("anthropic");
 			assert.ok(nonCustom && !routesToCustomProvider(nonCustom), "non-custom providers must not route here");
 		});
+
+		it("OpenDesign Go uses the existing custom flow with live workspace models", () => {
+			const provider = findProvider("opendesign-go");
+			assert.ok(provider);
+			assert.ok(routesToCustomProvider(provider));
+			assert.equal(provider.baseUrl, "https://amr-link.open-design.ai/v1");
+			assert.equal(provider.api, "openai-completions");
+			assert.equal(provider.liveModels, true);
+			assert.equal(provider.billing, "subscription");
+			assert.equal(provider.subscription, undefined, "API-key setup must not trigger OAuth");
+		});
 	});
 
 	describe("writeCustomProviderToModelsJson → resolveModelNeverMiss round-trip", () => {

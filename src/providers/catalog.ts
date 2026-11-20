@@ -213,6 +213,18 @@ export const PROVIDERS: ProviderInfo[] = [
 		baseUrl: "https://api.tokensmarket.ai/v1",
 		billing: "metered",
 	},
+	{
+		id: "opendesign-go",
+		name: "OpenDesign Go",
+		description: "OpenDesign plan models through an OpenAI-compatible API",
+		keyUrl: "https://open-design.ai/help/cloud-api/",
+		envVar: "OPENDESIGN_API_KEY",
+		custom: true,
+		liveModels: true,
+		api: "openai-completions",
+		baseUrl: "https://amr-link.open-design.ai/v1",
+		billing: "subscription",
+	},
 
 	{
 		id: "groq",
