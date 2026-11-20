@@ -182,7 +182,7 @@ brigade tui
 
 The onboarding wizard walks you through **five steps**: **(0) storage mode**
 (filesystem or self-hosted Convex), **(1) pick a provider** (Anthropic, OpenAI, Gemini,
-OpenRouter, OrcaRouter, Token Market, Ollama, and more), **(2) connect it** (paste an API key, **sign in with a
+OpenRouter, OrcaRouter, Token Market, OpenDesign Go, Ollama, and more), **(2) connect it** (paste an API key, **sign in with a
 Claude/ChatGPT/Copilot subscription**, reuse your Claude Code or Codex CLI login, or
 connect local Ollama), **(3) choose a default model**, and **(4) web search** (pick a
 search backend; keyless options work out of the box). Subsequent launches resume right
@@ -791,11 +791,18 @@ switch to `"tree"` to let a parent see sub-agents it spawned.
 
 ## Providers & web search
 
-**Models out of the box:** Anthropic, OpenAI, Google Gemini, OpenRouter, OrcaRouter, Token Market,
+**Models out of the box:** Anthropic, OpenAI, Google Gemini, OpenRouter, OrcaRouter, Token Market, OpenDesign Go,
 Groq, Cerebras, xAI, DeepSeek, Mistral, **Ollama** (local), and **Custom**
 OpenAI-compatible endpoints (Together, Fireworks, vLLM, LM Studio, on-prem gateways
 — anything that speaks `/v1/chat/completions`). Connect several at once, switch with
 `/model`, and Brigade keeps your context across the switch.
+
+**OpenDesign Go:** subscribe to [OpenDesign's Go plan](https://go.open-design.ai/),
+create a workspace key using the [API setup guide](https://open-design.ai/help/cloud-api/),
+then choose **OpenDesign Go** in onboarding. Paste the key or confirm an existing
+`OPENDESIGN_API_KEY`; Brigade discovers the models available to that workspace at
+`https://amr-link.open-design.ai/v1`. Select a model with the capabilities your tasks
+need. This uses API-key authentication; plan allowance and renewal details remain in OpenDesign.
 
 **Sign in with a subscription — no API key.** Don't want to manage keys, consoles,
 and billing? Use the subscription you already pay for. Two ways, both keyless:
